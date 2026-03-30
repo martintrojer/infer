@@ -14,6 +14,7 @@
 //! We simplify to post-state only for now (forward analysis without
 //! precondition inference).
 
+use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
@@ -23,6 +24,8 @@ use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::{Allocator, Attribute};
 use crate::base_domain::BaseDomain;
+use crate::formula::atom::Atom;
+use crate::formula::lin_arith::LinArith;
 use crate::formula::{Formula, NewEq, Operand};
 use crate::invalidation::Invalidation;
 use crate::sat_unsat::SatUnsat;
@@ -107,16 +110,21 @@ impl AbductiveDomain {
     /// If no edge exists, creates a fresh target and adds the edge.
     /// Also records the read in the pre-state (biabduction).
     pub fn read_heap(&mut self, addr: AbstractValue, access: Access) -> AbstractValue {
-        let target = if let Some(target) = self.post.heap.find_edge(addr, &access) {
-            target
-        } else {
-            let target = AbstractValue::mk_fresh();
-            self.post.heap.add_edge(addr, access.clone(), target);
-            target
-        };
-        // Abduce: record this read in the pre-state so the summary captures
-        // what the procedure assumes about its inputs.
-        self.pre.heap.add_edge(addr, access, target);
+        if let Some(target) = self.post.heap.find_edge(addr, &access) {
+            return target;
+        }
+
+        let target = AbstractValue::mk_fresh();
+        self.post.heap.add_edge(addr, access.clone(), target);
+
+        // Mirror OCaml's SafeMemory.eval_edge: only abduce reads rooted in the
+        // existing pre-state, and never overwrite the original pre-edge on
+        // subsequent reads after the post-state has diverged.
+        if self.pre.heap.get_edges(addr).is_some() {
+            self.pre.heap.add_edge(addr, access, target);
+            self.pre.heap.register_address(target);
+        }
+
         target
     }
 
@@ -160,20 +168,128 @@ impl AbductiveDomain {
         self.post.attrs.add_one(repr, attr);
     }
 
+    fn apply_formula_result(&mut self, result: SatUnsat<Vec<NewEq>>) -> SatUnsat<()> {
+        result.and_then(|new_eqs| self.incorporate_new_eqs(new_eqs))
+    }
+
+    fn incorporate_new_eqs(&mut self, new_eqs: Vec<NewEq>) -> SatUnsat<()> {
+        for new_eq in new_eqs {
+            match new_eq {
+                NewEq::Equal(old, new) if old == new => {}
+                NewEq::Equal(old, new) => self.subst_var(old, new),
+                NewEq::EqZero(v) => {
+                    let repr = self.path_condition.get_var_repr(v);
+                    if self.is_stack_allocated(repr) {
+                        return SatUnsat::Unsat;
+                    }
+                    if self.is_heap_allocated(repr) || self.must_be_valid.contains(&repr) {
+                        self.post.attrs.invalidate(
+                            repr,
+                            Invalidation::ConstantDereference(IntLit::zero()),
+                            Location::dummy(),
+                        );
+                    }
+                }
+            }
+        }
+        SatUnsat::Sat(())
+    }
+
+    fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
+        let new = self.path_condition.get_var_repr(new);
+        self.pre.subst_var(old, new);
+        self.post.subst_var(old, new);
+        let must_be_valid = std::mem::take(&mut self.must_be_valid);
+        self.must_be_valid = self.subst_value_set(must_be_valid, old, new);
+        let need_dynamic_type_specialization =
+            std::mem::take(&mut self.need_dynamic_type_specialization);
+        self.need_dynamic_type_specialization =
+            self.subst_value_set(need_dynamic_type_specialization, old, new);
+        for value in self.const_cache.values_mut() {
+            let value0 = if *value == old { new } else { *value };
+            *value = self.path_condition.get_var_repr(value0);
+        }
+    }
+
+    fn subst_value_set(
+        &self,
+        values: std::collections::HashSet<AbstractValue>,
+        old: AbstractValue,
+        new: AbstractValue,
+    ) -> std::collections::HashSet<AbstractValue> {
+        values
+            .into_iter()
+            .map(|value| {
+                let value = if value == old { new } else { value };
+                self.path_condition.get_var_repr(value)
+            })
+            .collect()
+    }
+
+    fn is_heap_allocated(&self, addr: AbstractValue) -> bool {
+        self.post
+            .heap
+            .iter()
+            .any(|(src, edges)| !edges.is_empty() && self.path_condition.get_var_repr(*src) == addr)
+            || self.pre.heap.iter().any(|(src, edges)| {
+                !edges.is_empty() && self.path_condition.get_var_repr(*src) == addr
+            })
+    }
+
+    fn is_stack_allocated(&self, addr: AbstractValue) -> bool {
+        self.post.stack.iter().any(|(var, &stack_addr)| {
+            matches!(var, Var::ProgramVar(_))
+                && self.path_condition.get_var_repr(stack_addr) == addr
+        })
+    }
+
     /// Record that two abstract values are equal.
-    pub fn and_equal(&mut self, v1: AbstractValue, v2: AbstractValue) -> SatUnsat<Vec<NewEq>> {
-        self.path_condition.and_equal_vars(v1, v2)
+    pub fn and_equal(&mut self, v1: AbstractValue, v2: AbstractValue) -> SatUnsat<()> {
+        let result = self.path_condition.and_equal_vars(v1, v2);
+        self.apply_formula_result(result)
     }
 
     /// Record that an abstract value equals a constant.
-    pub fn and_equal_const(&mut self, v: AbstractValue, c: i64) -> SatUnsat<Vec<NewEq>> {
-        self.path_condition.and_equal_const(v, c)
+    pub fn and_equal_const(&mut self, v: AbstractValue, c: i64) -> SatUnsat<()> {
+        let result = self.path_condition.and_equal_const(v, c);
+        self.apply_formula_result(result)
     }
 
     /// Record that an abstract value is positive (> 0, i.e., non-null for pointers).
     /// Cross-ref: OCaml PulseArithmetic.ml and_positive.
-    pub fn and_positive(&mut self, v: AbstractValue) -> SatUnsat<Vec<NewEq>> {
-        self.path_condition.and_positive(v)
+    pub fn and_positive(&mut self, v: AbstractValue) -> SatUnsat<()> {
+        let result = self.path_condition.and_positive(v);
+        self.apply_formula_result(result)
+    }
+
+    /// Record that a variable equals a linear expression.
+    pub fn and_equal_linear(&mut self, v: AbstractValue, lin: LinArith) -> SatUnsat<()> {
+        let result = self.path_condition.and_equal_linear(v, lin);
+        self.apply_formula_result(result)
+    }
+
+    /// Record that a variable equals a binary operation.
+    pub fn and_equal_binop(
+        &mut self,
+        v: AbstractValue,
+        op: sil::binop::Binop,
+        x: &Operand,
+        y: &Operand,
+    ) -> SatUnsat<()> {
+        let result = self.path_condition.and_equal_binop(v, op, x, y);
+        self.apply_formula_result(result)
+    }
+
+    /// Add a translated callee atom directly to the path condition.
+    pub fn and_atom_direct(&mut self, atom: Atom) -> SatUnsat<()> {
+        let result = self.path_condition.and_atom_direct(atom);
+        self.apply_formula_result(result)
+    }
+
+    /// Add a translated callee prune condition and remember its depth.
+    pub fn and_condition_direct(&mut self, atom: Atom, depth: usize) -> SatUnsat<()> {
+        let result = self.path_condition.and_condition_direct(atom, depth);
+        self.apply_formula_result(result)
     }
 
     /// Get the known constant value of a variable, if any.
@@ -213,8 +329,9 @@ impl AbductiveDomain {
     }
 
     /// Record a disequality.
-    pub fn and_not_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<Vec<NewEq>> {
-        self.path_condition.and_not_equal(op1, op2)
+    pub fn and_not_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<()> {
+        let result = self.path_condition.and_not_equal(op1, op2);
+        self.apply_formula_result(result)
     }
 
     /// Check if an abstract value is known to be zero (null).
@@ -236,9 +353,9 @@ impl AbductiveDomain {
         if let Some(q) = self.path_condition.is_known_const(v) {
             let c = *q.numer() / *q.denom();
             // Check if we've seen this constant before
-            if let Some(&existing) = self.const_cache.get(&c) {
+            if let Some(existing) = self.const_cache.get(&c).copied() {
                 if existing != v {
-                    let _ = self.path_condition.and_equal_vars(v, existing);
+                    let _ = self.and_equal(v, existing);
                 }
                 return self.path_condition.get_var_repr(existing);
             }
@@ -295,18 +412,27 @@ impl AbductiveDomain {
         v1: AbstractValue,
         v2: AbstractValue,
         negated: bool,
-    ) -> SatUnsat<Vec<NewEq>> {
-        self.path_condition.prune_eq(v1, v2, negated)
+    ) -> SatUnsat<()> {
+        let result = self.path_condition.prune_eq(v1, v2, negated);
+        self.apply_formula_result(result)
     }
 
     /// Add a prune constraint with a constant.
-    pub fn prune_eq_const(
-        &mut self,
-        v: AbstractValue,
-        c: i64,
-        negated: bool,
-    ) -> SatUnsat<Vec<NewEq>> {
-        self.path_condition.prune_eq_const(v, c, negated)
+    pub fn prune_eq_const(&mut self, v: AbstractValue, c: i64, negated: bool) -> SatUnsat<()> {
+        let result = self.path_condition.prune_eq_const(v, c, negated);
+        self.apply_formula_result(result)
+    }
+
+    /// Record a local `<` prune condition.
+    pub fn prune_less_than(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<()> {
+        let result = self.path_condition.prune_less_than(op1, op2);
+        self.apply_formula_result(result)
+    }
+
+    /// Record a local `<=` prune condition.
+    pub fn prune_less_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<()> {
+        let result = self.path_condition.prune_less_equal(op1, op2);
+        self.apply_formula_result(result)
     }
 }
 
@@ -399,6 +525,112 @@ mod tests {
         // Reading again should return the same value (edge now exists)
         let v2 = state.read_heap(addr, Access::Dereference);
         assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn test_heap_read_does_not_abduce_local_roots() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        let local_addr = AbstractValue::mk_fresh();
+        let _ = state.read_heap(local_addr, Access::Dereference);
+
+        assert_eq!(
+            state.pre.heap.find_edge(local_addr, &Access::Dereference),
+            None
+        );
+    }
+
+    #[test]
+    fn test_heap_read_preserves_original_pre_edge_after_post_write() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
+            Mangled::from_string("p"),
+            Procname::c_from_string("test"),
+        )));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+
+        let before = state.read_heap(formal_addr, Access::Dereference);
+        let after = AbstractValue::mk_fresh();
+        state.write_heap(formal_addr, Access::Dereference, after);
+
+        let found = state.read_heap(formal_addr, Access::Dereference);
+
+        assert_eq!(found, after, "post-state should see the latest write");
+        assert_eq!(
+            state.pre.heap.find_edge(formal_addr, &Access::Dereference),
+            Some(before),
+            "pre-state should keep the original value seen through the formal"
+        );
+    }
+
+    #[test]
+    fn test_heap_read_registers_pre_targets_for_deep_reads() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
+            Mangled::from_string("p"),
+            Procname::c_from_string("test"),
+        )));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+
+        let inner = state.read_heap(formal_addr, Access::Dereference);
+        let leaf = state.read_heap(inner, Access::Dereference);
+
+        assert_eq!(
+            state.pre.heap.find_edge(inner, &Access::Dereference),
+            Some(leaf),
+            "new pre targets should be registered so deeper reads are abduced too"
+        );
+    }
+
+    #[test]
+    fn test_and_equal_substitutes_heap_attrs_and_sets() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let src = AbstractValue::of_raw(1);
+        let new = AbstractValue::of_raw(10);
+        let old = AbstractValue::of_raw(20);
+
+        state.pre.heap.add_edge(src, Access::Dereference, old);
+        state.post.heap.add_edge(src, Access::Dereference, old);
+        state.add_attr(old, Attribute::Initialized);
+        state.must_be_valid.insert(old);
+        state.need_dynamic_type_specialization.insert(old);
+
+        assert!(state.and_equal(old, new).is_sat());
+        assert_eq!(
+            state.pre.heap.find_edge(src, &Access::Dereference),
+            Some(new)
+        );
+        assert_eq!(
+            state.post.heap.find_edge(src, &Access::Dereference),
+            Some(new)
+        );
+        assert!(state
+            .post
+            .attrs
+            .get(&new)
+            .is_some_and(|attrs| attrs.contains(&Attribute::Initialized)));
+        assert!(state.must_be_valid.contains(&new));
+        assert!(state.need_dynamic_type_specialization.contains(&new));
+    }
+
+    #[test]
+    fn test_eq_zero_marks_must_be_valid_value_invalid() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
+            Mangled::from_string("p"),
+            Procname::c_from_string("test"),
+        )));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+        let formal_val = state.read_heap(formal_addr, Access::Dereference);
+
+        state.mark_must_be_valid(formal_val);
+        assert!(state.and_equal_const(formal_val, 0).is_sat());
+        assert!(state.check_valid(formal_val).is_err());
     }
 
     #[test]

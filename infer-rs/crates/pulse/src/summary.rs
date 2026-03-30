@@ -95,83 +95,203 @@ pub struct PrePost {
     pub diagnostic: Option<Diagnostic>,
 }
 
+fn build_pre_post(
+    pdesc: &Procdesc,
+    astate: AbductiveDomain,
+    kind: PrePostKind,
+    diagnostic: Option<Diagnostic>,
+) -> PrePost {
+    let formals: Vec<(Pvar, AbstractValue)> = pdesc
+        .formals
+        .iter()
+        .filter_map(|(mangled, _typ, _annot)| {
+            let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+            let var = Var::ProgramVar(Box::new(pvar.clone()));
+            astate.post.stack.find(&var).map(|addr| (pvar, addr))
+        })
+        .collect();
+
+    let result = find_return_value(&astate, pdesc);
+    let pre = astate.pre.clone();
+
+    PrePost {
+        pre,
+        post: astate,
+        formals,
+        result,
+        kind,
+        diagnostic,
+    }
+}
+
+pub(crate) fn abort_is_manifest(pdesc: &Procdesc, astate: &AbductiveDomain) -> bool {
+    let mut pp = build_pre_post(pdesc, astate.clone(), PrePostKind::AbortProgram, None);
+    let _ = pp.normalize();
+    pre_post_is_manifest(pdesc, &pp)
+}
+
 impl PrePost {
-    /// Normalize the summary by discarding attributes on unreachable addresses.
+    /// Restore formal/global/return variable views in the post-state before
+    /// summary filtering.
     ///
-    /// Matches OCaml's `discard_unreachable_ ~for_summary:true` which removes
-    /// attributes on addresses not reachable from the pre/post stacks.
-    /// This strips spurious Invalid attrs (e.g., on integer constants stored
-    /// through pointers) that don't affect callers.
-    fn normalize(&mut self) -> Vec<Diagnostic> {
+    /// Mirrors OCaml `restore_formals_for_summary`: when a procedure mutates a
+    /// formal variable locally (for example, advancing a loop cursor), callers
+    /// should still see the original formal view from the pre-state rather than
+    /// the callee's final local cursor position.
+    fn restore_formals_for_summary(&mut self) {
         use std::collections::HashSet;
 
-        // Collect all addresses reachable from pre stack, post stack,
-        // formals, and return value
-        let mut reachable = HashSet::new();
-        let mut worklist = Vec::new();
+        let mut filtered_post_stack = crate::base_stack::BaseStack::empty();
+        for (var, addr) in self.post.post.stack.iter() {
+            if var.is_global() || var.is_return() {
+                filtered_post_stack.add(var.clone(), *addr);
+            }
+        }
+        self.post.post.stack = filtered_post_stack;
 
-        // Seeds: pre stack values
-        for (_, addr) in self.pre.stack.iter() {
-            worklist.push(*addr);
+        let pre_bindings: Vec<_> = self
+            .pre
+            .stack
+            .iter()
+            .map(|(var, addr)| (var.clone(), *addr))
+            .collect();
+
+        for (var, addr) in pre_bindings {
+            self.post.post.stack.add(var.clone(), addr);
+            self.restore_pre_var_value(
+                addr,
+                var.is_global() || var.is_return(),
+                &mut HashSet::new(),
+            );
         }
-        // Note: we intentionally do NOT seed from the post stack.
-        // Local variables are not visible to callers, so their attrs
-        // shouldn't be in the summary. Only formals and return value
-        // matter. Matches OCaml's restore_formals_for_summary which
-        // removes the post stack before discarding unreachable.
-        // Seeds: formal addresses
-        for (_, addr) in &self.formals {
-            worklist.push(*addr);
-        }
-        // Seeds: return value
-        if let Some(rv) = self.result {
-            worklist.push(rv);
+    }
+
+    fn restore_pre_var_value(
+        &mut self,
+        addr: AbstractValue,
+        is_value_visible_outside: bool,
+        visited: &mut std::collections::HashSet<AbstractValue>,
+    ) {
+        if !visited.insert(addr) {
+            return;
         }
 
-        // BFS through heap edges
+        let Some(pre_edges) = self.pre.heap.get_edges(addr).cloned() else {
+            if !is_value_visible_outside {
+                self.post.post.heap.remove(addr);
+            }
+            return;
+        };
+
+        let post_has_edge =
+            |post: &crate::base_memory::BaseMemory, src: AbstractValue, access: &Access| {
+                post.find_edge(src, access).is_some()
+            };
+
+        for (access, target) in pre_edges.iter() {
+            match access {
+                Access::Dereference => {
+                    if is_value_visible_outside && post_has_edge(&self.post.post.heap, addr, access)
+                    {
+                        continue;
+                    }
+                    self.post.post.heap.add_edge(addr, access.clone(), *target);
+                }
+                Access::FieldAccess(_) | Access::ArrayAccess(_, _) => {
+                    self.post.post.heap.add_edge(addr, access.clone(), *target);
+                    self.restore_pre_var_value(*target, is_value_visible_outside, visited);
+                }
+            }
+        }
+    }
+
+    fn collect_reachable_from_seeds(
+        &self,
+        seeds: impl IntoIterator<Item = AbstractValue>,
+        include_pre_heap: bool,
+        include_post_heap: bool,
+    ) -> std::collections::HashSet<AbstractValue> {
+        let mut reachable = std::collections::HashSet::new();
+        let mut worklist: Vec<_> = seeds.into_iter().collect();
+
         while let Some(addr) = worklist.pop() {
             if !reachable.insert(addr) {
                 continue;
             }
-            // Follow pre heap edges
-            if let Some(edges) = self.pre.heap.get_edges(addr) {
-                for (_, target) in edges.iter() {
-                    worklist.push(*target);
+
+            if include_pre_heap {
+                if let Some(edges) = self.pre.heap.get_edges(addr) {
+                    for (_, target) in edges.iter() {
+                        worklist.push(*target);
+                    }
                 }
             }
-            // Follow post heap edges
-            if let Some(edges) = self.post.post.heap.get_edges(addr) {
-                for (_, target) in edges.iter() {
-                    worklist.push(*target);
+
+            if include_post_heap {
+                if let Some(edges) = self.post.post.heap.get_edges(addr) {
+                    for (_, target) in edges.iter() {
+                        worklist.push(*target);
+                    }
                 }
             }
         }
 
-        // Check for memory leaks: find addresses reachable from local
-        // variables (post stack) but NOT from the summary's public interface
-        // (formals, return value). These are procedure-local allocations
-        // that the caller can never free.
-        // Cross-ref: OCaml PulseAbductiveDomain.ml check_memory_leaks +
-        // filter_live_addresses.
-        let mut locally_reachable = HashSet::new();
-        let mut local_worklist = Vec::new();
-        for (_, addr) in self.post.post.stack.iter() {
-            local_worklist.push(*addr);
+        reachable
+    }
+
+    /// Normalize the summary by discarding unreachable state.
+    ///
+    /// Matches OCaml's `discard_unreachable_ ~for_summary:true` which trims
+    /// dead heap cells and address attributes from exported summaries, then
+    /// simplifies the path condition to live values only.
+    fn normalize(&mut self) -> Vec<Diagnostic> {
+        use std::collections::HashSet;
+
+        // OCaml checks leaks from the pre-filter state, before restoring and
+        // trimming the post stack for summary creation.
+        let locally_reachable = self.collect_reachable_from_seeds(
+            self.post.post.stack.iter().map(|(_, addr)| *addr),
+            false,
+            true,
+        );
+
+        self.restore_formals_for_summary();
+
+        // The caller-visible summary surface is rooted in the pre stack and
+        // the return value. The post stack has been reduced to globals/return
+        // plus restored pre bindings above, so we intentionally do not seed
+        // from arbitrary post locals here.
+        let mut summary_roots: Vec<AbstractValue> =
+            self.pre.stack.iter().map(|(_, addr)| *addr).collect();
+        summary_roots.extend(self.formals.iter().map(|(_, addr)| *addr));
+        if let Some(rv) = self.result {
+            summary_roots.push(rv);
         }
-        while let Some(addr) = local_worklist.pop() {
-            if !locally_reachable.insert(addr) {
-                continue;
-            }
-            if let Some(edges) = self.post.post.heap.get_edges(addr) {
-                for (_, target) in edges.iter() {
-                    local_worklist.push(*target);
-                }
-            }
-        }
+
+        let reachable = self.collect_reachable_from_seeds(summary_roots, true, true);
+        let canonical_reachable: HashSet<_> = reachable
+            .iter()
+            .map(|addr| self.post.path_condition.get_var_repr(*addr))
+            .collect();
+        let mut heap_reachable = reachable.clone();
+        heap_reachable.extend(canonical_reachable.iter().copied());
+
         let leaks = self.check_memory_leaks(&reachable, &locally_reachable);
 
-        // Remove attrs on unreachable addresses
-        self.post.post.attrs.retain_reachable(&reachable);
+        self.pre.heap.retain_reachable(&heap_reachable);
+        self.pre.attrs.retain_reachable(&canonical_reachable);
+        self.post.post.heap.retain_reachable(&heap_reachable);
+        self.post.post.attrs.retain_reachable(&canonical_reachable);
+        self.post
+            .must_be_valid
+            .retain(|addr| canonical_reachable.contains(addr));
+        self.post
+            .need_dynamic_type_specialization
+            .retain(|addr| canonical_reachable.contains(addr));
+
+        let formula_reachable =
+            expand_formula_reachable(&self.post.path_condition, &canonical_reachable);
+        self.post.path_condition.simplify(&formula_reachable);
 
         leaks
     }
@@ -268,29 +388,8 @@ impl PulseSummary {
                     }
                     _ => (PrePostKind::ContinueProgram, None),
                 };
-                let astate = state.get_astate().clone();
-
-                let formals: Vec<(Pvar, AbstractValue)> = pdesc
-                    .formals
-                    .iter()
-                    .filter_map(|(mangled, _typ, _annot)| {
-                        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
-                        let var = Var::ProgramVar(Box::new(pvar.clone()));
-                        astate.post.stack.find(&var).map(|addr| (pvar, addr))
-                    })
-                    .collect();
-
-                let result = find_return_value(&astate, pdesc);
-
-                let pre = astate.pre.clone();
-                let mut pp = PrePost {
-                    pre,
-                    post: astate,
-                    formals,
-                    result,
-                    kind: initial_kind,
-                    diagnostic: abort_diag,
-                };
+                let mut pp =
+                    build_pre_post(pdesc, state.get_astate().clone(), initial_kind, abort_diag);
                 let leak_diags = pp.normalize();
                 // Only report leaks from ContinueProgram paths — error paths
                 // (ExitProgram/AbortProgram) typically produce spurious leaks.
@@ -300,17 +399,18 @@ impl PulseSummary {
                 }
 
                 // Classify AbortProgram as manifest or latent.
-                // Manifest errors: report diagnostic now (at callee level).
-                // Latent errors: defer to callers, re-evaluate at each call site.
+                // Manifest errors: publish the diagnostic now.
+                // Latent errors: keep the disjunct in the summary but do NOT
+                // publish a manifest diagnostic at this procedure.
                 // Cross-ref: OCaml PulseSummary.ml exec_summary_of_post_common
-                // calls report_summary_error which calls LatentIssue.should_report.
+                // reports only after latent-vs-manifest classification.
                 if pp.kind == PrePostKind::AbortProgram {
                     // Reclassify as latent if the error depends on caller inputs.
                     // Latent pre_posts propagate to callers for re-evaluation.
-                    // Diagnostics are extracted from the all-node scan in the
-                    // checker (covering unreachable-exit cases like infinite loops).
-                    if !is_manifest(&pp) {
+                    if !pre_post_is_manifest(pdesc, &pp) {
                         pp.kind = PrePostKind::LatentAbortProgram;
+                    } else if let Some(diag) = &pp.diagnostic {
+                        diagnostics.push(diag.clone());
                     }
                 }
 
@@ -370,55 +470,103 @@ impl PulseSummary {
 
 /// Check if an error is manifest (not dependent on caller-provided values).
 ///
-/// An error is manifest if no formula atoms reference formal parameter values.
-/// If atoms constrain formal-derived values (e.g., `a == 4` where `a` is a formal),
-/// the error is latent — it only manifests when a caller provides specific values.
+/// An error is manifest if every recorded prune condition is either:
+/// - local to the current procedure (depth 0),
+/// - ground, or
+/// - a benign non-null / disequality constraint on allocated or must-be-valid
+///   addresses.
 ///
-/// Cross-ref: OCaml PulseArithmetic.ml is_manifest checks whether the path condition
-/// only constrains allocated pointers to be non-null (benign constraints).
+/// Cross-ref: OCaml PulseArithmetic.ml / PulseFormula.is_manifest. The key
+/// detail is that only conditions imported from callees (depth > 0) can make
+/// an issue latent; direct tests in the current procedure do not.
 fn is_manifest(pre_post: &PrePost) -> bool {
-    use std::collections::HashSet;
+    pre_post
+        .post
+        .path_condition
+        .conditions()
+        .iter()
+        .all(|(atom, depth)| {
+            *depth == 0
+                || atom_is_ground(atom)
+                || atom_is_benign_manifest_constraint(pre_post, atom)
+        })
+}
 
-    // No formals → the error is entirely internal → manifest
-    if pre_post.formals.is_empty() {
-        return true;
+fn pre_post_is_manifest(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    proc_is_entry_point(pdesc) || is_manifest(pre_post)
+}
+
+fn proc_is_entry_point(pdesc: &Procdesc) -> bool {
+    pdesc.proc_name.get_method_name() == "main"
+}
+
+fn atom_is_ground(atom: &crate::formula::atom::Atom) -> bool {
+    atom.all_vars().is_empty()
+}
+
+fn atom_is_benign_manifest_constraint(
+    pre_post: &PrePost,
+    atom: &crate::formula::atom::Atom,
+) -> bool {
+    use crate::formula::atom::Atom;
+    use crate::formula::term::Term;
+
+    let is_allocatedish =
+        |v: AbstractValue| {
+            let repr = pre_post.post.path_condition.get_var_repr(v);
+            pre_post.post.post.attrs.get(&repr).is_some_and(|attrs| {
+                attrs.get_allocated().is_some() || attrs.get_invalid().is_some()
+            }) || pre_post.post.must_be_valid.contains(&repr)
+        };
+
+    let var_neq_zero = match atom {
+        Atom::NotEqual(Term::Var(v), Term::Const(0))
+        | Atom::NotEqual(Term::Const(0), Term::Var(v))
+        | Atom::LessThan(Term::Const(0), Term::Var(v))
+        | Atom::LessThan(Term::Var(v), Term::Const(0)) => Some(*v),
+        _ => None,
+    };
+    if let Some(v) = var_neq_zero {
+        return is_allocatedish(v);
     }
 
-    // Collect formal parameter values by following the deref edge from
-    // each formal's stack address in the post heap.
-    let phi = pre_post.post.path_condition.phi();
-    let mut param_vals: HashSet<AbstractValue> = HashSet::new();
-    for (_, formal_addr) in &pre_post.formals {
-        // Follow deref in post heap to find the parameter's current value
-        if let Some(target) = pre_post
-            .post
-            .post
-            .heap
-            .find_edge(*formal_addr, &crate::access::Access::Dereference)
-        {
-            param_vals.insert(target);
+    match atom {
+        Atom::NotEqual(Term::Var(x), Term::Var(y)) => is_allocatedish(*x) && is_allocatedish(*y),
+        _ => false,
+    }
+}
+
+fn expand_formula_reachable(
+    formula: &crate::formula::Formula,
+    seed_reachable: &std::collections::HashSet<AbstractValue>,
+) -> std::collections::HashSet<AbstractValue> {
+    let phi = formula.phi();
+    let mut reachable = seed_reachable.clone();
+    let mut worklist: Vec<_> = seed_reachable.iter().copied().collect();
+
+    while let Some(v) = worklist.pop() {
+        let repr = phi.get_repr(v);
+        if let Some(lin) = phi.linear_eqs.get(&repr) {
+            for dep in lin.vars.keys() {
+                let dep_repr = phi.get_repr(*dep);
+                if reachable.insert(dep_repr) {
+                    worklist.push(dep_repr);
+                }
+            }
         }
-    }
 
-    if param_vals.is_empty() {
-        return true; // no parameter values found → manifest
-    }
-
-    // Check atoms for constraints on parameter values.
-    // Atoms come from prune instructions (if/while conditions) and
-    // interproc formula translation. If an atom constrains a formal
-    // parameter value, the error depends on the caller's input.
-    // We only check atoms, not linear_eqs, because linear_eqs can
-    // contain spurious entries from local stores that overwrite formals.
-    for atom in &phi.atoms {
-        for v in atom.all_vars() {
-            if param_vals.contains(&v) {
-                return false; // constraint involves parameter → latent
+        for (&lhs, lin) in &phi.linear_eqs {
+            let lhs_repr = phi.get_repr(lhs);
+            if lhs_repr != repr
+                && lin.vars.keys().any(|dep| phi.get_repr(*dep) == repr)
+                && reachable.insert(lhs_repr)
+            {
+                worklist.push(lhs_repr);
             }
         }
     }
 
-    true
+    reachable
 }
 
 /// Check if an allocator and invalidation are a matching pair (alloc then free).
@@ -571,10 +719,18 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribute::Allocator;
+    use crate::formula::atom::Atom;
+    use crate::formula::lin_arith::LinArith;
+    use crate::formula::term::Term;
+    use sil::ident::{Ident, IdentName};
+    use sil::int_lit::IntLit;
     use sil::location::Location;
     use sil::mangled::Mangled;
     use sil::procname::Procname;
+    use sil::pvar::Pvar;
     use sil::typ::Typ;
+    use sil::var::Var;
 
     fn make_pdesc_with_formals(formals: &[&str]) -> Procdesc {
         let pname = Procname::c_from_string("test_proc");
@@ -582,6 +738,42 @@ mod tests {
         pdesc.formals = formals
             .iter()
             .map(|name| (Mangled::from_string(*name), Typ::void(), Default::default()))
+            .collect();
+        pdesc
+    }
+
+    fn make_abort_pre_post_with_formal(name: &str) -> (Procdesc, PrePost, AbstractValue) {
+        let pdesc = make_pdesc_with_formals(&[name]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string(name), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+
+        let pre_post = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_addr)],
+            result: None,
+            kind: PrePostKind::AbortProgram,
+            diagnostic: None,
+        };
+
+        (pdesc, pre_post, formal_val)
+    }
+
+    fn make_named_pdesc_with_formals(name: &str, formals: &[&str]) -> Procdesc {
+        let pname = Procname::c_from_string(name);
+        let mut pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        pdesc.formals = formals
+            .iter()
+            .map(|formal| {
+                (
+                    Mangled::from_string(*formal),
+                    Typ::void(),
+                    Default::default(),
+                )
+            })
             .collect();
         pdesc
     }
@@ -620,5 +812,275 @@ mod tests {
 
         let summary = PulseSummary::of_proc(&pdesc, &states, vec![], false);
         assert_eq!(summary.pre_posts.len(), 2, "should keep both disjuncts");
+    }
+
+    #[test]
+    fn test_normalize_restores_original_formal_view() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_stack_addr = astate.post.stack.find(&var).unwrap();
+        let original_value = astate.read_heap(formal_stack_addr, Access::Dereference);
+        let advanced_value = AbstractValue::mk_fresh();
+        astate.write_heap(formal_stack_addr, Access::Dereference, advanced_value);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_stack_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert_eq!(
+            pp.post
+                .post
+                .heap
+                .find_edge(formal_stack_addr, &Access::Dereference),
+            Some(original_value),
+            "summary normalization should restore the pre-state formal view"
+        );
+    }
+
+    #[test]
+    fn test_normalize_drops_local_only_heap_but_still_reports_leak() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let local_root = AbstractValue::mk_fresh();
+        let local_value = AbstractValue::mk_fresh();
+        let local_var = Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0));
+
+        astate.post.stack.add(local_var, local_root);
+        astate.write_heap(local_root, Access::Dereference, local_value);
+        astate.allocate(local_value, Allocator::CMalloc, Location::dummy());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let leaks = pp.normalize();
+
+        assert!(
+            leaks
+                .iter()
+                .any(|diag| matches!(diag, Diagnostic::MemoryLeak { .. })),
+            "leak reporting should happen before dead summary state is trimmed"
+        );
+        assert!(
+            pp.post.post.heap.get_edges(local_root).is_none(),
+            "local-only heap cells should not survive summary normalization"
+        );
+        assert!(
+            pp.post.post.attrs.get(&local_value).is_none(),
+            "local-only attrs should be removed from the exported summary"
+        );
+    }
+
+    #[test]
+    fn test_normalize_drops_unreachable_formula_constraints() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let local_value = AbstractValue::mk_fresh();
+        let _ = astate.path_condition.and_equal_const(local_value, 7);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert!(
+            !pp.post
+                .path_condition
+                .phi()
+                .linear_eqs
+                .contains_key(&local_value),
+            "constraints on dead local-only values should be dropped from summaries"
+        );
+    }
+
+    #[test]
+    fn test_is_manifest_ignores_local_prune_on_formal_value() {
+        let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
+        let _ = pre_post
+            .post
+            .path_condition
+            .prune_eq_const(formal_val, 4, false);
+
+        assert!(
+            is_manifest(&pre_post),
+            "direct tests in the current procedure should not make the issue latent"
+        );
+    }
+
+    #[test]
+    fn test_is_manifest_detects_imported_condition_on_formal_dependent_value() {
+        let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
+        let derived = AbstractValue::mk_fresh();
+        let _ = pre_post.post.path_condition.and_equal_linear(
+            derived,
+            LinArith::of_var(formal_val).add(&LinArith::of_int(1)),
+        );
+        let _ = pre_post
+            .post
+            .path_condition
+            .and_condition_direct(Atom::LessThan(Term::Var(derived), Term::Const(0)), 1);
+
+        assert!(
+            !is_manifest(&pre_post),
+            "callee-imported conditions on formal-derived values should be latent"
+        );
+    }
+
+    #[test]
+    fn test_is_manifest_ignores_unconstrained_formal_arithmetic() {
+        let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
+        let derived = AbstractValue::mk_fresh();
+        let _ = pre_post.post.path_condition.and_equal_linear(
+            derived,
+            LinArith::of_var(formal_val).add(&LinArith::of_int(1)),
+        );
+
+        assert!(
+            is_manifest(&pre_post),
+            "pure arithmetic definitions without path constraints should stay manifest"
+        );
+    }
+
+    #[test]
+    fn test_is_manifest_ignores_positive_constraint_on_must_be_valid_formal() {
+        let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
+        pre_post
+            .post
+            .must_be_valid
+            .insert(pre_post.post.path_condition.get_var_repr(formal_val));
+        let _ = pre_post
+            .post
+            .path_condition
+            .and_condition_direct(Atom::LessThan(Term::Const(0), Term::Var(formal_val)), 2);
+
+        assert!(
+            is_manifest(&pre_post),
+            "nonnull imported constraints on must-be-valid values should stay manifest"
+        );
+    }
+
+    #[test]
+    fn test_of_proc_suppresses_latent_abort_diagnostic() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let _ = astate
+            .path_condition
+            .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(4)), 1);
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "latent aborts should stay in the summary but not be published as manifest diagnostics"
+        );
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::LatentAbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_of_proc_keeps_manifest_abort_diagnostic() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let astate = AbductiveDomain::mk_initial(&pdesc);
+        let local_null = AbstractValue::mk_fresh();
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: local_null,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic),
+            }],
+            vec![],
+            false,
+        );
+
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::AbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_of_proc_reports_entrypoint_abort_even_if_formal_dependent() {
+        let pdesc = make_named_pdesc_with_formals("main", &["argc"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("argc"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let _ = astate
+            .path_condition
+            .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(1)), 1);
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic),
+            }],
+            vec![],
+            false,
+        );
+
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::AbortProgram
+        ));
     }
 }

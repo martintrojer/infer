@@ -659,7 +659,6 @@ fn analyze_with_spec_loop(
     // Post-analysis: check if any callee needs specialization we can provide
     let spec_requests: Vec<_> = callee_summaries
         .iter()
-        .filter(|(_, cs)| !cs.needs_specialization.is_empty())
         .filter_map(|(callee_pname, callee_summary)| {
             let first_pp = callee_summary.pre_posts.first()?;
             // Find the Call instruction to this callee
@@ -725,6 +724,7 @@ fn analyze_with_spec_loop(
                 &callee_summary.needs_specialization,
                 &eval_state,
                 &first_pp.formals,
+                &callee_summary.formal_types,
                 &call_args,
             )?;
             if callee_summary.get_specialized(&spec).is_some() {

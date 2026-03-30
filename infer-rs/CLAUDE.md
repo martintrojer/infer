@@ -12,6 +12,15 @@ Key OCaml files to cross-reference:
 - `PulseAbductiveDomain.ml` — domain (pre/post, discard_unreachable, filter_for_summary)
 - `Pulse.ml` — transfer functions (exec_instr, specialization)
 
+## Correctness Over Numbers
+
+**Always make the semantically correct edit first, even if compliance numbers get worse temporarily.**
+
+- Confirm correctness first: match the OCaml source of truth, use traces/summaries when needed, and add focused tests for the behavior being changed.
+- Only after the change is confirmed correct should you work on restoring or improving compliance numbers.
+- Do not add workarounds, special cases, or heuristic hacks whose main purpose is to make the sweep numbers look better without fixing the underlying behavior.
+- When a correct fix regresses totals, keep the correct fix and investigate the newly exposed gaps separately.
+
 ## Compliance debugging recipe
 
 When investigating why a C test file produces different results from OCaml:

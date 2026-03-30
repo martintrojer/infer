@@ -33,6 +33,10 @@ impl Edges {
         self.0.insert(access, target);
     }
 
+    pub fn remove(&mut self, access: &Access) {
+        self.0.remove(access);
+    }
+
     pub fn find(&self, access: &Access) -> Option<AbstractValue> {
         self.0.get(access).copied()
     }
@@ -51,11 +55,13 @@ impl Edges {
 
     /// Substitute abstract values in edge targets.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
-        for target in self.0.values_mut() {
-            if *target == old {
-                *target = new;
-            }
+        let mut updated = BTreeMap::new();
+        for (access, target) in std::mem::take(&mut self.0) {
+            let access = access.canonicalize(|v| if v == old { new } else { v });
+            let target = if target == old { new } else { target };
+            updated.insert(access, target);
         }
+        self.0 = updated;
     }
 }
 
@@ -98,6 +104,30 @@ impl BaseMemory {
     /// Get all edges from an address.
     pub fn get_edges(&self, addr: AbstractValue) -> Option<&Edges> {
         self.graph.get(&addr)
+    }
+
+    /// Remove all outgoing edges for an address.
+    pub fn remove(&mut self, addr: AbstractValue) {
+        self.graph.remove(&addr);
+    }
+
+    /// Replace all outgoing edges for an address.
+    pub fn set_edges(&mut self, addr: AbstractValue, edges: Edges) {
+        if edges.is_empty() {
+            self.graph.remove(&addr);
+        } else {
+            self.graph.insert(addr, edges);
+        }
+    }
+
+    /// Keep only reachable heap cells that still have outgoing edges.
+    ///
+    /// Mirrors the summary filtering in OCaml's `discard_unreachable_`,
+    /// which drops dead heap cells entirely instead of leaving empty nodes
+    /// behind in exported summaries.
+    pub fn retain_reachable(&mut self, reachable: &std::collections::HashSet<AbstractValue>) {
+        self.graph
+            .retain(|addr, edges| reachable.contains(addr) && !edges.is_empty());
     }
 
     /// Iterate over all addresses and their edges.
@@ -182,5 +212,30 @@ mod tests {
 
         // v1 --*--> v3 (v2 replaced by v3 in target)
         assert_eq!(mem.find_edge(v1, &Access::Dereference), Some(v3));
+    }
+
+    #[test]
+    fn test_subst_var_rewrites_array_index_access() {
+        let mut mem = BaseMemory::empty();
+        let base = AbstractValue::of_raw(1);
+        let old_idx = AbstractValue::of_raw(2);
+        let new_idx = AbstractValue::of_raw(3);
+        let target = AbstractValue::of_raw(4);
+
+        mem.add_edge(
+            base,
+            Access::ArrayAccess(sil::typ::Typ::void(), old_idx),
+            target,
+        );
+        mem.subst_var(old_idx, new_idx);
+
+        assert_eq!(
+            mem.find_edge(base, &Access::ArrayAccess(sil::typ::Typ::void(), new_idx)),
+            Some(target)
+        );
+        assert_eq!(
+            mem.find_edge(base, &Access::ArrayAccess(sil::typ::Typ::void(), old_idx)),
+            None
+        );
     }
 }

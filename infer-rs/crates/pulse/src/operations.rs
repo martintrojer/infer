@@ -138,7 +138,7 @@ pub fn eval(
             };
             let result = AbstractValue::mk_fresh();
             // Record the arithmetic relationship
-            let _ = state.path_condition.and_equal_binop(
+            let _ = state.and_equal_binop(
                 result,
                 bop.clone(),
                 &Operand::AbstractValue(lhs_val),
@@ -211,7 +211,7 @@ fn eval_const(
             // E.g., 5.5 → 11/2, enabling 2x=5.5 → x=2.75 (non-integer).
             if let Some(q) = crate::formula::lin_arith::Q::approximate_float(f.0) {
                 let lin = crate::formula::lin_arith::LinArith::of_q(q);
-                let _ = state.path_condition.and_equal_linear(v, lin);
+                let _ = state.and_equal_linear(v, lin);
             }
             PulseResult::Ok(v)
         }

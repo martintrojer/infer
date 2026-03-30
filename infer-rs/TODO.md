@@ -2,39 +2,38 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE 130/135, Leaks 20/20, UAF 10/7)
+### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE 138/135, Leaks 23/20, UAF 8/7)
 
-**NPE Over-detection (FPs, +8 total):**
+Correctness note: the recent equality-incorporation + abort-propagation fixes intentionally moved
+the totals. `specialization.c` is now correct again, but the new sweep exposed a different problem:
+AbortProgram/report publication is still not aligned with OCaml, so some interprocedural files now
+over-report. Keep the semantically correct execution fix; align report timing/publication next.
 
-1. **sizeof array** (+2): sizeof.c. `<int[]>` textual loses array length. Blocked on OCaml upstream.
-2. **nullptr_more.c** (+2): write_deref pre-edges too aggressive for some patterns.
-3. **nullptr.c** (+1): interproc biabduction (call_incr_deref_with_alias_good aliased formals, call_no_return_good write-through-ptr+noreturn, FN_nullptr_deref_old_bad bonus TP).
-4. **angelism.c** (+1): remaining interproc issue.
-5. **Other bonus TPs** (+2): offsetof_expr.c (+1), struct_values.c (+1).
+**NPE Over-detection (FPs, +14 gross / +3 net):**
 
-**NPE Under-detection (FNs, -13 total):**
+1. **AbortProgram/reporting parity** (+6): interprocedural.c (+3), latent.c (+3). After restoring callee AbortProgram propagation, report publication is still too eager compared with OCaml.
+2. **Nullptr family** (+4): nullptr.c (+2), nullptr_more.c (+2). Mix of write-through-pointer / biabduction/reporting mismatches.
+3. **sizeof / offsetof** (+3): sizeof.c (+2), offsetof_expr.c (+1). `sizeof.c` remains partly blocked on missing `<int[]>` length info.
+4. **angelism.c** (+1): remaining interproc/reporting issue.
 
-6. **Function pointer dispatch** (-5): funptr.c (11→6). Specialization loop wired in CLI. Direct dispatch + single-level specialization work. Remaining: returned funptr, struct callbacks, complex multi-arg patterns.
-7. **Deep interproc / models** (-3): initlistexpr.c(-3).
-8. **Latent chain / loop depth** (-2): latent.c. Two sub-issues: (a) `propagate_latent` chain needs `is_manifest` to check linear_eqs, blocked on `read_heap` pre-edge overwrite fix; (b) `traverse_and_crash_if_equal_to_root` produces fewer loop-unrolling disjuncts (rust=3, ocaml=7).
-9. **Function-pointer wrappers** (-2): memory_leak.c NPEs.
-10. **Other** (-1): compound_literal.c(-1).
+**NPE Under-detection (FNs, -11 gross):**
 
-**Leak differences (net 0, +3 / -3):**
+5. **Function pointer dispatch** (-5): funptr.c (11→6). Direct dispatch + single-level specialization work. Remaining: returned funptr, struct callbacks, deeper specialization chains.
+6. **Deep interproc / models** (-4): initlistexpr.c (4→1), compound_literal.c (2→1).
+7. **Function-pointer wrappers** (-2): memory_leak.c (3→1 NPEs).
 
-11. **cleanup_attribute.c** (+2): `__attribute__((cleanup()))` GCC extension not modeled. Cleanup function (free) called automatically at scope exit — not modeled.
-12. **nullptr.c** (-1): `null_alias_bad` — formal parameter overwritten with malloc, missing `restore_formals_for_summary` logic.
-13. **memory_leak.c** (-1): funptr wrapper pattern (`malloc_func`).
+**Leak differences (+3 FPs):**
 
-**UAF over-detection (+3 FPs):**
+8. **cleanup_attribute.c** (+2): `__attribute__((cleanup()))` GCC extension not modeled. Cleanup function (free) called automatically at scope exit — not modeled.
+9. **memory_leak.c** (+1): mixed bag of funptr wrapper misses and independent leak FPs.
 
-14. **latent.c** (+3): Latent issue propagation FPs — `propagate_latent` chain not working, needs `read_heap` pre-edge overwrite fix for linear_eqs in `is_manifest`.
-15. **interprocedural.c** (+1): `conditional_free_then_use_latent` reported at both callee and caller.
-16. **specialization.c** (-1): Missing funptr-based UAF.
+**UAF differences (+1 FP):**
+
+10. **AbortProgram/reporting parity** (+1): interprocedural.c now reports one extra UAF after preserving callee AbortProgram summaries. Likely the same structural publication issue as the NPE over-counts.
 
 **Skipped files (3):** infinite.c (106 procs with infinite loops/Ackermann), recursion.c, recursion2.c — fixpoint exhaustion.
 
-**Files matching OCaml (20 clean, NPE+Leaks):** enum.c, frontend.c, memcpy.c, getcwd.c, shift.c, var_arg.c, ternary.c, nullptr.c, lists.c, list_checks.c, uninit.c, assert_failure.c, specialization.c, arithmetic.c, integers.c, abduce.c, interprocedural.c, memory_leak_more.c, issues_abort_execution.c, traces.c.
+**Notable recent correctness wins:** `specialization.c` now matches the direct OCaml issue set again after wiring formula equalities back into the abductive state and preserving callee AbortProgram summaries; `assert.c` and `ternary.c` remain fixed by OCaml-style condition-depth tracking without reintroducing the latent/base bug.
 
 ### Textual pipeline gaps
 
@@ -53,7 +52,7 @@
 - **ValueHistory threading**: Error trace reconstruction. Cross-ref: `PulseValueHistory.ml`.
 - **Global variable handling** in summary application.
 - **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Remaining gap: `<int[]>` without array length.
-- **Latent issues parity**: basic `AbortProgram` / `LatentAbortProgram` support is in place, but `is_manifest` only trusts formula atoms because `read_heap` pre-edge overwrites make `linear_eqs` unreliable. Remaining: fix `read_heap` pre-edge overwrite → enable `linear_eqs` in `is_manifest` → fix `propagate_latent` chain (+2); add `LatentInvalidAccess` for summary disjunct parity.
+- **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, and callee AbortProgram summaries now propagate again. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, `LatentInvalidAccess`, latent issue type reporting, and OCaml-aligned publication timing for propagated aborts.
 
 ## Debugging tools
 

@@ -22,7 +22,7 @@ pub mod phi;
 pub mod term;
 pub mod var_uf;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::abstract_value::AbstractValue;
 use crate::sat_unsat::SatUnsat;
@@ -44,6 +44,7 @@ pub enum Operand {
 /// Mirrors OCaml's `Formula.t` which wraps `FormulaPhi.t` plus conditions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Formula {
+    conditions: BTreeMap<Atom, usize>,
     phi: phi::Phi,
 }
 
@@ -58,9 +59,24 @@ impl Formula {
         &self.phi
     }
 
+    /// Access the recorded prune conditions and the call depth at which they
+    /// were added. Depth 0 means local to the current procedure.
+    pub fn conditions(&self) -> &BTreeMap<Atom, usize> {
+        &self.conditions
+    }
+
     /// Add an atom constraint directly (for formula translation from callee).
     pub fn and_atom_direct(&mut self, atom: Atom) -> SatUnsat<Vec<NewEq>> {
         self.phi.and_atom(atom)
+    }
+
+    /// Add a translated callee condition and remember its call depth.
+    pub fn and_condition_direct(&mut self, atom: Atom, depth: usize) -> SatUnsat<Vec<NewEq>> {
+        let result = self.enforce_condition_atom(&atom);
+        if result.is_sat() {
+            self.record_condition_if_meaningful(atom, depth);
+        }
+        result
     }
 
     /// Get the canonical representative of a variable.
@@ -209,6 +225,17 @@ impl Formula {
         v2: AbstractValue,
         negated: bool,
     ) -> SatUnsat<Vec<NewEq>> {
+        self.prune_eq_with_depth(v1, v2, negated, 0)
+    }
+
+    /// Add a prune equality/disequality at a specific call depth.
+    pub fn prune_eq_with_depth(
+        &mut self,
+        v1: AbstractValue,
+        v2: AbstractValue,
+        negated: bool,
+        depth: usize,
+    ) -> SatUnsat<Vec<NewEq>> {
         let bop = if negated {
             sil::binop::Binop::Ne
         } else {
@@ -219,11 +246,52 @@ impl Formula {
         if self.check_citv_binop(false, &bop, &op1, &op2).is_unsat() {
             return SatUnsat::Unsat;
         }
-        if negated {
+        let condition_atom = if negated {
+            Atom::NotEqual(
+                operand_to_term(&op1, &self.phi),
+                operand_to_term(&op2, &self.phi),
+            )
+        } else {
+            Atom::Equal(
+                operand_to_term(&op1, &self.phi),
+                operand_to_term(&op2, &self.phi),
+            )
+        };
+        let result = if negated {
             self.and_not_equal(&op1, &op2)
         } else {
             self.phi.and_var_equal(v1, v2)
+        };
+        if result.is_sat() {
+            self.record_condition_if_meaningful(condition_atom, depth);
         }
+        result
+    }
+
+    /// Record a local `<` prune condition.
+    pub fn prune_less_than(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<Vec<NewEq>> {
+        let atom = Atom::LessThan(
+            operand_to_term(op1, &self.phi),
+            operand_to_term(op2, &self.phi),
+        );
+        let result = self.and_less_than(op1, op2);
+        if result.is_sat() {
+            self.record_condition_if_meaningful(atom, 0);
+        }
+        result
+    }
+
+    /// Record a local `<=` prune condition.
+    pub fn prune_less_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<Vec<NewEq>> {
+        let atom = Atom::LessEqual(
+            operand_to_term(op1, &self.phi),
+            operand_to_term(op2, &self.phi),
+        );
+        let result = self.and_less_equal(op1, op2);
+        if result.is_sat() {
+            self.record_condition_if_meaningful(atom, 0);
+        }
+        result
     }
 
     /// Check a comparison against CItv intervals.
@@ -275,16 +343,17 @@ impl Formula {
         // (truthy) or v = 0 (falsy), resolve back to the comparison and add
         // the appropriate atom. This matches OCaml's prune_binop which looks
         // up term_eqs to derive constraints from boolean results.
+        let mut condition_atom = None;
         if c == 0 {
             if let Some(teq) = self.phi.term_eqs.get(&v).cloned() {
-                let atom = if negated {
+                condition_atom = if negated {
                     // prune(v ≠ 0) i.e. v is truthy → the comparison is true
-                    comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, false)
+                    comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, false, &self.phi)
                 } else {
                     // prune(v = 0) i.e. v is falsy → the comparison is false (negate it)
-                    comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, true)
+                    comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, true, &self.phi)
                 };
-                if let Some(atom) = atom {
+                if let Some(atom) = condition_atom.clone() {
                     if self.phi.and_atom(atom).is_unsat() {
                         return SatUnsat::Unsat;
                     }
@@ -292,11 +361,30 @@ impl Formula {
             }
         }
 
-        if negated {
+        let result = if negated {
             self.and_not_equal(&Operand::AbstractValue(v), &Operand::ConstOperand(c))
         } else {
             self.phi.and_const_eq(v, c)
+        };
+
+        if result.is_sat() {
+            let atom = condition_atom.unwrap_or_else(|| {
+                if negated {
+                    Atom::NotEqual(
+                        operand_to_term(&Operand::AbstractValue(v), &self.phi),
+                        Term::Const(c),
+                    )
+                } else {
+                    Atom::Equal(
+                        operand_to_term(&Operand::AbstractValue(v), &self.phi),
+                        Term::Const(c),
+                    )
+                }
+            });
+            self.record_condition_if_meaningful(atom, 0);
         }
+
+        result
     }
 
     /// Record that v = binop(x, y).
@@ -441,6 +529,42 @@ impl Formula {
     /// Simplify the formula.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
         self.phi.simplify(reachable);
+        let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
+        for (atom, depth) in std::mem::take(&mut self.conditions) {
+            let atom = atom.translate(|v| self.phi.get_repr(v));
+            if atom.all_vars().into_iter().all(|v| reachable.contains(&v))
+                && atom.is_trivially_true() != Some(true)
+            {
+                match conditions.get_mut(&atom) {
+                    Some(existing_depth) => *existing_depth = (*existing_depth).min(depth),
+                    None => {
+                        conditions.insert(atom, depth);
+                    }
+                }
+            }
+        }
+        self.conditions = conditions;
+    }
+
+    fn record_condition_if_meaningful(&mut self, atom: Atom, depth: usize) {
+        if atom.is_trivially_true() == Some(true) {
+            return;
+        }
+        match self.conditions.get_mut(&atom) {
+            Some(existing_depth) => *existing_depth = (*existing_depth).min(depth),
+            None => {
+                self.conditions.insert(atom, depth);
+            }
+        }
+    }
+
+    fn enforce_condition_atom(&mut self, atom: &Atom) -> SatUnsat<Vec<NewEq>> {
+        match atom {
+            Atom::Equal(Term::Var(v1), Term::Var(v2)) => self.phi.and_var_equal(*v1, *v2),
+            Atom::Equal(Term::Var(v), Term::Const(c))
+            | Atom::Equal(Term::Const(c), Term::Var(v)) => self.phi.and_const_eq(*v, *c),
+            _ => self.phi.and_atom(atom.clone()),
+        }
     }
 }
 
@@ -452,6 +576,7 @@ fn comparison_to_atom(
     lhs: &Operand,
     rhs: &Operand,
     negated: bool,
+    phi: &phi::Phi,
 ) -> Option<Atom> {
     use sil::binop::Binop;
     let (effective_op, effective_negated) = if negated {
@@ -469,14 +594,8 @@ fn comparison_to_atom(
         (op, false)
     };
     let _ = effective_negated; // negation already applied above
-    let lt = match lhs {
-        Operand::AbstractValue(v) => Term::Var(*v),
-        Operand::ConstOperand(c) => Term::Const(*c),
-    };
-    let rt = match rhs {
-        Operand::AbstractValue(v) => Term::Var(*v),
-        Operand::ConstOperand(c) => Term::Const(*c),
-    };
+    let lt = operand_to_term(lhs, phi);
+    let rt = operand_to_term(rhs, phi);
     match effective_op {
         Binop::Eq => Some(Atom::Equal(lt, rt)),
         Binop::Ne => Some(Atom::NotEqual(lt, rt)),
@@ -625,6 +744,35 @@ mod tests {
         let result = f_false.prune_eq(p, null_val, false);
         assert!(result.is_sat());
         assert!(f_false.is_known_zero(p));
+    }
+
+    #[test]
+    fn test_prune_records_depth_zero_condition() {
+        let mut f = Formula::ttrue();
+        let p = AbstractValue::of_raw(1);
+
+        let result = f.prune_eq_const(p, 0, true);
+        assert!(result.is_sat());
+        assert_eq!(
+            f.conditions()
+                .get(&Atom::NotEqual(Term::Var(p), Term::Const(0))),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn test_simplify_drops_unreachable_conditions() {
+        let mut f = Formula::ttrue();
+        let p = AbstractValue::of_raw(1);
+
+        let result = f.prune_eq_const(p, 0, true);
+        assert!(result.is_sat());
+        f.simplify(&HashSet::new());
+
+        assert!(
+            f.conditions().is_empty(),
+            "conditions on dead values should not survive summary simplification"
+        );
     }
 
     #[test]

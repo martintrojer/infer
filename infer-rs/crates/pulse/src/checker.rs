@@ -83,18 +83,23 @@ pub fn analyze_with_specialization(
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
 
-    // Collect manifest diagnostics from all nodes (including unreachable-exit
-    // cases like infinite loops). Only collect from AbortProgram disjuncts
-    // that are manifest (no formals → definitely an error).
-    // Latent diagnostics are handled by of_proc's is_manifest check.
+    // Some manifest aborts do not reach the exit node (for example, paths that
+    // stop mid-procedure). Keep the non-exit scan for those, but filter each
+    // abort through the same latent-vs-manifest classification used during
+    // summary creation so we do not publish latent issues too early.
     let mut diagnostics = Vec::new();
     let mut seen_diags = std::collections::HashSet::new();
-    for state in inv_map.values() {
+    for (node_id, state) in &inv_map {
+        if *node_id == pdesc.exit_node {
+            continue;
+        }
         for d in &state.post.disjuncts {
-            if let ExecutionDomain::AbortProgram { diagnostic, .. } = d {
-                let key = diagnostic.dedup_key();
-                if seen_diags.insert(key) {
-                    diagnostics.push(diagnostic.as_ref().clone());
+            if let ExecutionDomain::AbortProgram { state, diagnostic } = d {
+                if crate::summary::abort_is_manifest(pdesc, state) {
+                    let key = diagnostic.dedup_key();
+                    if seen_diags.insert(key) {
+                        diagnostics.push(diagnostic.as_ref().clone());
+                    }
                 }
             }
         }
@@ -369,17 +374,13 @@ fn select_pre_posts<'a>(
     actuals: &[(Exp, sil::typ::Typ)],
     caller_state: &crate::abductive::AbductiveDomain,
 ) -> &'a [crate::summary::PrePost] {
-    // If the callee doesn't need specialization, use the main summary
-    if callee_summary.needs_specialization.is_empty() {
-        return &callee_summary.pre_posts;
-    }
-
-    // Check if the caller can provide Closure information for the needed paths
+    // Check if the caller can provide either alias or dynamic-type specialization.
     if let Some(first_pp) = callee_summary.pre_posts.first() {
         if let Some(spec) = crate::specialization::make_specialization_from_caller(
             &callee_summary.needs_specialization,
             caller_state,
             &first_pp.formals,
+            &callee_summary.formal_types,
             actuals,
         ) {
             if let Some(specialized) = callee_summary.get_specialized(&spec) {

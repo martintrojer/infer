@@ -21,13 +21,13 @@ use crate::domain::{AbstractDomain, Comparable, WithBottom};
 /// Wraps a list of abstract states representing alternative execution paths.
 /// The number of disjuncts is bounded to prevent exponential blowup.
 #[derive(Clone, Debug)]
-pub struct DisjunctiveDomain<D: Clone + fmt::Debug + PartialEq> {
+pub struct DisjunctiveDomain<D: Comparable> {
     pub disjuncts: Vec<D>,
     pub max_disjuncts: usize,
     pub max_widen_iters: usize,
 }
 
-impl<D: Clone + fmt::Debug + PartialEq> DisjunctiveDomain<D> {
+impl<D: Comparable> DisjunctiveDomain<D> {
     /// Create a domain with a single initial disjunct.
     pub fn singleton(d: D, max_disjuncts: usize, max_widen_iters: usize) -> Self {
         Self {
@@ -55,30 +55,30 @@ impl<D: Clone + fmt::Debug + PartialEq> DisjunctiveDomain<D> {
     }
 }
 
-impl<D: Clone + fmt::Debug + PartialEq> PartialEq for DisjunctiveDomain<D> {
+impl<D: Comparable> PartialEq for DisjunctiveDomain<D> {
     fn eq(&self, other: &Self) -> bool {
         self.disjuncts == other.disjuncts
     }
 }
 
-impl<D: Clone + fmt::Debug + PartialEq> Comparable for DisjunctiveDomain<D> {
+impl<D: Comparable> Comparable for DisjunctiveDomain<D> {
     /// Subset check: lhs ≤ rhs if every disjunct in lhs has a matching
-    /// disjunct in rhs (by equality). This is a fast approximation —
-    /// OCaml uses pointer equality for speed.
+    /// disjunct in rhs under the inner domain ordering.
     fn leq(&self, rhs: &Self) -> bool {
         self.disjuncts
             .iter()
-            .all(|d| rhs.disjuncts.iter().any(|r| d == r))
+            .all(|d| rhs.disjuncts.iter().any(|r| d.leq(r)))
     }
 }
 
-impl<D: Clone + fmt::Debug + PartialEq> AbstractDomain for DisjunctiveDomain<D> {
+impl<D: Comparable> AbstractDomain for DisjunctiveDomain<D> {
     /// Join = union of disjuncts, bounded by max_disjuncts.
     fn join(&self, other: &Self) -> Self {
         let mut result = self.clone();
         for d in &other.disjuncts {
-            // Skip duplicates (deduplication)
-            if !result.disjuncts.iter().any(|existing| existing == d) {
+            // Favor keeping existing disjuncts, but drop semantically
+            // equivalent ones modulo the inner domain ordering.
+            if !result.disjuncts.iter().any(|existing| d.leq(existing)) {
                 result.disjuncts.push(d.clone());
             }
         }
@@ -97,7 +97,7 @@ impl<D: Clone + fmt::Debug + PartialEq> AbstractDomain for DisjunctiveDomain<D> 
     }
 }
 
-impl<D: Clone + fmt::Debug + PartialEq> WithBottom for DisjunctiveDomain<D> {
+impl<D: Comparable> WithBottom for DisjunctiveDomain<D> {
     fn bottom() -> Self {
         // Can't know the config at bottom() — use sensible defaults.
         // The actual values get overridden when singleton() is used.
@@ -109,7 +109,7 @@ impl<D: Clone + fmt::Debug + PartialEq> WithBottom for DisjunctiveDomain<D> {
     }
 }
 
-impl<D: Clone + fmt::Debug + PartialEq> fmt::Display for DisjunctiveDomain<D> {
+impl<D: Comparable> fmt::Display for DisjunctiveDomain<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} disjuncts", self.disjuncts.len())
     }

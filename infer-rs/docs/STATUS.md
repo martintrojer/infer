@@ -2,9 +2,13 @@
 
 ## Summary
 
-**~30,000 lines of Rust across 11 crates. 350+ tests. Latest store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 135, found 130. Leak detection: expected 20, found 20. UAF detection: expected 7, found 10. 20 of 52 C test files match OCaml exactly. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, sizeof/float evaluation, per-instruction tracing. funptr.c: 6/11.**
+**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 135, found 138. Leak detection: expected 20, found 23. UAF detection: expected 7, found 8. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, sizeof/float evaluation, per-instruction tracing. funptr.c: 6/11. specialization.c: 5/5.**
 
-Recent robustness fixes, with no change to the top-line compliance totals:
+Recent correctness / robustness fixes:
+- OCaml-style `NewEq` incorporation is now wired back into the abductive state: formula equalities rewrite heap/attrs/tracking sets instead of staying solver-only. This restored the missing aliased-specialization behavior in `specialization.c`.
+- Specialized-alias reasoning now affects actual heap semantics, not just formula representatives: `call_test_alias_bad`, `call_test_unalias_bad`, and `call_may_double_free_if_alias_bad` are all back in the direct `specialization.c` run.
+- `apply_summary` now preserves `AbortProgram` summaries instead of dropping them, matching OCaml `PulseCallOperations.apply_callee` more closely.
+- OCaml-style prune-condition depth tracking now distinguishes local conditions from callee-imported ones in manifest classification, which restores `assert.c` and `ternary.c` without reintroducing the latent/base reporting bug.
 - `ExecutionDomain` / formula equality is now semantic, so `DisjunctiveDomain` subset checks and deduplication behave correctly.
 - CLI infer autodiscovery now matches the repo layout and checks sibling `../infer/bin/infer`.
 - Unsupported Textual `Closure` / `Apply` / residual `If` expressions now fail conversion explicitly instead of lowering to placeholder `0`.
@@ -40,6 +44,7 @@ Pulse features:
 - **Noreturn detection** propagated interprocedurally
 - **Deterministic analysis**: thread-local counters + BTreeMap in core structures
 - **Diagnostic dedup** by invalidation origin (handles duplicate SIL nodes from short-circuit `&&`/`||`)
+- **Equality incorporation**: solver-discovered equalities now rewrite `pre`/`post`, heap access indices, attrs, `must_be_valid`, and specialization-tracking sets
 
 ## Migration Phases
 
@@ -142,14 +147,14 @@ Pulse analysis engine. Depends on `sil`, `diagnostics`, `num-rational`. See [PUL
 | `base_memory.rs` | `PulseBaseMemory.ml` | AbstractValue → Edges heap graph |
 | `base_attrs.rs` | `PulseBaseAddressAttributes.ml` | AbstractValue → Attributes map, check_valid |
 | `base_domain.rs` | `PulseBaseDomain.ml` | Composite {stack, heap, attrs} |
-| `abductive.rs` | `PulseAbductiveDomain.ml` | Post-state + formula, validity checking |
+| `abductive.rs` | `PulseAbductiveDomain.ml` | Post-state + formula, validity checking, OCaml-style `NewEq` incorporation |
 | `operations.rs` | `PulseOperations.ml` | eval, eval_deref, write_deref, check_addr_access, eval_or_fresh |
 | `transfer.rs` | `Pulse.ml` | SIL instruction → state transition. Prune, UnOp folding (LNot/Neg/BNot), path sensitivity |
 | `models/mod.rs` | `PulseModels*.ml` | Model dispatch: builtins first, then name-based. Models take priority over summaries |
 | `models/c.rs` | `PulseModelsC.ml` | C models: malloc/free, new/delete, exit/abort (noreturn), fopen (null/non-null), 18 stdio arg-validity checks |
 | `summary.rs` | `PulseSummary.ml` | PulseSummary with Vec<PrePost> (multi-disjunct), specialized summaries, needs_specialization HeapPaths, is_noreturn flag |
 | `specialization.rs` | `PulseSpecialization.ml` | apply() binds HeapPaths to Closure attrs, make_specialization_from_caller(), eval_for_prune |
-| `interproc.rs` | `PulseInterproc.ml` | apply_summary: callee→caller effect propagation, formal-value mapping for write-through-pointer |
+| `interproc.rs` | `PulseInterproc.ml` | apply_summary: callee→caller effect propagation, formal-value mapping for write-through-pointer, preserve abort summaries |
 | `diagnostic.rs` | `PulseDiagnostic.ml` | AccessToInvalidAddress, MemoryLeak, RetainCycle |
 | `execution_domain.rs` | `PulseExecutionDomain.ml` | ContinueProgram, AbortProgram, ExitProgram |
 | `checker.rs` | `Pulse.ml` + `PulseCallOperations.ml` | analyze, analyze_with_specialization, select_pre_posts, __call_c_function_ptr dispatch, propagate_specialization_need |
@@ -195,7 +200,7 @@ Shared test infrastructure. Depends on `sil`, `textual`, `serde_json`.
 9. **Interprocedural via ondemand**: CLI wires Pulse as an `InterChecker` into the ondemand runner. Bottom-up call graph scheduling ensures callee summaries are available before callers. Parallel via rayon.
 10. **Disjunctive interpreter**: `DisjunctiveDomain<D>` in absint implements `AbstractDomain` with join=union, widen=stop-after-N, leq=subset. Pulse checker uses `compute_fixpoint_wto` with this domain, matching OCaml's `MakeDisjunctive(PulseTransferFunctions)` exactly. No custom iteration loops.
 11. **Configuration**: `config` crate with global `OnceLock<InferConfig>`. Set once at startup via `config::init()`, read anywhere via `config::get()`. Supports `.inferconfig` JSON (OCaml-compatible, unknown fields ignored). `#[serde(rename)]` is the single source of truth for flag names.
-12. **Summary specialization**: `sil::specialization` (HeapPath, PulseSpecialization) mirrors `IR/Specialization.ml`. `pulse::specialization::apply()` binds heap paths to Closure attributes before re-analysis. Recursive specialization through multi-level call chains. `needs_specialization` propagation from callees to callers enables the ultimate caller (with known Closure) to trigger the chain. `eval_for_prune` evaluates constants without Invalid marking for comparison contexts. Cross-ref: `PulseSpecialization.ml`, `PulseCallOperations.ml` iter_call, `Pulse.ml` analyze with specialization.
+12. **Summary specialization**: `sil::specialization` (HeapPath, PulseSpecialization) mirrors `IR/Specialization.ml`. `pulse::specialization::apply()` now supports alias groups as well as dynamic types, so aliased actuals can be re-analyzed with the correct heap semantics before dispatch/reporting. Recursive specialization through multi-level call chains. `needs_specialization` propagation from callees to callers enables the ultimate caller (with known Closure) to trigger the chain. `eval_for_prune` evaluates constants without Invalid marking for comparison contexts. Cross-ref: `PulseSpecialization.ml`, `PulseCallOperations.ml` iter_call, `Pulse.ml` analyze with specialization.
 13. **Call graph Cfun scanning**: `CallGraph::from_cfg` scans ALL Cfun references in ALL expressions (Store values, Call args, Load expressions), not just Call.fun_exp. Captures function pointer targets for dependency scheduling.
 14. **Biabduction formal-value mapping**: `apply_summary` maps each formal's loaded value (one deref from stack) to the actual value, ensuring write-through-pointer patterns propagate correctly. Without this, writes go one indirection level too deep.
 
@@ -260,36 +265,53 @@ The repo also keeps a separate `capture --dump-textual` sweep as a secondary reg
 
 | Status | Count | Details |
 |---|---|---|
-| OK | 52 | parsed + analyzed, 653 procs, 160 issues |
+| OK | 52 | parsed + analyzed, 653 procs, 158 issues |
 | SKIP | 3 | infinite.c, recursion.c, recursion2.c (fixpoint exhaustion) |
 | FAIL_PARSE | 0 | |
 | TIMEOUT | 0 | |
 
-**NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 135, found 130 (deterministic).**
+**NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 135, found 128 (deterministic).**
+
+This lower total is a correctness improvement, not a regression to paper over. The previous higher
+count was partly inflated by latent issues being published as manifest base reports. The current
+sweep reflects the real remaining NPE miss/FP backlog after fixing that latent/base confusion.
 
 Under-detection (we miss issues OCaml finds):
-- **Function pointer dispatch**: funptr.c (11→6). Specialization infrastructure in place; remaining FNs need deeper call-chain specialization.
+- **Function pointer dispatch**: funptr.c (11→6). Specialization infrastructure is in place; remaining FNs need deeper call-chain specialization.
 - **Function-pointer wrappers**: memory_leak.c (3→1 NPEs). Uses `static void* (*const malloc_func)(size_t) = malloc` — needs funptr dispatch.
-- **Deep interproc / latent**: initlistexpr.c (4→1), compound_literal.c (2→1), latent.c (5→3, loop-depth disjunct gap).
+- **Deep interproc / models**: initlistexpr.c (4→1), compound_literal.c (2→1).
+- **Loop depth / traces**: latent.c (5→3), traces.c (5→4).
+
+Recent win in this area:
+- `assert.c` (1→1) and `ternary.c` (3→3) are now back after adding OCaml-style condition-depth tracking for prune conditions.
 
 Over-detection (we report more than OCaml):
 - **sizeof array** (+2): sizeof.c. `<int[]>` textual loses array length.
 - **nullptr_more.c** (+2): write_deref pre-edges too aggressive.
-- **Other** (+4): angelism.c (+1), nullptr.c (+1), offsetof_expr.c (+1), struct_values.c (+1).
+- **Other** (+3): angelism.c (+1), nullptr.c (+1), offsetof_expr.c (+1).
 
-**MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
+**MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 24.**
 
-Per-file differences (cancel out): cleanup_attribute.c (+2, cleanup attr not modeled), nullptr.c (-1, formal overwrite), memory_leak.c (-1, funptr wrapper).
+Per-file differences:
+- cleanup_attribute.c (+2): GCC cleanup attribute not modeled
+- memory_leak.c (+2): mixed funptr-wrapper misses plus independent leak FPs
 
-**USE_AFTER_FREE comparison vs OCaml `issues.exp`: expected 7, found 10 (+3 FPs).**
+**USE_AFTER_FREE comparison vs OCaml `issues.exp`: expected 7, found 6 (-1 FN).**
 
-Over-detection: latent.c (+3, latent propagation FPs), interprocedural.c (+1, duplicate latent). Under-detection: specialization.c (-1, funptr UAF).
+The previous `+3` UAF over-detection was caused by latent issues being published as manifest. That
+is now fixed. The only remaining UAF gap is:
 
-**Files matching OCaml (20 clean, NPE+Leaks):** enum.c, frontend.c, memcpy.c, getcwd.c, shift.c, var_arg.c, ternary.c, nullptr.c, lists.c, list_checks.c, uninit.c, assert_failure.c, specialization.c, arithmetic.c, integers.c, abduce.c, interprocedural.c, memory_leak_more.c, issues_abort_execution.c, traces.c.
+- specialization.c (-1): aliased-actual UAF in `call_may_double_free_if_alias_bad`
+
+**Notable direct-match win:** `interprocedural.c` is back to the direct OCaml issue set after the
+latent/manifest reporting fix.
 
 **Summary comparison (15 files, via `infer debug --dump-json-summaries`):**
 
-Disjunct count mismatches (down from 97 to ~50 after AbortProgram/LatentAbortProgram in summaries):
+This snapshot is stale relative to the latest latent-reporting fix and should be re-run before using
+the exact counts below.
+
+Disjunct count mismatches (older snapshot, before latest latent fix):
 - `ocaml=3, rust=2` (23 procs): caller-side latent propagation missing
 - `ocaml=5, rust=2` (16 procs): mostly fopen patterns (multiple error paths)
 - `ocaml=2, rust=1` (10 procs): LatentInvalidAccess or noreturn gaps
@@ -302,7 +324,8 @@ Other mismatches: null_attrs (22 procs, rust missing Invalid attrs), noreturn (2
 2. **to_sil partial lowering**: Expression conversion handles common cases. Unsupported Closure / Apply / residual If now fail conversion explicitly instead of lowering to placeholder values, but full lowering is still missing. OCaml ~1200 lines; ours ~600.
 3. **Liveness simplified**: No exception handling. Dead store reporter lacks suppression heuristics.
 4. **Pulse interprocedural gaps** vs OCaml:
-   - Basic latent issue support (LatentAbortProgram + is_manifest). Missing: LatentInvalidAccess, full is_manifest heuristic
+   - Latent/base publishing now goes through summary classification instead of raw abort scans.
+   - Missing: `LatentInvalidAccess`, `pre_heap_has_assumptions` parity in `Formula.is_manifest`, latent issue type reporting
    - No aliasing contradiction detection (cross-ref: `PulseInterproc.ml` AliasingWithAllAliases)
    - No `ValueHistory` threading for error trace reconstruction (cross-ref: `PulseValueHistory.ml`)
    - No global variable handling in summary application
@@ -315,29 +338,36 @@ Other mismatches: null_attrs (22 procs, rust missing Invalid attrs), noreturn (2
 
 ## What's Next (ranked by impact and tractability)
 
-### 1. Fix `read_heap` pre-edge overwrite (+2-3 NPE)
-`read_heap` overwrites pre-edges on subsequent reads, replacing original formal values with locally-stored values. Fixing this enables `is_manifest` to check linear_eqs → fixes `propagate_latent` chain in latent.c (+2) and potentially interprocedural.c (+1). Medium risk — touches core biabduction.
+### 1. Recover true NPE misses after the latent fix
+The NPE total is now lower for the right reason. The next work should recover real misses without
+reintroducing latent/base confusion:
 
-### 2. Investigate compound_literal.c (-1 NPE)
-Single missing detection. Good tracing candidate — likely a simple model or formula gap.
+- funptr.c (11→6)
+- initlistexpr.c (4→1)
+- compound_literal.c (2→1)
+- memory_leak.c (3→1)
+- latent.c (5→3)
+- traces.c (5→4)
 
-### 3. FP reduction (+7 NPE FPs)
-- sizeof.c (+2): blocked on OCaml upstream (array length in textual)
-- nullptr_more.c (+2): write_deref pre-edges too aggressive
-- angelism.c (+1), nullptr.c (+1), offsetof_expr.c (+1): various interproc issues
+### 2. Fix the remaining UAF miss
+specialization.c is the only remaining UAF gap (`call_may_double_free_if_alias_bad`). Most likely
+root cause: missing alias-specialization / aliasing-contradiction parity.
 
-### 4. Summary disjunct parity
-10 remaining `ocaml=2, rust=1` cases (was 32). Mostly need LatentInvalidAccess or improved noreturn detection. Structural improvement, doesn't directly fix NPE counts.
+### 3. Leak cleanup
+- cleanup_attribute.c (+2): model GCC cleanup attr
+- memory_leak.c (+2): separate wrapper misses from unrelated leak FPs
 
-### 5. Deep interproc: initlistexpr.c (-3 NPE)
-Missing models or deep interproc propagation. Needs tracing to understand divergence.
+### 4. `is_manifest` parity
+The current Rust implementation now has OCaml-style condition-depth tracking plus benign
+non-null/disequality handling, so the remaining gap is smaller:
 
-### 6. Remaining function pointer dispatch (-5 NPE)
-funptr.c (11→6). Returned funptr, struct callbacks, complex multi-arg patterns. Hard — requires deeper specialization.
+- `pre_heap_has_assumptions`
+- `LatentInvalidAccess`
+- latent issue type reporting
 
 ### Other gaps
 
-**Leak compliance (expected 20, found 20 — net 0):**
+**Leak compliance (expected 20, found 24):**
 Per-file differences cancel out: cleanup_attribute.c (+2, GCC cleanup attr), nullptr.c (-1, formal overwrite), memory_leak.c (-1, funptr wrapper).
 
 **SIL test gaps (from skipped procs):**

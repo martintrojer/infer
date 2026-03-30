@@ -66,7 +66,6 @@ fn analyze_with_spec_loop(
     // that we can now provide. Collect requests first, then apply.
     let spec_requests: Vec<_> = callee_summaries
         .iter()
-        .filter(|(_, cs)| !cs.needs_specialization.is_empty())
         .filter_map(|(callee_pname, callee_summary)| {
             let first_pp = callee_summary.pre_posts.first()?;
             let call_args = pdesc.iter_instrs().find_map(|(_nid, instr)| {
@@ -135,6 +134,7 @@ fn analyze_with_spec_loop(
                 &callee_summary.needs_specialization,
                 &eval_state,
                 &first_pp.formals,
+                &callee_summary.formal_types,
                 &call_args,
             );
             let spec = spec?;

@@ -29,5 +29,6 @@ pub mod operations;
 pub mod pulse_result;
 pub mod sat_unsat;
 pub mod specialization;
+pub mod state_cmp;
 pub mod summary;
 pub mod transfer;

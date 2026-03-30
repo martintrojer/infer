@@ -7,6 +7,8 @@
 //!
 //! Mirrors OCaml's `PulseExecutionDomain.t`.
 
+use absint::domain::Comparable;
+
 use crate::abductive::AbductiveDomain;
 use crate::diagnostic::Diagnostic;
 
@@ -54,5 +56,82 @@ impl ExecutionDomain {
             ExecutionDomain::AbortProgram { state, .. }
             | ExecutionDomain::LatentAbortProgram { state, .. } => state,
         }
+    }
+}
+
+impl Comparable for ExecutionDomain {
+    fn leq(&self, rhs: &Self) -> bool {
+        use ExecutionDomain::{
+            AbortProgram, ContinueProgram, ExceptionRaised, ExitProgram, LatentAbortProgram,
+        };
+
+        match (self, rhs) {
+            (ContinueProgram(lhs), ContinueProgram(rhs))
+            | (ExceptionRaised(lhs), ExceptionRaised(rhs))
+            | (ExitProgram(lhs), ExitProgram(rhs)) => crate::state_cmp::alpha_equivalent(lhs, rhs),
+            (
+                AbortProgram {
+                    state: lhs_state,
+                    diagnostic: lhs_diag,
+                },
+                AbortProgram {
+                    state: rhs_state,
+                    diagnostic: rhs_diag,
+                },
+            )
+            | (
+                LatentAbortProgram {
+                    state: lhs_state,
+                    diagnostic: lhs_diag,
+                },
+                LatentAbortProgram {
+                    state: rhs_state,
+                    diagnostic: rhs_diag,
+                },
+            ) => {
+                crate::state_cmp::alpha_equivalent(lhs_state, rhs_state)
+                    && diagnostics_compatible(lhs_diag, rhs_diag)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn diagnostics_compatible(lhs: &Diagnostic, rhs: &Diagnostic) -> bool {
+    match (lhs, rhs) {
+        (
+            Diagnostic::AccessToInvalidAddress {
+                invalidation: lhs_invalidation,
+                access_location: lhs_access_location,
+                invalidation_location: lhs_invalidation_location,
+                ..
+            },
+            Diagnostic::AccessToInvalidAddress {
+                invalidation: rhs_invalidation,
+                access_location: rhs_access_location,
+                invalidation_location: rhs_invalidation_location,
+                ..
+            },
+        ) => {
+            lhs_invalidation == rhs_invalidation
+                && lhs_access_location == rhs_access_location
+                && lhs_invalidation_location == rhs_invalidation_location
+        }
+        (
+            Diagnostic::MemoryLeak {
+                allocator: lhs_allocator,
+                allocation_location: lhs_allocation_location,
+                ..
+            },
+            Diagnostic::MemoryLeak {
+                allocator: rhs_allocator,
+                allocation_location: rhs_allocation_location,
+                ..
+            },
+        ) => lhs_allocator == rhs_allocator && lhs_allocation_location == rhs_allocation_location,
+        (Diagnostic::RetainCycle { location: lhs }, Diagnostic::RetainCycle { location: rhs }) => {
+            lhs == rhs
+        }
+        _ => false,
     }
 }

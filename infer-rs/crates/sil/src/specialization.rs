@@ -43,22 +43,15 @@ impl std::fmt::Display for HeapPath {
     }
 }
 
-/// Pulse specialization: dynamic types for heap paths.
+/// Pulse specialization: alias groups and dynamic types for heap paths.
 ///
 /// Mirrors OCaml's `Specialization.Pulse.t`.
 ///
-/// Currently focused on `dynamic_types` for function pointer dispatch.
-/// OCaml also has `aliases` for aliasing-based specialization which
-/// we may add later.
-/// Pulse specialization: dynamic types for heap paths.
-///
-/// Mirrors OCaml's `Specialization.Pulse.t`.
-///
-/// Currently focused on `dynamic_types` for function pointer dispatch.
-/// OCaml also has `aliases` for aliasing-based specialization which
-/// we may add later.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PulseSpecialization {
+    /// Heap paths that should be equal in this specialized context.
+    /// Each inner vec is one alias group.
+    pub aliases: Option<Vec<Vec<HeapPath>>>,
     /// Dynamic type bindings: maps heap paths to their known dynamic type.
     /// For C function pointers, the type name encodes the target procedure.
     /// Cross-ref: OCaml `Specialization.Pulse.dynamic_types`.
@@ -71,21 +64,40 @@ impl PulseSpecialization {
     }
 
     pub fn is_bottom(&self) -> bool {
-        self.dynamic_types.is_empty()
+        self.aliases.is_none() && self.dynamic_types.is_empty()
     }
 }
 
 impl std::fmt::Display for PulseSpecialization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.dynamic_types.is_empty() {
+        if self.is_bottom() {
             write!(f, "⊥")
         } else {
-            let parts: Vec<String> = self
-                .dynamic_types
-                .iter()
-                .map(|(path, ty)| format!("{path}: {ty}"))
-                .collect();
-            write!(f, "dynamic_types: {{{}}}", parts.join(", "))
+            let mut parts = Vec::new();
+            if let Some(alias_groups) = &self.aliases {
+                let aliases = alias_groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .iter()
+                            .map(|path| format!("{path}"))
+                            .collect::<Vec<_>>()
+                            .join(" = ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                parts.push(format!("alias: {aliases}"));
+            }
+            if !self.dynamic_types.is_empty() {
+                let dynamic_types = self
+                    .dynamic_types
+                    .iter()
+                    .map(|(path, ty)| format!("{path}: {ty}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("dynamic_types: {{{dynamic_types}}}"));
+            }
+            write!(f, "{}", parts.join(" "))
         }
     }
 }

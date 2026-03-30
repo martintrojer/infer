@@ -217,15 +217,9 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
             if negated {
                 // !(x < y) → y ≤ x
-                state
-                    .path_condition
-                    .and_less_equal(&op_rhs, &op_lhs)
-                    .is_sat()
+                state.prune_less_equal(&op_rhs, &op_lhs).is_sat()
             } else {
-                state
-                    .path_condition
-                    .and_less_than(&op_lhs, &op_rhs)
-                    .is_sat()
+                state.prune_less_than(&op_lhs, &op_rhs).is_sat()
             }
         }
         Exp::BinOp(Binop::Le, lhs, rhs) => {
@@ -235,15 +229,9 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
             if negated {
                 // !(x ≤ y) → y < x
-                state
-                    .path_condition
-                    .and_less_than(&op_rhs, &op_lhs)
-                    .is_sat()
+                state.prune_less_than(&op_rhs, &op_lhs).is_sat()
             } else {
-                state
-                    .path_condition
-                    .and_less_equal(&op_lhs, &op_rhs)
-                    .is_sat()
+                state.prune_less_equal(&op_lhs, &op_rhs).is_sat()
             }
         }
         Exp::BinOp(Binop::Gt, lhs, rhs) => {
@@ -254,15 +242,9 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
             if negated {
                 // !(x > y) → x ≤ y
-                state
-                    .path_condition
-                    .and_less_equal(&op_lhs, &op_rhs)
-                    .is_sat()
+                state.prune_less_equal(&op_lhs, &op_rhs).is_sat()
             } else {
-                state
-                    .path_condition
-                    .and_less_than(&op_rhs, &op_lhs)
-                    .is_sat()
+                state.prune_less_than(&op_rhs, &op_lhs).is_sat()
             }
         }
         Exp::BinOp(Binop::Ge, lhs, rhs) => {
@@ -273,15 +255,9 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
             if negated {
                 // !(x ≥ y) → y < x  → wait, !(x ≥ y) = y > x = x < y
-                state
-                    .path_condition
-                    .and_less_than(&op_lhs, &op_rhs)
-                    .is_sat()
+                state.prune_less_than(&op_lhs, &op_rhs).is_sat()
             } else {
-                state
-                    .path_condition
-                    .and_less_equal(&op_rhs, &op_lhs)
-                    .is_sat()
+                state.prune_less_equal(&op_rhs, &op_lhs).is_sat()
             }
         }
         // Logical negation
@@ -482,17 +458,14 @@ mod tests {
     fn test_prune_eq_zero_constrains() {
         let mut state = mk_state();
         let p = AbstractValue::mk_fresh();
-        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
-        state
-            .post
-            .stack
-            .add(Var::ProgramVar(Box::new(pvar.clone())), p);
+        let id = Ident::create_normal(IdentName::from_string("p"), 0);
+        state.post.stack.add(Var::LogicalVar(id.clone()), p);
 
         // prune(p == 0) → p is known zero
         let instr = Instr::Prune {
             exp: Exp::BinOp(
                 sil::binop::Binop::Eq,
-                Box::new(Exp::Lvar(pvar)),
+                Box::new(Exp::Var(id)),
                 Box::new(Exp::Const(Const::Cint(IntLit::zero()))),
             ),
             loc: Location::dummy(),
@@ -515,17 +488,14 @@ mod tests {
     fn test_prune_ne_zero_constrains() {
         let mut state = mk_state();
         let p = AbstractValue::mk_fresh();
-        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
-        state
-            .post
-            .stack
-            .add(Var::ProgramVar(Box::new(pvar.clone())), p);
+        let id = Ident::create_normal(IdentName::from_string("p"), 0);
+        state.post.stack.add(Var::LogicalVar(id.clone()), p);
 
         // prune(p != 0) → p is NOT known zero
         let instr = Instr::Prune {
             exp: Exp::BinOp(
                 sil::binop::Binop::Ne,
-                Box::new(Exp::Lvar(pvar)),
+                Box::new(Exp::Var(id)),
                 Box::new(Exp::Const(Const::Cint(IntLit::zero()))),
             ),
             loc: Location::dummy(),

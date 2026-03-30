@@ -262,6 +262,11 @@ impl Phi {
         self.is_int_vars.contains(&repr)
     }
 
+    /// Iterate over remembered pure-function applications.
+    pub fn iter_fn_app_eqs(&self) -> impl Iterator<Item = (&FnAppKey, &AbstractValue)> {
+        self.fn_app_eqs.iter()
+    }
+
     /// Record a disequality or inequality atom.
     pub fn and_atom(&mut self, atom: Atom) -> SatUnsat<Vec<NewEq>> {
         let resolved = self.resolve_atom(&atom);

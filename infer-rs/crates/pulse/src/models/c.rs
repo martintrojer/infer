@@ -273,10 +273,9 @@ fn invalidate_first_arg(
 
 /// Model: `free(ptr)` — invalidate with CFree.
 ///
-/// In C, `free(NULL)` is a valid no-op. We skip the validity check
-/// when the pointer is known to be zero (null).
-/// Cross-ref: OCaml PulseModelsC.ml free calls check_valid, but
-/// OCaml's null path is typically pruned before reaching free.
+/// In C, `free(NULL)` is a valid no-op. Mirror OCaml's
+/// `Basic.free_or_delete`: try both `ptr == 0` and `ptr > 0`, but
+/// keep only the satisfiable branches.
 fn free(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -285,35 +284,27 @@ fn free(
 ) -> Vec<ExecutionDomain> {
     if let Some((arg_exp, _)) = args.first() {
         let addr = operations::eval_or_fresh(arg_exp, loc, &mut state);
-        // free(NULL) is a valid no-op
-        if state.is_known_zero(addr) {
-            let ret_val = AbstractValue::mk_fresh();
-            operations::write_id(ret_id, ret_val, &mut state);
-            return vec![ExecutionDomain::ContinueProgram(state)];
-        }
-        // For unknown addresses: two disjuncts.
-        // 1. null → no-op (constrain addr = 0)
-        // 2. non-null → invalidate (constrain addr > 0)
-        // This enables interproc: when the caller passes NULL, the
-        // non-null disjunct's formula (addr > 0) contradicts (0 > 0),
-        // so only the null-skip disjunct survives.
-        // Cross-ref: OCaml PulseModelsC.ml free calls check_valid which
-        // creates both paths implicitly.
-        if !state.path_condition.is_known_nonzero(addr) {
-            let mut null_state = state.clone();
-            let _ = null_state.and_equal_const(addr, 0);
+
+        let mut results = Vec::new();
+
+        let mut null_state = state.clone();
+        if null_state.and_equal_const(addr, 0).is_sat() {
             let ret_val = AbstractValue::mk_fresh();
             operations::write_id(ret_id, ret_val, &mut null_state);
-
-            let mut nonnull_state = state;
-            let _ = nonnull_state.and_positive(addr);
-            let results =
-                invalidate_first_arg(ret_id, args, Invalidation::CFree, loc, nonnull_state);
-
-            let mut all = vec![ExecutionDomain::ContinueProgram(null_state)];
-            all.extend(results);
-            return all;
+            results.push(ExecutionDomain::ContinueProgram(null_state));
         }
+
+        if state.and_positive(addr).is_sat() {
+            results.extend(invalidate_first_arg(
+                ret_id,
+                args,
+                Invalidation::CFree,
+                loc,
+                state,
+            ));
+        }
+
+        return results;
     }
     invalidate_first_arg(ret_id, args, Invalidation::CFree, loc, state)
 }
@@ -544,6 +535,7 @@ fn cpp_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formula::Operand;
     use sil::ident::IdentName;
     use sil::mangled::Mangled;
     use sil::procdesc::Procdesc;
@@ -610,6 +602,30 @@ mod tests {
             has_freed,
             "some disjunct should have freed pointer as invalid"
         );
+    }
+
+    #[test]
+    fn test_free_on_known_nonnull_path_does_not_keep_null_disjunct() {
+        let mut state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let ptr = AbstractValue::mk_fresh();
+        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(pvar.clone())), ptr);
+        state.allocate(ptr, Allocator::CMalloc, Location::dummy());
+        let _ = state.and_not_equal(&Operand::AbstractValue(ptr), &Operand::ConstOperand(0));
+
+        let args = vec![(Exp::Lvar(pvar), Typ::void())];
+        let results = free(&ret_id, &args, &Location::dummy(), state);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "free should discard the impossible NULL branch on a known non-null path"
+        );
+        assert!(results.iter().all(|r| r.is_continue()));
     }
 
     #[test]

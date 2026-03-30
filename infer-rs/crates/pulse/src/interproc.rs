@@ -11,7 +11,7 @@
 //! `apply_summary` maps the callee's effects (heap writes, invalidations,
 //! constraints) into the caller's abstract state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sil::exp::Exp;
 use sil::ident::Ident;
@@ -97,15 +97,39 @@ pub fn apply_summary(
         PreMaterializeResult::Ok => None,
     };
 
-    // Step 2: Walk the callee's post heap and materialize edges in the caller
-    let callee_heap = &pre_post.post.post.heap;
-    for (callee_addr, edges) in callee_heap.iter() {
-        let caller_addr = resolve_mut(&mut subst, *callee_addr);
-        for (access, callee_target) in edges.iter() {
-            let caller_target = resolve_mut(&mut subst, *callee_target);
-            let caller_access = translate_access(&subst, access);
-            caller_state.write_heap(caller_addr, caller_access, caller_target);
+    // Step 2: Apply the callee's post heap to the caller.
+    //
+    // This must handle strong updates, not just writes. If an access exists in
+    // the callee pre but disappears from the callee post, we must delete the
+    // corresponding caller edge. Cross-ref: OCaml PulseInterproc.ml
+    // `delete_edges_in_callee_pre_from_caller` + `record_post_cell`.
+    let mut processed_pre_cells = HashSet::new();
+    for (callee_addr, pre_edges) in pre_post.pre.heap.iter() {
+        let Some(&caller_addr) = subst.get(callee_addr) else {
+            continue;
+        };
+        apply_post_cell(
+            caller_addr,
+            Some(pre_edges),
+            pre_post.post.post.heap.get_edges(*callee_addr),
+            &mut subst,
+            &mut caller_state,
+        );
+        processed_pre_cells.insert(*callee_addr);
+    }
+
+    for (callee_addr, post_edges) in pre_post.post.post.heap.iter() {
+        if processed_pre_cells.contains(callee_addr) {
+            continue;
         }
+        let caller_addr = resolve_mut(&mut subst, *callee_addr);
+        apply_post_cell(
+            caller_addr,
+            None,
+            Some(post_edges),
+            &mut subst,
+            &mut caller_state,
+        );
     }
 
     // Step 3: Resolve the return value into the substitution BEFORE
@@ -179,19 +203,23 @@ pub fn apply_summary(
             vec![ExecutionDomain::ContinueProgram(caller_state)]
         }
         crate::summary::PrePostKind::AbortProgram => {
-            // Manifest error: already reported at callee level. Skip.
-            // The AbortProgram stays in the callee's summary for accurate
-            // disjunct counts but doesn't propagate to callers.
-            vec![]
+            // Cross-ref: OCaml PulseCallOperations.ml apply_callee preserves
+            // AbortProgram when applying a callee summary instead of dropping
+            // it. This is particularly important for on-demand specialized
+            // summaries: their diagnostics are not published elsewhere.
+            if let Some(diag) = &pre_post.diagnostic {
+                vec![ExecutionDomain::AbortProgram {
+                    state: Box::new(caller_state),
+                    diagnostic: Box::new(diag.clone()),
+                }]
+            } else {
+                vec![]
+            }
         }
         crate::summary::PrePostKind::LatentAbortProgram => {
-            // Latent error: the callee's error depends on caller-provided values.
-            // The error was NOT reported at the callee level. At each call site,
-            // we re-apply the summary. If the path is feasible (formula translation
-            // didn't return Unsat above), the error manifests in this caller's
-            // context → report as AbortProgram.
-            // Cross-ref: OCaml PulseCallOperations.ml re-calls should_report
-            // on the caller's state for LatentAbortProgram disjuncts.
+            // Latent error: the callee's error depends on caller-provided
+            // values. If the path is feasible in this caller, reify it as an
+            // AbortProgram here.
             if let Some(diag) = &pre_post.diagnostic {
                 vec![ExecutionDomain::AbortProgram {
                     state: Box::new(caller_state),
@@ -302,6 +330,38 @@ fn materialize_pre(
     }
 }
 
+fn apply_post_cell(
+    caller_addr: AbstractValue,
+    pre_edges_opt: Option<&crate::base_memory::Edges>,
+    post_edges_opt: Option<&crate::base_memory::Edges>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) {
+    let mut caller_edges = caller_state
+        .post
+        .heap
+        .get_edges(caller_addr)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(pre_edges) = pre_edges_opt {
+        for (access, _) in pre_edges.iter() {
+            let caller_access = translate_access(subst, access);
+            caller_edges.remove(&caller_access);
+        }
+    }
+
+    if let Some(post_edges) = post_edges_opt {
+        for (access, callee_target) in post_edges.iter() {
+            let caller_target = resolve_mut(subst, *callee_target);
+            let caller_access = translate_access(subst, access);
+            caller_edges.add(caller_access, caller_target);
+        }
+    }
+
+    caller_state.post.heap.set_edges(caller_addr, caller_edges);
+}
+
 /// Resolve a callee abstract value to a caller abstract value.
 ///
 /// If the value is in the substitution, return the caller value.
@@ -356,7 +416,6 @@ fn translate_formula(
         if all_vars_mapped {
             let translated = lin.translate(|v| subst.get(&v).copied().unwrap_or(v));
             if caller_state
-                .path_condition
                 .and_equal_linear(caller_v, translated)
                 .is_unsat()
             {
@@ -387,10 +446,26 @@ fn translate_formula(
             });
         }
     }
+    for atom in callee_formula.conditions().keys() {
+        for v in atom.all_vars() {
+            extended_subst.entry(v).or_insert_with(|| {
+                if let Some(q) = phi.get_known_const(v) {
+                    if q.is_integer() {
+                        let c = *q.numer() / *q.denom();
+                        let fresh = crate::abstract_value::AbstractValue::mk_fresh();
+                        caller_state.and_equal_const(fresh, c);
+                        return fresh;
+                    }
+                }
+                v // unmapped, keep as-is (will be filtered by all_mapped check)
+            });
+        }
+    }
     // Translate atoms using extended subst
     log::debug!(
-        "  [translate_formula] atoms={}, subst_size={}, extended_subst_size={}",
+        "  [translate_formula] atoms={}, conditions={}, subst_size={}, extended_subst_size={}",
         phi.atoms.len(),
+        callee_formula.conditions().len(),
         subst.len(),
         extended_subst.len()
     );
@@ -404,7 +479,23 @@ fn translate_formula(
         }
         let translated = atom.translate(|v| extended_subst.get(&v).copied().unwrap_or(v));
         log::debug!("    atom: {atom} → {translated}");
-        let sat = caller_state.path_condition.and_atom_direct(translated);
+        let sat = caller_state.and_atom_direct(translated);
+        if sat.is_unsat() {
+            log::debug!("    → UNSAT!");
+            return false;
+        }
+    }
+    for (atom, depth) in callee_formula.conditions() {
+        let all_mapped = atom
+            .all_vars()
+            .iter()
+            .all(|v| extended_subst.contains_key(v));
+        if !all_mapped {
+            continue;
+        }
+        let translated = atom.translate(|v| extended_subst.get(&v).copied().unwrap_or(v));
+        log::debug!("    condition[{depth}]: {atom} → {translated}");
+        let sat = caller_state.and_condition_direct(translated, depth + 1);
         if sat.is_unsat() {
             log::debug!("    → UNSAT!");
             return false;
@@ -550,5 +641,126 @@ mod tests {
                 "callee's write through p should materialize in caller's heap"
             );
         }
+    }
+
+    #[test]
+    fn test_apply_summary_removes_caller_edges_missing_from_callee_post() {
+        // Simulate: void clear_out(int **out) { *out = <deleted>; }
+        // The callee pre reads `*out`, but the post no longer has that edge.
+        // Applying the summary should delete the corresponding caller edge.
+        let pname = Procname::c_from_string("clear_out");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(Mangled::from_string("out"), Typ::void(), Default::default())];
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        let out_pvar = Pvar::mk(Mangled::from_string("out"), pname);
+        let out_var = Var::ProgramVar(Box::new(out_pvar.clone()));
+        let out_stack_addr = state.post.stack.find(&out_var).unwrap();
+        let out_value = state.read_heap(out_stack_addr, Access::Dereference);
+        let _old_target = state.read_heap(out_value, Access::Dereference);
+
+        let pre = state.pre.clone();
+        state.post.heap.remove(out_value);
+
+        let pre_post = PrePost {
+            pre,
+            post: state,
+            formals: vec![(out_pvar, out_stack_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        let caller_old_target = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+        caller_state.write_heap(x_addr, Access::Dereference, caller_old_target);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(Exp::Lvar(x_pvar), Typ::void())];
+        let results = apply_summary(
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(results.iter().any(|r| r.is_continue()));
+
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            assert_eq!(
+                s.post.heap.find_edge(x_addr, &Access::Dereference),
+                None,
+                "callee post should delete caller edges that disappeared from the callee post"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_propagates_abort_program_diagnostic() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let diagnostic = crate::diagnostic::Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::of_raw(1),
+            invalidation: crate::invalidation::Invalidation::CFree,
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state.clone(),
+            formals: vec![(
+                Pvar::mk(Mangled::from_string("p"), callee_pname),
+                callee_state
+                    .post
+                    .stack
+                    .find(&Var::ProgramVar(Box::new(Pvar::mk(
+                        Mangled::from_string("p"),
+                        Procname::c_from_string("callee"),
+                    ))))
+                    .unwrap(),
+            )],
+            result: None,
+            kind: crate::summary::PrePostKind::AbortProgram,
+            diagnostic: Some(diagnostic.clone()),
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let arg = AbstractValue::mk_fresh();
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        caller_state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(x_pvar.clone())), arg);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(Exp::Lvar(x_pvar), Typ::void())];
+        let results = apply_summary(
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
+                if found.as_ref() == &diagnostic
+        ));
     }
 }
