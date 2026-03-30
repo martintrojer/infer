@@ -55,113 +55,49 @@ fn analyze_with_spec_loop(
         }
     }
 
-    let mut summary =
-        pulse::checker::analyze_with_specialization(pdesc, &callee_summaries, specialization);
+    let (mut summary, mut spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
+        pdesc,
+        &callee_summaries,
+        specialization,
+    );
 
     if depth >= MAX_SPEC_DEPTH {
         return summary;
     }
 
-    // Post-analysis: check if any callee summaries need specialization
-    // that we can now provide. Collect requests first, then apply.
-    let spec_requests: Vec<_> = callee_summaries
-        .iter()
-        .filter_map(|(callee_pname, callee_summary)| {
-            let first_pp = callee_summary.pre_posts.first()?;
-            let call_args = pdesc.iter_instrs().find_map(|(_nid, instr)| {
-                if let sil::instr::Instr::Call {
-                    fun_exp: sil::exp::Exp::Const(sil::const_val::Const::Cfun(cp)),
-                    args,
-                    ..
-                } = instr
-                {
-                    if cp == callee_pname {
-                        Some(args.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })?;
-            // Build state up to the call to evaluate actuals for Closure attrs
-            let mut eval_state = pulse::abductive::AbductiveDomain::mk_initial(pdesc);
-            // Apply specialization to the eval state so Closure attrs are visible
-            if let Some(spec) = specialization {
-                pulse::specialization::apply(spec, &mut eval_state);
-            }
-            for (_nid, pre_instr) in pdesc.iter_instrs() {
-                if let sil::instr::Instr::Call {
-                    fun_exp: sil::exp::Exp::Const(sil::const_val::Const::Cfun(cp)),
-                    ..
-                } = pre_instr
-                {
-                    if cp == callee_pname {
-                        break;
-                    }
-                }
-                // Replay Store and Load instructions to build eval_state
-                match pre_instr {
-                    sil::instr::Instr::Store { e1, e2, loc, .. } => {
-                        let rhs = pulse::operations::eval_or_fresh(e2, loc, &mut eval_state);
-                        let lhs = pulse::operations::eval_or_fresh(e1, loc, &mut eval_state);
-                        eval_state.write_heap(lhs, pulse::access::Access::Dereference, rhs);
-                    }
-                    sil::instr::Instr::Load { id, e, loc, .. } => {
-                        // Replay Load matching exec_load's deref semantics:
-                        // Lvar/Var deref through the address, others eval directly.
-                        let needs_deref = matches!(
-                            e,
-                            sil::exp::Exp::Lvar(_)
-                                | sil::exp::Exp::Lfield(..)
-                                | sil::exp::Exp::Lindex(..)
-                                | sil::exp::Exp::Var(_)
-                        );
-                        let val = if needs_deref {
-                            match pulse::operations::eval_deref(e, loc, &mut eval_state) {
-                                pulse::pulse_result::PulseResult::Ok(v) => v,
-                                _ => pulse::operations::eval_or_fresh(e, loc, &mut eval_state),
-                            }
-                        } else {
-                            pulse::operations::eval_or_fresh(e, loc, &mut eval_state)
-                        };
-                        pulse::operations::write_id(id, val, &mut eval_state);
-                    }
-                    _ => {}
-                }
-            }
-            let spec = pulse::specialization::make_specialization_from_caller(
-                &callee_summary.needs_specialization,
-                &eval_state,
-                &first_pp.formals,
-                &callee_summary.formal_types,
-                &call_args,
-            );
-            let spec = spec?;
-            if callee_summary.get_specialized(&spec).is_some() {
-                return None;
-            }
-            Some((callee_pname.clone(), spec))
-        })
-        .collect();
-
-    if !spec_requests.is_empty() {
+    loop {
+        let mut added_any = false;
         for (callee_pname, spec) in &spec_requests {
+            if callee_summaries
+                .get(callee_pname)
+                .is_some_and(|summary| summary.get_specialized(spec).is_some())
+            {
+                continue;
+            }
             if let Some(callee_pdesc) = ctx.cfg.get_proc_desc(callee_pname) {
                 // RECURSIVE: re-analyze callee with specialization AND the
                 // specialization loop, so sub-callees can also be specialized.
                 let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
-                    existing.add_specialized(spec.clone(), spec_summary.pre_posts);
+                    existing.add_specialized_summary(spec.clone(), spec_summary);
+                    added_any = true;
                 }
             }
         }
-        // Re-analyze with specialized summaries
-        summary =
-            pulse::checker::analyze_with_specialization(pdesc, &callee_summaries, specialization);
+        if !added_any {
+            return summary;
+        }
+        // Re-analyze with the newly added specialized summaries, and collect
+        // any follow-up requests from the actual caller states at their calls.
+        (summary, spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
+            pdesc,
+            &callee_summaries,
+            specialization,
+        );
+        if spec_requests.is_empty() {
+            return summary;
+        }
     }
-
-    summary
 }
 
 /// Collect all Cfun procname references from an instruction and look up summaries.
@@ -1570,12 +1506,16 @@ fn test_debug_follow_ret() {
     let tm = textual_utils::parse_file_and_convert(sil);
     let checker = PulseInterChecker;
     let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
-    // Check return_null and return_first summaries
+    // Dump selected summaries for local debugging of latent/reporting parity.
     for (pname, summary) in store.to_vec() {
         let name = format!("{pname}");
         if name.contains("return_null")
             || name.contains("return_first")
             || name.contains("follow_value_by_ret")
+            || name.contains("conditional_free_then_use")
+            || name.contains("latent_dereference")
+            || name.contains("propagate_latent")
+            || name.contains("make_latent_manifest")
         {
             let has_null = summary
                 .pre_posts
@@ -1586,9 +1526,107 @@ fn test_debug_follow_ret() {
                 .iter()
                 .map(|d| d.get_issue_type())
                 .collect();
+            let kinds: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.kind))
+                .collect();
+            let conditions: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.post.path_condition.conditions()))
+                .collect();
             eprintln!(
-                "  {name}: disjuncts={} null_ret={has_null} issues={issues:?}",
-                summary.pre_posts.len()
+                "  {name}: disjuncts={} kinds={kinds:?} conditions={conditions:?} null_ret={has_null} issues={issues:?}",
+                summary.pre_posts.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_debug_latent_summary() {
+    let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
+    if !sil.exists() {
+        eprintln!("skip");
+        return;
+    }
+    let tm = textual_utils::parse_file_and_convert(sil);
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    for (pname, summary) in store.to_vec() {
+        let name = format!("{pname}");
+        if name.contains("latent")
+            || name.contains("manifest_use_after_free")
+            || name.contains("deref_then_free_then_deref")
+            || name.contains("traverse_and_crash")
+            || name.contains("crash_after")
+            || name.contains("main")
+        {
+            let issues: Vec<_> = summary
+                .diagnostics
+                .iter()
+                .map(|d| d.get_issue_type())
+                .collect();
+            let kinds: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.kind))
+                .collect();
+            let conditions: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.post.path_condition.conditions()))
+                .collect();
+            eprintln!(
+                "  {name}: disjuncts={} kinds={kinds:?} conditions={conditions:?} issues={issues:?}",
+                summary.pre_posts.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_debug_specialization_summary() {
+    let sil = std::path::Path::new("/tmp/interproc_debug/specialization.sil");
+    if !sil.exists() {
+        eprintln!("skip");
+        return;
+    }
+    let tm = textual_utils::parse_file_and_convert(sil);
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    for (pname, summary) in store.to_vec() {
+        let name = format!("{pname}");
+        if name.contains("test_alias")
+            || name.contains("test_unalias")
+            || name.contains("call_test_alias")
+            || name.contains("call_test_unalias")
+            || name.contains("may_double_free")
+            || name.contains("call_may_double_free")
+        {
+            let issues: Vec<_> = summary
+                .diagnostics
+                .iter()
+                .map(|d| d.get_issue_type())
+                .collect();
+            let specs: Vec<_> = summary
+                .specialized
+                .iter()
+                .map(|(spec, pps)| format!("{spec} disjuncts={}", pps.len()))
+                .collect();
+            let kinds: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.kind))
+                .collect();
+            let conditions: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.post.path_condition.conditions()))
+                .collect();
+            eprintln!(
+                "  {name}: issues={issues:?} kinds={kinds:?} conditions={conditions:?} specialized={specs:?}"
             );
         }
     }

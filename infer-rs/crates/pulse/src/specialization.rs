@@ -25,8 +25,6 @@ use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::Attribute;
-use crate::formula::atom::Atom;
-use crate::formula::term::Term;
 use crate::pulse_result::PulseResult;
 
 /// Apply a specialization to an AbductiveDomain.
@@ -60,7 +58,7 @@ fn prune_eq_list_values(state: &mut AbductiveDomain, alias_group: &[HeapPath]) {
         return;
     };
     for &value in tail {
-        let _ = state.and_condition_direct(Atom::Equal(Term::Var(head), Term::Var(value)), 1);
+        let _ = state.and_equal(head, value);
     }
 }
 
@@ -129,9 +127,18 @@ pub fn make_specialization_from_caller(
                 PulseResult::FatalError(_, _) => continue,
             };
 
-        // Check if the actual has a Closure attribute (checking the eval state
-        // where the Closure was created by eval_const for Cfun).
-        if let Some(pname) = eval_state.get_closure_proc_name(actual_val) {
+        // Cross-ref: OCaml specialization is keyed by the full callee heap
+        // path, not just by the root actual. For example, callbacks require
+        // looking through `formal->field` to find the closure stored there.
+        let Some(needed_val) =
+            actual_value_for_callee_heap_path(heap_path, actual_val, &eval_state)
+        else {
+            continue;
+        };
+
+        // Check the translated caller-side value for a Closure attribute,
+        // using the eval state where eval_const can synthesize one for Cfun.
+        if let Some(pname) = eval_state.get_closure_proc_name(needed_val) {
             let type_name = sil::typ::TypeName::CStruct(
                 sil::qualified_cpp_name::QualifiedCppName::from_string(format!("{pname}")),
             );
@@ -193,6 +200,41 @@ fn formal_value_heap_path(formal_pvar: &Pvar) -> HeapPath {
     HeapPath::Dereference(Box::new(HeapPath::Pvar(formal_pvar.clone())))
 }
 
+/// Translate a callee heap path rooted at a formal into the corresponding
+/// caller-side value reached from the actual argument.
+///
+/// Actual arguments represent the value passed to the callee, not the callee's
+/// stack slot for the formal. Therefore a leading `Dereference(Pvar(formal))`
+/// in the callee heap path corresponds to the actual value itself.
+///
+/// Cross-ref: OCaml `PulseInterproc` tracks dynamic-type needs by heap path,
+/// then resolves those paths in the caller state before requesting
+/// specialization.
+fn actual_value_for_callee_heap_path(
+    heap_path: &HeapPath,
+    actual_val: AbstractValue,
+    caller_state: &AbductiveDomain,
+) -> Option<AbstractValue> {
+    match heap_path {
+        HeapPath::Pvar(_) => Some(actual_val),
+        HeapPath::Dereference(inner) => {
+            if matches!(inner.as_ref(), HeapPath::Pvar(_)) {
+                Some(actual_val)
+            } else {
+                let base = actual_value_for_callee_heap_path(inner, actual_val, caller_state)?;
+                caller_state.post.heap.find_edge(base, &Access::Dereference)
+            }
+        }
+        HeapPath::FieldAccess(field, inner) => {
+            let base = actual_value_for_callee_heap_path(inner, actual_val, caller_state)?;
+            caller_state
+                .post
+                .heap
+                .find_edge(base, &Access::FieldAccess(field.clone()))
+        }
+    }
+}
+
 /// Extract the root Pvar from a HeapPath.
 fn extract_root_pvar(path: &HeapPath) -> Option<&Pvar> {
     match path {
@@ -205,11 +247,13 @@ fn extract_root_pvar(path: &HeapPath) -> Option<&Pvar> {
 mod tests {
     use super::*;
     use sil::exp::Exp;
+    use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
     use sil::location::Location;
     use sil::mangled::Mangled;
     use sil::procdesc::Procdesc;
     use sil::procname::Procname;
+    use sil::qualified_cpp_name::QualifiedCppName;
     use sil::typ::Typ;
 
     fn make_pdesc(name: &str, formals: &[&str]) -> Procdesc {
@@ -274,12 +318,9 @@ mod tests {
             .attrs
             .get(&state.get_var_repr(p_val))
             .is_some_and(|attrs| attrs.contains(&Attribute::Initialized)));
-        assert_eq!(
-            state
-                .path_condition
-                .conditions()
-                .get(&Atom::Equal(Term::Var(p_val), Term::Var(q_val))),
-            Some(&1)
+        assert!(
+            state.path_condition.conditions().is_empty(),
+            "specialization equalities should be baked into phi, not exported as caller conditions"
         );
     }
 
@@ -327,6 +368,65 @@ mod tests {
                 formal_value_heap_path(&formals[0].0),
                 formal_value_heap_path(&formals[1].0)
             ]])
+        );
+    }
+
+    #[test]
+    fn test_make_specialization_from_caller_follows_field_access_heap_path() {
+        let callback_struct =
+            sil::typ::TypeName::CStruct(QualifiedCppName::from_string("Callback"));
+        let field = Fieldname::make(callback_struct.clone(), "f");
+
+        let callee_pdesc = make_pdesc("apply_callback", &["callback"]);
+        let callback_formal = Pvar::mk(
+            Mangled::from_string("callback"),
+            callee_pdesc.proc_name.clone(),
+        );
+        let needed_path = HeapPath::FieldAccess(
+            field.clone(),
+            Box::new(formal_value_heap_path(&callback_formal)),
+        );
+
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let callback_pvar = Pvar::mk(Mangled::from_string("cb"), caller_pdesc.proc_name.clone());
+        let callback_addr = AbstractValue::mk_fresh();
+        let funptr_val = AbstractValue::mk_fresh();
+        caller_state.post.stack.add(
+            Var::ProgramVar(Box::new(callback_pvar.clone())),
+            callback_addr,
+        );
+        caller_state.post.heap.add_edge(
+            callback_addr,
+            Access::FieldAccess(field.clone()),
+            funptr_val,
+        );
+        caller_state.post.attrs.add_one(
+            funptr_val,
+            Attribute::Closure(Procname::c_from_string("assign_NULL")),
+        );
+
+        let mut callee_needs = HashMap::new();
+        callee_needs.insert(needed_path.clone(), AbstractValue::mk_fresh());
+
+        let spec = make_specialization_from_caller(
+            &callee_needs,
+            &caller_state,
+            &[(callback_formal, AbstractValue::mk_fresh())],
+            &[Typ::mk_ptr(Typ::void())],
+            &[(Exp::Lvar(callback_pvar), Typ::mk_ptr(Typ::void()))],
+        )
+        .expect("expected dynamic-type specialization for callback field");
+
+        assert_eq!(
+            spec.dynamic_types.get(&needed_path),
+            Some(&sil::typ::TypeName::CStruct(QualifiedCppName::from_string(
+                "assign_NULL"
+            )))
         );
     }
 }

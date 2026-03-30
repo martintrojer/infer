@@ -5,15 +5,54 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-Keep the correctness-first latent/manifest classification fix in place. The latest OCaml-aligned
-follow-up was adding call-depth provenance for prune conditions so local branch tests no longer
-make issues latent. `assert.c` and `ternary.c` are now back. The next active target is the single
-remaining UAF miss in `specialization.c`, specifically by making sure solver-discovered equalities
-are incorporated back into the Rust abductive state the way OCaml does. That direct fix now
-restores the expected five Rust issues for `specialization.c`, including the missing
-`call_may_double_free_if_alias_bad` UAF. The active target has now moved to the new sweep
-over-counts, especially `interprocedural.c` and `latent.c`, after restoring callee
-`AbortProgram` propagation.
+The active line has moved from latent-condition cleanup to the remaining specialization/reporting
+conflicts.
+
+Latest authoritative sweep:
+
+- `NPE: expected 135, found 138`
+- `LEAK: expected 20, found 22`
+- `UAF: expected 7, found 6`
+
+What improved this turn:
+
+- `funptr.c` recovered from `6` issues up to `10` after replacing the fake specialization-request
+  replay with requests collected from the actual fixpoint state at each call.
+- `memory_leak.c` improved from `15` to `14` issues.
+- `specialization.c` NPE parity is now exact (`4`), after making alias specialization equalities
+  part of `phi` rather than exported depth-1 conditions.
+- `nullptr.c` also improved slightly (`16` vs previous `17`).
+
+What is still open:
+
+- `funptr.c` is still short by `1` NPE.
+- `cleanup_attribute.c` still has `+2` leaks.
+- `specialization.c` regressed to missing the single expected UAF
+  (`call_may_double_free_if_alias_bad`).
+
+Current strongest diagnosis:
+
+1. Specialized-summary request collection is now coming from the actual caller state during the
+   fixpoint, not from the previous hand-rolled replay. That fix is correct and should stay.
+
+2. The remaining specialization conflict is now about **how specialized invalid-access summaries are
+   classified and reported**, not about whether the specialization was requested.
+
+3. `call_test_alias_bad` / `call_test_unalias_bad` were staying latent because
+   `specialization.rs` used `and_condition_direct(..., depth=1)` for alias groups. OCaml
+   `PulseSpecialization.apply` uses `PulseArithmetic.prune_binop`, so the Rust side was corrected to
+   use `state.and_equal(...)` instead. This fixed those callers.
+
+4. The remaining missing UAF strongly suggests the current Rust latent/manifest logic still lacks an
+   OCaml-equivalent `LatentInvalidAccess` / `PotentialInvalidAccessSummary` path. After the alias
+   equalities moved into `phi`, `may_double_free_if_alias` no longer has imported conditions to keep
+   the invalid access latent, but OCaml still treats it as latent and reifies it in the caller.
+
+5. `funptr.c` still misses the single expected `apply_funptr_with_intptrptr_and_after` issue
+   because we do not yet have a clean way to report a specialized callee diagnostic exactly once.
+   The previous caller-level propagation over-reported it twice (both callers). Stripping manifest
+   diagnostics from cached specialized pre/posts avoids the duplicate callers, but without a proper
+   specialized-diagnostic reporting path it under-reports by one.
 
 ## Non-Negotiable Guidance
 
@@ -22,22 +61,17 @@ over-counts, especially `interprocedural.c` and `latent.c`, after restoring call
 - Correctness over numbers: confirm the semantic fix first, then investigate totals.
 - Run `make check` before closing work if possible.
 
-## Current Dirty Files
+## Files Touched In This Checkpoint
 
-- `CLAUDE.md`
-- `crates/pulse/src/abductive.rs`
-- `crates/pulse/src/execution_domain.rs`
-- `crates/pulse/src/base_memory.rs`
+- `crates/cli/src/main.rs`
+- `crates/pulse/src/checker.rs`
 - `crates/pulse/src/formula/mod.rs`
-- `crates/pulse/src/formula/phi.rs`
 - `crates/pulse/src/interproc.rs`
-- `crates/pulse/src/state_cmp.rs`
+- `crates/pulse/src/specialization.rs`
 - `crates/pulse/src/summary.rs`
 - `crates/pulse/src/transfer.rs`
-- `crates/absint/src/disjunctive.rs`
+- `crates/pulse/tests/end_to_end.rs`
 - `LOG.md`
-- `TODO.md`
-- `docs/STATUS.md`
 
 ## Confirmed Changes Already Made
 
@@ -110,8 +144,10 @@ over-counts, especially `interprocedural.c` and `latent.c`, after restoring call
 ## Validation Already Run
 
 - `cargo fmt --all`
-- `cargo test -p pulse --lib`
-  Latest result when last run: `131 passed`
+- `make check`
+  - passed cleanly on 2026-03-30 after the specialization/interproc changes
+- `cargo test -p pulse --lib -- --nocapture`
+  - now `148 passed`
 - Focused alpha-equivalence tests added and passing:
   - duplicate disjuncts with renamed abstract values collapse
   - disconnected leak-only state does not collapse away
@@ -121,13 +157,23 @@ over-counts, especially `interprocedural.c` and `latent.c`, after restoring call
     remains
   - `assert.c` now reports the expected 1 NPE again
   - `ternary.c` now reports the expected 3 NPEs again
-- Latest authoritative sweep:
-  - `cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
-  - NPE: expected `135`, found `128`
-  - LEAK: expected `20`, found `24`
-  - UAF: expected `7`, found `6`
+- Latest focused validations after the condition-shape fix:
+  - `cargo test -p pulse --test end_to_end test_debug_follow_ret -- --nocapture`
+    - latent propagation remains latent through summaries and reifies at entry points
+  - `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --nocapture`
+    - traversal conditions no longer collapse to tautologies like `x = x`
+    - `manifest_use_after_free` / `deref_then_free_then_deref_bad` still emit both NPE and UAF
+  - `cargo test -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
+    - after the alias-specialization change:
+      - `call_test_alias_bad` now reports `NULLPTR_DEREFERENCE`
+      - `call_test_unalias_bad` now reports `NULLPTR_DEREFERENCE`
+      - `call_may_double_free_if_alias_bad` currently has no issue
+  - `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+    - `NPE: expected 135, found 138`
+    - `LEAK: expected 20, found 22`
+    - `UAF: expected 7, found 6`
 
-## Regressions Seen After the Correctness Fixes
+## Remaining Sweep Differences
 
 Authoritative sweep command:
 
@@ -135,28 +181,14 @@ Authoritative sweep command:
 cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture
 ```
 
-Observed totals after the latest correctness-first latent + condition-depth fixes:
+Current file-level diffs from the latest sweep:
 
-- NPE: expected `135`, found `128`
-- LEAK: expected `20`, found `24`
-- UAF: expected `7`, found `6`
-
-Important interpretation:
-
-- The big NPE drop is expected after stopping the incorrect publication of latent issues as manifest
-  base reports.
-- This is the correct direction under the user's guidance: keep the semantically correct latent fix,
-  then work on recovering the now-unmasked true under-detections.
-
-Current headline diffs:
-
-- NPE under-detection: `funptr.c`, `initlistexpr.c`, `compound_literal.c`, `memory_leak.c`,
-  `latent.c` (loop depth), `traces.c`
-- NPE over-detection still present in `angelism.c`, `nullptr.c`, `nullptr_more.c`,
-  `offsetof_expr.c`, `sizeof.c`
-- LEAK over-detection remains only in `cleanup_attribute.c` (+2, GCC cleanup attr) and
-  `memory_leak.c` (+2, funptr wrappers)
-- UAF now only misses `specialization.c` (-1)
+- NPE under: `compound_literal.c` (-1), `funptr.c` (-1), `initlistexpr.c` (-3),
+  `memory_leak.c` (-2)
+- NPE over: `angelism.c` (+1), `integers.c` (+2), `nullptr.c` (+2),
+  `nullptr_more.c` (+2), `offsetof_expr.c` (+1), `sizeof.c` (+2)
+- LEAK over: `cleanup_attribute.c` (+2), `memory_leak.c` (+1)
+- UAF under: `specialization.c` (-1)
 
 ## Relevant OCaml Cross-References
 
@@ -179,59 +211,37 @@ Current headline diffs:
 
 ## Current Line Of Thinking
 
-### What was just tested
+### What was just confirmed
 
-The OCaml-style condition-depth port is internally consistent (`cargo test -p pulse --lib` passes)
-and fixes the sharp manifestness regressions:
+- The latest `Formula::simplify` fix is correct and stable.
+- Summary conditions now preserve caller-relevant atom shape instead of normalizing through `phi`.
+- `interprocedural.c` is back to the expected 6 issues.
+- `latent.c` count is back in line with OCaml.
+- Specialization requests must be collected from the real fixpoint caller state; the previous
+  replay-based request builder was wrong.
+- Specialized alias equalities belong in `phi` (`and_equal`), not as imported depth-1 conditions.
 
-- `assert.c` direct Rust CLI now reports the expected 1 NPE
-- `ternary.c` direct Rust CLI now reports the expected 3 NPEs
-- the authoritative sweep improved from `121` to `128` NPEs without changing leak/UAF totals
+### Immediate next edits
 
-### Current strongest open question
+- Keep the specialization-request collector that runs during the real fixpoint.
+- Investigate an OCaml-aligned Rust analogue of `LatentInvalidAccess` /
+  `PotentialInvalidAccessSummary` so `may_double_free_if_alias` becomes latent in the callee and
+  reifies in `call_may_double_free_if_alias_bad`.
+- Add a proper reporting path for specialized callee diagnostics so
+  `apply_funptr_with_intptrptr_and_after` can be reported once without duplicating across callers.
+- When touching either path, cross-check against:
+  - `infer/src/pulse/PulseSummary.ml`
+  - `infer/src/pulse/PulseAbductiveDomain.ml`
+  - `infer/src/pulse/PulseCallOperations.ml`
 
-Why `specialization.c` still misses the aliased-actual UAF in
-`call_may_double_free_if_alias_bad`.
+Largest current authoritative diffs:
 
-### Latest active hypothesis
-
-The alias-specialization builder itself is probably not the blocker anymore. The more likely gap is
-that Rust has been learning `NewEq` facts in the formula solver without rewriting `pre` / `post`
-/ attrs / heap-tracking sets. OCaml pushes those equalities back into the abductive state via
-`PulseAbductiveDomain.incorporate_new_eqs`. The current implementation pass is to add the Rust
-analogue in `crates/pulse/src/abductive.rs` and route mutating formula call sites through it.
-
-### Latest confirmed outcome
-
-That equality-incorporation pass did move the specialization target:
-
-- `call_test_alias_bad` is now reported again
-- `call_test_unalias_bad` is now reported again
-- `call_may_double_free_if_alias_bad` UAF is now reported again
-
-The follow-up OCaml parity fix was in `interproc.rs`: do not drop `AbortProgram` pre-posts during
-summary application. OCaml `PulseCallOperations.apply_callee` preserves them, and specialized
-summaries are otherwise not publishing their diagnostics anywhere else.
-
-### New sweep baseline
-
-Latest authoritative sweep after the specialization + abort-propagation fixes:
-
-- NPE: expected `135`, found `138`
-- LEAK: expected `20`, found `23`
-- UAF: expected `7`, found `8`
-
-Largest current diffs:
-
-- NPE over: `interprocedural.c` (+3), `latent.c` (+3), `nullptr.c` (+2), `nullptr_more.c` (+2),
-  `sizeof.c` (+2)
-- NPE under: `funptr.c` (-5), `initlistexpr.c` (-3), `memory_leak.c` (-2)
+- NPE under: `compound_literal.c` (-1), `funptr.c` (-1), `initlistexpr.c` (-3),
+  `memory_leak.c` (-2)
+- NPE over: `angelism.c` (+1), `integers.c` (+2), `nullptr.c` (+2), `nullptr_more.c` (+2),
+  `offsetof_expr.c` (+1), `sizeof.c` (+2)
 - LEAK over: `cleanup_attribute.c` (+2), `memory_leak.c` (+1)
-- UAF over: `interprocedural.c` (+1)
-
-Working hypothesis: execution is now closer to OCaml, but abort/report publication timing is still
-too eager after re-enabling `AbortProgram` propagation. Cross-check `PulseReport` /
-`PulseSummary.exec_summary_of_post_common` before changing anything.
+- UAF under: `specialization.c` (-1)
 
 ### Still-open structural hypothesis
 
@@ -243,24 +253,13 @@ interproc mismatch if the next targeted bug points back into summary materializa
 
 ## Most Likely Next Steps
 
-1. Keep the latent-reporting fix; do not chase the old 135 NPE total by reintroducing latent/base
-   confusion.
-
-2. Next correctness target:
-   - `specialization.c` missing UAF
-   - then `memory_leak.c` funptr wrappers / leak FPs
-   - then remaining NPE misses (`compound_literal.c`, `initlistexpr.c`, `funptr.c`, `latent.c`,
-     `traces.c`)
-
-3. Before any deeper interproc edit, re-check the OCaml source of truth in:
-   - `PulseInterproc.ml`
-   - `PulseSummary.ml`
-   - `PulseAbductiveDomain.ml`
-
-4. After the sweep, next target is abort/report publication parity:
-   - inspect `interprocedural.c` and `latent.c`
-   - compare Rust propagated abort reporting against OCaml `PulseReport.ml`
-   - avoid undoing the now-correct specialization/UAF fix
+1. Keep the correctness-first fixes even where totals are still worse than OCaml.
+2. Port the missing OCaml latent-invalid-access path so `specialization.c` regains the expected
+   UAF without undoing the alias-specialization fix.
+3. Add a proper single-publication path for specialized callee diagnostics so `funptr.c` can regain
+   its missing issue without double-reporting.
+4. Re-run the ignored sweep after each correctness change and update `TODO.md` / `STATUS.md` only
+   from the new authoritative counts.
 
 ## Useful Commands
 

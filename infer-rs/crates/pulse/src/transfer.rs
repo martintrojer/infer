@@ -11,6 +11,7 @@
 //! (the list has >1 element when an error is found — one AbortProgram
 //! and one ContinueProgram for the "maybe it's ok" case).
 
+use sil::const_val::Const;
 use sil::exp::Exp;
 use sil::instr::Instr;
 use sil::location::Location;
@@ -199,22 +200,12 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
     use sil::binop::Binop;
     match exp {
         // Equality and disequality
-        Exp::BinOp(Binop::Eq, lhs, rhs) => {
-            let lhs_val = operations::eval_or_fresh_for_prune(lhs, loc, state);
-            let rhs_val = operations::eval_or_fresh_for_prune(rhs, loc, state);
-            state.prune_eq(lhs_val, rhs_val, negated).is_sat()
-        }
-        Exp::BinOp(Binop::Ne, lhs, rhs) => {
-            let lhs_val = operations::eval_or_fresh_for_prune(lhs, loc, state);
-            let rhs_val = operations::eval_or_fresh_for_prune(rhs, loc, state);
-            state.prune_eq(lhs_val, rhs_val, !negated).is_sat()
-        }
+        Exp::BinOp(Binop::Eq, lhs, rhs) => prune_eq_operands(lhs, rhs, loc, state, negated),
+        Exp::BinOp(Binop::Ne, lhs, rhs) => prune_eq_operands(lhs, rhs, loc, state, !negated),
         // Comparison operators: add atoms directly
         Exp::BinOp(Binop::Lt, lhs, rhs) => {
-            let lhs_val = operations::eval_or_fresh_for_prune(lhs, loc, state);
-            let rhs_val = operations::eval_or_fresh_for_prune(rhs, loc, state);
-            let op_lhs = crate::formula::Operand::AbstractValue(lhs_val);
-            let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
+            let op_lhs = eval_operand_for_prune(lhs, loc, state);
+            let op_rhs = eval_operand_for_prune(rhs, loc, state);
             if negated {
                 // !(x < y) → y ≤ x
                 state.prune_less_equal(&op_rhs, &op_lhs).is_sat()
@@ -223,10 +214,8 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             }
         }
         Exp::BinOp(Binop::Le, lhs, rhs) => {
-            let lhs_val = operations::eval_or_fresh_for_prune(lhs, loc, state);
-            let rhs_val = operations::eval_or_fresh_for_prune(rhs, loc, state);
-            let op_lhs = crate::formula::Operand::AbstractValue(lhs_val);
-            let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
+            let op_lhs = eval_operand_for_prune(lhs, loc, state);
+            let op_rhs = eval_operand_for_prune(rhs, loc, state);
             if negated {
                 // !(x ≤ y) → y < x
                 state.prune_less_than(&op_rhs, &op_lhs).is_sat()
@@ -236,10 +225,8 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
         }
         Exp::BinOp(Binop::Gt, lhs, rhs) => {
             // x > y ↔ y < x
-            let lhs_val = operations::eval_or_fresh_for_prune(lhs, loc, state);
-            let rhs_val = operations::eval_or_fresh_for_prune(rhs, loc, state);
-            let op_lhs = crate::formula::Operand::AbstractValue(lhs_val);
-            let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
+            let op_lhs = eval_operand_for_prune(lhs, loc, state);
+            let op_rhs = eval_operand_for_prune(rhs, loc, state);
             if negated {
                 // !(x > y) → x ≤ y
                 state.prune_less_equal(&op_lhs, &op_rhs).is_sat()
@@ -249,10 +236,8 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
         }
         Exp::BinOp(Binop::Ge, lhs, rhs) => {
             // x ≥ y ↔ y ≤ x
-            let lhs_val = operations::eval_or_fresh_for_prune(lhs, loc, state);
-            let rhs_val = operations::eval_or_fresh_for_prune(rhs, loc, state);
-            let op_lhs = crate::formula::Operand::AbstractValue(lhs_val);
-            let op_rhs = crate::formula::Operand::AbstractValue(rhs_val);
+            let op_lhs = eval_operand_for_prune(lhs, loc, state);
+            let op_rhs = eval_operand_for_prune(rhs, loc, state);
             if negated {
                 // !(x ≥ y) → y < x  → wait, !(x ≥ y) = y > x = x < y
                 state.prune_less_than(&op_lhs, &op_rhs).is_sat()
@@ -266,6 +251,55 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
         _ => {
             let val = operations::eval_or_fresh_for_prune(exp, loc, state);
             state.prune_eq_const(val, 0, !negated).is_sat()
+        }
+    }
+}
+
+fn eval_operand_for_prune(
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> crate::formula::Operand {
+    match exp {
+        Exp::Const(Const::Cint(i)) => i
+            .to_i64()
+            .map(crate::formula::Operand::ConstOperand)
+            .unwrap_or_else(|| {
+                crate::formula::Operand::AbstractValue(operations::eval_or_fresh_for_prune(
+                    exp, loc, state,
+                ))
+            }),
+        Exp::Cast(_, inner) => eval_operand_for_prune(inner, loc, state),
+        _ => crate::formula::Operand::AbstractValue(operations::eval_or_fresh_for_prune(
+            exp, loc, state,
+        )),
+    }
+}
+
+fn prune_eq_operands(
+    lhs: &Exp,
+    rhs: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+    negated: bool,
+) -> bool {
+    let lhs = eval_operand_for_prune(lhs, loc, state);
+    let rhs = eval_operand_for_prune(rhs, loc, state);
+    match (lhs, rhs) {
+        (
+            crate::formula::Operand::AbstractValue(v1),
+            crate::formula::Operand::AbstractValue(v2),
+        ) => state.prune_eq(v1, v2, negated).is_sat(),
+        (crate::formula::Operand::AbstractValue(v), crate::formula::Operand::ConstOperand(c))
+        | (crate::formula::Operand::ConstOperand(c), crate::formula::Operand::AbstractValue(v)) => {
+            state.prune_eq_const(v, c, negated).is_sat()
+        }
+        (crate::formula::Operand::ConstOperand(c1), crate::formula::Operand::ConstOperand(c2)) => {
+            if negated {
+                c1 != c2
+            } else {
+                c1 == c2
+            }
         }
     }
 }
@@ -508,6 +542,40 @@ mod tests {
             assert!(
                 !s.is_known_zero(p),
                 "after prune(p != 0), p should not be known zero"
+            );
+        } else {
+            panic!("expected ContinueProgram");
+        }
+    }
+
+    #[test]
+    fn test_prune_eq_with_constant_preserves_constant_condition() {
+        let mut state = mk_state();
+        let p = AbstractValue::mk_fresh();
+        let id = Ident::create_normal(IdentName::from_string("p"), 0);
+        state.post.stack.add(Var::LogicalVar(id.clone()), p);
+
+        let instr = Instr::Prune {
+            exp: Exp::BinOp(
+                sil::binop::Binop::Eq,
+                Box::new(Exp::Var(id)),
+                Box::new(Exp::Const(Const::Cint(IntLit::of_int(4)))),
+            ),
+            loc: Location::dummy(),
+            is_then_branch: true,
+            if_kind: sil::instr::IfKind::If,
+        };
+        let results = exec_instr(&instr, state);
+
+        assert_eq!(results.len(), 1);
+        if let ExecutionDomain::ContinueProgram(s) = &results[0] {
+            assert_eq!(
+                s.path_condition.conditions().get(&crate::formula::atom::Atom::Equal(
+                    crate::formula::term::Term::Var(p),
+                    crate::formula::term::Term::Const(4),
+                )),
+                Some(&0),
+                "prune conditions should preserve literal constants instead of collapsing to Var=Var"
             );
         } else {
             panic!("expected ContinueProgram");

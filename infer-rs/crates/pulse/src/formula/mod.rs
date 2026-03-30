@@ -531,9 +531,10 @@ impl Formula {
         self.phi.simplify(reachable);
         let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
         for (atom, depth) in std::mem::take(&mut self.conditions) {
-            let atom = atom.translate(|v| self.phi.get_repr(v));
-            if atom.all_vars().into_iter().all(|v| reachable.contains(&v))
-                && atom.is_trivially_true() != Some(true)
+            if atom
+                .all_vars()
+                .into_iter()
+                .all(|v| reachable.contains(&self.phi.get_repr(v)))
             {
                 match conditions.get_mut(&atom) {
                     Some(existing_depth) => *existing_depth = (*existing_depth).min(depth),
@@ -772,6 +773,39 @@ mod tests {
         assert!(
             f.conditions().is_empty(),
             "conditions on dead values should not survive summary simplification"
+        );
+    }
+
+    #[test]
+    fn test_simplify_keeps_reachable_conditions_even_if_implied_by_phi() {
+        let mut f = Formula::ttrue();
+        let p = AbstractValue::of_raw(1);
+
+        let result = f.prune_eq_const(p, 0, false);
+        assert!(result.is_sat());
+        f.simplify(&HashSet::from([p]));
+
+        assert_eq!(
+            f.conditions().len(),
+            1,
+            "reachable prune conditions must survive simplification for manifestness checks"
+        );
+    }
+
+    #[test]
+    fn test_simplify_keeps_condition_shape_without_phi_normalization() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+
+        let result = f.prune_eq(x, y, false);
+        assert!(result.is_sat());
+        f.simplify(&HashSet::from([x]));
+
+        assert!(
+            f.conditions()
+                .contains_key(&Atom::Equal(Term::Var(x), Term::Var(y))),
+            "conditions should keep their original variables instead of collapsing to x = x"
         );
     }
 

@@ -649,105 +649,45 @@ fn analyze_with_spec_loop(
         }
     }
 
-    let mut summary =
-        pulse::checker::analyze_with_specialization(pdesc, &callee_summaries, specialization);
+    let (mut summary, mut spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
+        pdesc,
+        &callee_summaries,
+        specialization,
+    );
 
     if depth >= MAX_SPEC_DEPTH {
         return summary;
     }
 
-    // Post-analysis: check if any callee needs specialization we can provide
-    let spec_requests: Vec<_> = callee_summaries
-        .iter()
-        .filter_map(|(callee_pname, callee_summary)| {
-            let first_pp = callee_summary.pre_posts.first()?;
-            // Find the Call instruction to this callee
-            let call_args = pdesc.iter_instrs().find_map(|(_nid, instr)| {
-                if let sil::instr::Instr::Call {
-                    fun_exp: sil::exp::Exp::Const(sil::const_val::Const::Cfun(cp)),
-                    args,
-                    ..
-                } = instr
-                {
-                    if cp == callee_pname {
-                        Some(args.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })?;
-            // Build state up to the call to evaluate actuals
-            let mut eval_state = pulse::abductive::AbductiveDomain::mk_initial(pdesc);
-            if let Some(spec) = specialization {
-                pulse::specialization::apply(spec, &mut eval_state);
-            }
-            for (_nid, pre_instr) in pdesc.iter_instrs() {
-                if let sil::instr::Instr::Call {
-                    fun_exp: sil::exp::Exp::Const(sil::const_val::Const::Cfun(cp)),
-                    ..
-                } = pre_instr
-                {
-                    if cp == callee_pname {
-                        break;
-                    }
-                }
-                match pre_instr {
-                    sil::instr::Instr::Store { e1, e2, loc, .. } => {
-                        let rhs = pulse::operations::eval_or_fresh(e2, loc, &mut eval_state);
-                        let lhs = pulse::operations::eval_or_fresh(e1, loc, &mut eval_state);
-                        eval_state.write_heap(lhs, pulse::access::Access::Dereference, rhs);
-                    }
-                    sil::instr::Instr::Load { id, e, loc, .. } => {
-                        let needs_deref = matches!(
-                            e,
-                            sil::exp::Exp::Lvar(_)
-                                | sil::exp::Exp::Lfield(..)
-                                | sil::exp::Exp::Lindex(..)
-                                | sil::exp::Exp::Var(_)
-                        );
-                        let val = if needs_deref {
-                            match pulse::operations::eval_deref(e, loc, &mut eval_state) {
-                                pulse::pulse_result::PulseResult::Ok(v) => v,
-                                _ => pulse::operations::eval_or_fresh(e, loc, &mut eval_state),
-                            }
-                        } else {
-                            pulse::operations::eval_or_fresh(e, loc, &mut eval_state)
-                        };
-                        pulse::operations::write_id(id, val, &mut eval_state);
-                    }
-                    _ => {}
-                }
-            }
-            let spec = pulse::specialization::make_specialization_from_caller(
-                &callee_summary.needs_specialization,
-                &eval_state,
-                &first_pp.formals,
-                &callee_summary.formal_types,
-                &call_args,
-            )?;
-            if callee_summary.get_specialized(&spec).is_some() {
-                return None;
-            }
-            Some((callee_pname.clone(), spec))
-        })
-        .collect();
-
-    if !spec_requests.is_empty() {
+    loop {
+        let mut added_any = false;
         for (callee_pname, spec) in &spec_requests {
+            if callee_summaries
+                .get(callee_pname)
+                .is_some_and(|summary| summary.get_specialized(spec).is_some())
+            {
+                continue;
+            }
             if let Some(callee_pdesc) = ctx.cfg.get_proc_desc(callee_pname) {
                 let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
-                    existing.add_specialized(spec.clone(), spec_summary.pre_posts);
+                    existing.add_specialized_summary(spec.clone(), spec_summary);
+                    added_any = true;
                 }
             }
         }
-        summary =
-            pulse::checker::analyze_with_specialization(pdesc, &callee_summaries, specialization);
+        if !added_any {
+            return summary;
+        }
+        (summary, spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
+            pdesc,
+            &callee_summaries,
+            specialization,
+        );
+        if spec_requests.is_empty() {
+            return summary;
+        }
     }
-
-    summary
 }
 
 /// Adapter: implements `ondemand::InterChecker` for Pulse.

@@ -21,6 +21,7 @@ use sil::typ::Typ;
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
+use crate::attribute::Attribute;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::summary::PrePost;
@@ -34,6 +35,7 @@ use crate::summary::PrePost;
 /// Returns a list of resulting execution domains (may include errors
 /// from the callee's summary).
 pub fn apply_summary(
+    caller_pdesc: &sil::procdesc::Procdesc,
     pre_post: &PrePost,
     ret_id: &Ident,
     actuals: &[(Exp, Typ)],
@@ -171,11 +173,11 @@ pub fn apply_summary(
     let callee_attrs = &pre_post.post.post.attrs;
     for (callee_addr, attrs) in callee_attrs.iter() {
         let caller_addr = resolve_mut(&mut subst, *callee_addr);
-        if let Some((invalidation, inv_loc)) = attrs.get_invalid() {
-            caller_state.invalidate(caller_addr, invalidation.clone(), inv_loc.clone());
-        }
-        if let Some((allocator, alloc_loc)) = attrs.get_allocated() {
-            caller_state.allocate(caller_addr, allocator.clone(), alloc_loc.clone());
+        for attr in attrs.iter() {
+            caller_state
+                .post
+                .attrs
+                .add_one(caller_addr, translate_attribute(&mut subst, attr));
         }
     }
 
@@ -186,10 +188,17 @@ pub fn apply_summary(
         log::debug!("[apply_summary] pre_error present: {diag}");
     }
     if let Some(diag) = pre_error {
-        return vec![ExecutionDomain::AbortProgram {
-            state: Box::new(caller_state),
-            diagnostic: Box::new(diag),
-        }];
+        return if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
+            vec![ExecutionDomain::AbortProgram {
+                state: Box::new(caller_state),
+                diagnostic: Box::new(diag),
+            }]
+        } else {
+            vec![ExecutionDomain::LatentAbortProgram {
+                state: Box::new(caller_state),
+                diagnostic: Box::new(diag),
+            }]
+        };
     }
 
     // Return the same execution domain kind as the callee's pre_post.
@@ -217,14 +226,21 @@ pub fn apply_summary(
             }
         }
         crate::summary::PrePostKind::LatentAbortProgram => {
-            // Latent error: the callee's error depends on caller-provided
-            // values. If the path is feasible in this caller, reify it as an
-            // AbortProgram here.
+            // Cross-ref: OCaml PulseCallOperations.ml re-checks a latent issue
+            // in the caller's summarized state before deciding whether it is
+            // still latent or has become manifest here.
             if let Some(diag) = &pre_post.diagnostic {
-                vec![ExecutionDomain::AbortProgram {
-                    state: Box::new(caller_state),
-                    diagnostic: Box::new(diag.clone()),
-                }]
+                if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
+                    vec![ExecutionDomain::AbortProgram {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(diag.clone()),
+                    }]
+                } else {
+                    vec![ExecutionDomain::LatentAbortProgram {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(diag.clone()),
+                    }]
+                }
             } else {
                 vec![]
             }
@@ -515,9 +531,22 @@ fn translate_access(subst: &HashMap<AbstractValue, AbstractValue>, access: &Acce
     }
 }
 
+fn translate_attribute(
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    attr: &Attribute,
+) -> Attribute {
+    match attr {
+        Attribute::ReturnedFromUnknown(values) => {
+            Attribute::ReturnedFromUnknown(values.iter().map(|v| resolve_mut(subst, *v)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribute::Attribute;
     use sil::ident::IdentName;
     use sil::int_lit::IntLit;
     use sil::mangled::Mangled;
@@ -564,7 +593,14 @@ mod tests {
         let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
 
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
-        let results = apply_summary(&pre_post, &ret_id, &[], &Location::dummy(), caller_state);
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
 
         // Should have at least a ContinueProgram
         assert!(results.iter().any(|r| r.is_continue()));
@@ -575,6 +611,55 @@ mod tests {
             let ret_var = Var::LogicalVar(ret_id);
             let ret_addr = s.post.stack.find(&ret_var);
             assert!(ret_addr.is_some(), "return value should be bound");
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_propagates_return_closure_attr() {
+        let callee_pname = Procname::c_from_string("return_funptr");
+        let callee_pdesc = Procdesc::new(callee_pname, Typ::void(), Location::dummy());
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let ret_val = AbstractValue::mk_fresh();
+        callee_state.post.attrs.add_one(
+            ret_val,
+            Attribute::Closure(Procname::c_from_string("assign_NULL")),
+        );
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![],
+            result: Some(ret_val),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname, Typ::void(), Location::dummy());
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            let ret_var = Var::LogicalVar(ret_id);
+            let ret_addr = s
+                .post
+                .stack
+                .find(&ret_var)
+                .expect("return value should be bound");
+            assert!(s
+                .get_closure_proc_name(ret_addr)
+                .is_some_and(|pname| *pname == Procname::c_from_string("assign_NULL")));
+        } else {
+            panic!("expected a continuing result");
         }
     }
 
@@ -621,6 +706,7 @@ mod tests {
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let actuals = vec![(Exp::Lvar(x_pvar), Typ::void())];
         let results = apply_summary(
+            &caller_pdesc,
             &pre_post,
             &ret_id,
             &actuals,
@@ -687,6 +773,7 @@ mod tests {
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let actuals = vec![(Exp::Lvar(x_pvar), Typ::void())];
         let results = apply_summary(
+            &caller_pdesc,
             &pre_post,
             &ret_id,
             &actuals,
@@ -750,6 +837,7 @@ mod tests {
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let actuals = vec![(Exp::Lvar(x_pvar), Typ::void())];
         let results = apply_summary(
+            &caller_pdesc,
             &pre_post,
             &ret_id,
             &actuals,
@@ -761,6 +849,231 @@ mod tests {
             results.as_slice(),
             [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
                 if found.as_ref() == &diagnostic
+        ));
+    }
+
+    fn mk_latent_abort_pre_post() -> (PrePost, crate::diagnostic::Diagnostic) {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let _ = callee_state.path_condition.and_condition_direct(
+            crate::formula::atom::Atom::Equal(
+                crate::formula::term::Term::Var(formal_val),
+                crate::formula::term::Term::Const(4),
+            ),
+            1,
+        );
+
+        let diagnostic = crate::diagnostic::Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::LatentAbortProgram,
+            diagnostic: Some(diagnostic.clone()),
+        };
+
+        (pre_post, diagnostic)
+    }
+
+    #[test]
+    fn test_apply_summary_keeps_still_latent_abort_as_latent() {
+        let (pre_post, diagnostic) = mk_latent_abort_pre_post();
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(
+            Exp::Lvar(Pvar::mk(Mangled::from_string("x"), caller_pname)),
+            Typ::void(),
+        )];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentAbortProgram { diagnostic: found, .. }]
+                if found.as_ref() == &diagnostic
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_reifies_latent_abort_at_entry_point() {
+        let (pre_post, diagnostic) = mk_latent_abort_pre_post();
+
+        let caller_pname = Procname::c_from_string("main");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(
+            Mangled::from_string("argc"),
+            Typ::void(),
+            Default::default(),
+        )];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(
+            Exp::Lvar(Pvar::mk(Mangled::from_string("argc"), caller_pname)),
+            Typ::void(),
+        )];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
+                if found.as_ref() == &diagnostic
+        ));
+    }
+
+    fn mk_latent_precondition_pre_post() -> PrePost {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![
+            (
+                Mangled::from_string("flag"),
+                Typ::void(),
+                Default::default(),
+            ),
+            (Mangled::from_string("p"), Typ::void(), Default::default()),
+        ];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let flag_pvar = Pvar::mk(Mangled::from_string("flag"), callee_pname.clone());
+        let flag_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(flag_pvar.clone())))
+            .unwrap();
+        let flag_val = callee_state.read_heap(flag_addr, Access::Dereference);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        let p_target = AbstractValue::mk_fresh();
+        callee_state
+            .pre
+            .heap
+            .add_edge(p_val, Access::Dereference, p_target);
+        callee_state.pre.heap.register_address(p_target);
+        callee_state
+            .must_be_valid
+            .insert(callee_state.path_condition.get_var_repr(p_val));
+        let _ = callee_state.path_condition.and_condition_direct(
+            crate::formula::atom::Atom::Equal(
+                crate::formula::term::Term::Var(flag_val),
+                crate::formula::term::Term::Const(4),
+            ),
+            1,
+        );
+
+        PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(flag_pvar, flag_addr), (p_pvar, p_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_keeps_latent_precondition_violation_as_latent() {
+        let pre_post = mk_latent_precondition_pre_post();
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![
+            (
+                Exp::Lvar(Pvar::mk(Mangled::from_string("x"), caller_pname)),
+                Typ::void(),
+            ),
+            (
+                Exp::Const(sil::const_val::Const::Cint(IntLit::zero())),
+                Typ::void(),
+            ),
+        ];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentAbortProgram { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_reifies_latent_precondition_violation_at_entry_point() {
+        let pre_post = mk_latent_precondition_pre_post();
+
+        let caller_pname = Procname::c_from_string("main");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(
+            Mangled::from_string("argc"),
+            Typ::void(),
+            Default::default(),
+        )];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![
+            (
+                Exp::Lvar(Pvar::mk(Mangled::from_string("argc"), caller_pname)),
+                Typ::void(),
+            ),
+            (
+                Exp::Const(sil::const_val::Const::Cint(IntLit::zero())),
+                Typ::void(),
+            ),
+        ];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::AbortProgram { .. }]
         ));
     }
 }

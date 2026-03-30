@@ -377,6 +377,7 @@ impl PulseSummary {
                     ExecutionDomain::ContinueProgram(_)
                         | ExecutionDomain::ExitProgram(_)
                         | ExecutionDomain::AbortProgram { .. }
+                        | ExecutionDomain::LatentAbortProgram { .. }
                 )
             })
             .map(|state| {
@@ -386,6 +387,10 @@ impl PulseSummary {
                         // Temporarily mark as AbortProgram; will reclassify below
                         (PrePostKind::AbortProgram, Some(diagnostic.as_ref().clone()))
                     }
+                    ExecutionDomain::LatentAbortProgram { diagnostic, .. } => (
+                        PrePostKind::LatentAbortProgram,
+                        Some(diagnostic.as_ref().clone()),
+                    ),
                     _ => (PrePostKind::ContinueProgram, None),
                 };
                 let mut pp =
@@ -450,8 +455,28 @@ impl PulseSummary {
     }
 
     /// Add a specialized summary for a given specialization.
-    pub fn add_specialized(&mut self, spec: PulseSpecialization, pre_posts: Vec<PrePost>) {
-        self.specialized.push((spec, pre_posts));
+    pub fn add_specialized_summary(
+        &mut self,
+        spec: PulseSpecialization,
+        mut summary: PulseSummary,
+    ) {
+        // Specialized callee diagnostics should be reported on the callee
+        // itself. Keep them on the owning summary, and strip manifest abort
+        // diagnostics from the cached specialized pre/posts so callers do not
+        // report the same issue again for each call context.
+        let mut seen: std::collections::HashSet<_> =
+            self.diagnostics.iter().map(Diagnostic::dedup_key).collect();
+        for diag in summary.diagnostics.drain(..) {
+            if seen.insert(diag.dedup_key()) {
+                self.diagnostics.push(diag);
+            }
+        }
+        for pre_post in &mut summary.pre_posts {
+            if pre_post.kind == PrePostKind::AbortProgram {
+                pre_post.diagnostic = None;
+            }
+        }
+        self.specialized.push((spec, summary.pre_posts));
     }
 
     /// Look up a specialized summary.
@@ -800,6 +825,45 @@ mod tests {
     }
 
     #[test]
+    fn test_add_specialized_summary_merges_diagnostics_but_hides_abort_from_callers() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let state = AbductiveDomain::mk_initial(&pdesc);
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::of_raw(1),
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+        let specialized = PulseSummary {
+            pre_posts: vec![PrePost {
+                pre: state.pre.clone(),
+                post: state.clone(),
+                formals: vec![],
+                result: None,
+                kind: PrePostKind::AbortProgram,
+                diagnostic: Some(diagnostic.clone()),
+            }],
+            specialized: vec![],
+            diagnostics: vec![diagnostic.clone()],
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: false,
+            formal_types: vec![],
+        };
+
+        let mut summary = PulseSummary::intra_only(vec![]);
+        let spec = PulseSpecialization::bottom();
+        summary.add_specialized_summary(spec.clone(), specialized);
+
+        assert_eq!(summary.diagnostics, vec![diagnostic]);
+        let stored = summary
+            .get_specialized(&spec)
+            .expect("specialized summary should be stored");
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].diagnostic.is_none());
+    }
+
+    #[test]
     fn test_summary_keeps_all_disjuncts() {
         let pdesc = make_pdesc_with_formals(&[]);
         let initial = AbductiveDomain::mk_initial(&pdesc);
@@ -1012,6 +1076,42 @@ mod tests {
             summary.diagnostics.is_empty(),
             "latent aborts should stay in the summary but not be published as manifest diagnostics"
         );
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::LatentAbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_of_proc_preserves_explicit_latent_abort() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let _ = astate
+            .path_condition
+            .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(4)), 2);
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::LatentAbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(summary.diagnostics.is_empty());
         assert!(matches!(
             summary.pre_posts[0].kind,
             PrePostKind::LatentAbortProgram

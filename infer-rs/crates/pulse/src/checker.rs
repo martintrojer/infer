@@ -13,6 +13,7 @@
 //! from all predecessors are unioned. The WTO engine handles loops with proper
 //! widening at loop heads.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use absint::disjunctive::DisjunctiveDomain;
@@ -25,6 +26,7 @@ use sil::exp::Exp;
 use sil::instr::Instr;
 use sil::procdesc::{NodeId, Procdesc};
 use sil::procname::Procname;
+use sil::specialization::PulseSpecialization;
 
 use crate::abductive::AbductiveDomain;
 use crate::execution_domain::ExecutionDomain;
@@ -57,6 +59,20 @@ pub fn analyze_with_specialization(
     callee_summaries: &HashMap<Procname, PulseSummary>,
     specialization: Option<&sil::specialization::PulseSpecialization>,
 ) -> PulseSummary {
+    analyze_with_specialization_and_requests(pdesc, callee_summaries, specialization).0
+}
+
+/// Run Pulse analysis and also collect specialization requests discovered at
+/// actual call sites during the fixpoint.
+///
+/// This is the semantically correct source of specialization requests: the
+/// current abstract state at the call already reflects prior calls, stores,
+/// loads, and branch pruning in the caller.
+pub fn analyze_with_specialization_and_requests(
+    pdesc: &Procdesc,
+    callee_summaries: &HashMap<Procname, PulseSummary>,
+    specialization: Option<&sil::specialization::PulseSpecialization>,
+) -> (PulseSummary, Vec<(Procname, PulseSpecialization)>) {
     // Reset per-thread counters so each procedure gets deterministic IDs.
     crate::abstract_value::AbstractValue::reset_counters();
 
@@ -78,7 +94,9 @@ pub fn analyze_with_specialization(
 
     let pulse_tf = PulseTransferFunctions {
         callee_summaries,
+        pdesc,
         proc_name: format!("{}", pdesc.proc_name),
+        spec_requests: RefCell::new(Vec::new()),
     };
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
@@ -133,7 +151,9 @@ pub fn analyze_with_specialization(
     // ContinueProgram (all paths end in ExitProgram or AbortProgram)
     let is_noreturn = has_any_disjuncts && !has_continue;
 
-    PulseSummary::of_proc(pdesc, &exit_disjuncts, diagnostics, is_noreturn)
+    let summary = PulseSummary::of_proc(pdesc, &exit_disjuncts, diagnostics, is_noreturn);
+    let spec_requests = pulse_tf.spec_requests.into_inner();
+    (summary, spec_requests)
 }
 
 /// Pulse transfer functions for the disjunctive abstract interpreter.
@@ -142,7 +162,9 @@ pub fn analyze_with_specialization(
 /// Each instruction is executed on each ContinueProgram disjunct independently.
 struct PulseTransferFunctions<'a> {
     callee_summaries: &'a HashMap<Procname, PulseSummary>,
+    pdesc: &'a Procdesc,
     proc_name: String,
+    spec_requests: RefCell<Vec<(Procname, PulseSpecialization)>>,
 }
 
 impl TransferFunctions for PulseTransferFunctions<'_> {
@@ -171,8 +193,13 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             match disjunct {
                 ExecutionDomain::ContinueProgram(astate) => {
                     log::trace!("[{pn}]   disjunct #{i}: {astate:?}");
-                    let results =
-                        exec_instr_with_summaries(instr, astate.clone(), self.callee_summaries);
+                    let results = exec_instr_with_summaries(
+                        self.pdesc,
+                        instr,
+                        astate.clone(),
+                        self.callee_summaries,
+                        Some(&self.spec_requests),
+                    );
                     let nc = results.iter().filter(|d| d.is_continue()).count();
                     let na = results
                         .iter()
@@ -211,9 +238,11 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
 ///
 /// Priority: arg validity check > models > noreturn summaries > pre/post summaries > transfer.
 fn exec_instr_with_summaries(
+    pdesc: &Procdesc,
     instr: &Instr,
     mut state: AbductiveDomain,
     callee_summaries: &HashMap<Procname, PulseSummary>,
+    spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
 ) -> Vec<ExecutionDomain> {
     if let Instr::Call {
         ret: (ret_id, _),
@@ -227,7 +256,7 @@ fn exec_instr_with_summaries(
         // pointer to a procname via Closure attribute, then dispatch.
         // Cross-ref: OCaml PulseModelsC.ml call_c_function_ptr.
         if callee_pname.get_method_name() == "__call_c_function_ptr" {
-            return exec_call_c_function_ptr(ret_id, args, loc, state, callee_summaries);
+            return exec_call_c_function_ptr(pdesc, ret_id, args, loc, state, callee_summaries);
         }
 
         // Models take priority over summaries (e.g., exit() may have an
@@ -238,6 +267,28 @@ fn exec_instr_with_summaries(
         }
 
         if let Some(callee_summary) = callee_summaries.get(callee_pname) {
+            if let (Some(requests), Some(first_pp)) =
+                (spec_requests, callee_summary.pre_posts.first())
+            {
+                if let Some(spec) = crate::specialization::make_specialization_from_caller(
+                    &callee_summary.needs_specialization,
+                    &state,
+                    &first_pp.formals,
+                    &callee_summary.formal_types,
+                    args,
+                ) {
+                    if callee_summary.get_specialized(&spec).is_none() {
+                        let mut requests = requests.borrow_mut();
+                        if !requests
+                            .iter()
+                            .any(|(pname, existing)| pname == callee_pname && existing == &spec)
+                        {
+                            requests.push((callee_pname.clone(), spec));
+                        }
+                    }
+                }
+            }
+
             // Empty-body callees (extern stubs): treat as unknown with
             // type-aware havoc. Only pointer-typed formals get havoced.
             // Cross-ref: OCaml PulseCallOperations.ml should_havoc checks Tptr.
@@ -294,8 +345,14 @@ fn exec_instr_with_summaries(
                 );
                 let mut results = Vec::new();
                 for (j, pre_post) in pre_posts.iter().enumerate() {
-                    let applied =
-                        crate::interproc::apply_summary(pre_post, ret_id, args, loc, state.clone());
+                    let applied = crate::interproc::apply_summary(
+                        pdesc,
+                        pre_post,
+                        ret_id,
+                        args,
+                        loc,
+                        state.clone(),
+                    );
                     log::debug!("    pre/post #{j}: {} results", applied.len());
                     results.extend(applied);
                 }
@@ -401,6 +458,7 @@ fn select_pre_posts<'a>(
 ///
 /// Cross-ref: OCaml PulseModelsC.ml call_c_function_ptr.
 fn exec_call_c_function_ptr(
+    pdesc: &Procdesc,
     ret_id: &sil::ident::Ident,
     args: &[(Exp, sil::typ::Typ)],
     loc: &sil::location::Location,
@@ -453,6 +511,7 @@ fn exec_call_c_function_ptr(
                 let mut results = Vec::new();
                 for pre_post in &callee_summary.pre_posts {
                     results.extend(crate::interproc::apply_summary(
+                        pdesc,
                         pre_post,
                         ret_id,
                         actual_args,
