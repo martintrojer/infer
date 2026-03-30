@@ -1,0 +1,10 @@
+[package]
+name = "absint"
+description = "Abstract interpretation framework for the Infer static analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sil = { path = "../sil" }
+config = { path = "../config" }

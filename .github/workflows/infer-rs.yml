@@ -1,0 +1,65 @@
+name: infer-rs
+
+on:
+  push:
+    branches: [infer-rs, main]
+    paths:
+      - 'infer-rs/**'
+      - '.github/workflows/infer-rs.yml'
+  pull_request:
+    paths:
+      - 'infer-rs/**'
+      - '.github/workflows/infer-rs.yml'
+
+defaults:
+  run:
+    working-directory: infer-rs
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infer-rs
+      - run: cargo clippy -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: infer-rs
+      - name: Run tests
+        run: cargo test -- --nocapture 2>&1 | tee test-output.txt
+      - name: Report skipped tests
+        if: always()
+        run: |
+          SKIPPED=$(grep -c "SKIPPED:" test-output.txt || true)
+          if [ "$SKIPPED" -gt 0 ]; then
+            echo "::warning::$SKIPPED test(s) skipped (OCaml fixtures not available in CI):"
+            grep -B1 "SKIPPED:" test-output.txt | while read -r line; do
+              echo "::warning::  $line"
+            done
+          fi

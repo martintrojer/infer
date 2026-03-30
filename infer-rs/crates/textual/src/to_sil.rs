@@ -1,0 +1,980 @@
+// Copyright (c) Facebook, Inc. and its affiliates.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+//! Textual-to-SIL conversion.
+//!
+//! Mirrors OCaml's `TextualSil.ml`. Converts a Textual `Module` into
+//! SIL `Cfg` + `Tenv`.
+
+use sil::annot::AnnotItem;
+use sil::binop;
+use sil::call_flags::CallFlags;
+use sil::cfg::Cfg;
+use sil::const_val;
+use sil::exp;
+use sil::fieldname;
+use sil::ident;
+use sil::instr;
+use sil::int_lit::IntLit;
+use sil::location;
+use sil::mangled::Mangled;
+use sil::procdesc;
+use sil::procname;
+use sil::pvar;
+use sil::qualified_cpp_name::QualifiedCppName;
+use sil::source_file::SourceFile;
+use sil::strukt;
+use sil::tenv::Tenv;
+use sil::typ;
+use sil::unop;
+
+use std::collections::HashMap;
+
+use crate::ast;
+use crate::decls::DeclEnv;
+
+/// Errors during Textual-to-SIL conversion.
+#[derive(Clone, Debug)]
+pub struct ConvError {
+    pub loc: ast::Location,
+    pub message: String,
+}
+
+impl std::fmt::Display for ConvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conversion error at {}: {}", self.loc, self.message)
+    }
+}
+
+/// Source language enum for driving conversion behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    C,
+    Hack,
+    Java,
+    Python,
+    Rust,
+    Swift,
+    ObjectiveC,
+}
+
+impl Lang {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "c" | "C" => Some(Lang::C),
+            "hack" | "Hack" => Some(Lang::Hack),
+            "java" | "Java" => Some(Lang::Java),
+            "python" | "Python" => Some(Lang::Python),
+            "rust" | "Rust" => Some(Lang::Rust),
+            "swift" | "Swift" => Some(Lang::Swift),
+            "objc" | "ObjectiveC" => Some(Lang::ObjectiveC),
+            _ => None,
+        }
+    }
+}
+
+// ===========================================================================
+// Bridge modules — each mirrors a *Bridge module in TextualSil.ml
+// ===========================================================================
+
+/// Mirrors `LocationBridge`.
+fn location_to_sil(source_file: &SourceFile, loc: &ast::Location) -> location::Location {
+    match loc {
+        ast::Location::Known { line, col } => location::Location {
+            file: source_file.clone(),
+            line: *line as i32,
+            col: *col as i32,
+            macro_file_opt: None,
+            macro_line: -1,
+        },
+        ast::Location::Unknown => location::Location {
+            file: source_file.clone(),
+            line: -1,
+            col: -1,
+            macro_file_opt: None,
+            macro_line: -1,
+        },
+    }
+}
+
+/// Mirrors `TypeNameBridge.to_sil`.
+fn type_name_to_sil(lang: Lang, tname: &ast::TypeName) -> typ::TypeName {
+    let value = &tname.name.value;
+    match lang {
+        Lang::Java => typ::TypeName::JavaClass(typ::JavaClassName(value.replace("::", "."))),
+        Lang::Hack => typ::TypeName::HackClass(typ::HackClassName(value.clone())),
+        Lang::Python => typ::TypeName::PythonClass(typ::PythonClassName(value.clone())),
+        Lang::C | Lang::Rust => typ::TypeName::CStruct(QualifiedCppName::from_string(value)),
+        Lang::Swift => typ::TypeName::SwiftClass(typ::SwiftClassName(value.clone())),
+        Lang::ObjectiveC => typ::TypeName::ObjcClass(QualifiedCppName::from_string(value)),
+    }
+}
+
+/// Mirrors `TypBridge.to_sil`.
+fn typ_to_sil(lang: Lang, t: &ast::Typ) -> typ::Typ {
+    match t {
+        ast::Typ::Int => typ::Typ::int(typ::IKind::IInt),
+        ast::Typ::Null => typ::Typ::int(typ::IKind::IInt),
+        ast::Typ::Float => typ::Typ::float(typ::FKind::FFloat),
+        ast::Typ::Void => typ::Typ::void(),
+        ast::Typ::Fun(None) => typ::Typ::mk(typ::TypeDesc::Tfun(None)),
+        ast::Typ::Fun(Some(proto)) => {
+            let params = proto
+                .params_type
+                .iter()
+                .map(|t| typ_to_sil(lang, t))
+                .collect();
+            let ret = typ_to_sil(lang, &proto.return_type);
+            typ::Typ::mk(typ::TypeDesc::Tfun(Some(Box::new(
+                typ::FunctionPrototype {
+                    params_type: params,
+                    return_type: Box::new(ret),
+                },
+            ))))
+        }
+        ast::Typ::Ptr(inner, _attrs) => {
+            let inner_sil = typ_to_sil(lang, inner);
+            typ::Typ::mk_ptr(inner_sil)
+        }
+        ast::Typ::Struct(name) => {
+            let sil_name = type_name_to_sil(lang, name);
+            typ::Typ::mk_struct(sil_name)
+        }
+        ast::Typ::Array(elt) => {
+            let elt_sil = typ_to_sil(lang, elt);
+            typ::Typ::mk_array(elt_sil, None, None)
+        }
+    }
+}
+
+/// Mirrors `IdentBridge.to_sil`.
+fn ident_to_sil(id: ast::Ident) -> ident::Ident {
+    ident::Ident::create_normal(ident::IdentName::from_string("n"), id)
+}
+
+/// Mirrors `ConstBridge.to_sil`.
+fn const_to_sil(c: &ast::Const) -> const_val::Const {
+    match c {
+        ast::Const::Int(z) => const_val::Const::Cint(IntLit::of_big_int(z.clone())),
+        ast::Const::Null => const_val::Const::Cint(IntLit::zero()),
+        ast::Const::Str(s) => const_val::Const::Cstr(s.clone()),
+        ast::Const::Float(f) => const_val::Const::Cfloat(const_val::OrderedFloat(*f)),
+    }
+}
+
+/// Mirrors `ProcDeclBridge.to_sil` (simplified — creates a C-style procname).
+/// Convert a Textual qualified proc name to a SIL Procname.
+///
+/// `arity` is the number of formals (for Hack/Python/Erlang, where arity
+/// is part of the procname identity and distinguishes overloads).
+fn procname_to_sil(
+    lang: Lang,
+    qname: &ast::QualifiedProcName,
+    arity: Option<i32>,
+) -> procname::Procname {
+    let method = &qname.name.value;
+    match lang {
+        Lang::Java => {
+            let class = match &qname.enclosing_class {
+                ast::EnclosingClass::Enclosing(tn) => tn.name.value.replace("::", "."),
+                ast::EnclosingClass::TopLevel => "$TOPLEVEL$CLASS$".to_string(),
+            };
+            procname::Procname::Java(procname::JavaProcname {
+                class_name: typ::JavaClassName(class),
+                method_name: method.clone(),
+                parameters: Vec::new(),
+                return_type: None,
+                kind: procname::JavaKind::NonStatic,
+            })
+        }
+        Lang::Hack => {
+            let class = match &qname.enclosing_class {
+                ast::EnclosingClass::Enclosing(tn) => {
+                    Some(typ::HackClassName(tn.name.value.clone()))
+                }
+                ast::EnclosingClass::TopLevel => None,
+            };
+            procname::Procname::Hack(procname::HackProcname {
+                class_name: class,
+                function_name: method.clone(),
+                arity,
+            })
+        }
+        Lang::Python => {
+            let class = match &qname.enclosing_class {
+                ast::EnclosingClass::Enclosing(tn) => Some(tn.name.value.clone()),
+                ast::EnclosingClass::TopLevel => None,
+            };
+            procname::Procname::Python(procname::PythonProcname {
+                class_name: class,
+                function_name: method.clone(),
+                arity,
+            })
+        }
+        _ => {
+            // C/Rust/Swift/ObjC: arity is not part of the procname
+            let full_name = match &qname.enclosing_class {
+                ast::EnclosingClass::Enclosing(tn) => format!("{}.{}", tn, method),
+                ast::EnclosingClass::TopLevel => method.clone(),
+            };
+            procname::Procname::c_from_string(&full_name)
+        }
+    }
+}
+
+/// Mirrors `FieldDeclBridge.to_sil`.
+fn field_to_sil(lang: Lang, field: &ast::FieldDecl) -> strukt::Field {
+    let class_name = type_name_to_sil(lang, &field.qualified_name.enclosing_class);
+    strukt::Field {
+        name: fieldname::Fieldname::make(class_name, &field.qualified_name.name.value),
+        typ: typ_to_sil(lang, &field.typ),
+        annot: AnnotItem::empty(),
+    }
+}
+
+/// Mirrors `ExpBridge.to_sil` (simplified — handles the common cases).
+// `lang` and `source_file` are threaded through for recursive calls where
+// deeper expression kinds (Closure, Lfield) need them, even though the
+// current simplified implementation only uses them in a subset of arms.
+/// Strip __sil_cast for Store RHS only when wrapping non-zero constants.
+/// This enables constant propagation (e.g., `uint16_t i = 1` flows as 1)
+/// without creating new null paths from zero-casts.
+/// Like exp_to_sil but strips __sil_cast for prune contexts.
+///
+/// In prune expressions, __sil_cast is just a type annotation for
+/// comparison. Stripping it preserves the original abstract value,
+/// enabling null check pruning. This does NOT affect Store/Load
+/// contexts where the cast behavior matters.
+fn exp_to_sil_for_prune(
+    lang: Lang,
+    source_file: &SourceFile,
+    pname: &procname::Procname,
+    e: &ast::Exp,
+) -> exp::Exp {
+    match e {
+        ast::Exp::Call { proc, args, .. }
+            if proc.name.value == "__sil_cast" && !args.is_empty() =>
+        {
+            exp_to_sil_for_prune(lang, source_file, pname, &args[args.len() - 1])
+        }
+        ast::Exp::Call { proc, args, .. } => {
+            let callee_name = &proc.name.value;
+            // Handle __sil_* builtins → BinOp/UnOp with recursive prune handling
+            if let Some(bop) = sil_builtin_to_binop(callee_name) {
+                if args.len() == 2 {
+                    let lhs = exp_to_sil_for_prune(lang, source_file, pname, &args[0]);
+                    let rhs = exp_to_sil_for_prune(lang, source_file, pname, &args[1]);
+                    return exp::Exp::BinOp(bop, Box::new(lhs), Box::new(rhs));
+                }
+            }
+            if let Some(uop) = sil_builtin_to_unop(callee_name) {
+                if args.len() == 1 {
+                    let inner = exp_to_sil_for_prune(lang, source_file, pname, &args[0]);
+                    return exp::Exp::UnOp(uop, Box::new(inner), None);
+                }
+            }
+            // Fall back to normal exp_to_sil for non-builtin calls
+            exp_to_sil(lang, source_file, pname, e)
+        }
+        // For non-Call expressions, delegate to normal exp_to_sil
+        _ => exp_to_sil(lang, source_file, pname, e),
+    }
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn exp_to_sil(
+    lang: Lang,
+    source_file: &SourceFile,
+    pname: &procname::Procname,
+    e: &ast::Exp,
+) -> exp::Exp {
+    match e {
+        ast::Exp::Var(id) => exp::Exp::Var(ident_to_sil(*id)),
+        ast::Exp::Const(c) => exp::Exp::Const(const_to_sil(c)),
+        ast::Exp::Lvar(name) => {
+            let pv = pvar::Pvar::mk(Mangled::from_string(&name.value), pname.clone());
+            exp::Exp::Lvar(pv)
+        }
+        ast::Exp::Load { exp, typ: _ } => {
+            // In SIL, loads are instructions, not expressions.
+            // During to_sil conversion, the Let-binding that contains
+            // this Load expression will be expanded into a Load instruction.
+            // For now, just translate the inner expression.
+            exp_to_sil(lang, source_file, pname, exp)
+        }
+        ast::Exp::Field { exp, field } => {
+            let inner = exp_to_sil(lang, source_file, pname, exp);
+            let class_name = type_name_to_sil(lang, &field.enclosing_class);
+            let sil_field = fieldname::Fieldname::make(class_name.clone(), &field.name.value);
+            let struct_typ = typ::Typ::mk_struct(class_name);
+            exp::Exp::Lfield(
+                exp::LfieldObjData {
+                    exp: Box::new(inner),
+                    is_implicit: false,
+                },
+                sil_field,
+                struct_typ,
+            )
+        }
+        ast::Exp::Index(e1, e2) => {
+            let sil_e1 = exp_to_sil(lang, source_file, pname, e1);
+            let sil_e2 = exp_to_sil(lang, source_file, pname, e2);
+            exp::Exp::Lindex(Box::new(sil_e1), Box::new(sil_e2))
+        }
+        ast::Exp::Call { proc, args, .. } => {
+            let callee_name = &proc.name.value;
+            // Check for __sil_* builtins → BinOp/UnOp expressions
+            if let Some(bop) = sil_builtin_to_binop(callee_name) {
+                if args.len() == 2 {
+                    let lhs = exp_to_sil(lang, source_file, pname, &args[0]);
+                    let rhs = exp_to_sil(lang, source_file, pname, &args[1]);
+                    return exp::Exp::BinOp(bop, Box::new(lhs), Box::new(rhs));
+                }
+            }
+            if let Some(uop) = sil_builtin_to_unop(callee_name) {
+                if args.len() == 1 {
+                    let inner = exp_to_sil(lang, source_file, pname, &args[0]);
+                    return exp::Exp::UnOp(uop, Box::new(inner), None);
+                }
+            }
+
+            // __sil_cast(<typ>, val) → Cast(typ, val)
+            // Matches OCaml's Exp.Cast which is stripped at eval time.
+            // Without this, __sil_cast falls through to a Cfun reference
+            // that disconnects the inner value — breaking leak detection
+            // and value propagation through stores.
+            if callee_name == "__sil_cast" && args.len() == 2 {
+                // Don't strip casts around zero constants — these create null
+                // paths that need to stay opaque for correct null-deref analysis.
+                let is_zero = matches!(&args[1],
+                    ast::Exp::Const(ast::Const::Int(n)) if *n == num_bigint::BigInt::from(0));
+                if !is_zero {
+                    let typ_arg = exp_to_sil(lang, source_file, pname, &args[0]);
+                    let val_arg = exp_to_sil(lang, source_file, pname, &args[1]);
+                    if let exp::Exp::Sizeof(data) = &typ_arg {
+                        return exp::Exp::Cast(data.typ.clone(), Box::new(val_arg));
+                    }
+                }
+            }
+
+            // __sil_cfun("name") → Const(Cfun(C.from_string(name)))
+            // Function pointer constant: preserves procedure identity through
+            // the textual roundtrip. Cross-ref: OCaml TextualSil.ml ExpBridge.
+            if callee_name == "__sil_cfun" {
+                if let Some(ast::Exp::Const(ast::Const::Str(name))) = args.first() {
+                    let pn = procname::Procname::c_from_string(name);
+                    return exp::Exp::Const(const_val::Const::Cfun(pn));
+                }
+            }
+
+            // Regular calls: create a function constant reference.
+            let arity = Some(args.len() as i32);
+            let callee = procname_to_sil(lang, proc, arity);
+            exp::Exp::Const(const_val::Const::Cfun(callee))
+        }
+        ast::Exp::Typ(t) => {
+            // Type expressions like `<Node>` — used for allocate builtins
+            let sil_t = typ_to_sil(lang, t);
+            exp::Exp::Sizeof(exp::SizeofData {
+                typ: sil_t,
+                nbytes: None,
+                dynamic_length: None,
+                nullable: false,
+            })
+        }
+        ast::Exp::Closure { .. } | ast::Exp::Apply { .. } | ast::Exp::If { .. } => {
+            // These require more complex expansion that is not yet implemented.
+            // Closure: needs object allocation + field stores for captures.
+            // Apply: needs dynamic dispatch resolution.
+            // If: should be eliminated by transforms before reaching to_sil.
+            // Return zero as a placeholder — the procedure will still be
+            // analyzed but these expressions will be treated as constant 0.
+            exp::Exp::zero()
+        }
+    }
+}
+
+// ===========================================================================
+// Struct conversion
+// ===========================================================================
+
+fn struct_to_sil(lang: Lang, s: &ast::Struct) -> (typ::TypeName, strukt::Struct) {
+    let sil_name = type_name_to_sil(lang, &s.name);
+    let fields = s.fields.iter().map(|f| field_to_sil(lang, f)).collect();
+    let supers = s
+        .supers
+        .iter()
+        .map(|sup| type_name_to_sil(lang, sup))
+        .collect();
+
+    let sil_struct = strukt::Struct {
+        fields,
+        supers,
+        ..strukt::Struct::default()
+    };
+
+    (sil_name, sil_struct)
+}
+
+// ===========================================================================
+// Terminator → CFG edges
+// ===========================================================================
+
+/// Collect successor node IDs from a terminator.
+/// `exit_id` is the exit node ID (for `Ret`/`Unreachable`).
+fn terminator_succs(
+    term: &ast::Terminator,
+    label_to_id: &HashMap<String, procdesc::NodeId>,
+    exit_id: procdesc::NodeId,
+) -> Vec<procdesc::NodeId> {
+    match term {
+        ast::Terminator::Ret(_) | ast::Terminator::Unreachable | ast::Terminator::Throw(_) => {
+            vec![exit_id]
+        }
+        ast::Terminator::Jump(calls) if calls.is_empty() => {
+            // Empty jmp = fall through to exit (OCaml textual convention)
+            vec![exit_id]
+        }
+        ast::Terminator::Jump(calls) => calls
+            .iter()
+            .filter_map(|call| label_to_id.get(&call.label.value).copied())
+            .collect(),
+        ast::Terminator::If { then_, else_, .. } => {
+            let mut succs = terminator_succs(then_, label_to_id, exit_id);
+            succs.extend(terminator_succs(else_, label_to_id, exit_id));
+            succs
+        }
+    }
+}
+
+// ===========================================================================
+// Procedure conversion
+// ===========================================================================
+
+fn procdesc_to_sil(
+    lang: Lang,
+    source_file: &SourceFile,
+    pdesc: &ast::ProcDesc,
+) -> procdesc::Procdesc {
+    let arity = pdesc
+        .procdecl
+        .formals_types
+        .as_ref()
+        .map(|f| f.len() as i32);
+    let pname = procname_to_sil(lang, &pdesc.procdecl.qualified_name, arity);
+    let ret_type = typ_to_sil(lang, &pdesc.procdecl.result_type.typ);
+    let loc = location_to_sil(source_file, &pdesc.exit_loc);
+
+    let mut sil_pdesc = procdesc::Procdesc::new(pname.clone(), ret_type.clone(), loc);
+
+    // Formals
+    sil_pdesc.formals = pdesc
+        .params
+        .iter()
+        .zip(pdesc.procdecl.formals_types.as_deref().unwrap_or_default())
+        .map(|(name, at)| {
+            (
+                Mangled::from_string(&name.value),
+                typ_to_sil(lang, &at.typ),
+                AnnotItem::empty(),
+            )
+        })
+        .collect();
+
+    // Locals
+    sil_pdesc.locals = pdesc
+        .locals
+        .iter()
+        .map(|(name, at)| procdesc::VarData {
+            name: Mangled::from_string(&name.value),
+            typ: typ_to_sil(lang, &at.typ),
+            modify_in_block: false,
+            is_constexpr: false,
+            is_declared_unused: false,
+            is_structured_binding: false,
+        })
+        .collect();
+
+    // Pass 1: create all nodes and build label→node_id map.
+    let mut label_to_id: HashMap<String, procdesc::NodeId> = HashMap::new();
+
+    for (i, node) in pdesc.nodes.iter().enumerate() {
+        let node_loc = location_to_sil(source_file, &node.label_loc);
+        let kind = procdesc::NodeKind::StmtNode(procdesc::StmtNodeKind::MethodBody);
+
+        let mut sil_instrs = Vec::new();
+        for textual_instr in &node.instrs {
+            if let Some(sil_instr) = instr_to_sil(lang, source_file, &pname, textual_instr) {
+                sil_instrs.push(sil_instr);
+            }
+        }
+
+        // Ret(exp) → Store { __return <- exp } before jumping to exit.
+        // This mirrors OCaml's `write_to_ret_var` in TextualSil.ml.
+        if let ast::Terminator::Ret(ret_exp) = &node.last {
+            let ret_pvar = pvar::Pvar::mk(Mangled::from_string("__return"), pname.clone());
+            let sil_ret_exp = exp_to_sil(lang, source_file, &pname, ret_exp);
+            let ret_loc = location_to_sil(source_file, &node.last_loc);
+            sil_instrs.push(instr::Instr::Store {
+                e1: Box::new(exp::Exp::Lvar(ret_pvar)),
+                typ: ret_type.clone(),
+                e2: Box::new(sil_ret_exp),
+                loc: ret_loc,
+            });
+        }
+
+        let node_id = sil_pdesc.add_node(kind, sil_instrs, node_loc);
+        label_to_id.insert(node.label.value.clone(), node_id);
+
+        // Connect start → first node.
+        if i == 0 {
+            sil_pdesc.set_succs(0, vec![node_id]);
+        }
+    }
+
+    // Pass 2: wire up CFG edges from terminators.
+    for node in &pdesc.nodes {
+        let from_id = label_to_id[&node.label.value];
+        let succs = terminator_succs(&node.last, &label_to_id, 1);
+        if !succs.is_empty() {
+            sil_pdesc.set_succs(from_id, succs);
+        }
+    }
+
+    sil_pdesc
+}
+
+/// Convert a single Textual instruction to a SIL instruction.
+fn instr_to_sil(
+    lang: Lang,
+    source_file: &SourceFile,
+    pname: &procname::Procname,
+    textual_instr: &ast::Instr,
+) -> Option<instr::Instr> {
+    let loc = |l: &ast::Location| location_to_sil(source_file, l);
+
+    match textual_instr {
+        ast::Instr::Load {
+            id,
+            exp,
+            typ,
+            loc: l,
+        } => {
+            let sil_id = ident_to_sil(*id);
+            let sil_exp = exp_to_sil(lang, source_file, pname, exp);
+            let sil_typ = typ
+                .as_ref()
+                .map(|t| typ_to_sil(lang, t))
+                .unwrap_or_else(typ::Typ::void);
+            Some(instr::Instr::Load {
+                id: sil_id,
+                e: sil_exp,
+                typ: sil_typ,
+                loc: loc(l),
+            })
+        }
+        ast::Instr::Store {
+            exp1,
+            typ,
+            exp2,
+            loc: l,
+        } => {
+            let sil_e1 = exp_to_sil(lang, source_file, pname, exp1);
+            let sil_e2 = exp_to_sil(lang, source_file, pname, exp2);
+            let sil_typ = typ
+                .as_ref()
+                .map(|t| typ_to_sil(lang, t))
+                .unwrap_or_else(typ::Typ::void);
+            Some(instr::Instr::Store {
+                e1: Box::new(sil_e1),
+                typ: sil_typ,
+                e2: Box::new(sil_e2),
+                loc: loc(l),
+            })
+        }
+        ast::Instr::Prune { exp, loc: l } => {
+            // Use prune-specific expression conversion that strips __sil_cast.
+            // This is safe because casts in prune expressions are just type
+            // annotations for comparison, and stripping them enables proper
+            // null check pruning (e.g., `if (ptr != NULL)` uses
+            // `__sil_ne(__sil_cast(<int>, ptr), __sil_cast(<int>, 0))`).
+            // Cross-ref: OCaml TextualSil.ml is_cast_builtin +
+            // PulseOperations.prune which evaluates without casts.
+            let sil_exp = exp_to_sil_for_prune(lang, source_file, pname, exp);
+            Some(instr::Instr::Prune {
+                exp: sil_exp,
+                loc: loc(l),
+                is_then_branch: true,
+                if_kind: instr::IfKind::If,
+            })
+        }
+        ast::Instr::Let { id, exp, loc: l } => {
+            // Let bindings in Textual need to be expanded:
+            // - If exp is a Call to __sil_* builtin → SIL BinOp/UnOp expression
+            // - If exp is a Call → SIL Call instruction
+            // - If exp is a Load → SIL Load instruction
+            // - Otherwise → SIL Load of the expression
+            let ret_id = id
+                .map(ident_to_sil)
+                .unwrap_or_else(ident::Ident::create_none);
+            match exp {
+                ast::Exp::Call { proc, args, .. } => {
+                    let callee_name = &proc.name.value;
+
+                    // Try __sil_* builtin dispatch (BinOp, UnOp, allocate, cast)
+                    if let Some(sil_instr) = sil_builtin_to_instr(
+                        callee_name,
+                        args,
+                        lang,
+                        source_file,
+                        pname,
+                        ret_id.clone(),
+                        &loc(l),
+                    ) {
+                        return Some(sil_instr);
+                    }
+
+                    // Regular call
+                    let call_arity = Some(args.len() as i32);
+                    let callee = procname_to_sil(lang, proc, call_arity);
+                    let fun_exp = exp::Exp::Const(const_val::Const::Cfun(callee));
+                    let sil_args: Vec<(exp::Exp, typ::Typ)> = args
+                        .iter()
+                        .map(|a| (exp_to_sil(lang, source_file, pname, a), typ::Typ::void()))
+                        .collect();
+                    Some(instr::Instr::Call {
+                        ret: (ret_id, typ::Typ::void()),
+                        fun_exp,
+                        args: sil_args,
+                        loc: loc(l),
+                        flags: CallFlags::default(),
+                    })
+                }
+                _ => {
+                    let sil_exp = exp_to_sil(lang, source_file, pname, exp);
+                    Some(instr::Instr::Load {
+                        id: ret_id,
+                        e: sil_exp,
+                        typ: typ::Typ::void(),
+                        loc: loc(l),
+                    })
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// __sil_* builtin dispatch
+// ===========================================================================
+//
+// Unified handler for all `__sil_*` Textual builtins. Mirrors OCaml's
+// `Textual.ProcDecl.binop_table`, `unop_table`, and `is_allocate_*_builtin`.
+//
+// Categories:
+// - BinOp: `__sil_eq(x,y)` → `Load { id, BinOp(Eq, x, y) }`
+// - UnOp: `__sil_lnot(x)` → `Load { id, UnOp(LNot, x) }`
+// - Allocate: `__sil_allocate(<T>)` → `Call { __new, [Sizeof(T)] }`
+// - Cast: `__sil_cast(<T>, x)` → `Load { id, Cast(T, x) }`
+
+fn sil_builtin_to_binop(name: &str) -> Option<binop::Binop> {
+    // OCaml's dump-textual emits type-suffixed variants like __sil_plusa_int,
+    // __sil_plusa_uint, __sil_mult_ulong, etc. The integer kind doesn't affect
+    // the formula — we map all variants to the base operation.
+    match name {
+        "__sil_plusa" | "__sil_plusa_int" | "__sil_plusa_uint" | "__sil_plusa_ulong" => {
+            Some(binop::Binop::PlusA(None))
+        }
+        "__sil_pluspi" => Some(binop::Binop::PlusPI),
+        "__sil_minusa" | "__sil_minusa_int" | "__sil_minusa_uint" => {
+            Some(binop::Binop::MinusA(None))
+        }
+        "__sil_minuspi" => Some(binop::Binop::MinusPI),
+        "__sil_minuspp" => Some(binop::Binop::MinusPP),
+        "__sil_mult" | "__sil_mult_int" | "__sil_mult_ulong" => Some(binop::Binop::Mult(None)),
+        "__sil_div" | "__sil_divi" => Some(binop::Binop::DivI),
+        "__sil_divf" => Some(binop::Binop::DivF),
+        "__sil_mod" => Some(binop::Binop::Mod),
+        "__sil_shiftlt" => Some(binop::Binop::Shiftlt),
+        "__sil_shiftrt" => Some(binop::Binop::Shiftrt),
+        "__sil_lt" => Some(binop::Binop::Lt),
+        "__sil_gt" => Some(binop::Binop::Gt),
+        "__sil_le" => Some(binop::Binop::Le),
+        "__sil_ge" => Some(binop::Binop::Ge),
+        "__sil_eq" => Some(binop::Binop::Eq),
+        "__sil_ne" => Some(binop::Binop::Ne),
+        "__sil_band" => Some(binop::Binop::BAnd),
+        "__sil_bxor" => Some(binop::Binop::BXor),
+        "__sil_bor" => Some(binop::Binop::BOr),
+        "__sil_land" => Some(binop::Binop::LAnd),
+        "__sil_lor" => Some(binop::Binop::LOr),
+        _ => None,
+    }
+}
+
+fn sil_builtin_to_unop(name: &str) -> Option<unop::Unop> {
+    match name {
+        "__sil_neg" => Some(unop::Unop::Neg),
+        "__sil_bnot" => Some(unop::Unop::BNot),
+        "__sil_lnot" => Some(unop::Unop::LNot),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sil_builtin_to_instr(
+    name: &str,
+    args: &[ast::Exp],
+    lang: Lang,
+    source_file: &SourceFile,
+    pname: &procname::Procname,
+    ret_id: ident::Ident,
+    loc: &location::Location,
+) -> Option<instr::Instr> {
+    if let Some(bop) = sil_builtin_to_binop(name) {
+        if args.len() == 2 {
+            let lhs = exp_to_sil(lang, source_file, pname, &args[0]);
+            let rhs = exp_to_sil(lang, source_file, pname, &args[1]);
+            return Some(instr::Instr::Load {
+                id: ret_id,
+                e: exp::Exp::BinOp(bop, Box::new(lhs), Box::new(rhs)),
+                typ: typ::Typ::void(),
+                loc: loc.clone(),
+            });
+        }
+    }
+
+    if let Some(uop) = sil_builtin_to_unop(name) {
+        if args.len() == 1 {
+            let inner = exp_to_sil(lang, source_file, pname, &args[0]);
+            return Some(instr::Instr::Load {
+                id: ret_id,
+                e: exp::Exp::UnOp(uop, Box::new(inner), None),
+                typ: typ::Typ::void(),
+                loc: loc.clone(),
+            });
+        }
+    }
+
+    // Allocate builtins → BuiltinDecl.__new / __new_array
+    match name {
+        "__sil_allocate" | "__sil_allocate_array" => {
+            let sil_args: Vec<(exp::Exp, typ::Typ)> = args
+                .iter()
+                .map(|a| (exp_to_sil(lang, source_file, pname, a), typ::Typ::void()))
+                .collect();
+            let builtin = if name == "__sil_allocate" {
+                sil::builtin_decl::__new()
+            } else {
+                sil::builtin_decl::__new_array()
+            };
+            return Some(instr::Instr::Call {
+                ret: (ret_id, typ::Typ::void()),
+                fun_exp: exp::Exp::Const(const_val::Const::Cfun(builtin)),
+                args: sil_args,
+                loc: loc.clone(),
+                flags: CallFlags::default(),
+            });
+        }
+        _ => {}
+    }
+
+    // __sil_cfun("name") → Load { Const(Cfun(name)) }
+    // Function pointer constant, preserving procedure identity through textual.
+    // Cross-ref: OCaml TextualSil.ml is_cfun_builtin.
+    if name == "__sil_cfun" {
+        if let Some(ast::Exp::Const(ast::Const::Str(fname))) = args.first() {
+            let pn = procname::Procname::c_from_string(fname);
+            return Some(instr::Instr::Load {
+                id: ret_id,
+                e: exp::Exp::Const(const_val::Const::Cfun(pn)),
+                typ: typ::Typ::void(),
+                loc: loc.clone(),
+            });
+        }
+    }
+
+    // Cast builtin
+    if name == "__sil_cast" && args.len() == 2 {
+        let typ_arg = exp_to_sil(lang, source_file, pname, &args[0]);
+        let val_arg = exp_to_sil(lang, source_file, pname, &args[1]);
+        // Cast(typ, val) — extract the type from the Sizeof expression
+        if let exp::Exp::Sizeof(data) = &typ_arg {
+            return Some(instr::Instr::Load {
+                id: ret_id,
+                e: exp::Exp::Cast(data.typ.clone(), Box::new(val_arg)),
+                typ: typ::Typ::void(),
+                loc: loc.clone(),
+            });
+        }
+    }
+
+    None
+}
+
+// ===========================================================================
+// Module conversion — the main entry point
+// ===========================================================================
+
+/// Convert a Textual module into SIL Cfg + Tenv.
+///
+/// Mirrors OCaml's `TextualSil.module_to_sil`.
+pub fn module_to_sil(
+    module: &ast::Module,
+    _decls: &DeclEnv,
+) -> Result<(Cfg, Tenv), Vec<ConvError>> {
+    let lang_str = module.lang().unwrap_or("c");
+    let lang = Lang::parse(lang_str).unwrap_or(Lang::C);
+    let source_file = SourceFile::new(&module.source_file);
+
+    let mut cfg = Cfg::new();
+    let mut tenv = Tenv::new();
+
+    for decl in &module.decls {
+        match decl {
+            ast::Decl::Struct(s) => {
+                let (sil_name, sil_struct) = struct_to_sil(lang, s);
+                tenv.insert(sil_name, sil_struct);
+            }
+            ast::Decl::Proc(pdesc) => {
+                let sil_pdesc = procdesc_to_sil(lang, &source_file, pdesc);
+                cfg.add_proc_desc(sil_pdesc);
+            }
+            ast::Decl::Global(_) | ast::Decl::Procdecl(_) => {
+                // Globals and declarations don't produce CFG entries
+            }
+        }
+    }
+
+    Ok((cfg, tenv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_module;
+
+    #[test]
+    fn test_basic_conversion() {
+        let src = r#".source_language = "java"
+
+type node = { val: int; next: *node }
+
+define f(x: int) : int {
+  #entry:
+    n0 : int = load &x
+    ret n0
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _errors) = DeclEnv::from_module(&module);
+        let (cfg, tenv) = module_to_sil(&module, &decls).unwrap();
+
+        assert_eq!(cfg.num_procs(), 1);
+        assert_eq!(tenv.len(), 1);
+
+        // Check the procedure
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        assert_eq!(pdesc.formals.len(), 1);
+        // start(0) + exit(1) + entry block(2) = 3 nodes
+        assert_eq!(pdesc.nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_conversion_with_calls() {
+        let src = r#".source_language = "java"
+
+declare plus(int, int) : int
+
+define f(x: int, y: int) : int {
+  #entry:
+    n0 : int = load &x
+    n1 : int = load &y
+    n2 = plus(n0, n1)
+    ret n2
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _tenv) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        // 4 instructions: 2 loads + 1 call + 1 store(__return)
+        let instrs: Vec<_> = pdesc.iter_instrs().collect();
+        assert_eq!(instrs.len(), 4);
+    }
+
+    #[test]
+    fn test_struct_with_supers() {
+        let src = r#".source_language = "java"
+
+type Base = { x: int }
+type Child extends Base = { y: float }
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (_, tenv) = module_to_sil(&module, &decls).unwrap();
+
+        assert_eq!(tenv.len(), 2);
+        // Child should have Base as a super
+        let child_name = typ::TypeName::JavaClass(typ::JavaClassName("Child".into()));
+        let child = tenv.lookup(&child_name).unwrap();
+        assert_eq!(child.supers.len(), 1);
+        assert_eq!(child.fields.len(), 1);
+    }
+
+    #[test]
+    fn test_store_instruction() {
+        let src = r#".source_language = "java"
+
+define f(x: int) : void {
+  #entry:
+    store &x <- 42 : int
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        let instrs: Vec<_> = pdesc.iter_instrs().collect();
+        // 2 instructions: 1 store + 1 store(__return for `ret null`)
+        assert_eq!(instrs.len(), 2);
+        assert!(matches!(instrs[0].1, instr::Instr::Store { .. }));
+    }
+
+    #[test]
+    fn test_multiple_procedures() {
+        let src = r#".source_language = "java"
+
+define f() : void {
+  #entry:
+    ret null
+}
+
+define g() : void {
+  #entry:
+    ret null
+}
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        assert_eq!(cfg.num_procs(), 2);
+    }
+
+    #[test]
+    fn test_hack_type_names() {
+        let src = r#".source_language = "hack"
+
+type MyClass = { field: int }
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (_, tenv) = module_to_sil(&module, &decls).unwrap();
+
+        let name = typ::TypeName::HackClass(typ::HackClassName("MyClass".into()));
+        assert!(tenv.lookup(&name).is_some());
+    }
+}

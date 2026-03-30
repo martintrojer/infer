@@ -1,0 +1,22 @@
+[package]
+name = "pulse"
+description = "Pulse analysis engine: separation-logic-based memory safety checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sil = { path = "../sil" }
+absint = { path = "../absint" }
+config = { path = "../config" }
+diagnostics = { path = "../diagnostics" }
+serde = { workspace = true }
+log = { workspace = true }
+num-rational = "0.4"
+num-traits = { workspace = true }
+num-bigint = { workspace = true }
+
+[dev-dependencies]
+test-harness = { path = "../test-harness" }
+textual = { path = "../textual" }
+ondemand = { path = "../ondemand" }

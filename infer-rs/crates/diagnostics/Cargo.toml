@@ -1,0 +1,11 @@
+[package]
+name = "diagnostics"
+description = "Issue types, severity levels, and issue reporting for infer-rs analyses"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sil = { path = "../sil" }
+serde = { workspace = true }
+serde_json = "1"

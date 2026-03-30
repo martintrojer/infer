@@ -1,0 +1,41 @@
+.source_language = "java"
+
+// Safe programs — no bugs expected.
+
+define identity(x: int) : int {
+  #entry:
+    n0 : int = load &x
+    ret n0
+}
+
+define swap(a: int, b: int) : void {
+  #entry:
+    n0 : int = load &a
+    n1 : int = load &b
+    store &a <- n1 : int
+    store &b <- n0 : int
+    ret null
+}
+
+define branch(flag: int, x: int, y: int) : int {
+  #entry:
+    n0 : int = load &flag
+    jmp then_arm, else_arm
+  #then_arm:
+    n1 : int = load &x
+    jmp join
+  #else_arm:
+    n2 : int = load &y
+    jmp join
+  #join:
+    ret null
+}
+
+declare compute(int) : int
+
+define call_and_return(x: int) : int {
+  #entry:
+    n0 : int = load &x
+    n1 = compute(n0)
+    ret n1
+}

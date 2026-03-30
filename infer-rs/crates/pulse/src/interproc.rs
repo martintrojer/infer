@@ -1,0 +1,554 @@
+// Copyright (c) Facebook, Inc. and its affiliates.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+//! Interprocedural summary application for Pulse.
+//!
+//! Mirrors OCaml's `PulseInterproc.ml` (simplified).
+//!
+//! When a call to a known procedure with a summary is encountered,
+//! `apply_summary` maps the callee's effects (heap writes, invalidations,
+//! constraints) into the caller's abstract state.
+
+use std::collections::HashMap;
+
+use sil::exp::Exp;
+use sil::ident::Ident;
+use sil::location::Location;
+use sil::typ::Typ;
+
+use crate::abductive::AbductiveDomain;
+use crate::abstract_value::AbstractValue;
+use crate::access::Access;
+use crate::execution_domain::ExecutionDomain;
+use crate::operations;
+use crate::summary::PrePost;
+
+/// Apply a callee's summary to the caller's abstract state.
+///
+/// Creates a substitution from callee abstract values to caller abstract
+/// values, then applies the callee's heap effects, invalidations, and
+/// path conditions to the caller's state.
+///
+/// Returns a list of resulting execution domains (may include errors
+/// from the callee's summary).
+pub fn apply_summary(
+    pre_post: &PrePost,
+    ret_id: &Ident,
+    actuals: &[(Exp, Typ)],
+    loc: &Location,
+    mut caller_state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    // Step 1: Build the callee→caller substitution from formals→actuals
+    let mut subst: HashMap<AbstractValue, AbstractValue> = HashMap::new();
+
+    for (i, (_formal_pvar, formal_addr)) in pre_post.formals.iter().enumerate() {
+        if let Some((actual_exp, _typ)) = actuals.get(i) {
+            let actual_val = operations::eval_or_fresh(actual_exp, loc, &mut caller_state);
+            subst.insert(*formal_addr, actual_val);
+        }
+    }
+
+    // Step 1a: Map each formal's loaded value (one deref from stack address)
+    // to the actual value. This captures the C semantics where the formal's
+    // loaded value IS the parameter value passed by the caller.
+    //
+    // Without this, pre-materialization follows the caller's existing Deref
+    // edge and maps the formal value to what the caller's pointer POINTS TO
+    // (too deep by one level), causing write-through-pointer effects to go
+    // to the wrong address.
+    //
+    // Cross-ref: In OCaml this is handled implicitly through how eval_var
+    // and the pre-materialization interact. Our explicit mapping ensures
+    // formal values correctly correspond to actual values.
+    {
+        let pre_heap = &pre_post.pre.heap;
+        let subst_snapshot: Vec<_> = subst.iter().map(|(k, v)| (*k, *v)).collect();
+        for (formal_stack_addr, actual_val) in &subst_snapshot {
+            if let Some(edges) = pre_heap.get_edges(*formal_stack_addr) {
+                for (access, target) in edges.iter() {
+                    if matches!(access, Access::Dereference) {
+                        subst.entry(*target).or_insert(*actual_val);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 1b: Materialize pre-condition — walk the callee's pre-state heap
+    // and match against the caller's heap. Check that callee's pre-conditions
+    // are satisfied (addresses it reads are valid in the caller).
+    // Matches OCaml's `materialize_pre` in PulseInterproc.ml.
+    // Only the original formal→actual entries are "formal stack addresses"
+    // (always valid). Step 1a additions are loaded values that may need checking.
+    let formal_stack_addrs: std::collections::HashSet<AbstractValue> =
+        pre_post.formals.iter().map(|(_, addr)| *addr).collect();
+
+    let pre_error = match materialize_pre(
+        &pre_post.pre,
+        &pre_post.post,
+        &formal_stack_addrs,
+        &mut subst,
+        &mut caller_state,
+        loc,
+    ) {
+        PreMaterializeResult::PreConditionViolation(diag) => Some(*diag),
+        PreMaterializeResult::Ok => None,
+    };
+
+    // Step 2: Walk the callee's post heap and materialize edges in the caller
+    let callee_heap = &pre_post.post.post.heap;
+    for (callee_addr, edges) in callee_heap.iter() {
+        let caller_addr = resolve_mut(&mut subst, *callee_addr);
+        for (access, callee_target) in edges.iter() {
+            let caller_target = resolve_mut(&mut subst, *callee_target);
+            let caller_access = translate_access(&subst, access);
+            caller_state.write_heap(caller_addr, caller_access, caller_target);
+        }
+    }
+
+    // Step 3: Resolve the return value into the substitution BEFORE
+    // translating the formula, so constraints on the return value (e.g.,
+    // "return value >= 0") are properly mapped to the caller.
+    if let Some(ret_addr) = &pre_post.result {
+        let caller_ret = resolve_mut(&mut subst, *ret_addr);
+        operations::write_id(ret_id, caller_ret, &mut caller_state);
+    } else {
+        let fresh = AbstractValue::mk_fresh();
+        operations::write_id(ret_id, fresh, &mut caller_state);
+    }
+
+    // Step 4: Translate callee's formula constraints to caller.
+    // If the callee's constraints contradict the caller's state
+    // (e.g., callee assumes x < 128 but caller has x = 1000),
+    // this pre_post is inapplicable → skip it (return empty).
+    // Cross-ref: OCaml PulseInterproc.ml apply_post returns Unsat
+    // when the callee's formula contradicts the caller.
+    log::debug!(
+        "[apply_summary] translate_formula for {:?} pre_post",
+        pre_post.kind
+    );
+    if !translate_formula(&pre_post.post.path_condition, &subst, &mut caller_state) {
+        log::debug!("[apply_summary] → rejected (Unsat)");
+        return vec![]; // pre_post inapplicable to this caller state
+    }
+    log::debug!("[apply_summary] → accepted (Sat)");
+
+    // Step 5: Apply callee's attributes to caller (invalidations + allocations).
+    // This MUST happen after formula translation (step 4) because
+    // translate_formula calls and_equal/and_equal_const which can merge
+    // union-find classes, changing get_var_repr results. If attrs are
+    // applied before formula translation, Allocated and later CFree (from
+    // the free model) would be stored under different representatives,
+    // causing false positive memory leaks.
+    // Cross-ref: OCaml PulseInterproc.ml apply_post applies attrs after
+    // incorporating the callee's path condition.
+    let callee_attrs = &pre_post.post.post.attrs;
+    for (callee_addr, attrs) in callee_attrs.iter() {
+        let caller_addr = resolve_mut(&mut subst, *callee_addr);
+        if let Some((invalidation, inv_loc)) = attrs.get_invalid() {
+            caller_state.invalidate(caller_addr, invalidation.clone(), inv_loc.clone());
+        }
+        if let Some((allocator, alloc_loc)) = attrs.get_allocated() {
+            caller_state.allocate(caller_addr, allocator.clone(), alloc_loc.clone());
+        }
+    }
+
+    // If there was a pre-condition violation, report it and abort this path.
+    // The callee dereferences a formal that's invalid in the caller.
+    // Matches OCaml's first_error → check_all_valid → error flow.
+    if let Some(ref diag) = pre_error {
+        log::debug!("[apply_summary] pre_error present: {diag}");
+    }
+    if let Some(diag) = pre_error {
+        return vec![ExecutionDomain::AbortProgram {
+            state: Box::new(caller_state),
+            diagnostic: Box::new(diag),
+        }];
+    }
+
+    // Return the same execution domain kind as the callee's pre_post.
+    // Cross-ref: OCaml PulseCallOperations.ml apply_callee dispatches
+    // on the callee's execution state to determine the caller's state.
+    match pre_post.kind {
+        crate::summary::PrePostKind::ExitProgram => {
+            vec![ExecutionDomain::ExitProgram(caller_state)]
+        }
+        crate::summary::PrePostKind::ContinueProgram => {
+            vec![ExecutionDomain::ContinueProgram(caller_state)]
+        }
+        crate::summary::PrePostKind::AbortProgram => {
+            // Manifest error: already reported at callee level. Skip.
+            // The AbortProgram stays in the callee's summary for accurate
+            // disjunct counts but doesn't propagate to callers.
+            vec![]
+        }
+        crate::summary::PrePostKind::LatentAbortProgram => {
+            // Latent error: the callee's error depends on caller-provided values.
+            // The error was NOT reported at the callee level. At each call site,
+            // we re-apply the summary. If the path is feasible (formula translation
+            // didn't return Unsat above), the error manifests in this caller's
+            // context → report as AbortProgram.
+            // Cross-ref: OCaml PulseCallOperations.ml re-calls should_report
+            // on the caller's state for LatentAbortProgram disjuncts.
+            if let Some(diag) = &pre_post.diagnostic {
+                vec![ExecutionDomain::AbortProgram {
+                    state: Box::new(caller_state),
+                    diagnostic: Box::new(diag.clone()),
+                }]
+            } else {
+                vec![]
+            }
+        }
+    }
+}
+
+/// Walk the callee's pre-state heap and match it against the caller's heap.
+///
+/// For each edge `callee_addr --access--> callee_target` in the pre-state:
+/// 1. Resolve `callee_addr` to `caller_addr` via the substitution
+/// 2. If the caller has a matching edge `caller_addr --access--> caller_target`,
+///    record `callee_target → caller_target` in the substitution
+/// 3. If not, create a fresh caller value (the caller didn't have this edge)
+///
+/// This is the core of biabduction: it connects callee's internal abstract
+/// values to the caller's existing heap structure, enabling null attributes
+/// and other properties to flow through multi-level call chains.
+///
+/// Mirrors OCaml's `materialize_pre` in PulseInterproc.ml.
+/// Result of pre-materialization.
+enum PreMaterializeResult {
+    /// Pre-materialization succeeded — callee's pre-conditions are met.
+    Ok,
+    /// Pre-condition violation — the callee dereferences a formal
+    /// that is invalid (null/freed) in the caller's state.
+    PreConditionViolation(Box<crate::diagnostic::Diagnostic>),
+}
+
+fn materialize_pre(
+    callee_pre: &crate::base_domain::BaseDomain,
+    callee_post: &AbductiveDomain,
+    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+    loc: &Location,
+) -> PreMaterializeResult {
+    let mut visited = std::collections::HashSet::new();
+    let mut worklist: Vec<AbstractValue> = subst.keys().copied().collect();
+    // Record first error but continue walking the pre (matching OCaml's
+    // first_error field in call_state). OCaml (PulseInterproc.ml:601-624):
+    // check_valid on every address with pre edges. On invalid: record
+    // first_error, skip that address's edges, continue with the rest.
+    let mut first_error: Option<Box<crate::diagnostic::Diagnostic>> = None;
+
+    while let Some(callee_addr) = worklist.pop() {
+        if !visited.insert(callee_addr) {
+            continue;
+        }
+
+        let caller_addr = resolve_mut(subst, callee_addr);
+
+        if let Some(edges) = callee_pre.heap.get_edges(callee_addr) {
+            // Only check validity for addresses the callee actually
+            // dereferences (marked must_be_valid). Just having pre-edges
+            // (from loading the formal) doesn't mean the address must be valid.
+            // Cross-ref: OCaml PulseInterproc.ml check_all_valid only checks
+            // addresses with MustBeValid attribute (line 1218).
+            // Skip must_be_valid check for formal stack addresses — they
+            // map to actual VALUES in the subst, not stack addresses, so
+            // check_valid would incorrectly test the value instead of the
+            // (always-valid) stack slot. Only check derived addresses.
+            let is_formal_stack = formal_stack_addrs.contains(&callee_addr);
+            if !edges.is_empty() && !is_formal_stack && callee_post.is_must_be_valid(callee_addr) {
+                if let Err(inv_info) = caller_state.check_valid(caller_addr) {
+                    log::debug!("    [materialize_pre] PRE-VIOLATION: callee={callee_addr} caller={caller_addr}");
+                    if first_error.is_none() {
+                        first_error = Some(Box::new(
+                            crate::diagnostic::Diagnostic::AccessToInvalidAddress {
+                                addr: caller_addr,
+                                invalidation: inv_info.0,
+                                access_location: loc.clone(),
+                                invalidation_location: inv_info.1,
+                            },
+                        ));
+                    }
+                    // Skip exploring edges from this invalid address
+                    // (OCaml line 621-623)
+                    continue;
+                }
+            }
+
+            for (access, callee_target) in edges.iter() {
+                let caller_target =
+                    if let Some(existing) = caller_state.post.heap.find_edge(caller_addr, access) {
+                        existing
+                    } else {
+                        resolve_mut(subst, *callee_target)
+                    };
+
+                subst.entry(*callee_target).or_insert(caller_target);
+
+                if !visited.contains(callee_target) {
+                    worklist.push(*callee_target);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(diag) => PreMaterializeResult::PreConditionViolation(diag),
+        None => PreMaterializeResult::Ok,
+    }
+}
+
+/// Resolve a callee abstract value to a caller abstract value.
+///
+/// If the value is in the substitution, return the caller value.
+/// Otherwise, create a fresh value, remember the mapping, and return it.
+fn resolve_mut(
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_val: AbstractValue,
+) -> AbstractValue {
+    *subst
+        .entry(callee_val)
+        .or_insert_with(AbstractValue::mk_fresh)
+}
+
+/// Translate the callee's formula constraints into the caller's state.
+///
+/// Returns false if unsatisfiable (callee constraints contradict caller).
+///
+/// Translates linear equations, atoms, and known constants from the
+/// callee's formula space into the caller's abstract value space.
+fn translate_formula(
+    callee_formula: &crate::formula::Formula,
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) -> bool {
+    let phi = &callee_formula.phi();
+
+    // Translate linear equations: for each callee_v = lin_expr,
+    // translate all variables in the linear expression to caller space
+    for (&callee_v, lin) in &phi.linear_eqs {
+        let Some(&caller_v) = subst.get(&callee_v) else {
+            continue;
+        };
+        // Check if it's a constant
+        if let Some(q) = lin.get_as_const() {
+            let c = *q.numer() / *q.denom();
+            if caller_state.and_equal_const(caller_v, c).is_unsat() {
+                return false;
+            }
+            continue;
+        }
+        // Check if it's a single variable
+        if let Some(callee_other) = lin.get_as_var() {
+            if let Some(&caller_other) = subst.get(&callee_other) {
+                if caller_state.and_equal(caller_v, caller_other).is_unsat() {
+                    return false;
+                }
+            }
+            continue;
+        }
+        // For more complex linear expressions, translate if all vars are in subst
+        let all_vars_mapped = lin.vars.keys().all(|v| subst.contains_key(v));
+        if all_vars_mapped {
+            let translated = lin.translate(|v| subst.get(&v).copied().unwrap_or(v));
+            if caller_state
+                .path_condition
+                .and_equal_linear(caller_v, translated)
+                .is_unsat()
+            {
+                return false;
+            }
+        }
+    }
+
+    // Build extended subst: add callee constants not in formal→actual subst.
+    // This handles atoms like `x >= 0` where `0` is a callee-local abstract
+    // value not in the subst. Without this, atoms with callee constants
+    // are either skipped or translated with dangling callee values.
+    // Cross-ref: OCaml PulseInterproc.ml translates formula with full
+    // variable resolution.
+    let mut extended_subst = subst.clone();
+    for atom in &phi.atoms {
+        for v in atom.all_vars() {
+            extended_subst.entry(v).or_insert_with(|| {
+                if let Some(q) = phi.get_known_const(v) {
+                    if q.is_integer() {
+                        let c = *q.numer() / *q.denom();
+                        let fresh = crate::abstract_value::AbstractValue::mk_fresh();
+                        caller_state.and_equal_const(fresh, c);
+                        return fresh;
+                    }
+                }
+                v // unmapped, keep as-is (will be filtered by all_mapped check)
+            });
+        }
+    }
+    // Translate atoms using extended subst
+    log::debug!(
+        "  [translate_formula] atoms={}, subst_size={}, extended_subst_size={}",
+        phi.atoms.len(),
+        subst.len(),
+        extended_subst.len()
+    );
+    for atom in &phi.atoms {
+        let all_mapped = atom
+            .all_vars()
+            .iter()
+            .all(|v| extended_subst.contains_key(v));
+        if !all_mapped {
+            continue;
+        }
+        let translated = atom.translate(|v| extended_subst.get(&v).copied().unwrap_or(v));
+        log::debug!("    atom: {atom} → {translated}");
+        let sat = caller_state.path_condition.and_atom_direct(translated);
+        if sat.is_unsat() {
+            log::debug!("    → UNSAT!");
+            return false;
+        }
+    }
+    true
+}
+
+/// Translate a callee Access to a caller Access (substituting array indices).
+fn translate_access(subst: &HashMap<AbstractValue, AbstractValue>, access: &Access) -> Access {
+    match access {
+        Access::ArrayAccess(typ, idx) => {
+            let caller_idx = subst.get(idx).copied().unwrap_or(*idx);
+            Access::ArrayAccess(typ.clone(), caller_idx)
+        }
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sil::ident::IdentName;
+    use sil::int_lit::IntLit;
+    use sil::mangled::Mangled;
+    use sil::procdesc::Procdesc;
+    use sil::procname::Procname;
+    use sil::pvar::Pvar;
+    use sil::var::Var;
+
+    fn mk_callee_summary_null_return() -> (Procdesc, PrePost) {
+        // Simulate: int* callee() { return NULL; }
+        let pname = Procname::c_from_string("callee");
+        let pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        // Return value is null (= 0)
+        let ret_val = AbstractValue::mk_fresh();
+        state.and_equal_const(ret_val, 0);
+        state.invalidate(
+            ret_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            Location::dummy(),
+        );
+
+        let pre = state.pre.clone();
+        let pre_post = PrePost {
+            pre,
+            post: state,
+            formals: vec![],
+            result: Some(ret_val),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        (pdesc, pre_post)
+    }
+
+    #[test]
+    fn test_apply_summary_null_return() {
+        let (_, pre_post) = mk_callee_summary_null_return();
+
+        // Caller state
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname, Typ::void(), Location::dummy());
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let results = apply_summary(&pre_post, &ret_id, &[], &Location::dummy(), caller_state);
+
+        // Should have at least a ContinueProgram
+        assert!(results.iter().any(|r| r.is_continue()));
+
+        // The return value should be bound and the address should be invalid
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            let ret_var = Var::LogicalVar(ret_id);
+            let ret_addr = s.post.stack.find(&ret_var);
+            assert!(ret_addr.is_some(), "return value should be bound");
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_with_actuals() {
+        // Simulate: void callee(int *p) { *p = 42; }
+        let pname = Procname::c_from_string("callee");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        // Formal p's address
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), pname);
+        let p_var = Var::ProgramVar(Box::new(p_pvar.clone()));
+        let p_addr = state.post.stack.find(&p_var).unwrap();
+
+        // *p = 42: write through p's dereference
+        let val_42 = AbstractValue::mk_fresh();
+        state.and_equal_const(val_42, 42);
+        state.write_heap(p_addr, Access::Dereference, val_42);
+
+        let pre = state.pre.clone();
+        let pre_post = PrePost {
+            pre,
+            post: state,
+            formals: vec![(p_pvar, p_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        // Caller: call callee(&x)
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(Exp::Lvar(x_pvar), Typ::void())];
+        let results = apply_summary(
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(results.iter().any(|r| r.is_continue()));
+
+        // After applying the summary, x should have a dereference edge
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            assert!(
+                s.post
+                    .heap
+                    .find_edge(x_addr, &Access::Dereference)
+                    .is_some(),
+                "callee's write through p should materialize in caller's heap"
+            );
+        }
+    }
+}

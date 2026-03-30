@@ -1,0 +1,17 @@
+[package]
+name = "ondemand"
+description = "On-demand analysis runner: parallel procedure analysis with inter-procedural support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sil = { path = "../sil" }
+absint = { path = "../absint" }
+rayon = "1"
+dashmap = "6"
+
+[dev-dependencies]
+analyses = { path = "../analyses" }
+test-harness = { path = "../test-harness" }
+textual = { path = "../textual" }

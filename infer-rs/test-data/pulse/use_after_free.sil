@@ -1,0 +1,24 @@
+.source_language = "c"
+
+// Use after free: read through a freed pointer.
+// The free model isn't wired yet, so this tests the infrastructure.
+// When models are added, this should report USE_AFTER_FREE.
+
+declare malloc() : *void
+declare free(*void) : void
+
+define use_after_free_bad() : void {
+  #entry:
+    n0 = malloc()
+    n1 = free(n0)
+    n2 : int = load n0
+    ret null
+}
+
+define no_uaf_ok() : void {
+  #entry:
+    n0 = malloc()
+    n1 : int = load n0
+    n2 = free(n0)
+    ret null
+}

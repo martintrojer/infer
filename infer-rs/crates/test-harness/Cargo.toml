@@ -1,0 +1,12 @@
+[package]
+name = "test-harness"
+description = "Test harness for infer-rs: Textual parsing, OCaml infer runner, and fixture loading"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sil = { path = "../sil" }
+textual = { path = "../textual" }
+serde = { workspace = true }
+serde_json = "1"

@@ -1,0 +1,18 @@
+[package]
+name = "analyses"
+# Maps to OCaml's `infer/src/checkers/` — renamed for clarity since these are
+# intraprocedural analyses (liveness, purity, lineage, etc.), not the heavier
+# engines like Pulse or RacerD which get their own crates.
+description = "Intraprocedural analyses for the Infer static analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sil = { path = "../sil" }
+absint = { path = "../absint" }
+diagnostics = { path = "../diagnostics" }
+
+[dev-dependencies]
+test-harness = { path = "../test-harness" }
+textual = { path = "../textual" }

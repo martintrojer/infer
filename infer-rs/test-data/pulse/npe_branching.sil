@@ -1,0 +1,279 @@
+.source_language = "java"
+
+// Ported from infer/tests/codetoanalyze/sil/pulse/npe.sil
+// Tests branch-dependent null dereference detection.
+
+type cell = { value: int; next: *cell }
+type list = { header: *cell }
+
+// Simple null deref: store null into l, then load through it.
+// Expected: NULL_DEREFERENCE
+define basic_bad(l: *list) : void {
+  #entry:
+    store &l <- null : *list
+    n0 : *list = load &l
+    n1 : *cell = load n0.list.header
+    ret null
+}
+
+// Null deref guarded by __sil_lt: the then-branch (2 < 3 is true) is safe,
+// else-branch has the null deref. Since 2 < 3, else is unreachable.
+// Expected: no issues (OCaml: if_test_lt_ok)
+define if_test_lt_ok(l: *list) : void {
+  #entry:
+    n4 = 2
+    n5 = __sil_lt(n4, 3)
+    jmp then_node, else_node
+  #then_node:
+    prune n5
+    ret null
+  #else_node:
+    prune __sil_lnot(n5)
+    store &l <- null : *list
+    n0 : *list = load &l
+    n1 : *cell = load n0.list.header
+    ret null
+}
+
+// Null deref guarded by __sil_lt: the then-branch (2 < 3 is true) has the bug.
+// Expected: NULL_DEREFERENCE (OCaml: if_test_lt_bad)
+define if_test_lt_bad(l: *list) : void {
+  #entry:
+    n4 = 2
+    n5 = __sil_lt(n4, 3)
+    jmp then_node, else_node
+  #then_node:
+    prune n5
+    store &l <- null : *list
+    n0 : *list = load &l
+    n1 : *cell = load n0.list.header
+    ret null
+  #else_node:
+    prune __sil_lnot(n5)
+    ret null
+}
+
+// Null deref guarded by __sil_eq: then-branch (2 == 2 is true) is safe.
+// Expected: no issues (OCaml: if_test_eq_ok)
+define if_test_eq_ok(l: *list) : void {
+  #entry:
+    n4 = 2
+    n5 = __sil_eq(n4, 2)
+    jmp then_node, else_node
+  #then_node:
+    prune n5
+    ret null
+  #else_node:
+    prune __sil_lnot(n5)
+    store &l <- null : *list
+    n0 : *list = load &l
+    n1 : *cell = load n0.list.header
+    ret null
+}
+
+// Null deref guarded by __sil_eq: then-branch (2 == 2 is true) has the bug.
+// Expected: NULL_DEREFERENCE (OCaml: if_test_eq_bad)
+define if_test_eq_bad(l: *list) : void {
+  #entry:
+    n4 = 2
+    n5 = __sil_eq(n4, 2)
+    jmp then_node, else_node
+  #then_node:
+    prune n5
+    store &l <- null : *list
+    n0 : *list = load &l
+    n1 : *cell = load n0.list.header
+    ret null
+  #else_node:
+    prune __sil_lnot(n5)
+    ret null
+}
+
+// Null deref in then-branch only (unknown condition).
+// Expected: NULL_DEREFERENCE (the then branch is reachable)
+define conditional_bad(n: int) : void {
+  local l: *list
+  #entry:
+    n4 : int = load &n
+    n5 = __sil_eq(n4, 2)
+    jmp then_node, else_node
+  #then_node:
+    prune n5
+    store &l <- null : *list
+    n0 : *list = load &l
+    n1 : *cell = load n0.list.header
+    ret null
+  #else_node:
+    prune __sil_lnot(n5)
+    ret null
+}
+
+// Null propagated through stores: l1.header = null, l2.header = l1.header.
+// Expected: NULL_DEREFERENCE
+define store_bad(l1: *list, l2: *list) : void {
+  #entry:
+    n0 : *list = load &l1
+    store n0.list.header <- null : *cell
+    n1 : *cell = load n0.list.header
+    n2 : *list = load &l2
+    store n2.list.header <- n1 : *cell
+    n3 : *cell = load n2.list.header
+    n4 : int = load n3.cell.value
+    ret null
+}
+
+// Load null from local variable, then deref through field.
+// Expected: NULL_DEREFERENCE
+define load_bad() : void {
+  local locvar: *cell
+  #entry:
+    store &locvar <- null : *cell
+    n0 : *cell = load &locvar
+    n1 : int = load n0.cell.value
+    ret null
+}
+
+// Safe procedure: no null dereference.
+// Expected: no issues
+define safe_load_ok(l: *list) : void {
+  #entry:
+    n0 : *list = load &l
+    ret null
+}
+
+// Interprocedural: return null, caller dereferences.
+// Expected: NULL_DEREFERENCE on call_and_npe_bad (not on return_null_ok)
+define return_null_ok() : *cell {
+  #entry:
+    ret null
+}
+
+define return_cell_ok() : *cell {
+  #entry:
+    n0 = __sil_allocate(<cell>)
+    ret n0
+}
+
+define call_and_npe_bad() : void {
+  #entry:
+    n0 = return_null_ok()
+    n1 : int = load n0.cell.value
+    ret null
+}
+
+define call_and_no_npe_ok() : void {
+  #entry:
+    n0 = return_cell_ok()
+    n1 : int = load n0.cell.value
+    ret null
+}
+
+// Load null from internal field, then deref.
+// Expected: NULL_DEREFERENCE
+define load_internal_bad() : void {
+  local locvar: cell
+  #entry:
+    store &locvar.cell.next <- null : *cell
+    n0 : *cell = load &locvar.cell.next
+    n1 : int = load n0.cell.value
+    ret null
+}
+
+// Array: store null at [0], allocate at [1]. Load [0] and deref.
+// Expected: NULL_DEREFERENCE
+define array_bad(a: (*cell)[]) : void {
+  #entry:
+    n0 = __sil_allocate(<cell>)
+    store &a[0] <- null : *cell
+    store &a[1] <- n0 : *cell
+    n1 : *cell = load &a[0]
+    n2 : int = load n1.cell.value
+    ret null
+}
+
+// Array: store null at [0], allocate at [1]. Load [1] (safe) and deref.
+// Expected: no issues
+define array_ok(a: (*cell)[]) : void {
+  #entry:
+    n0 = __sil_allocate(<cell>)
+    store &a[0] <- null : *cell
+    store &a[1] <- n0 : *cell
+    n1 : *cell = load &a[1]
+    n2 : int = load n1.cell.value
+    ret null
+}
+
+// Loop: null deref inside loop body.
+// Expected: NULL_DEREFERENCE
+// Also exercises WTO fixpoint on back-edge.
+define loop_null_deref_bad() : void {
+  local p: *cell
+  #entry:
+    store &p <- null : *cell
+    jmp loop_head
+  #loop_head:
+    n0 : *cell = load &p
+    n1 : int = load n0.cell.value
+    jmp loop_head
+}
+
+// Loop: safe body (no null deref).
+// Expected: no issues
+// Exercises WTO fixpoint convergence.
+define loop_safe_ok(p: *cell) : void {
+  #entry:
+    jmp loop_head
+  #loop_head:
+    n0 : *cell = load &p
+    jmp loop_head
+}
+
+// Interprocedural: get_header dereferences through double pointer.
+// From to_sil_bug.sil
+define get_header(list_ptr_ptr: **list) : *cell {
+  #entry:
+    n1 : **list = load &list_ptr_ptr
+    n2 : *list = load n1
+    n3 : *cell = load n2.list.header
+    ret n3
+}
+
+// Caller stores null, passes pointer-to-null through double indirection.
+// Expected: NULL_DEREFERENCE (via interprocedural summary of get_header)
+define use_get_next_bad(l: *list) : void {
+  local temp: **list
+  #entry:
+    store &l <- null : *list
+    store &temp <- &l : **list
+    n1 : **list = load &temp
+    n2 = get_header(n1)
+    ret null
+}
+
+// Allocate object — should not report issues.
+// From alloc.sil
+define allocate_ok() : void {
+  #entry:
+    n0 = __sil_allocate(<cell>)
+    ret null
+}
+
+// Allocate then use — should be safe.
+define allocate_and_use_ok() : void {
+  #entry:
+    n0 = __sil_allocate(<cell>)
+    n1 : int = load n0.cell.value
+    ret null
+}
+
+// Diamond CFG: both branches are safe.
+// Expected: no issues
+define diamond_safe_ok(x: int) : void {
+  #entry:
+    n0 : int = load &x
+    jmp left, right
+  #left:
+    ret null
+  #right:
+    ret null
+}

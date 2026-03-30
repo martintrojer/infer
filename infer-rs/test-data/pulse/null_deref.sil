@@ -1,0 +1,17 @@
+.source_language = "c"
+
+// Null dereference: store through a null pointer.
+// Expected: NULL_DEREFERENCE
+define null_deref_bad() : void {
+  #entry:
+    n0 = 0
+    store n0 <- 42 : int
+    ret null
+}
+
+// Safe: store to a local variable (not through pointer).
+define safe_store_ok(x: int) : void {
+  #entry:
+    store &x <- 5 : int
+    ret null
+}

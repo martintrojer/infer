@@ -1,0 +1,132 @@
+// 
+// Copyright (c) Facebook, Inc. and its affiliates.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+.source_language = "C"
+
+define use_then_dead_bad() : int {
+  local y: int, x: int
+  #node_0:
+      jmp node_1
+      
+  #node_6:
+      jmp
+      
+  #node_4:
+      n0:int = load &y
+      jmp node_5
+      
+  #node_5:
+      ret n0
+      
+  #node_3:
+      store &x <- 7:int
+      jmp node_4
+      
+  #node_2:
+      _ = __sil_metadata_variable_lifetime_begins(&y, <int>)
+      n1:int = load &x
+      store &y <- n1:int
+      jmp node_3
+      
+  #node_1:
+      _ = __sil_metadata_variable_lifetime_begins(&x, <int>)
+      store &x <- 5:int
+      jmp node_2
+      
+}
+
+define param_reassign_bad(x: int) : void {
+  #node_0:
+      jmp node_1
+      
+  #node_2:
+      jmp
+      
+  #node_1:
+      store &x <- 5:int
+      jmp node_2
+      
+}
+
+define nested_dead_bad() : void {
+  local y: int, x: int
+  #node_0:
+      jmp node_1
+      
+  #node_8:
+      jmp
+      
+  #node_4:
+      jmp node_7
+      
+  #node_7:
+      jmp node_8
+      
+  #node_2:
+      n0:int = load &x
+      jmp node_6, node_5
+      
+  #node_6:
+      prune __sil_gt(n0, 3)
+      jmp node_3
+      
+  #node_5:
+      prune __sil_lnot(__sil_gt(n0, 3))
+      jmp node_4
+      
+  #node_3:
+      _ = __sil_metadata_variable_lifetime_begins(&y, <int>)
+      store &y <- 10:int
+      jmp node_4
+      
+  #node_1:
+      _ = __sil_metadata_variable_lifetime_begins(&x, <int>)
+      store &x <- 5:int
+      jmp node_2
+      
+}
+
+define easy_bad() : void {
+  local x: int
+  #node_0:
+      jmp node_1
+      
+  #node_2:
+      jmp
+      
+  #node_1:
+      _ = __sil_metadata_variable_lifetime_begins(&x, <int>)
+      store &x <- 5:int
+      jmp node_2
+      
+}
+
+define dead_then_live_bad() : int {
+  local x: int
+  #node_0:
+      jmp node_1
+      
+  #node_5:
+      jmp
+      
+  #node_3:
+      n0:int = load &x
+      jmp node_4
+      
+  #node_4:
+      ret n0
+      
+  #node_2:
+      store &x <- 3:int
+      jmp node_3
+      
+  #node_1:
+      _ = __sil_metadata_variable_lifetime_begins(&x, <int>)
+      store &x <- 5:int
+      jmp node_2
+      
+}
+
