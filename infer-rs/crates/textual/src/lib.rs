@@ -19,6 +19,7 @@
 pub mod ast;
 pub mod decls;
 pub mod lexer;
+pub mod line_map;
 pub mod parser;
 pub mod printer;
 pub mod to_sil;

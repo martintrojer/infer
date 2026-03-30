@@ -564,7 +564,10 @@ mod tests {
             !summary.diagnostics.is_empty(),
             "should detect null dereference"
         );
-        assert_eq!(summary.diagnostics[0].get_issue_type(), "NULL_DEREFERENCE");
+        assert_eq!(
+            summary.diagnostics[0].get_issue_type_id(),
+            diagnostics::issue_type::IssueTypeId::NullptrDereference
+        );
     }
 
     #[test]
@@ -584,7 +587,9 @@ mod tests {
         let summary = analyze(&pdesc);
         let log = to_issue_log(&summary, "null_deref");
         assert!(!log.is_empty());
-        assert!(log.to_issues_exp().contains("NULL_DEREFERENCE"));
+        assert!(log
+            .to_issues_exp()
+            .contains(diagnostics::issue_type::IssueTypeId::NullptrDereference.id()));
     }
 
     /// Diamond CFG: start → a → {b, c} → d → exit
@@ -732,8 +737,8 @@ mod tests {
             caller_summary.diagnostics
         );
         assert_eq!(
-            caller_summary.diagnostics[0].get_issue_type(),
-            "NULL_DEREFERENCE"
+            caller_summary.diagnostics[0].get_issue_type_id(),
+            diagnostics::issue_type::IssueTypeId::NullptrDereference
         );
     }
 

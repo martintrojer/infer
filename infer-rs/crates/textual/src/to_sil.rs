@@ -80,15 +80,36 @@ impl Lang {
 // ===========================================================================
 
 /// Mirrors `LocationBridge`.
-fn location_to_sil(source_file: &SourceFile, loc: &ast::Location) -> location::Location {
+///
+/// If a `LineMap` is provided, remaps the textual file line/col to the original
+/// source line/col (from `@[line:col]` annotations or `// .line` directives).
+fn location_to_sil(
+    source_file: &SourceFile,
+    loc: &ast::Location,
+    line_map: Option<&crate::line_map::LineMap>,
+) -> location::Location {
     match loc {
-        ast::Location::Known { line, col } => location::Location {
-            file: source_file.clone(),
-            line: *line as i32,
-            col: *col as i32,
-            macro_file_opt: None,
-            macro_line: -1,
-        },
+        ast::Location::Known { line, col } => {
+            // Try to remap via line map
+            if let Some(map) = line_map {
+                if let Some(orig) = map.lookup(*line) {
+                    return location::Location {
+                        file: source_file.clone(),
+                        line: orig.line as i32,
+                        col: orig.col as i32,
+                        macro_file_opt: None,
+                        macro_line: -1,
+                    };
+                }
+            }
+            location::Location {
+                file: source_file.clone(),
+                line: *line as i32,
+                col: *col as i32,
+                macro_file_opt: None,
+                macro_line: -1,
+            }
+        }
         ast::Location::Unknown => location::Location {
             file: source_file.clone(),
             line: -1,
@@ -457,6 +478,7 @@ fn procdesc_to_sil(
     lang: Lang,
     source_file: &SourceFile,
     pdesc: &ast::ProcDesc,
+    line_map: Option<&crate::line_map::LineMap>,
 ) -> procdesc::Procdesc {
     let arity = pdesc
         .procdecl
@@ -465,7 +487,7 @@ fn procdesc_to_sil(
         .map(|f| f.len() as i32);
     let pname = procname_to_sil(lang, &pdesc.procdecl.qualified_name, arity);
     let ret_type = typ_to_sil(lang, &pdesc.procdecl.result_type.typ);
-    let loc = location_to_sil(source_file, &pdesc.exit_loc);
+    let loc = location_to_sil(source_file, &pdesc.exit_loc, line_map);
 
     let mut sil_pdesc = procdesc::Procdesc::new(pname.clone(), ret_type.clone(), loc);
 
@@ -501,12 +523,14 @@ fn procdesc_to_sil(
     let mut label_to_id: HashMap<String, procdesc::NodeId> = HashMap::new();
 
     for (i, node) in pdesc.nodes.iter().enumerate() {
-        let node_loc = location_to_sil(source_file, &node.label_loc);
+        let node_loc = location_to_sil(source_file, &node.label_loc, line_map);
         let kind = procdesc::NodeKind::StmtNode(procdesc::StmtNodeKind::MethodBody);
 
         let mut sil_instrs = Vec::new();
         for textual_instr in &node.instrs {
-            if let Some(sil_instr) = instr_to_sil(lang, source_file, &pname, textual_instr) {
+            if let Some(sil_instr) =
+                instr_to_sil(lang, source_file, &pname, textual_instr, line_map)
+            {
                 sil_instrs.push(sil_instr);
             }
         }
@@ -516,7 +540,7 @@ fn procdesc_to_sil(
         if let ast::Terminator::Ret(ret_exp) = &node.last {
             let ret_pvar = pvar::Pvar::mk(Mangled::from_string("__return"), pname.clone());
             let sil_ret_exp = exp_to_sil(lang, source_file, &pname, ret_exp);
-            let ret_loc = location_to_sil(source_file, &node.last_loc);
+            let ret_loc = location_to_sil(source_file, &node.last_loc, line_map);
             sil_instrs.push(instr::Instr::Store {
                 e1: Box::new(exp::Exp::Lvar(ret_pvar)),
                 typ: ret_type.clone(),
@@ -552,8 +576,9 @@ fn instr_to_sil(
     source_file: &SourceFile,
     pname: &procname::Procname,
     textual_instr: &ast::Instr,
+    line_map: Option<&crate::line_map::LineMap>,
 ) -> Option<instr::Instr> {
-    let loc = |l: &ast::Location| location_to_sil(source_file, l);
+    let loc = |l: &ast::Location| location_to_sil(source_file, l, line_map);
 
     match textual_instr {
         ast::Instr::Load {
@@ -821,9 +846,21 @@ fn sil_builtin_to_instr(
 /// Convert a Textual module into SIL Cfg + Tenv.
 ///
 /// Mirrors OCaml's `TextualSil.module_to_sil`.
+///
+/// If `line_map` is provided, locations are remapped from textual line numbers
+/// to original source line numbers (from `@[line:col]` or `// .line` directives).
 pub fn module_to_sil(
     module: &ast::Module,
     _decls: &DeclEnv,
+) -> Result<(Cfg, Tenv), Vec<ConvError>> {
+    module_to_sil_with_line_map(module, _decls, None)
+}
+
+/// Convert a Textual module into SIL Cfg + Tenv with an optional line map.
+pub fn module_to_sil_with_line_map(
+    module: &ast::Module,
+    _decls: &DeclEnv,
+    line_map: Option<&crate::line_map::LineMap>,
 ) -> Result<(Cfg, Tenv), Vec<ConvError>> {
     let lang_str = module.lang().unwrap_or("c");
     let lang = Lang::parse(lang_str).unwrap_or(Lang::C);
@@ -839,7 +876,7 @@ pub fn module_to_sil(
                 tenv.insert(sil_name, sil_struct);
             }
             ast::Decl::Proc(pdesc) => {
-                let sil_pdesc = procdesc_to_sil(lang, &source_file, pdesc);
+                let sil_pdesc = procdesc_to_sil(lang, &source_file, pdesc, line_map);
                 cfg.add_proc_desc(sil_pdesc);
             }
             ast::Decl::Global(_) | ast::Decl::Procdecl(_) => {

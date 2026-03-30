@@ -5,6 +5,7 @@
 
 //! End-to-end Pulse tests: Textual .sil → parse → to_sil → Pulse → diagnostics.
 
+use diagnostics::issue_type::IssueTypeId;
 use test_harness::textual_utils;
 
 /// Adapter for running Pulse through the ondemand interprocedural runner.
@@ -314,7 +315,7 @@ fn test_e2e_null_deref_fixture() {
         let proc_name = format!("{}", pdesc.proc_name);
         let summary = pulse::checker::analyze(pdesc);
         for diag in &summary.diagnostics {
-            if diag.get_issue_type() == "NULL_DEREFERENCE" {
+            if diag.get_issue_type_id() == IssueTypeId::NullptrDereference {
                 found_null_deref = true;
             }
             if proc_name.contains("safe_store_ok") {
@@ -401,7 +402,7 @@ fn test_e2e_npe_branching_fixture() {
             .find(|(k, _)| k.contains(name))
             .map(|(_, v)| v);
         assert!(
-            issues.is_some_and(|v| v.iter().any(|i| i == "NULL_DEREFERENCE")),
+            issues.is_some_and(|v| v.iter().any(|i| i == IssueTypeId::NullptrDereference.id())),
             "{name} should report NULL_DEREFERENCE, got: {issues:?}"
         );
     }
@@ -473,7 +474,10 @@ fn assert_pulse_file(path: &std::path::Path, skip: &[&str]) {
             continue;
         }
         if proc_name.contains("_bad") || proc_name.contains("Bad") {
-            if !issues.iter().any(|i| i == "NULL_DEREFERENCE") {
+            if !issues
+                .iter()
+                .any(|i| i == IssueTypeId::NullptrDereference.id())
+            {
                 failures.push(format!(
                     "{proc_name}: expected NULL_DEREFERENCE, got {issues:?}"
                 ));
@@ -790,11 +794,11 @@ fn test_c_dump_textual_sweep() {
             let exp = test_harness::fixtures::issues_for_file(&expected, filename);
             let exp_npe = exp
                 .iter()
-                .filter(|e| e.issue_type == "NULLPTR_DEREFERENCE")
+                .filter(|e| e.issue_type == IssueTypeId::NullptrDereference.id())
                 .count();
             let rust_npe = rust_issues
                 .iter()
-                .filter(|i| i.as_str() == "NULL_DEREFERENCE")
+                .filter(|i| i.as_str() == IssueTypeId::NullptrDereference.id())
                 .count();
             total_expected += exp_npe;
             total_found += rust_npe;
@@ -821,11 +825,11 @@ fn test_c_dump_textual_sweep() {
             let exp = test_harness::fixtures::issues_for_file(&expected, filename);
             let exp_leak = exp
                 .iter()
-                .filter(|e| e.issue_type == "MEMORY_LEAK_C")
+                .filter(|e| e.issue_type == IssueTypeId::MemoryLeakC.id())
                 .count();
             let rust_leak = rust_issues
                 .iter()
-                .filter(|i| i.as_str() == "MEMORY_LEAK_C")
+                .filter(|i| i.as_str() == IssueTypeId::MemoryLeakC.id())
                 .count();
             leak_expected += exp_leak;
             leak_found += rust_leak;
@@ -949,7 +953,7 @@ fn test_e2e_fopen_null_deref() {
         bad.is_some_and(|(_, s)| s
             .diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "NULL_DEREFERENCE")),
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
         "no_fopen_check_bad should report NULL_DEREFERENCE"
     );
 }
@@ -1124,7 +1128,7 @@ fn test_e2e_null_attrs_propagation() {
         bad.is_some_and(|(_, s)| s
             .diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "NULL_DEREFERENCE")),
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
         "caller_deref_bad should report NULL_DEREFERENCE from callee returning null"
     );
 }
@@ -1253,7 +1257,7 @@ fn test_e2e_funptr_dispatch() {
         bad.is_some_and(|(_, s)| s
             .diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "NULL_DEREFERENCE")),
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
         "funptr_deref_bad should report NULL_DEREFERENCE via function pointer returning null"
     );
     let good = store
@@ -1313,7 +1317,7 @@ fn test_e2e_funptr_multilevel() {
         bad.is_some_and(|(_, s)| s
             .diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "NULL_DEREFERENCE")),
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
         "test_multilevel_bad should detect NULL_DEREFERENCE through 2-level function pointer chain"
     );
 }
@@ -1354,7 +1358,7 @@ fn test_e2e_write_through_ptr() {
     let has_npe = bad.as_ref().is_some_and(|(_, s)| {
         s.diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "NULL_DEREFERENCE")
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)
     });
     eprintln!("direct_call_bad: has_npe={has_npe}");
     // This currently fails due to biabduction indirection issue
@@ -1449,7 +1453,7 @@ fn test_e2e_unknown_call_havoc() {
         let has_npe = summary
             .diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "NULL_DEREFERENCE");
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference);
         eprintln!(
             "{name}: has_npe={has_npe}, diags={}",
             summary.diagnostics.len()
@@ -1519,7 +1523,7 @@ fn test_e2e_memory_leak() {
         let has_leak = summary
             .diagnostics
             .iter()
-            .any(|d| d.get_issue_type() == "MEMORY_LEAK_C");
+            .any(|d| d.get_issue_type_id() == IssueTypeId::MemoryLeakC);
         eprintln!(
             "{name}: has_leak={has_leak}, diags={:?}",
             summary
@@ -1569,4 +1573,179 @@ fn test_debug_follow_ret() {
             );
         }
     }
+}
+
+/// Sweep using --store-textual + --export-textual: batch capture all C files,
+/// export via manifest, analyze each .sil with line map remapping.
+///
+/// Run explicitly:
+///   cargo test --test end_to_end test_store_textual_sweep -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_store_textual_sweep() {
+    use test_harness::infer_runner::InferRunner;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let c_dir = test_harness::fixtures::ocaml_c_test_dir().join("pulse");
+    if !c_dir.exists() {
+        eprintln!("skipping: OCaml C test dir not found");
+        return;
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(&c_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "c"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    let c_paths: Vec<_> = entries.iter().map(|e| e.path()).collect();
+    let c_refs: Vec<&std::path::Path> = c_paths.iter().map(|p| p.as_path()).collect();
+
+    eprintln!("Capturing {} C files with --store-textual...", c_refs.len());
+    let (manifest_entries, export_dir) = match runner.store_textual_and_export(&c_refs) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL: store_textual_and_export: {e}");
+            panic!("store_textual_and_export failed");
+        }
+    };
+    eprintln!(
+        "Exported {} files to {}",
+        manifest_entries.len(),
+        export_dir.display()
+    );
+
+    // Files known to hang (infinite loops / deep recursion exhaust fixpoint)
+    let skip_files = ["infinite.c", "recursion.c", "recursion2.c"];
+
+    let mut ok = 0;
+    let mut fail_parse = 0;
+    let mut fail_timeout = 0;
+    let mut total_procs = 0;
+    let mut total_issues = 0;
+    let mut file_results: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for entry in &manifest_entries {
+        let source_name = std::path::Path::new(&entry.source)
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("");
+
+        if skip_files.iter().any(|s| *s == source_name) {
+            eprintln!("  SKIP {source_name} (known hang)");
+            continue;
+        }
+
+        let sil_path = export_dir.join(&entry.sil);
+        let source_file = entry.source.clone();
+
+        match std::panic::catch_unwind(|| {
+            // Parse with line map for correct source locations
+            let src = std::fs::read_to_string(&sil_path).unwrap();
+            let filename = sil_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("test.sil");
+            let mut module = textual::parse_module(&src, filename).unwrap();
+            module.source_file = source_file;
+
+            let (decls, _) = textual::decls::DeclEnv::from_module(&module);
+            textual::transform::run(&mut module, &decls);
+
+            let line_map = textual::line_map::LineMap::create(&src);
+            let lm_ref = if line_map.is_empty() {
+                None
+            } else {
+                Some(&line_map)
+            };
+            let (cfg, tenv) =
+                textual::to_sil::module_to_sil_with_line_map(&module, &decls, lm_ref).unwrap();
+            (cfg, tenv)
+        }) {
+            Err(_) => {
+                eprintln!("  FAIL_PARSE {source_name}");
+                fail_parse += 1;
+            }
+            Ok((cfg, tenv)) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let checker = PulseInterChecker;
+                    let (store, _) = ondemand::runner::run_inter(&checker, &cfg, &tenv);
+                    let mut n_procs = 0;
+                    let mut issues = Vec::new();
+                    for (_pname, summary) in store.to_vec() {
+                        n_procs += 1;
+                        for d in &summary.diagnostics {
+                            issues.push(d.get_issue_type().to_string());
+                        }
+                    }
+                    let _ = tx.send((n_procs, issues));
+                });
+
+                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                    Ok((n_procs, issues)) => {
+                        handle.join().ok();
+                        let n_issues = issues.len();
+                        eprintln!("  OK {source_name}: {n_procs} procs, {n_issues} issues");
+                        ok += 1;
+                        total_procs += n_procs;
+                        total_issues += n_issues;
+                        file_results.insert(source_name.to_string(), issues);
+                    }
+                    Err(_) => {
+                        eprintln!("  TIMEOUT {source_name}");
+                        fail_timeout += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Compare against issues.exp
+    let exp_path = c_dir.join("issues.exp");
+    if exp_path.exists() {
+        let expected = test_harness::fixtures::parse_issues_exp(&exp_path);
+
+        for (type_id, label) in [
+            (IssueTypeId::NullptrDereference, "NPE"),
+            (IssueTypeId::MemoryLeakC, "LEAK"),
+            (IssueTypeId::UseAfterFree, "UAF"),
+        ] {
+            let id_str = type_id.id();
+            let mut total_expected = 0;
+            let mut total_found = 0;
+            let mut diffs = Vec::new();
+            for (filename, rust_issues) in &file_results {
+                let exp = test_harness::fixtures::issues_for_file(&expected, filename);
+                let exp_count = exp.iter().filter(|e| e.issue_type == id_str).count();
+                let rust_count = rust_issues.iter().filter(|i| i.as_str() == id_str).count();
+                total_expected += exp_count;
+                total_found += rust_count;
+                if exp_count != rust_count {
+                    diffs.push(format!(
+                        "    {filename}: expected {exp_count}, found {rust_count}"
+                    ));
+                }
+            }
+            eprintln!("\n=== {label}: expected {total_expected}, found {total_found} ===");
+            if !diffs.is_empty() {
+                diffs.sort();
+                eprintln!("  Differences:");
+                for d in &diffs {
+                    eprintln!("{d}");
+                }
+            }
+        }
+    }
+
+    eprintln!("\n=== Store-textual sweep ===");
+    eprintln!("  OK: {ok}, FAIL_PARSE: {fail_parse}, TIMEOUT: {fail_timeout}");
+    eprintln!("  {total_procs} procs analyzed, {total_issues} issues found");
+    assert!(ok > 0, "should have at least one passing file");
 }

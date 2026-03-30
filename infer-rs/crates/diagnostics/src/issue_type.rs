@@ -38,7 +38,7 @@ impl std::fmt::Display for Severity {
 pub enum Category {
     LogicError,
     MemoryError,
-    NullDereference,
+    NullPointerDereference,
     ResourceLeak,
     RaceCondition,
     Perf,
@@ -49,13 +49,75 @@ pub enum Category {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Checker(pub String);
 
+/// Well-known issue type identifiers.
+///
+/// Each variant's `id()` returns the exact string OCaml uses in `IssueType.ml`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IssueTypeId {
+    DeadStore,
+    NullptrDereference,
+    MemoryLeakC,
+    UseAfterFree,
+    UseAfterDelete,
+    UseAfterLifetime,
+    OptionalEmptyAccess,
+    VectorInvalidation,
+    RetainCycle,
+    PulseError,
+}
+
+impl IssueTypeId {
+    /// The string identifier matching OCaml's `IssueType.ml`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::DeadStore => "DEAD_STORE",
+            Self::NullptrDereference => "NULLPTR_DEREFERENCE",
+            Self::MemoryLeakC => "MEMORY_LEAK_C",
+            Self::UseAfterFree => "USE_AFTER_FREE",
+            Self::UseAfterDelete => "USE_AFTER_DELETE",
+            Self::UseAfterLifetime => "USE_AFTER_LIFETIME",
+            Self::OptionalEmptyAccess => "OPTIONAL_EMPTY_ACCESS",
+            Self::VectorInvalidation => "VECTOR_INVALIDATION",
+            Self::RetainCycle => "RETAIN_CYCLE",
+            Self::PulseError => "PULSE_ERROR",
+        }
+    }
+
+    pub fn severity(self) -> Severity {
+        match self {
+            Self::MemoryLeakC => Severity::Warning,
+            _ => Severity::Error,
+        }
+    }
+
+    pub fn category(self) -> Category {
+        match self {
+            Self::DeadStore => Category::LogicError,
+            Self::NullptrDereference => Category::NullPointerDereference,
+            Self::MemoryLeakC => Category::ResourceLeak,
+            Self::UseAfterFree
+            | Self::UseAfterDelete
+            | Self::UseAfterLifetime
+            | Self::VectorInvalidation
+            | Self::RetainCycle => Category::MemoryError,
+            Self::OptionalEmptyAccess | Self::PulseError => Category::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for IssueTypeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id())
+    }
+}
+
 /// An issue type definition.
 ///
 /// Each distinct kind of bug has its own `IssueType` with a unique ID.
 /// Mirrors OCaml's `IssueType.t`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IssueType {
-    /// Unique identifier string, e.g. "DEAD_STORE", "NULL_DEREFERENCE".
+    /// Unique identifier string, e.g. "DEAD_STORE", "NULLPTR_DEREFERENCE".
     pub id: String,
     /// Severity level.
     pub severity: Severity,
@@ -71,48 +133,26 @@ impl std::fmt::Display for IssueType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Well-known issue types
-// ---------------------------------------------------------------------------
-
-/// Dead store: a value is written to a variable but never read.
-pub const DEAD_STORE: &str = "DEAD_STORE";
-
-/// Null dereference: a null pointer is dereferenced.
-pub const NULL_DEREFERENCE: &str = "NULL_DEREFERENCE";
-
-/// Memory leak (C): allocated memory is not freed on all paths.
-/// Matches OCaml's MEMORY_LEAK_C issue type.
-pub const MEMORY_LEAK_C: &str = "MEMORY_LEAK_C";
-
-/// Use after free: memory accessed after being freed.
-pub const USE_AFTER_FREE: &str = "USE_AFTER_FREE";
-
 impl IssueType {
-    pub fn dead_store() -> Self {
+    /// Create an IssueType from a well-known ID and checker name.
+    pub fn from_id(id: IssueTypeId, checker: &str) -> Self {
         Self {
-            id: DEAD_STORE.to_string(),
-            severity: Severity::Error,
-            category: Category::LogicError,
-            checker: Checker("Liveness".to_string()),
+            id: id.id().to_string(),
+            severity: id.severity(),
+            category: id.category(),
+            checker: Checker(checker.to_string()),
         }
+    }
+
+    pub fn dead_store() -> Self {
+        Self::from_id(IssueTypeId::DeadStore, "Liveness")
     }
 
     pub fn null_dereference() -> Self {
-        Self {
-            id: NULL_DEREFERENCE.to_string(),
-            severity: Severity::Error,
-            category: Category::NullDereference,
-            checker: Checker("Pulse".to_string()),
-        }
+        Self::from_id(IssueTypeId::NullptrDereference, "Pulse")
     }
 
     pub fn memory_leak() -> Self {
-        Self {
-            id: MEMORY_LEAK_C.to_string(),
-            severity: Severity::Error,
-            category: Category::ResourceLeak,
-            checker: Checker("Pulse".to_string()),
-        }
+        Self::from_id(IssueTypeId::MemoryLeakC, "Pulse")
     }
 }

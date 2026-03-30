@@ -4,9 +4,16 @@
 
 **~30,000 lines of Rust across 11 crates. 350+ tests. 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 135, found 130. Leak detection: expected 20, found 20. 20 of 52 C test files match OCaml exactly. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, sizeof/float evaluation, per-instruction tracing. funptr.c: 6/11.**
 
-Two full analysis pipelines work end-to-end:
+Three CLI modes:
+- **Full pipeline**: `infer-rs --pulse-only -- clang -c file.c` (capture + export + analyze)
+- **Existing capture**: `infer-rs --pulse-only` (export from capture.db + analyze)
+- **Direct .sil**: `infer-rs --pulse-only file.sil` (debugging)
+
+Two analysis pipelines:
 - **Liveness**: `.sil` → parse → transforms → to_sil → backward analysis → DEAD_STORE reporting
-- **Pulse**: `.sil` → parse → transforms → to_sil → forward analysis → NULL_DEREFERENCE / USE_AFTER_FREE detection
+- **Pulse**: `.sil` → parse → transforms → to_sil → forward analysis → NULLPTR_DEREFERENCE / USE_AFTER_FREE detection
+
+Source location remapping: `LineMap` maps `.sil` line numbers back to original C source via `@[line:col]` annotations (C/C++ frontend) and `// .line` directives (Rust frontend).
 
 Pulse features:
 
@@ -58,7 +65,7 @@ infer-rs/
     test-harness/   (665 /   823) test infrastructure: Textual utils, OCaml infer runner, fixtures
     ondemand/     (1,184 / 1,480) parallel analysis runner with inter-procedural support
     diagnostics/    (214 /   267) issue types, severity, issue reporting
-    config/         (135 /   176) configuration: .inferconfig, global OnceLock, OCaml flag compat
+    config/         (200 /   250) configuration: .inferconfig, global OnceLock, OCaml flag compat, manifest parsing
     pulse/        (5,200 / 6,400) Pulse analysis engine (null deref, UAF, models, interproc, specialization, WTO+DisjunctiveDomain)
     cli/            (436 /   537) CLI binary (clap, ondemand integration, config wiring)
 ```
@@ -156,7 +163,7 @@ Issue reporting types. Depends on `sil`.
 
 | Module | Mirrors OCaml | Description |
 |--------|---------------|-------------|
-| `issue_type.rs` | `IssueType.ml` | Severity, Category, IssueType with well-known constants (DEAD_STORE, etc.) |
+| `issue_type.rs` | `IssueType.ml` | Severity, Category, IssueTypeId enum (single source of truth for issue type strings matching OCaml), IssueType |
 | `issue.rs` | `Errlog.ml` + `Reporting.ml` | Issue, IssueLog with sort, merge, JSON export, issues.exp format |
 
 ### test-harness crate
@@ -165,7 +172,7 @@ Shared test infrastructure. Depends on `sil`, `textual`, `serde_json`.
 | Module | Description |
 |--------|-------------|
 | `textual_utils.rs` | `parse_and_convert()`, `parse_file_and_convert()`, `TestModule` with label→node_id lookup |
-| `infer_runner.rs` | `InferRunner`: OCaml infer integration, `dump_textual_for_c()`, `analyze_pulse_c()`, report.json parsing, `compare_issues()` |
+| `infer_runner.rs` | `InferRunner`: OCaml infer integration, `store_textual_and_export()`, `dump_textual_for_c()`, `analyze_pulse_c()`, report.json parsing, `compare_issues()` |
 | `fixtures.rs` | `test_data_dir()`, `ocaml_c_test_dir()`, `parse_issues_exp()`, `issues_for_file()`, `load_fixture()` |
 | `summary_compare.rs` | `parse_ocaml_summaries()`, `SummaryFacts`, `compare_summaries()`, `ComparisonReport` |
 
@@ -235,17 +242,19 @@ Remaining 27 tests are blocked on: exceptions (7), closure-to-object (3), tenv a
 - **Virtual dispatch in loads** (2 procs): `n0.OO.get_null().B.f` chained method call resolution
 - **Devirtualization** (5 procs): 1 miss (virtual dispatch through interprocedural call chain), 4 FP (return value not evaluated through prune conditions after devirtualized call)
 
-### C source → dump-textual → Rust pipeline (pulse)
-46 of 55 C source files pass through the full pipeline: C source → OCaml `infer capture --dump-textual` → Rust parse → Pulse analysis. Run with `make check-full`.
+### C source → store-textual → export → Rust pipeline (pulse)
+52 of 55 C source files pass through the full pipeline: C source → OCaml `infer --store-textual` → `infer debug --export-textual` → manifest.json → Rust parse → Pulse analysis.
+
+Run with: `cargo test --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
 
 **Pipeline status (55 files):**
 
 | Status | Count | Details |
 |---|---|---|
 | OK | 52 | parsed + analyzed, 653 procs, 160 issues |
-| FAIL_DUMP | 0 | all fixed upstream |
-| TIMEOUT | 0 | (latent.c now completes with null-path pruning) |
-| SKIP | 3 | infinite.c, recursion.c, recursion2.c (infinite loops exhaust fixpoint) |
+| SKIP | 3 | infinite.c, recursion.c, recursion2.c (fixpoint exhaustion) |
+| FAIL_PARSE | 0 | |
+| TIMEOUT | 0 | |
 
 **NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 135, found 130 (deterministic).**
 
@@ -262,6 +271,10 @@ Over-detection (we report more than OCaml):
 **MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
 
 Per-file differences (cancel out): cleanup_attribute.c (+2, cleanup attr not modeled), nullptr.c (-1, formal overwrite), memory_leak.c (-1, funptr wrapper).
+
+**USE_AFTER_FREE comparison vs OCaml `issues.exp`: expected 7, found 10 (+3 FPs).**
+
+Over-detection: latent.c (+3, latent propagation FPs), interprocedural.c (+1, duplicate latent). Under-detection: specialization.c (-1, funptr UAF).
 
 **Files matching OCaml (20 clean, NPE+Leaks):** enum.c, frontend.c, memcpy.c, getcwd.c, shift.c, var_arg.c, ternary.c, nullptr.c, lists.c, list_checks.c, uninit.c, assert_failure.c, specialization.c, arithmetic.c, integers.c, abduce.c, struct_values.c, interprocedural.c, memory_leak_more.c, issues_abort_execution.c, traces.c.
 

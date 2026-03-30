@@ -273,6 +273,71 @@ impl InferRunner {
         Ok(summary_path)
     }
 
+    /// Capture C source files with `--store-textual`, then export via `--export-textual`.
+    ///
+    /// Returns a list of `ManifestEntry` and the export directory path.
+    ///
+    /// Runs:
+    ///   `infer --store-textual -j 1 -o <out> -- clang -c <sources>`
+    ///   `infer debug --export-textual <export_dir> -o <out>`
+    pub fn store_textual_and_export(
+        &self,
+        sources: &[&Path],
+    ) -> Result<(Vec<config::manifest::ManifestEntry>, PathBuf), String> {
+        let out_dir = self.tmp_dir.join("infer_out");
+        let export_dir = self.tmp_dir.join("exported");
+        let _ = std::fs::create_dir_all(&self.tmp_dir);
+
+        // Step 1: capture with --store-textual
+        // Use original source paths (not copies) to preserve include paths.
+        // Run from tmp_dir so .o files don't pollute the source tree.
+        let mut cmd = Command::new(&self.infer_bin);
+        cmd.current_dir(&self.tmp_dir)
+            .arg("--store-textual")
+            .arg("-j")
+            .arg("1")
+            .arg("-o")
+            .arg(&out_dir)
+            .arg("--")
+            .arg("clang")
+            .arg("-c");
+        for src in sources {
+            cmd.arg(src);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run infer capture: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "infer --store-textual failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        // Step 2: export textual
+        let output = Command::new(&self.infer_bin)
+            .arg("debug")
+            .arg("--export-textual")
+            .arg(&export_dir)
+            .arg("-o")
+            .arg(&out_dir)
+            .output()
+            .map_err(|e| format!("failed to run infer debug: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "infer debug --export-textual failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        // Parse manifest
+        let manifest_path = export_dir.join("manifest.json");
+        let entries = config::manifest::read_manifest(&manifest_path)?;
+
+        Ok((entries, export_dir))
+    }
+
     /// Capture `.sil` files without analyzing (capture only).
     ///
     /// Useful for testing that Textual files are valid according to OCaml infer.
@@ -408,7 +473,7 @@ mod tests {
     fn test_parse_report_json() {
         let json = r#"[
             {
-                "bug_type": "NULL_DEREFERENCE",
+                "bug_type": "NULLPTR_DEREFERENCE",
                 "qualifier": "null dereference of x",
                 "file": "test.c",
                 "line": 10,
@@ -427,7 +492,7 @@ mod tests {
         // Sorted by derived Ord on InferIssue (bug_type, qualifier, file, line, procedure)
         assert_eq!(issues[0].bug_type, "MEMORY_LEAK");
         assert_eq!(issues[0].line, 20);
-        assert_eq!(issues[1].bug_type, "NULL_DEREFERENCE");
+        assert_eq!(issues[1].bug_type, "NULLPTR_DEREFERENCE");
         assert_eq!(issues[1].line, 10);
     }
 

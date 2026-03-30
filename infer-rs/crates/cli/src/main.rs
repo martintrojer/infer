@@ -3,7 +3,21 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! infer-rs CLI: analyze Textual .sil files and report issues.
+//! infer-rs CLI: Rust implementation of the Infer static analyzer.
+//!
+//! Two modes of operation:
+//!
+//! 1. Full pipeline (capture + analyze):
+//!    `infer-rs --pulse-only -- clang -c file.c`
+//!    Shells out to `infer --store-textual`, exports textual, analyzes.
+//!
+//! 2. Analyze only (capture.db already exists):
+//!    `infer-rs --pulse-only`
+//!    Exports textual from existing capture.db, analyzes.
+//!
+//! 3. Direct .sil files (debugging):
+//!    `infer-rs --pulse-only file.sil`
+//!    Analyzes the given .sil files directly.
 
 use std::path::{Path, PathBuf};
 use std::process;
@@ -13,18 +27,18 @@ use diagnostics::issue::IssueLog;
 
 /// infer-rs: Rust implementation of the Infer static analyzer.
 ///
-/// Analyzes Textual .sil files and reports issues (null dereferences,
-/// use-after-free, dead stores).
+/// Run with `-- <build command>` to capture and analyze, or without to
+/// analyze an existing capture.db. Pass .sil files directly for debugging.
 #[derive(Parser, Debug)]
 #[command(name = "infer-rs", version, about)]
 struct Cli {
-    /// .sil files to analyze (Textual format).
+    /// .sil files to analyze directly (bypasses capture/export).
     #[arg(long = "capture-textual", value_name = "FILE")]
     capture_textual: Vec<PathBuf>,
 
-    /// Additional .sil files (positional).
-    #[arg(value_name = "FILE")]
-    files: Vec<PathBuf>,
+    /// Positional args: .sil files, or after `--` the build command.
+    #[arg(value_name = "ARG", trailing_var_arg = true)]
+    args: Vec<String>,
 
     /// Run only the Pulse checker (null deref, use-after-free).
     #[arg(long)]
@@ -34,7 +48,7 @@ struct Cli {
     #[arg(long)]
     liveness_only: bool,
 
-    /// Output directory for report.json.
+    /// Output directory for report.json and exported textual.
     #[arg(short = 'o', long = "output", default_value = "infer-rs-out")]
     out_dir: PathBuf,
 
@@ -54,6 +68,10 @@ struct Cli {
     #[arg(long = "max-widens")]
     max_widens: Option<usize>,
 
+    /// Number of parallel analysis jobs (default: number of CPUs).
+    #[arg(short = 'j', long = "jobs")]
+    jobs: Option<usize>,
+
     /// Analysis debug level: 0=quiet, 1=per-instruction, 2=full state dumps.
     /// Matches OCaml's --debug-level-analysis. Also controlled via RUST_LOG env.
     #[arg(long = "debug-level-analysis", default_value = "0")]
@@ -62,6 +80,14 @@ struct Cli {
     /// Path to .inferconfig file (default: search upward from CWD).
     #[arg(long = "inferconfig-path")]
     inferconfig_path: Option<PathBuf>,
+
+    /// Path to infer binary (default: auto-detect).
+    #[arg(long = "infer-bin")]
+    infer_bin: Option<PathBuf>,
+
+    /// Infer results directory (default: infer-out).
+    #[arg(long = "results-dir")]
+    results_dir: Option<PathBuf>,
 }
 
 impl Cli {
@@ -98,17 +124,57 @@ impl Cli {
         if self.debug_level_analysis > 0 {
             c.debug_level_analysis = self.debug_level_analysis;
         }
+        if self.jobs.is_some() {
+            c.jobs = self.jobs;
+        }
 
         c
     }
+
+    /// Determine what mode we're running in based on args.
+    fn mode(&self) -> Mode {
+        // If we have --capture-textual files, analyze those directly
+        if !self.capture_textual.is_empty() {
+            return Mode::DirectSil(self.capture_textual.clone());
+        }
+
+        // Check if args start with "--" (trailing_var_arg captures everything after --)
+        // or are .sil files
+        if !self.args.is_empty() {
+            // If all args are .sil files, treat as direct mode
+            let all_sil = self.args.iter().all(|a| a.ends_with(".sil"));
+            if all_sil {
+                return Mode::DirectSil(self.args.iter().map(PathBuf::from).collect());
+            }
+            // Otherwise it's a build command
+            return Mode::CaptureAndAnalyze(self.args.clone());
+        }
+
+        // No args: analyze existing capture.db
+        Mode::AnalyzeExisting
+    }
+}
+
+enum Mode {
+    /// `infer-rs -- clang -c file.c` — capture then analyze
+    CaptureAndAnalyze(Vec<String>),
+    /// `infer-rs` — export from existing capture.db then analyze
+    AnalyzeExisting,
+    /// `infer-rs file.sil` — analyze .sil files directly
+    DirectSil(Vec<PathBuf>),
+}
+
+/// A file to analyze: the .sil path and optionally the original source filename.
+struct AnalysisFile {
+    sil_path: PathBuf,
+    /// Original source file (e.g. "test.c"). None = use .sil filename.
+    source: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    // Initialize logging: --debug-level-analysis maps to log levels,
-    // but RUST_LOG env var takes precedence if set.
-    // 0 = warn (default), 1 = debug (per-instruction), 2 = trace (full state)
+    // Initialize logging
     if std::env::var("RUST_LOG").is_err() {
         let level = match cli.debug_level_analysis {
             0 => "warn",
@@ -119,22 +185,66 @@ fn main() {
     }
     env_logger::init();
 
-    let sil_files: Vec<PathBuf> = cli
-        .capture_textual
-        .iter()
-        .chain(cli.files.iter())
-        .cloned()
-        .collect();
-
-    if sil_files.is_empty() {
-        eprintln!("error: no .sil files specified");
-        eprintln!("Usage: infer-rs [--capture-textual] <FILE.sil>...");
-        process::exit(1);
-    }
-
     // Initialize global config from .inferconfig + CLI args
     config::init(cli.to_config());
     let cfg = config::get();
+
+    // Configure rayon thread pool
+    if let Some(j) = cfg.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(j)
+            .build_global()
+            .expect("failed to initialize rayon thread pool");
+    }
+
+    let mode = cli.mode();
+    let files: Vec<AnalysisFile> = match mode {
+        Mode::CaptureAndAnalyze(ref build_cmd) => {
+            let infer_out = cli
+                .results_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("infer-out"));
+            run_capture(build_cmd, &infer_out, cli.infer_bin.as_deref(), cfg.quiet);
+            export_textual(
+                &infer_out,
+                &cli.out_dir,
+                cli.infer_bin.as_deref(),
+                cfg.quiet,
+            )
+        }
+        Mode::AnalyzeExisting => {
+            let infer_out = cli
+                .results_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("infer-out"));
+            if !infer_out.join("capture.db-wal").exists() && !infer_out.join("capture.db").exists()
+            {
+                eprintln!(
+                    "error: no capture.db found in {}. Run with -- <build command> first.",
+                    infer_out.display()
+                );
+                process::exit(1);
+            }
+            export_textual(
+                &infer_out,
+                &cli.out_dir,
+                cli.infer_bin.as_deref(),
+                cfg.quiet,
+            )
+        }
+        Mode::DirectSil(paths) => paths
+            .into_iter()
+            .map(|p| AnalysisFile {
+                sil_path: p,
+                source: None,
+            })
+            .collect(),
+    };
+
+    if files.is_empty() {
+        eprintln!("error: no .sil files to analyze");
+        process::exit(1);
+    }
 
     let run_pulse = cfg.pulse_only || !cfg.liveness_only;
     let run_liveness = cfg.liveness_only || !cfg.pulse_only;
@@ -143,19 +253,19 @@ fn main() {
     let mut total_procs = 0;
     let mut total_files = 0;
 
-    for sil_path in &sil_files {
+    for af in &files {
         if !cfg.quiet {
-            eprintln!("Analyzing {}", sil_path.display());
+            eprintln!("Analyzing {}", af.sil_path.display());
         }
 
-        match analyze_file(sil_path, run_pulse, run_liveness) {
+        match analyze_file(&af.sil_path, af.source.as_deref(), run_pulse, run_liveness) {
             Ok((log, num_procs)) => {
                 total_procs += num_procs;
                 total_files += 1;
                 all_issues.merge(log);
             }
             Err(e) => {
-                eprintln!("error: {}: {e}", sil_path.display());
+                eprintln!("error: {}: {e}", af.sil_path.display());
             }
         }
     }
@@ -199,8 +309,164 @@ fn main() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capture & export
+// ---------------------------------------------------------------------------
+
+/// Find the infer binary. Checks: explicit path, INFER_BIN env, relative path, PATH.
+fn find_infer(explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        if p.exists() {
+            return p.to_path_buf();
+        }
+        eprintln!("error: infer binary not found at {}", p.display());
+        process::exit(1);
+    }
+    if let Ok(bin) = std::env::var("INFER_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return p;
+        }
+    }
+    // Relative to workspace root: ../infer/bin/infer
+    let ws_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf());
+    if let Some(root) = ws_root {
+        let candidate = root.join("infer/bin/infer");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Fall back to PATH
+    if let Ok(output) = std::process::Command::new("which").arg("infer").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    eprintln!("error: cannot find infer binary. Set --infer-bin or INFER_BIN.");
+    process::exit(1);
+}
+
+/// Run `infer capture --store-textual -- <build_cmd>`.
+fn run_capture(build_cmd: &[String], infer_out: &Path, infer_bin: Option<&Path>, quiet: bool) {
+    let infer = find_infer(infer_bin);
+    if !quiet {
+        eprintln!(
+            "Capturing: infer --store-textual -o {} -- {}",
+            infer_out.display(),
+            build_cmd.join(" ")
+        );
+    }
+
+    let status = std::process::Command::new(&infer)
+        .arg("--store-textual")
+        .arg("-o")
+        .arg(infer_out)
+        .arg("-j")
+        .arg("1")
+        .arg("--")
+        .args(build_cmd)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("error: infer capture exited with {s}");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: failed to run infer: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Run `infer debug --export-textual <dir> -o <infer_out>` and return analysis files.
+fn export_textual(
+    infer_out: &Path,
+    out_dir: &Path,
+    infer_bin: Option<&Path>,
+    quiet: bool,
+) -> Vec<AnalysisFile> {
+    let infer = find_infer(infer_bin);
+    let export_dir = out_dir.join("textual");
+    if let Err(e) = std::fs::create_dir_all(&export_dir) {
+        eprintln!("error: failed to create export directory: {e}");
+        process::exit(1);
+    }
+
+    if !quiet {
+        eprintln!(
+            "Exporting textual: infer debug --export-textual {} -o {}",
+            export_dir.display(),
+            infer_out.display()
+        );
+    }
+
+    let output = std::process::Command::new(&infer)
+        .arg("debug")
+        .arg("--export-textual")
+        .arg(&export_dir)
+        .arg("-o")
+        .arg(infer_out)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            if !quiet {
+                let msg = String::from_utf8_lossy(&o.stdout);
+                if !msg.is_empty() {
+                    eprint!("{msg}");
+                }
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!("error: infer debug --export-textual failed: {stderr}");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: failed to run infer debug: {e}");
+            process::exit(1);
+        }
+    }
+
+    // Read manifest.json
+    let manifest_path = export_dir.join("manifest.json");
+    read_manifest(&manifest_path, &export_dir)
+}
+
+/// Parse manifest.json and return analysis files with source mappings.
+fn read_manifest(manifest_path: &Path, base_dir: &Path) -> Vec<AnalysisFile> {
+    let entries = match config::manifest::read_manifest(manifest_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+
+    entries
+        .iter()
+        .map(|e| AnalysisFile {
+            sil_path: base_dir.join(&e.sil),
+            source: Some(e.source.clone()),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Analysis
+// ---------------------------------------------------------------------------
+
 fn analyze_file(
     path: &Path,
+    source_override: Option<&str>,
     run_pulse: bool,
     run_liveness: bool,
 ) -> Result<(IssueLog, usize), String> {
@@ -213,6 +479,11 @@ fn analyze_file(
     let mut module =
         textual::parse_module(&src, filename).map_err(|e| format!("parse error: {e}"))?;
 
+    // Override source_file with original filename from manifest
+    if let Some(source) = source_override {
+        module.source_file = source.to_string();
+    }
+
     let (decls, decl_errors) = textual::decls::DeclEnv::from_module(&module);
     if !decl_errors.is_empty() {
         return Err(format!("declaration errors: {decl_errors:?}"));
@@ -221,8 +492,17 @@ fn analyze_file(
     // Run Textual transforms (let_propagation inlines __sil_* builtins)
     textual::transform::run(&mut module, &decls);
 
-    let (sil_cfg, tenv) = textual::to_sil::module_to_sil(&module, &decls)
-        .map_err(|e| format!("conversion errors: {e:?}"))?;
+    // Build line map for source location remapping (@[line:col] and // .line)
+    let line_map = textual::line_map::LineMap::create(&src);
+    let line_map_ref = if line_map.is_empty() {
+        None
+    } else {
+        Some(&line_map)
+    };
+
+    let (sil_cfg, tenv) =
+        textual::to_sil::module_to_sil_with_line_map(&module, &decls, line_map_ref)
+            .map_err(|e| format!("conversion errors: {e:?}"))?;
 
     let mut log = IssueLog::new();
     let num_procs = sil_cfg.num_procs();

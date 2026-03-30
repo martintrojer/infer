@@ -16,6 +16,8 @@
 //! `.inferconfig` files shared with OCaml infer to work without
 //! modification.
 
+pub mod manifest;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -104,6 +106,12 @@ pub struct InferConfig {
     #[serde(rename = "debug-level-analysis")]
     pub debug_level_analysis: u8,
 
+    // ---- Parallelism ----
+    /// Number of parallel analysis jobs. None = use all available CPUs.
+    /// OCaml: `-j` / `--jobs` (default: number of CPUs)
+    #[serde(rename = "jobs")]
+    pub jobs: Option<usize>,
+
     // ---- Output ----
     /// Suppress progress output.
     #[serde(rename = "quiet")]
@@ -120,6 +128,7 @@ impl Default for InferConfig {
             liveness_only: false,
             max_widens: 10_000,
             debug_level_analysis: 0,
+            jobs: None,
             quiet: false,
         }
     }

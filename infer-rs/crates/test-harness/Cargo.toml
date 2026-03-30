@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 sil = { path = "../sil" }
 textual = { path = "../textual" }
+config = { path = "../config" }
 serde = { workspace = true }
 serde_json = "1"

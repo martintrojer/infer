@@ -2,7 +2,7 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (C sweep: NPE expected 135, found 130. Leaks expected 20, found 20)
+### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE 130/135, Leaks 20/20, UAF 10/7)
 
 **NPE Over-detection (FPs, +7 total):**
 
@@ -25,6 +25,14 @@
 11. **cleanup_attribute.c** (+2): `__attribute__((cleanup()))` GCC extension not modeled. Cleanup function (free) called automatically at scope exit — not modeled.
 12. **nullptr.c** (-1): `null_alias_bad` — formal parameter overwritten with malloc, missing `restore_formals_for_summary` logic.
 13. **memory_leak.c** (-1): funptr wrapper pattern (`malloc_func`).
+
+**UAF over-detection (+3 FPs):**
+
+14. **latent.c** (+3): Latent issue propagation FPs — `propagate_latent` chain not working, needs `read_heap` pre-edge overwrite fix for linear_eqs in `is_manifest`.
+15. **interprocedural.c** (+1): `conditional_free_then_use_latent` reported at both callee and caller.
+16. **specialization.c** (-1): Missing funptr-based UAF.
+
+**Skipped files (3):** infinite.c (106 procs with infinite loops/Ackermann), recursion.c, recursion2.c — fixpoint exhaustion.
 
 **Files matching OCaml (20 clean, NPE+Leaks):** enum.c, frontend.c, memcpy.c, getcwd.c, shift.c, var_arg.c, ternary.c, nullptr.c, lists.c, list_checks.c, uninit.c, assert_failure.c, specialization.c, arithmetic.c, integers.c, abduce.c, struct_values.c, interprocedural.c, memory_leak_more.c, issues_abort_execution.c, traces.c.
 

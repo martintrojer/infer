@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use diagnostics::issue_type::IssueTypeId;
 use sil::location::Location;
 
 use crate::abstract_value::AbstractValue;
@@ -47,18 +48,18 @@ impl Diagnostic {
                 invalidation_location,
                 ..
             } => (
-                self.get_issue_type().to_string(),
+                self.get_issue_type_id().id().to_string(),
                 invalidation_location.clone(),
             ),
             Diagnostic::MemoryLeak {
                 allocation_location,
                 ..
             } => (
-                self.get_issue_type().to_string(),
+                self.get_issue_type_id().id().to_string(),
                 allocation_location.clone(),
             ),
             Diagnostic::RetainCycle { location } => {
-                (self.get_issue_type().to_string(), location.clone())
+                (self.get_issue_type_id().id().to_string(), location.clone())
             }
         }
     }
@@ -77,63 +78,51 @@ impl Diagnostic {
         }
     }
 
-    /// Get the issue type string for reporting.
-    pub fn get_issue_type(&self) -> &str {
+    /// Get the well-known issue type ID.
+    pub fn get_issue_type_id(&self) -> IssueTypeId {
         match self {
             Diagnostic::AccessToInvalidAddress { invalidation, .. } => {
                 if invalidation.is_null_deref() {
-                    "NULL_DEREFERENCE"
+                    IssueTypeId::NullptrDereference
                 } else {
                     match invalidation {
-                        Invalidation::CFree | Invalidation::FClose => "USE_AFTER_FREE",
+                        Invalidation::CFree | Invalidation::FClose => IssueTypeId::UseAfterFree,
                         Invalidation::CppDelete | Invalidation::CppDeleteArray => {
-                            "USE_AFTER_DELETE"
+                            IssueTypeId::UseAfterDelete
                         }
-                        Invalidation::GoneOutOfScope(_, _) => "USE_AFTER_LIFETIME",
-                        Invalidation::OptionalEmpty => "OPTIONAL_EMPTY_ACCESS",
-                        Invalidation::StdVector(_) => "VECTOR_INVALIDATION",
-                        _ => "PULSE_ERROR",
+                        Invalidation::GoneOutOfScope(_, _) => IssueTypeId::UseAfterLifetime,
+                        Invalidation::OptionalEmpty => IssueTypeId::OptionalEmptyAccess,
+                        Invalidation::StdVector(_) => IssueTypeId::VectorInvalidation,
+                        _ => IssueTypeId::PulseError,
                     }
                 }
             }
-            Diagnostic::MemoryLeak { .. } => "MEMORY_LEAK_C",
-            Diagnostic::RetainCycle { .. } => "RETAIN_CYCLE",
+            Diagnostic::MemoryLeak { .. } => IssueTypeId::MemoryLeakC,
+            Diagnostic::RetainCycle { .. } => IssueTypeId::RetainCycle,
         }
+    }
+
+    /// Get the issue type string for reporting. Matches OCaml's issue type IDs.
+    pub fn get_issue_type(&self) -> &'static str {
+        self.get_issue_type_id().id()
     }
 
     /// Get the severity.
     pub fn get_severity(&self) -> diagnostics::issue_type::Severity {
-        match self {
-            Diagnostic::MemoryLeak { .. } => diagnostics::issue_type::Severity::Warning,
-            _ => diagnostics::issue_type::Severity::Error,
-        }
+        self.get_issue_type_id().severity()
     }
 
     /// Get the issue category.
     pub fn get_category(&self) -> diagnostics::issue_type::Category {
-        match self {
-            Diagnostic::AccessToInvalidAddress { invalidation, .. } => {
-                if invalidation.is_null_deref() {
-                    diagnostics::issue_type::Category::NullDereference
-                } else {
-                    diagnostics::issue_type::Category::MemoryError
-                }
-            }
-            Diagnostic::MemoryLeak { .. } => diagnostics::issue_type::Category::ResourceLeak,
-            Diagnostic::RetainCycle { .. } => diagnostics::issue_type::Category::MemoryError,
-        }
+        self.get_issue_type_id().category()
     }
 
     /// Convert to a diagnostics::Issue for reporting.
     pub fn to_issue(&self, procedure: &str) -> diagnostics::issue::Issue {
         let loc = self.get_location();
+        let type_id = self.get_issue_type_id();
         diagnostics::issue::Issue {
-            issue_type: diagnostics::issue_type::IssueType {
-                id: self.get_issue_type().to_string(),
-                severity: self.get_severity(),
-                category: self.get_category(),
-                checker: diagnostics::issue_type::Checker("Pulse".to_string()),
-            },
+            issue_type: diagnostics::issue_type::IssueType::from_id(type_id, "Pulse"),
             qualifier: format!("{self}"),
             file: format!("{}", loc.file),
             line: loc.line as u32,
