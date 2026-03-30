@@ -48,6 +48,18 @@ struct Cli {
     #[arg(long)]
     liveness_only: bool,
 
+    /// Regex of methods to model as wrappers to `free(3)`.
+    #[arg(long = "pulse-model-free-pattern")]
+    pulse_model_free_pattern: Option<String>,
+
+    /// Regex of methods to model as wrappers to `malloc(3)`.
+    #[arg(long = "pulse-model-malloc-pattern")]
+    pulse_model_malloc_pattern: Option<String>,
+
+    /// Regex of methods to model as wrappers to `realloc(3)`.
+    #[arg(long = "pulse-model-realloc-pattern")]
+    pulse_model_realloc_pattern: Option<String>,
+
     /// Output directory for report.json and exported textual.
     #[arg(short = 'o', long = "output", default_value = "infer-rs-out")]
     out_dir: PathBuf,
@@ -108,6 +120,15 @@ impl Cli {
         }
         if self.liveness_only {
             c.liveness_only = true;
+        }
+        if let Some(v) = &self.pulse_model_free_pattern {
+            c.pulse_model_free_pattern = Some(v.clone());
+        }
+        if let Some(v) = &self.pulse_model_malloc_pattern {
+            c.pulse_model_malloc_pattern = Some(v.clone());
+        }
+        if let Some(v) = &self.pulse_model_realloc_pattern {
+            c.pulse_model_realloc_pattern = Some(v.clone());
         }
         if self.quiet {
             c.quiet = true;
@@ -670,8 +691,14 @@ fn analyze_with_spec_loop(
             }
             if let Some(callee_pdesc) = ctx.cfg.get_proc_desc(callee_pname) {
                 let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
+                let spec_summary_for_store = spec_summary.clone();
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
                     existing.add_specialized_summary(spec.clone(), spec_summary);
+                    let _ = ctx.summaries.update(callee_pname, |stored| {
+                        if stored.get_specialized(spec).is_none() {
+                            stored.add_specialized_summary(spec.clone(), spec_summary_for_store);
+                        }
+                    });
                     added_any = true;
                 }
             }

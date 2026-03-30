@@ -2,38 +2,45 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE 138/135, Leaks 23/20, UAF 8/7)
+### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE expected 131 found 139, Leaks expected 20 found 22, UAF expected 7 found 7)
 
-Correctness note: the recent equality-incorporation + abort-propagation fixes intentionally moved
-the totals. `specialization.c` is now correct again, but the new sweep exposed a different problem:
-AbortProgram/report publication is still not aligned with OCaml, so some interprocedural files now
-over-report. Keep the semantically correct execution fix; align report timing/publication next.
+Correctness note: keep the semantically correct specialization / latent-invalid-access /
+specialized-summary fixes even when totals move temporarily. The current sweep reflects the real
+remaining count gaps after removing the old basename-matching measurement bug.
 
-**NPE Over-detection (FPs, +14 gross / +3 net):**
+**NPE Over-detection (FPs, +10 gross / +8 net):**
 
-1. **AbortProgram/reporting parity** (+6): interprocedural.c (+3), latent.c (+3). After restoring callee AbortProgram propagation, report publication is still too eager compared with OCaml.
-2. **Nullptr family** (+4): nullptr.c (+2), nullptr_more.c (+2). Mix of write-through-pointer / biabduction/reporting mismatches.
-3. **sizeof / offsetof** (+3): sizeof.c (+2), offsetof_expr.c (+1). `sizeof.c` remains partly blocked on missing `<int[]>` length info.
-4. **angelism.c** (+1): remaining interproc/reporting issue.
+1. **Nullptr + integer-ish cluster** (+9): `integers.c` (+2), `nullptr.c` (+2), `nullptr_more.c` (+2), `offsetof_expr.c` (+1), `sizeof.c` (+2).
+2. **angelism.c** (+1): likely still an interprocedural/reporting mismatch.
 
-**NPE Under-detection (FNs, -11 gross):**
+**NPE Under-detection (FNs, -2 gross):**
 
-5. **Function pointer dispatch** (-5): funptr.c (11→6). Direct dispatch + single-level specialization work. Remaining: returned funptr, struct callbacks, deeper specialization chains.
-6. **Deep interproc / models** (-4): initlistexpr.c (4→1), compound_literal.c (2→1).
-7. **Function-pointer wrappers** (-2): memory_leak.c (3→1 NPEs).
+3. **memory_leak.c** (-2): remaining function-pointer-wrapper / null-path issue-set mismatch.
 
-**Leak differences (+3 FPs):**
+**Leak differences (+2 FPs in sweep):**
 
-8. **cleanup_attribute.c** (+2): `__attribute__((cleanup()))` GCC extension not modeled. Cleanup function (free) called automatically at scope exit — not modeled.
-9. **memory_leak.c** (+1): mixed bag of funptr wrapper misses and independent leak FPs.
+4. **cleanup_attribute.c** (+2): `__attribute__((cleanup()))` GCC extension still not modeled closely enough.
 
-**UAF differences (+1 FP):**
+**Config / harness follow-up:**
 
-10. **AbortProgram/reporting parity** (+1): interprocedural.c now reports one extra UAF after preserving callee AbortProgram summaries. Likely the same structural publication issue as the NPE over-counts.
+5. **Thread per-suite `.inferconfig` into the ignored sweep harness**: support for
+   `pulse-model-{free,malloc,realloc}-pattern` is implemented, but the ignored store-textual sweep
+   still does not load suite-local `.inferconfig` files. Until that is fixed, config-driven
+   correctness changes will not affect the published sweep totals.
 
-**Skipped files (3):** infinite.c (106 procs with infinite loops/Ackermann), recursion.c, recursion2.c — fixpoint exhaustion.
+**Masked direct-run issue-set gaps:**
 
-**Notable recent correctness wins:** `specialization.c` now matches the direct OCaml issue set again after wiring formula equalities back into the abductive state and preserving callee AbortProgram summaries; `assert.c` and `ternary.c` remain fixed by OCaml-style condition-depth tracking without reintroducing the latent/base bug.
+6. **memory_leak.c leak parity is still not truly done**: with
+   `infer/tests/codetoanalyze/c/pulse/.inferconfig`, Rust now recovers `user_malloc_leak_bad` and
+   `test_config_options_no_free_bad`, but pointer-arithmetic / array reachability still produces
+   false positives that happen to cancel in the sweep counts.
+
+**Skipped files (3):** `infinite.c` (106 procs with infinite loops/Ackermann), `recursion.c`,
+`recursion2.c` — fixpoint exhaustion.
+
+**Notable recent correctness wins:** `funptr.c` is now at parity (`11` issues), `specialization.c`
+is back to the direct OCaml issue set, and `compound_literal.c` / `initlistexpr.c` already match
+OCaml after fixing the sweep expectation helper to use exact basenames.
 
 ### Textual pipeline gaps
 
@@ -52,7 +59,7 @@ over-report. Keep the semantically correct execution fix; align report timing/pu
 - **ValueHistory threading**: Error trace reconstruction. Cross-ref: `PulseValueHistory.ml`.
 - **Global variable handling** in summary application.
 - **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Remaining gap: `<int[]>` without array length.
-- **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, and callee AbortProgram summaries now propagate again. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, `LatentInvalidAccess`, latent issue type reporting, and OCaml-aligned publication timing for propagated aborts.
+- **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, callee AbortProgram summaries now propagate again, and Rust now has a caller-side latent-invalid-access path. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, latent issue type reporting, and OCaml-aligned publication timing for any still-propagated abort over-reports.
 
 ## Debugging tools
 

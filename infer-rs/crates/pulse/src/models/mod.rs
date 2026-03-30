@@ -42,6 +42,7 @@ static MODELED_FUNCTIONS: LazyLock<std::collections::HashSet<&'static str>> = La
 /// Check if a callee has any model (cheap, no cloning).
 pub fn has_model(callee: &Procname) -> bool {
     MODELED_FUNCTIONS.contains(callee.get_method_name())
+        || c::matches_configured_wrapper(callee, config::get())
 }
 
 /// Try to dispatch a call to a built-in model.

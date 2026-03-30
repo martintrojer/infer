@@ -160,7 +160,12 @@ pub fn parse_issues_exp(path: &Path) -> Vec<ExpectedIssue> {
 pub fn issues_for_file<'a>(issues: &'a [ExpectedIssue], filename: &str) -> Vec<&'a ExpectedIssue> {
     issues
         .iter()
-        .filter(|i| i.file.ends_with(filename))
+        .filter(|i| {
+            Path::new(&i.file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(filename)
+        })
         .collect()
 }
 
@@ -190,5 +195,27 @@ mod tests {
     fn test_list_sil_files_nonexistent_dir() {
         let files = list_sil_files(Path::new("/nonexistent/path"));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_issues_for_file_matches_exact_basename() {
+        let issues = vec![
+            ExpectedIssue {
+                file: "codetoanalyze/c/pulse/compound_literal.c".to_string(),
+                procedure: "detect_zero_bad".to_string(),
+                line: 3,
+                issue_type: "NULLPTR_DEREFERENCE".to_string(),
+            },
+            ExpectedIssue {
+                file: "codetoanalyze/c/pulse/frontend_compound_literal.c".to_string(),
+                procedure: "init_with_compound_literal_npe_bad".to_string(),
+                line: 4,
+                issue_type: "NULLPTR_DEREFERENCE".to_string(),
+            },
+        ];
+
+        let matched = issues_for_file(&issues, "compound_literal.c");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].procedure, "detect_zero_bad");
     }
 }

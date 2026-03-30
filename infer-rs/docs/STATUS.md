@@ -2,9 +2,13 @@
 
 ## Summary
 
-**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 135, found 138. Leak detection: expected 20, found 23. UAF detection: expected 7, found 8. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, sizeof/float evaluation, per-instruction tracing. funptr.c: 6/11. specialization.c: 5/5.**
+**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 139. Leak detection: expected 20, found 22. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, per-instruction tracing, OCaml-compatible wrapper-model config flags. funptr.c: 11/11. specialization.c: 5/5.**
 
 Recent correctness / robustness fixes:
+- Added a Rust analogue of OCaml's latent-invalid-access flow and caller-side reification, which restores the missing aliased UAF behavior in `specialization.c` without turning callee-only paths into manifest base reports.
+- Specialized summaries are now published back into the owning ondemand summary store, which restores `funptr.c` parity in the direct CLI/store pipeline.
+- The store-textual sweep expectation helper now matches exact basenames instead of suffixes, which removed fake `compound_literal.c` / `initlistexpr.c` diffs caused by filename collisions.
+- OCaml-compatible `pulse-model-free-pattern`, `pulse-model-malloc-pattern`, and `pulse-model-realloc-pattern` flags are now supported through `.inferconfig` and CLI overrides, including the shared `Str.regexp` syntax used by Infer test suites.
 - OCaml-style `NewEq` incorporation is now wired back into the abductive state: formula equalities rewrite heap/attrs/tracking sets instead of staying solver-only. This restored the missing aliased-specialization behavior in `specialization.c`.
 - Specialized-alias reasoning now affects actual heap semantics, not just formula representatives: `call_test_alias_bad`, `call_test_unalias_bad`, and `call_may_double_free_if_alias_bad` are all back in the direct `specialization.c` run.
 - `apply_summary` now preserves `AbortProgram` summaries instead of dropping them, matching OCaml `PulseCallOperations.apply_callee` more closely.
@@ -38,8 +42,8 @@ Pulse features:
 - **Formula solver**: union-find, linear arithmetic, atoms, term equalities, CItv integer intervals, `is_int` reasoning, LessThan implication checks, FunctionApplication tracking
 - **Path-sensitive constant folding**: comparison ops, Mult/DivI/DivF/Mod, Shiftlt/Shiftrt, BAnd/BOr/BXor
 - **`__sil_*` builtin conversion**: 23+ binops, 3 unops, allocate, cast, cfun
-- **C models**: malloc/free/realloc, new/delete, exit/abort/\_\_assert\_rtn (noreturn), fopen/getcwd (null/non-null), memcpy/memmove, \_\_builtin\_expect, 18 stdio arg checks
-- **Memory leak detection**: unreachable allocated-not-freed addresses at summary creation, `find_return_value` void fix, `getcwd` conditional alloc, `is_known_nonzero` atom check
+- **C models**: malloc/free/realloc, new/delete, exit/abort/\_\_assert\_rtn (noreturn), fopen/getcwd (null/non-null), memcpy/memmove, \_\_builtin\_expect, 18 stdio arg checks, config-driven malloc/free/realloc wrapper matching via OCaml-compatible `.inferconfig` regexes
+- **Memory leak detection**: unreachable allocated-not-freed addresses at summary creation, `find_return_value` void fix, `getcwd` conditional alloc, `is_known_nonzero` atom check, custom allocator tracking for config-driven wrappers
 - **Function pointer dispatch** via `__call_c_function_ptr` + Closure attributes
 - **Noreturn detection** propagated interprocedurally
 - **Deterministic analysis**: thread-local counters + BTreeMap in core structures
@@ -257,7 +261,7 @@ Remaining 27 tests are blocked on: exceptions (7), closure-to-object (3), tenv a
 52 of 55 C source files pass through the full pipeline: C source → OCaml `infer --store-textual` → `infer debug --export-textual` → manifest.json → Rust parse → Pulse analysis.
 This is the authoritative compliance benchmark because it matches the CLI capture/export path.
 
-Run with: `cargo test --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+Run with: `cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
 
 The repo also keeps a separate `capture --dump-textual` sweep as a secondary regression test for the raw dumped `.sil` path. That sweep is useful for parser/to_sil debugging, but its numbers are not the published compliance baseline.
 
@@ -265,58 +269,48 @@ The repo also keeps a separate `capture --dump-textual` sweep as a secondary reg
 
 | Status | Count | Details |
 |---|---|---|
-| OK | 52 | parsed + analyzed, 653 procs, 158 issues |
+| OK | 52 | parsed + analyzed, 653 procs, 168 issues |
 | SKIP | 3 | infinite.c, recursion.c, recursion2.c (fixpoint exhaustion) |
 | FAIL_PARSE | 0 | |
 | TIMEOUT | 0 | |
 
-**NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 135, found 128 (deterministic).**
-
-This lower total is a correctness improvement, not a regression to paper over. The previous higher
-count was partly inflated by latent issues being published as manifest base reports. The current
-sweep reflects the real remaining NPE miss/FP backlog after fixing that latent/base confusion.
-
-Under-detection (we miss issues OCaml finds):
-- **Function pointer dispatch**: funptr.c (11→6). Specialization infrastructure is in place; remaining FNs need deeper call-chain specialization.
-- **Function-pointer wrappers**: memory_leak.c (3→1 NPEs). Uses `static void* (*const malloc_func)(size_t) = malloc` — needs funptr dispatch.
-- **Deep interproc / models**: initlistexpr.c (4→1), compound_literal.c (2→1).
-- **Loop depth / traces**: latent.c (5→3), traces.c (5→4).
-
-Recent win in this area:
-- `assert.c` (1→1) and `ternary.c` (3→3) are now back after adding OCaml-style condition-depth tracking for prune conditions.
-
-Over-detection (we report more than OCaml):
-- **sizeof array** (+2): sizeof.c. `<int[]>` textual loses array length.
-- **nullptr_more.c** (+2): write_deref pre-edges too aggressive.
-- **Other** (+3): angelism.c (+1), nullptr.c (+1), offsetof_expr.c (+1).
-
-**MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 24.**
+**NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 131, found 139.**
 
 Per-file differences:
-- cleanup_attribute.c (+2): GCC cleanup attribute not modeled
-- memory_leak.c (+2): mixed funptr-wrapper misses plus independent leak FPs
+- Over-detection: `angelism.c` (+1), `integers.c` (+2), `nullptr.c` (+2), `nullptr_more.c` (+2),
+  `offsetof_expr.c` (+1), `sizeof.c` (+2)
+- Under-detection: `memory_leak.c` (-2)
 
-**USE_AFTER_FREE comparison vs OCaml `issues.exp`: expected 7, found 6 (-1 FN).**
+Recent wins in this area:
+- `funptr.c` now matches OCaml in the store/direct pipeline (`11` issues).
+- `compound_literal.c` and `initlistexpr.c` already match OCaml; their earlier sweep diffs were
+  measurement bugs caused by basename suffix matching in the expectation helper.
+- `assert.c` and `ternary.c` remain fixed by OCaml-style prune-condition depth tracking.
 
-The previous `+3` UAF over-detection was caused by latent issues being published as manifest. That
-is now fixed. The only remaining UAF gap is:
+**MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 22.**
 
-- specialization.c (-1): aliased-actual UAF in `call_may_double_free_if_alias_bad`
+Per-file differences:
+- `cleanup_attribute.c` (+2): GCC `__attribute__((cleanup()))` parity is still missing.
 
-**Notable direct-match win:** `interprocedural.c` is back to the direct OCaml issue set after the
-latent/manifest reporting fix.
+Direct issue-set note:
+- `pulse-model-{free,malloc,realloc}-pattern` support is now implemented and direct CLI runs with
+  `infer/tests/codetoanalyze/c/pulse/.inferconfig` recover `user_malloc_leak_bad` and
+  `test_config_options_no_free_bad` in `memory_leak.c`.
+- The current ignored store-textual sweep still does not load per-suite `.inferconfig`
+  automatically, so those config-driven fixes are not reflected in the published sweep totals yet.
+
+**USE_AFTER_FREE comparison vs OCaml `issues.exp`: expected 7, found 7.**
+
+UAF sweep parity is now exact.
+
+**Notable direct-match wins:** `funptr.c` is `11/11`, `specialization.c` is `5/5`, and
+`interprocedural.c` matches the direct OCaml issue set again.
 
 **Summary comparison (15 files, via `infer debug --dump-json-summaries`):**
 
-This snapshot is stale relative to the latest latent-reporting fix and should be re-run before using
-the exact counts below.
-
-Disjunct count mismatches (older snapshot, before latest latent fix):
-- `ocaml=3, rust=2` (23 procs): caller-side latent propagation missing
-- `ocaml=5, rust=2` (16 procs): mostly fopen patterns (multiple error paths)
-- `ocaml=2, rust=1` (10 procs): LatentInvalidAccess or noreturn gaps
-
-Other mismatches: null_attrs (22 procs, rust missing Invalid attrs), noreturn (21 procs).
+The older summary-comparison snapshot is now stale relative to the latent-invalid-access,
+specialized-summary publication, basename-fix, and config-support work above. Re-run it before
+using any exact disjunct/null-attr mismatch counts.
 
 ## Known Issues / Gaps
 
@@ -325,50 +319,62 @@ Other mismatches: null_attrs (22 procs, rust missing Invalid attrs), noreturn (2
 3. **Liveness simplified**: No exception handling. Dead store reporter lacks suppression heuristics.
 4. **Pulse interprocedural gaps** vs OCaml:
    - Latent/base publishing now goes through summary classification instead of raw abort scans.
-   - Missing: `LatentInvalidAccess`, `pre_heap_has_assumptions` parity in `Formula.is_manifest`, latent issue type reporting
+   - Latent invalid access now exists for caller-derived invalid addresses; remaining mismatch is full `pre_heap_has_assumptions` / latent issue typing parity in `Formula.is_manifest`
    - No aliasing contradiction detection (cross-ref: `PulseInterproc.ml` AliasingWithAllAliases)
    - No `ValueHistory` threading for error trace reconstruction (cross-ref: `PulseValueHistory.ml`)
    - No global variable handling in summary application
    - Specialization implemented for function pointers; dynamic type specialization for OO not yet done
 5. **Pulse formula**: Union-find + linear arithmetic + atoms + term equalities + atom contradiction + CItv integer intervals + is_int integer reasoning. Missing: simplex tableau, non-linear terms.
-6. **Pulse models**: C models cover malloc/free/realloc, new/delete, exit/abort/__infer_fail/__assert_rtn (noreturn), fopen (null/non-null), memcpy/memmove (dest+src validity), 18 stdio arg checks, `__call_c_function_ptr` (function pointer dispatch). Missing: list API. No Java, Hack, ObjC models.
+6. **Pulse models**: C models cover malloc/free/realloc, config-driven malloc/free/realloc wrappers via `.inferconfig`, new/delete, exit/abort/__infer_fail/__assert_rtn (noreturn), fopen (null/non-null), memcpy/memmove (dest+src validity), 18 stdio arg checks, `__call_c_function_ptr` (function pointer dispatch). Missing: list API. No Java, Hack, ObjC models.
 7. **No summary persistence**: In-memory only. Optional disk persistence planned.
 8. **Closure-to-object transform**: Closures left as-is rather than transformed to object allocations.
 9. **Tenv annotations**: `.final`, `.abstract`, `.kind`, `.constant` struct attributes not handled in to_sil.
 
 ## What's Next (ranked by impact and tractability)
 
-### 1. Recover true NPE misses after the latent fix
-The NPE total is now lower for the right reason. The next work should recover real misses without
-reintroducing latent/base confusion:
+### 1. Thread per-suite `.inferconfig` into the ignored store-textual sweep
+The Rust side now supports OCaml-compatible `pulse-model-{free,malloc,realloc}-pattern`, but the
+ignored sweep still runs the library pipeline without loading per-suite `.inferconfig`. Until that
+is fixed, config-driven correctness work will not move the published totals.
 
-- funptr.c (11→6)
-- initlistexpr.c (4→1)
-- compound_literal.c (2→1)
-- memory_leak.c (3→1)
-- latent.c (5→3)
-- traces.c (5→4)
+### 2. Fix `cleanup_attribute.c` leak parity
+The sweep's only leak-count mismatch is now:
 
-### 2. Fix the remaining UAF miss
-specialization.c is the only remaining UAF gap (`call_may_double_free_if_alias_bad`). Most likely
-root cause: missing alias-specialization / aliasing-contradiction parity.
+- `cleanup_attribute.c` (+2): model GCC cleanup-attribute behavior closely enough to suppress the
+  current false positives in `cleanup_malloc_ok`
 
-### 3. Leak cleanup
-- cleanup_attribute.c (+2): model GCC cleanup attr
-- memory_leak.c (+2): separate wrapper misses from unrelated leak FPs
+### 3. Reduce the remaining NPE over-reports
+Current over-count cluster:
 
-### 4. `is_manifest` parity
-The current Rust implementation now has OCaml-style condition-depth tracking plus benign
-non-null/disequality handling, so the remaining gap is smaller:
+- `angelism.c` (+1)
+- `integers.c` (+2)
+- `nullptr.c` (+2)
+- `nullptr_more.c` (+2)
+- `offsetof_expr.c` (+1)
+- `sizeof.c` (+2)
+
+### 4. Investigate `memory_leak.c` issue-set parity
+The remaining NPE under-count is concentrated here (`-2` in the sweep), and direct runs still have
+hidden issue-set mismatches even when leak counts net out:
+
+- function-pointer wrapper null-path parity (`malloc_via_ptr`)
+- pointer-arithmetic / array reachability false positives (`alloc_ref_counted_ok`, array frees)
+- now-separate config-driven wrapper behavior versus core Pulse behavior
+
+### 5. Finish the remaining `is_manifest` / latent-reporting parity
+The current Rust implementation now has condition-depth tracking, latent invalid-access support, and
+specialized-summary filtering. The remaining gap is narrower:
 
 - `pre_heap_has_assumptions`
-- `LatentInvalidAccess`
-- latent issue type reporting
+- latent issue type reporting / traces
+- any residual propagated-abort publication mismatches behind the remaining NPE over-counts
 
 ### Other gaps
 
-**Leak compliance (expected 20, found 24):**
-Per-file differences cancel out: cleanup_attribute.c (+2, GCC cleanup attr), nullptr.c (-1, formal overwrite), memory_leak.c (-1, funptr wrapper).
+**Leak compliance (expected 20, found 22):**
+- Sweep-visible mismatch: `cleanup_attribute.c` (+2)
+- Hidden direct-run mismatch: `memory_leak.c` issue-set parity still depends on both config loading
+  and pointer-arithmetic reachability
 
 **SIL test gaps (from skipped procs):**
 - Virtual dispatch in loads (2 procs in static_types.sil)
@@ -377,8 +383,7 @@ Per-file differences cancel out: cleanup_attribute.c (+2, GCC cleanup attr), nul
 - Cross-file resolution (3 procs across npe*.sil)
 
 **Features:**
-- LatentInvalidAccess — second latent mechanism for must_be_valid addresses
-- Full `is_manifest` — match OCaml's allocated-pointer heuristic
+- Full `is_manifest` parity — match OCaml's allocated-pointer and pre-heap-assumption heuristics
 - Complete type verification — DFS ordering, terminator type checking, restore_ssa
 - More Pulse models — Java, Hack, ObjC
 - Summary persistence — serde+bincode to disk

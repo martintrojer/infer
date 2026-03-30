@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 
 # Logging
 log = "0.4"
+regex = "1"
 
 # Arbitrary precision integers (for IntLit)
 num-bigint = "0.4"

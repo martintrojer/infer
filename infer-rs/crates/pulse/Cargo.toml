@@ -12,6 +12,7 @@ config = { path = "../config" }
 diagnostics = { path = "../diagnostics" }
 serde = { workspace = true }
 log = { workspace = true }
+regex = { workspace = true }
 num-rational = "0.4"
 num-traits = { workspace = true }
 num-bigint = { workspace = true }

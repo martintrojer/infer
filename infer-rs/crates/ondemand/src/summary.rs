@@ -39,8 +39,10 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
     pub fn insert(&self, proc_name: Procname, summary: S) {
         let cell = Arc::new(OnceLock::new());
         let _ = cell.set(summary);
-        self.store.insert(proc_name, cell);
-        self.completed.fetch_add(1, Ordering::Relaxed);
+        let replaced = self.store.insert(proc_name, cell);
+        if replaced.is_none() {
+            self.completed.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Get a clone of a procedure's summary, if it has been computed.
@@ -83,6 +85,31 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
             self.completed.fetch_add(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Update an already computed summary in place.
+    ///
+    /// The update is atomic with respect to other updates on the same key:
+    /// we clone the current summary under the DashMap entry lock, apply the
+    /// mutation, then replace the stored OnceLock.
+    pub fn update(&self, proc_name: &Procname, f: impl FnOnce(&mut S)) -> bool
+    where
+        S: Clone,
+    {
+        let Some(mut entry) = self.store.get_mut(proc_name) else {
+            return false;
+        };
+        let Some(current) = entry.get().cloned() else {
+            return false;
+        };
+
+        let mut updated = current;
+        f(&mut updated);
+
+        let cell = Arc::new(OnceLock::new());
+        let _ = cell.set(updated);
+        *entry.value_mut() = cell;
+        true
     }
 
     /// Get a clone of a summary by procedure display name (exact or suffix match).
@@ -193,6 +220,17 @@ mod tests {
         // Second call returns cached value, doesn't call compute
         let v = store.get_or_compute(&pname, || panic!("should not be called"));
         assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn test_update_existing_summary() {
+        let store = SummaryStore::new();
+        let pname = Procname::c_from_string("foo");
+        store.insert(pname.clone(), 1u32);
+
+        assert!(store.update(&pname, |summary| *summary += 41));
+        assert_eq!(store.get(&pname), Some(42));
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //!
 //! Mirrors OCaml's `PulseModelsC.ml`.
 
+use regex::Regex;
 use sil::builtin_decl;
 use sil::exp::Exp;
 use sil::ident::Ident;
@@ -73,6 +74,17 @@ pub fn dispatch(
     loc: &Location,
     state: AbductiveDomain,
 ) -> Option<Vec<ExecutionDomain>> {
+    dispatch_with_config(callee, ret_id, args, loc, state, config::get())
+}
+
+fn dispatch_with_config(
+    callee: &Procname,
+    ret_id: &Ident,
+    args: &[(Exp, Typ)],
+    loc: &Location,
+    state: AbductiveDomain,
+    cfg: &config::InferConfig,
+) -> Option<Vec<ExecutionDomain>> {
     if builtin_decl::match_builtin(&builtin_decl::malloc(), callee) {
         return Some(malloc(ret_id, loc, state));
     }
@@ -119,6 +131,15 @@ pub fn dispatch(
     if name == "realloc" {
         return Some(realloc(ret_id, args, loc, state));
     }
+    if matches_procname_pattern(callee, cfg.pulse_model_free_pattern.as_deref()) {
+        return Some(free(ret_id, args, loc, state));
+    }
+    if matches_procname_pattern(callee, cfg.pulse_model_realloc_pattern.as_deref()) {
+        return Some(custom_realloc(callee, ret_id, args, loc, state));
+    }
+    if matches_procname_pattern(callee, cfg.pulse_model_malloc_pattern.as_deref()) {
+        return Some(custom_malloc(callee, ret_id, loc, state));
+    }
     // fopen: return null-or-non-null disjuncts for null-deref checking,
     // but do NOT mark as Allocated (no MEMORY_LEAK_C tracking for file
     // handles). Cross-ref: OCaml tracks fopen via CFile allocator which
@@ -156,6 +177,50 @@ pub fn dispatch(
     }
 
     None
+}
+
+/// Dynamic-model pre-check for regex-configured wrappers.
+///
+/// Cross-ref: OCaml PulseModelsC.ml `match_regexp_opt Config.pulse_model_*_pattern`.
+pub(crate) fn matches_configured_wrapper(callee: &Procname, cfg: &config::InferConfig) -> bool {
+    matches_procname_pattern(callee, cfg.pulse_model_free_pattern.as_deref())
+        || matches_procname_pattern(callee, cfg.pulse_model_malloc_pattern.as_deref())
+        || matches_procname_pattern(callee, cfg.pulse_model_realloc_pattern.as_deref())
+}
+
+/// Match the procname against an OCaml-configured regex pattern.
+///
+/// OCaml uses `Str.string_match r s 0`, so the pattern must match at the
+/// start of the procname string. Shared `.inferconfig` files also use OCaml
+/// `Str.regexp` syntax such as `\\(my\\|a\\)_malloc`, so translate the subset
+/// of grouping/alternation escapes used in those configs before compiling with
+/// Rust's regex engine.
+fn matches_procname_pattern(callee: &Procname, pattern: Option<&str>) -> bool {
+    let Some(pattern) = pattern else {
+        return false;
+    };
+
+    let translated = translate_ocaml_regex(pattern);
+    let Ok(regex) = Regex::new(&translated) else {
+        return false;
+    };
+    let proc_name = callee.to_string();
+    regex.find(&proc_name).is_some_and(|m| m.start() == 0)
+}
+
+fn translate_ocaml_regex(pattern: &str) -> String {
+    let mut translated = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some('(' | ')' | '|') = chars.peek().copied() {
+                translated.push(chars.next().expect("peeked character should exist"));
+                continue;
+            }
+        }
+        translated.push(ch);
+    }
+    translated
 }
 
 /// Returns two disjuncts: fresh non-null value + null value.
@@ -226,6 +291,17 @@ fn allocate_or_null(
 /// Model: `ret = malloc(size)` — allocate or null.
 fn malloc(ret_id: &Ident, loc: &Location, state: AbductiveDomain) -> Vec<ExecutionDomain> {
     allocate_or_null(ret_id, Allocator::CMalloc, loc, state)
+}
+
+/// Model: configured wrapper to `malloc(size)` — allocate or null with a
+/// custom allocator tag.
+fn custom_malloc(
+    callee: &Procname,
+    ret_id: &Ident,
+    loc: &Location,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    allocate_or_null(ret_id, Allocator::CustomMalloc(callee.clone()), loc, state)
 }
 
 /// Shared: invalidate first argument with given invalidation kind.
@@ -428,7 +504,34 @@ fn realloc(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     loc: &Location,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    realloc_with_allocator(ret_id, args, loc, state, Allocator::CRealloc)
+}
+
+/// Model: configured wrapper to `realloc(ptr, size)`.
+fn custom_realloc(
+    callee: &Procname,
+    ret_id: &Ident,
+    args: &[(Exp, Typ)],
+    loc: &Location,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    realloc_with_allocator(
+        ret_id,
+        args,
+        loc,
+        state,
+        Allocator::CustomRealloc(callee.clone()),
+    )
+}
+
+fn realloc_with_allocator(
+    ret_id: &Ident,
+    args: &[(Exp, Typ)],
+    loc: &Location,
     mut state: AbductiveDomain,
+    allocator: Allocator,
 ) -> Vec<ExecutionDomain> {
     // Step 1: Free the old pointer (first arg)
     if let Some((ptr_exp, _)) = args.first() {
@@ -441,7 +544,7 @@ fn realloc(
     }
 
     // Step 2: Allocate or return null (same as malloc)
-    allocate_or_null(ret_id, Allocator::CRealloc, loc, state)
+    allocate_or_null(ret_id, allocator, loc, state)
 }
 
 /// Model: `memcpy(dest, src, size)` / `memmove(dest, src, size)`.
@@ -653,6 +756,78 @@ mod tests {
         let callee = Procname::c_from_string("unknown_func");
         let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_none(), "unknown function should not dispatch");
+    }
+
+    #[test]
+    fn test_matches_procname_pattern_uses_ocaml_str_syntax() {
+        let callee = Procname::c_from_string("a_malloc");
+        assert!(matches_procname_pattern(
+            &callee,
+            Some("\\(my\\|a\\)_malloc")
+        ));
+        assert!(!matches_procname_pattern(&callee, Some("^my_malloc$")));
+    }
+
+    #[test]
+    fn test_dispatch_routes_custom_malloc_from_config() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let callee = Procname::c_from_string("a_malloc");
+        let expected_allocator = Allocator::CustomMalloc(callee.clone());
+        let cfg = config::InferConfig {
+            pulse_model_malloc_pattern: Some("\\(my\\|a\\)_malloc".to_string()),
+            ..config::InferConfig::default()
+        };
+
+        let result = dispatch_with_config(&callee, &ret_id, &[], &Location::dummy(), state, &cfg)
+            .expect("configured malloc wrapper should dispatch");
+
+        let continue_state = result
+            .into_iter()
+            .find_map(|exec| match exec {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("malloc wrapper should produce a ContinueProgram state");
+        let ret_addr = continue_state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id.clone()))
+            .expect("wrapper should bind return value");
+        let (allocator, _) = continue_state
+            .post
+            .attrs
+            .get(&ret_addr)
+            .and_then(|attrs| attrs.get_allocated())
+            .expect("wrapper return should be tracked as allocated");
+        assert_eq!(allocator, &expected_allocator);
+    }
+
+    #[test]
+    fn test_dispatch_routes_custom_realloc_from_config() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let callee = Procname::c_from_string("my_realloc");
+        let cfg = config::InferConfig {
+            pulse_model_realloc_pattern: Some("my_realloc".to_string()),
+            ..config::InferConfig::default()
+        };
+
+        let result = dispatch_with_config(&callee, &ret_id, &[], &Location::dummy(), state, &cfg);
+        assert!(
+            result.is_some(),
+            "configured realloc wrapper should dispatch"
+        );
+    }
+
+    #[test]
+    fn test_matches_configured_wrapper_for_free_pattern() {
+        let callee = Procname::c_from_string("my_free");
+        let cfg = config::InferConfig {
+            pulse_model_free_pattern: Some("^my_free$".to_string()),
+            ..config::InferConfig::default()
+        };
+        assert!(matches_configured_wrapper(&callee, &cfg));
     }
 
     #[test]

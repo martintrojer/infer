@@ -92,6 +92,21 @@ pub struct InferConfig {
     #[serde(rename = "liveness-only")]
     pub liveness_only: bool,
 
+    /// Regex of methods that should be modelled as wrappers to `free(3)`.
+    /// OCaml: `--pulse-model-free-pattern` (default none)
+    #[serde(rename = "pulse-model-free-pattern")]
+    pub pulse_model_free_pattern: Option<String>,
+
+    /// Regex of methods that should be modelled as wrappers to `malloc(3)`.
+    /// OCaml: `--pulse-model-malloc-pattern` (default none)
+    #[serde(rename = "pulse-model-malloc-pattern")]
+    pub pulse_model_malloc_pattern: Option<String>,
+
+    /// Regex of methods that should be modelled as wrappers to `realloc(3)`.
+    /// OCaml: `--pulse-model-realloc-pattern` (default none)
+    #[serde(rename = "pulse-model-realloc-pattern")]
+    pub pulse_model_realloc_pattern: Option<String>,
+
     // ---- Abstract interpretation ----
     /// Maximum number of widenings before the fixpoint engine gives up.
     /// OCaml: hardcoded `Config.max_widens = 10000`
@@ -126,6 +141,9 @@ impl Default for InferConfig {
             pulse_intraprocedural_only: false,
             pulse_only: false,
             liveness_only: false,
+            pulse_model_free_pattern: None,
+            pulse_model_malloc_pattern: None,
+            pulse_model_realloc_pattern: None,
             max_widens: 10_000,
             debug_level_analysis: 0,
             jobs: None,
@@ -210,6 +228,9 @@ mod tests {
         assert!(!config.pulse_intraprocedural_only);
         assert!(!config.pulse_only);
         assert!(!config.liveness_only);
+        assert!(config.pulse_model_free_pattern.is_none());
+        assert!(config.pulse_model_malloc_pattern.is_none());
+        assert!(config.pulse_model_realloc_pattern.is_none());
         assert!(!config.quiet);
     }
 
@@ -221,6 +242,28 @@ mod tests {
         assert!(config.quiet);
         // Other fields should be defaults
         assert_eq!(config.max_widens, 10_000);
+    }
+
+    #[test]
+    fn test_from_json_custom_model_patterns() {
+        let json = r#"{
+            "pulse-model-free-pattern": "^my_free$",
+            "pulse-model-malloc-pattern": "\\(my\\|a\\)_malloc",
+            "pulse-model-realloc-pattern": "my_realloc"
+        }"#;
+        let config = InferConfig::from_json(json);
+        assert_eq!(
+            config.pulse_model_free_pattern.as_deref(),
+            Some("^my_free$")
+        );
+        assert_eq!(
+            config.pulse_model_malloc_pattern.as_deref(),
+            Some("\\(my\\|a\\)_malloc")
+        );
+        assert_eq!(
+            config.pulse_model_realloc_pattern.as_deref(),
+            Some("my_realloc")
+        );
     }
 
     #[test]

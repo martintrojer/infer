@@ -182,6 +182,18 @@ The `config` crate holds all analysis configuration via `InferConfig`. It suppor
 
 **Global access:** call `config::init(cfg)` once at startup, then `config::get()` anywhere — no parameter threading needed (uses `OnceLock`).
 
+**Config-dependent compliance work:** before treating a sweep mismatch as a Pulse logic bug, check
+whether the source directory has a `.inferconfig` that changes modeling. The C Pulse suite uses
+`pulse-model-free-pattern`, `pulse-model-malloc-pattern`, and
+`pulse-model-realloc-pattern` to model wrapper functions. These patterns use OCaml `Str.regexp`
+syntax from shared Infer configs, for example `\\(my\\|a\\)_malloc`.
+
+- For CLI reproduction, pass `--inferconfig-path <path-to-.inferconfig>` explicitly.
+- For library tests or ignored sweeps, make sure the config is initialized the same way if the
+  behavior depends on it.
+- The current ignored store-textual sweep does not automatically load per-suite `.inferconfig`
+  files, so config-driven fixes may need a harness follow-up before they move published totals.
+
 ## Relationship to OCaml Codebase
 
 - The OCaml source of truth is in `infer/src/`. Read the `.mli` files for type definitions before modifying Rust types.

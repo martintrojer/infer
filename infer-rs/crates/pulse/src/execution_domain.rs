@@ -35,6 +35,14 @@ pub enum ExecutionDomain {
         state: Box<AbductiveDomain>,
         diagnostic: Box<Diagnostic>,
     },
+    /// A latent invalid access carried interprocedurally until a caller can
+    /// prove the accessed address is invalid in its own context.
+    ///
+    /// Cross-ref: OCaml PulseExecutionDomain.ml LatentInvalidAccess.
+    LatentInvalidAccess {
+        state: Box<AbductiveDomain>,
+        diagnostic: Box<Diagnostic>,
+    },
     /// The procedure exits normally (return).
     ExitProgram(AbductiveDomain),
     /// An exception was raised.
@@ -54,7 +62,8 @@ impl ExecutionDomain {
             | ExecutionDomain::ExitProgram(s)
             | ExecutionDomain::ExceptionRaised(s) => s,
             ExecutionDomain::AbortProgram { state, .. }
-            | ExecutionDomain::LatentAbortProgram { state, .. } => state,
+            | ExecutionDomain::LatentAbortProgram { state, .. }
+            | ExecutionDomain::LatentInvalidAccess { state, .. } => state,
         }
     }
 }
@@ -63,6 +72,7 @@ impl Comparable for ExecutionDomain {
     fn leq(&self, rhs: &Self) -> bool {
         use ExecutionDomain::{
             AbortProgram, ContinueProgram, ExceptionRaised, ExitProgram, LatentAbortProgram,
+            LatentInvalidAccess,
         };
 
         match (self, rhs) {
@@ -85,6 +95,16 @@ impl Comparable for ExecutionDomain {
                     diagnostic: lhs_diag,
                 },
                 LatentAbortProgram {
+                    state: rhs_state,
+                    diagnostic: rhs_diag,
+                },
+            )
+            | (
+                LatentInvalidAccess {
+                    state: lhs_state,
+                    diagnostic: lhs_diag,
+                },
+                LatentInvalidAccess {
                     state: rhs_state,
                     diagnostic: rhs_diag,
                 },

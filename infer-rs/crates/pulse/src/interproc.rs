@@ -22,6 +22,7 @@ use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::Attribute;
+use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::summary::PrePost;
@@ -245,6 +246,91 @@ pub fn apply_summary(
                 vec![]
             }
         }
+        crate::summary::PrePostKind::LatentInvalidAccess => {
+            if let Some(diag) = &pre_post.diagnostic {
+                let diag = translate_diagnostic(diag, &mut subst, &caller_state);
+                if latent_invalid_access_is_manifest(&diag, &caller_state) {
+                    let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
+                    vec![ExecutionDomain::AbortProgram {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(manifest_diag),
+                    }]
+                } else {
+                    vec![ExecutionDomain::LatentInvalidAccess {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(diag),
+                    }]
+                }
+            } else {
+                vec![]
+            }
+        }
+    }
+}
+
+fn translate_diagnostic(
+    diagnostic: &Diagnostic,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &AbductiveDomain,
+) -> Diagnostic {
+    match diagnostic {
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            invalidation,
+            access_location,
+            invalidation_location,
+        } => {
+            let caller_addr = caller_state
+                .path_condition
+                .get_var_repr(resolve_mut(subst, *addr));
+            Diagnostic::AccessToInvalidAddress {
+                addr: caller_addr,
+                invalidation: invalidation.clone(),
+                access_location: access_location.clone(),
+                invalidation_location: invalidation_location.clone(),
+            }
+        }
+        _ => diagnostic.clone(),
+    }
+}
+
+fn latent_invalid_access_is_manifest(
+    diagnostic: &Diagnostic,
+    caller_state: &AbductiveDomain,
+) -> bool {
+    matches!(
+        diagnostic,
+        Diagnostic::AccessToInvalidAddress { addr, .. }
+            if caller_state.check_valid(*addr).is_err()
+    )
+}
+
+fn reify_invalid_access_diagnostic(
+    diagnostic: Diagnostic,
+    caller_state: &AbductiveDomain,
+) -> Diagnostic {
+    match diagnostic {
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            access_location,
+            ..
+        } => match caller_state.check_valid(addr) {
+            Err(inv_info) => Diagnostic::AccessToInvalidAddress {
+                addr,
+                invalidation: inv_info.0,
+                access_location,
+                invalidation_location: inv_info.1,
+            },
+            Ok(()) => Diagnostic::AccessToInvalidAddress {
+                addr,
+                invalidation: crate::invalidation::Invalidation::ConstantDereference(
+                    sil::int_lit::IntLit::zero(),
+                ),
+                access_location,
+                invalidation_location: Location::dummy(),
+            },
+        },
+        _ => diagnostic,
     }
 }
 
@@ -890,6 +976,45 @@ mod tests {
         (pre_post, diagnostic)
     }
 
+    fn mk_latent_invalid_access_pre_post(invalidate_formal: bool) -> (PrePost, Diagnostic, Pvar) {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        callee_state.mark_must_be_valid(formal_val);
+        if invalidate_formal {
+            callee_state.invalidate(
+                formal_val,
+                crate::invalidation::Invalidation::CFree,
+                Location::dummy(),
+            );
+        }
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::CFree,
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar.clone(), formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::LatentInvalidAccess,
+            diagnostic: Some(diagnostic.clone()),
+        };
+
+        (pre_post, diagnostic, formal_pvar)
+    }
+
     #[test]
     fn test_apply_summary_keeps_still_latent_abort_as_latent() {
         let (pre_post, diagnostic) = mk_latent_abort_pre_post();
@@ -949,6 +1074,64 @@ mod tests {
             results.as_slice(),
             [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
                 if found.as_ref() == &diagnostic
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_keeps_still_latent_invalid_access_as_latent() {
+        let (pre_post, diagnostic, _formal_pvar) = mk_latent_invalid_access_pre_post(false);
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(
+            Exp::Lvar(Pvar::mk(Mangled::from_string("x"), caller_pname)),
+            Typ::void(),
+        )];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentInvalidAccess { diagnostic: found, .. }]
+                if found.as_ref().get_issue_type_id() == diagnostic.get_issue_type_id()
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_reifies_latent_invalid_access_when_caller_addr_is_invalid() {
+        let (pre_post, _diagnostic, _formal_pvar) = mk_latent_invalid_access_pre_post(true);
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(
+            Exp::Lvar(Pvar::mk(Mangled::from_string("x"), caller_pname)),
+            Typ::void(),
+        )];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
+                if found.get_issue_type_id() == diagnostics::issue_type::IssueTypeId::UseAfterFree
         ));
     }
 

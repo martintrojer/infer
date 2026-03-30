@@ -78,8 +78,14 @@ fn analyze_with_spec_loop(
                 // RECURSIVE: re-analyze callee with specialization AND the
                 // specialization loop, so sub-callees can also be specialized.
                 let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
+                let spec_summary_for_store = spec_summary.clone();
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
                     existing.add_specialized_summary(spec.clone(), spec_summary);
+                    let _ = ctx.summaries.update(callee_pname, |stored| {
+                        if stored.get_specialized(spec).is_none() {
+                            stored.add_specialized_summary(spec.clone(), spec_summary_for_store);
+                        }
+                    });
                     added_any = true;
                 }
             }

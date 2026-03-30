@@ -139,7 +139,8 @@ pub fn analyze_with_specialization_and_requests(
                 ExecutionDomain::ContinueProgram(_)
                 | ExecutionDomain::ExitProgram(_)
                 | ExecutionDomain::AbortProgram { .. }
-                | ExecutionDomain::LatentAbortProgram { .. } => {
+                | ExecutionDomain::LatentAbortProgram { .. }
+                | ExecutionDomain::LatentInvalidAccess { .. } => {
                     exit_disjuncts.push(d.clone());
                 }
                 _ => {}

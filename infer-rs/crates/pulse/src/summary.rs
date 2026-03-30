@@ -73,6 +73,12 @@ pub enum PrePostKind {
     /// Callers re-evaluate whether the error manifests in their context.
     /// Cross-ref: OCaml PulseExecutionDomain.ml LatentAbortProgram.
     LatentAbortProgram,
+    /// Latent invalid access: the callee touched an address derived from the
+    /// caller, but only callers can decide whether that address is invalid in
+    /// their own context.
+    ///
+    /// Cross-ref: OCaml PulseExecutionDomain.ml LatentInvalidAccess.
+    LatentInvalidAccess,
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +384,7 @@ impl PulseSummary {
                         | ExecutionDomain::ExitProgram(_)
                         | ExecutionDomain::AbortProgram { .. }
                         | ExecutionDomain::LatentAbortProgram { .. }
+                        | ExecutionDomain::LatentInvalidAccess { .. }
                 )
             })
             .map(|state| {
@@ -389,6 +396,10 @@ impl PulseSummary {
                     }
                     ExecutionDomain::LatentAbortProgram { diagnostic, .. } => (
                         PrePostKind::LatentAbortProgram,
+                        Some(diagnostic.as_ref().clone()),
+                    ),
+                    ExecutionDomain::LatentInvalidAccess { diagnostic, .. } => (
+                        PrePostKind::LatentInvalidAccess,
                         Some(diagnostic.as_ref().clone()),
                     ),
                     _ => (PrePostKind::ContinueProgram, None),
@@ -410,9 +421,14 @@ impl PulseSummary {
                 // Cross-ref: OCaml PulseSummary.ml exec_summary_of_post_common
                 // reports only after latent-vs-manifest classification.
                 if pp.kind == PrePostKind::AbortProgram {
+                    if !proc_is_entry_point(pdesc)
+                        && pre_post_has_caller_visible_invalid_access(&mut pp)
+                    {
+                        pp.kind = PrePostKind::LatentInvalidAccess;
+                    }
                     // Reclassify as latent if the error depends on caller inputs.
                     // Latent pre_posts propagate to callers for re-evaluation.
-                    if !pre_post_is_manifest(pdesc, &pp) {
+                    else if !pre_post_is_manifest(pdesc, &pp) {
                         pp.kind = PrePostKind::LatentAbortProgram;
                     } else if let Some(diag) = &pp.diagnostic {
                         diagnostics.push(diag.clone());
@@ -464,10 +480,23 @@ impl PulseSummary {
         // itself. Keep them on the owning summary, and strip manifest abort
         // diagnostics from the cached specialized pre/posts so callers do not
         // report the same issue again for each call context.
+        let latent_keys: std::collections::HashSet<_> = summary
+            .pre_posts
+            .iter()
+            .filter(|pre_post| {
+                matches!(
+                    pre_post.kind,
+                    PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
+                )
+            })
+            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+            .map(Diagnostic::dedup_key)
+            .collect();
         let mut seen: std::collections::HashSet<_> =
             self.diagnostics.iter().map(Diagnostic::dedup_key).collect();
         for diag in summary.diagnostics.drain(..) {
-            if seen.insert(diag.dedup_key()) {
+            let key = diag.dedup_key();
+            if !latent_keys.contains(&key) && seen.insert(key) {
                 self.diagnostics.push(diag);
             }
         }
@@ -519,6 +548,29 @@ fn is_manifest(pre_post: &PrePost) -> bool {
 
 fn pre_post_is_manifest(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
     proc_is_entry_point(pdesc) || is_manifest(pre_post)
+}
+
+fn pre_post_has_caller_visible_invalid_access(pre_post: &mut PrePost) -> bool {
+    let Some(diag_addr) = pre_post.diagnostic.as_ref().and_then(|diag| match diag {
+        Diagnostic::AccessToInvalidAddress { addr, .. } => {
+            Some(pre_post.post.path_condition.get_var_repr(*addr))
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    if let Some(Diagnostic::AccessToInvalidAddress { addr, .. }) = pre_post.diagnostic.as_mut() {
+        *addr = diag_addr;
+    }
+
+    if !pre_post.post.must_be_valid.contains(&diag_addr) {
+        return false;
+    }
+
+    pre_post
+        .collect_reachable_from_seeds(pre_post.pre.stack.iter().map(|(_, addr)| *addr), true, true)
+        .contains(&diag_addr)
 }
 
 fn proc_is_entry_point(pdesc: &Procdesc) -> bool {
@@ -1116,6 +1168,95 @@ mod tests {
             summary.pre_posts[0].kind,
             PrePostKind::LatentAbortProgram
         ));
+    }
+
+    #[test]
+    fn test_of_proc_keeps_caller_visible_invalid_access_latent() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        astate.mark_must_be_valid(formal_val);
+        astate.invalidate(
+            formal_val,
+            crate::invalidation::Invalidation::CFree,
+            Location::dummy(),
+        );
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::CFree,
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "caller-visible invalid accesses should stay latent in the callee summary"
+        );
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::LatentInvalidAccess
+        ));
+    }
+
+    #[test]
+    fn test_add_specialized_summary_skips_latent_specialized_diagnostic() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        astate.mark_must_be_valid(formal_val);
+        astate.invalidate(
+            formal_val,
+            crate::invalidation::Invalidation::CFree,
+            Location::dummy(),
+        );
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::CFree,
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+        let specialized = PulseSummary {
+            pre_posts: vec![PrePost {
+                pre: astate.pre.clone(),
+                post: astate,
+                formals: vec![(pvar, formal_addr)],
+                result: None,
+                kind: PrePostKind::LatentInvalidAccess,
+                diagnostic: Some(diagnostic.clone()),
+            }],
+            specialized: vec![],
+            diagnostics: vec![diagnostic],
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: false,
+            formal_types: vec![],
+        };
+
+        let mut summary = PulseSummary::intra_only(vec![]);
+        summary.add_specialized_summary(PulseSpecialization::bottom(), specialized);
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "latent specialized diagnostics should stay latent and not be published on the owner"
+        );
     }
 
     #[test]

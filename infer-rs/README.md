@@ -2,7 +2,7 @@
 
 Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory safety checking (null dereferences, use-after-free, memory leaks).
 
-Current full store-textual sweep: 52/55 C files, NPE 130/135, Leaks 20/20, UAF 10/7.
+Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 139. Leaks: expected 20, found 22. UAF: expected 7, found 7.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data.
 
@@ -58,6 +58,13 @@ infer-rs --pulse-only *.sil
 | `--max-widens N` | Max widenings before fixpoint gives up (default: 10000) |
 | `--debug-level-analysis N` | 0=quiet, 1=per-instruction, 2=full state dumps |
 | `--inferconfig-path FILE` | Path to .inferconfig file |
+| `--pulse-model-free-pattern REGEX` | Model matching functions as wrappers to `free(3)` |
+| `--pulse-model-malloc-pattern REGEX` | Model matching functions as wrappers to `malloc(3)` |
+| `--pulse-model-realloc-pattern REGEX` | Model matching functions as wrappers to `realloc(3)` |
+
+`pulse-model-{free,malloc,realloc}-pattern` is compatible with OCaml Infer's
+shared `.inferconfig` files, including the `Str.regexp` syntax used in test
+suites such as `\\(my\\|a\\)_malloc`.
 
 ### infer binary discovery
 
@@ -87,6 +94,9 @@ cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ig
 `make check-full` exercises the older `capture --dump-textual` path as a secondary regression check.
 The published compliance numbers in [docs/STATUS.md](docs/STATUS.md) come from the
 `--store-textual` + `--export-textual` sweep because that matches the CLI pipeline.
+That ignored sweep still does not load per-suite `.inferconfig` files automatically, so
+config-driven wrapper models are currently verified with direct CLI runs rather than reflected in
+the published totals.
 
 ## Project Structure
 
