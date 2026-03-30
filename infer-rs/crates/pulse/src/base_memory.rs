@@ -21,7 +21,7 @@ use crate::access::Access;
 ///
 /// OCaml uses `RecencyMap` (bounded map). We use `BTreeMap` (unbounded)
 /// for simplicity; can add recency eviction later if needed.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Edges(BTreeMap<Access, AbstractValue>);
 
 impl Edges {
@@ -60,7 +60,7 @@ impl Edges {
 }
 
 /// The heap graph: maps abstract addresses to their outgoing edges.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseMemory {
     graph: BTreeMap<AbstractValue, Edges>,
 }

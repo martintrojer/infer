@@ -30,26 +30,23 @@ fn test_ocaml_captures_sil_pulse_files() {
     }
 
     let paths: Vec<&std::path::Path> = sil_files.iter().map(|p| p.as_path()).collect();
-    let result = runner.capture_and_analyze(&paths, "pulse").unwrap();
+    let result = runner.capture_only(&paths).unwrap();
 
     assert!(
         result.out_dir.exists(),
         "infer output directory should exist"
     );
-    // OCaml infer exits 2 when issues are found — both 0 and 2 are acceptable
     assert!(
-        result.success || result.out_dir.exists(),
-        "infer should produce output. stderr: {}",
+        result.exit_code == 0,
+        "capture should exit 0, got {}. stderr: {}",
+        result.exit_code,
         result.stderr
     );
-    let report = result.out_dir.join("report.json");
-    if report.exists() {
-        let content = std::fs::read_to_string(&report).unwrap();
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&content).is_ok(),
-            "report.json should be valid JSON"
-        );
-    }
+    assert!(
+        result.out_dir.join("capture.db").exists()
+            || result.out_dir.join("capture.db-wal").exists(),
+        "capture output should contain a capture database"
+    );
 }
 
 /// Test that both OCaml and Rust can parse the same .sil files.

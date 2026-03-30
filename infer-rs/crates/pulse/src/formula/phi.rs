@@ -45,7 +45,7 @@ pub enum NewEq {
 /// - `atoms`: disequality/inequality constraints
 ///
 /// Cross-ref: OCaml's `PulseFormulaPhi.ml` type `phi`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Phi {
     /// Union-find for variable equality classes.
     pub var_eqs: VarUF,
@@ -98,7 +98,7 @@ pub enum FnAppActual {
 }
 
 /// A term equality: records that a variable equals a binary operation on two operands.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermEq {
     pub op: sil::binop::Binop,
     pub lhs: super::Operand,

@@ -17,7 +17,7 @@ use crate::attribute::{Attribute, Attributes};
 use crate::invalidation::Invalidation;
 
 /// Maps abstract addresses to their attribute sets.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseAddressAttributes {
     map: BTreeMap<AbstractValue, Attributes>,
 }

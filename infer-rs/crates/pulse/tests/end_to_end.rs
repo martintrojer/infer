@@ -220,31 +220,50 @@ fn collect_cfun_refs_exp(
 }
 
 /// Smoke test: Textual → parse → to_sil → Pulse pipeline does not panic.
-///
-/// Uses a global `__null` variable — detection depends on global handling.
-/// The definitive null deref test is `test_e2e_null_deref_fixture`.
 #[test]
 fn test_e2e_pipeline_smoke() {
     let tm = textual_utils::parse_and_convert(
         r#"
         .source_language = "c"
-        define null_deref() : void {
+
+        define null_deref_bad() : void {
           #entry:
-            n0 : *void = load &__null
+            n0 = 0
             store n0 <- 42 : int
             ret null
         }
 
-        global __null : *void
+        define safe_store_ok(x: int) : void {
+          #entry:
+            store &x <- 5 : int
+            ret null
+        }
     "#,
     );
 
-    // Pipeline should not panic
+    let mut null_deref_issues = 0;
+    let mut safe_issues = 0;
     for pdesc in tm.cfg.iter_proc_descs() {
+        let proc_name = format!("{}", pdesc.proc_name);
         let summary = pulse::checker::analyze(pdesc);
-        // Just verify analyze completes — detection tested by test_e2e_null_deref_fixture
-        let _ = pulse::checker::to_issue_log(&summary, &format!("{}", pdesc.proc_name));
+        let issue_log = pulse::checker::to_issue_log(&summary, &proc_name);
+
+        if proc_name.contains("null_deref_bad") {
+            null_deref_issues = issue_log
+                .issues
+                .iter()
+                .filter(|issue| issue.issue_type.id == IssueTypeId::NullptrDereference.id())
+                .count();
+        } else if proc_name.contains("safe_store_ok") {
+            safe_issues = issue_log.len();
+        }
     }
+
+    assert_eq!(
+        null_deref_issues, 1,
+        "inline pipeline should report one NULL_DEREFERENCE"
+    );
+    assert_eq!(safe_issues, 0, "safe procedure should stay issue-free");
 }
 
 /// Safe procedure: no bugs.

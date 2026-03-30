@@ -2,6 +2,8 @@
 
 Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory safety checking (null dereferences, use-after-free, memory leaks).
 
+Current full store-textual sweep: 52/55 C files, NPE 130/135, Leaks 20/20, UAF 10/7.
+
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data.
 
 ## CLI Usage
@@ -63,7 +65,7 @@ The `infer` binary is found automatically in this order:
 
 1. `--infer-bin <path>` CLI flag
 2. `INFER_BIN` environment variable
-3. `../../infer/bin/infer` relative to the infer-rs binary (in-repo builds)
+3. `../infer/bin/infer` relative to the workspace root (in-repo builds)
 4. `infer` on `PATH`
 
 ### Output
@@ -78,7 +80,13 @@ The `infer` binary is found automatically in this order:
 cd infer-rs
 make check          # fmt + clippy + unit/integration tests (~3s)
 make check-full     # + C dump-textual sweep (~60s, needs infer binary)
+# authoritative compliance sweep used for STATUS.md:
+cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture
 ```
+
+`make check-full` exercises the older `capture --dump-textual` path as a secondary regression check.
+The published compliance numbers in [docs/STATUS.md](docs/STATUS.md) come from the
+`--store-textual` + `--export-textual` sweep because that matches the CLI pipeline.
 
 ## Project Structure
 

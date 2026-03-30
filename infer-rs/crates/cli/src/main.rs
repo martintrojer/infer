@@ -313,6 +313,17 @@ fn main() {
 // Capture & export
 // ---------------------------------------------------------------------------
 
+fn workspace_root() -> Option<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+}
+
+fn workspace_relative_infer(ws_root: &Path) -> PathBuf {
+    ws_root.join("../infer/bin/infer")
+}
+
 /// Find the infer binary. Checks: explicit path, INFER_BIN env, relative path, PATH.
 fn find_infer(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
@@ -329,12 +340,9 @@ fn find_infer(explicit: Option<&Path>) -> PathBuf {
         }
     }
     // Relative to workspace root: ../infer/bin/infer
-    let ws_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf());
+    let ws_root = workspace_root();
     if let Some(root) = ws_root {
-        let candidate = root.join("infer/bin/infer");
+        let candidate = workspace_relative_infer(&root);
         if candidate.exists() {
             return candidate;
         }
@@ -383,6 +391,24 @@ fn run_capture(build_cmd: &[String], infer_out: &Path, infer_bin: Option<&Path>,
             eprintln!("error: failed to run infer: {e}");
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_workspace_relative_infer_uses_sibling_repo() {
+        let ws_root = workspace_root().expect("workspace root should be resolvable");
+        assert_eq!(
+            workspace_relative_infer(&ws_root),
+            ws_root.join("../infer/bin/infer")
+        );
+        assert_ne!(
+            workspace_relative_infer(&ws_root),
+            ws_root.join("infer/bin/infer")
+        );
     }
 }
 

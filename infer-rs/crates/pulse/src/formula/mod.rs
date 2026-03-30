@@ -33,7 +33,7 @@ use term::Term;
 pub use phi::NewEq;
 
 /// An operand in a formula constraint: either a variable or a constant.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operand {
     AbstractValue(AbstractValue),
     ConstOperand(i64),
@@ -42,7 +42,7 @@ pub enum Operand {
 /// The formula: wraps `Phi` with the public API.
 ///
 /// Mirrors OCaml's `Formula.t` which wraps `FormulaPhi.t` plus conditions.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Formula {
     phi: phi::Phi,
 }

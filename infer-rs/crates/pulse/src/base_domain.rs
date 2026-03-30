@@ -18,7 +18,7 @@ use crate::base_stack::BaseStack;
 ///
 /// This is the raw state before abductive reasoning wraps it with
 /// pre/post separation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseDomain {
     pub stack: BaseStack,
     pub heap: BaseMemory,

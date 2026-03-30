@@ -47,11 +47,12 @@ fn run_liveness_on_file(path: &Path) -> (usize, usize) {
 fn try_parse_and_convert(path: &Path) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("io: {e}"))?;
     let filename = path.file_name().unwrap().to_str().unwrap_or("test.sil");
-    let module = textual::parse_module(&src, filename).map_err(|e| format!("parse: {e}"))?;
+    let mut module = textual::parse_module(&src, filename).map_err(|e| format!("parse: {e}"))?;
     let (decls, decl_errors) = textual::decls::DeclEnv::from_module(&module);
     if !decl_errors.is_empty() {
         return Err(format!("decl: {decl_errors:?}"));
     }
+    textual::transform::run(&mut module, &decls);
     textual::to_sil::module_to_sil(&module, &decls).map_err(|e| format!("to_sil: {e:?}"))?;
     Ok(())
 }

@@ -16,7 +16,7 @@ use crate::abstract_value::AbstractValue;
 use crate::invalidation::Invalidation;
 
 /// A Pulse diagnostic — a bug found during analysis.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Diagnostic {
     /// Accessing an address that has been invalidated (null deref, use-after-free, etc.).
     AccessToInvalidAddress {

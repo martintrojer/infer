@@ -70,6 +70,8 @@ pub fn find_infer_binary() -> Option<PathBuf> {
 pub struct InferResult {
     /// The infer-out directory containing results.
     pub out_dir: PathBuf,
+    /// Process exit code (`0` = clean, `2` = issues found).
+    pub exit_code: i32,
     /// Whether infer exited successfully.
     pub success: bool,
     /// Combined stdout.
@@ -159,6 +161,7 @@ impl InferRunner {
 
         Ok(InferResult {
             out_dir,
+            exit_code: output.status.code().unwrap_or(-1),
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -357,6 +360,7 @@ impl InferRunner {
 
         Ok(InferResult {
             out_dir,
+            exit_code: output.status.code().unwrap_or(-1),
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),

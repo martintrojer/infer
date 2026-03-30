@@ -2,7 +2,13 @@
 
 ## Summary
 
-**~30,000 lines of Rust across 11 crates. 350+ tests. 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 135, found 130. Leak detection: expected 20, found 20. 20 of 52 C test files match OCaml exactly. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, sizeof/float evaluation, per-instruction tracing. funptr.c: 6/11.**
+**~30,000 lines of Rust across 11 crates. 350+ tests. Latest store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 135, found 130. Leak detection: expected 20, found 20. UAF detection: expected 7, found 10. 20 of 52 C test files match OCaml exactly. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, sizeof/float evaluation, per-instruction tracing. funptr.c: 6/11.**
+
+Recent robustness fixes, with no change to the top-line compliance totals:
+- `ExecutionDomain` / formula equality is now semantic, so `DisjunctiveDomain` subset checks and deduplication behave correctly.
+- CLI infer autodiscovery now matches the repo layout and checks sibling `../infer/bin/infer`.
+- Unsupported Textual `Closure` / `Apply` / residual `If` expressions now fail conversion explicitly instead of lowering to placeholder `0`.
+- OCaml capture parity, CLI multi-file, and inline Pulse smoke tests now assert concrete behavior instead of mostly "did not crash".
 
 Three CLI modes:
 - **Full pipeline**: `infer-rs --pulse-only -- clang -c file.c` (capture + export + analyze)
@@ -244,8 +250,11 @@ Remaining 27 tests are blocked on: exceptions (7), closure-to-object (3), tenv a
 
 ### C source → store-textual → export → Rust pipeline (pulse)
 52 of 55 C source files pass through the full pipeline: C source → OCaml `infer --store-textual` → `infer debug --export-textual` → manifest.json → Rust parse → Pulse analysis.
+This is the authoritative compliance benchmark because it matches the CLI capture/export path.
 
 Run with: `cargo test --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+
+The repo also keeps a separate `capture --dump-textual` sweep as a secondary regression test for the raw dumped `.sil` path. That sweep is useful for parser/to_sil debugging, but its numbers are not the published compliance baseline.
 
 **Pipeline status (55 files):**
 
@@ -266,7 +275,7 @@ Under-detection (we miss issues OCaml finds):
 Over-detection (we report more than OCaml):
 - **sizeof array** (+2): sizeof.c. `<int[]>` textual loses array length.
 - **nullptr_more.c** (+2): write_deref pre-edges too aggressive.
-- **Other** (+3): angelism.c (+1), nullptr.c (+1), offsetof_expr.c (+1).
+- **Other** (+4): angelism.c (+1), nullptr.c (+1), offsetof_expr.c (+1), struct_values.c (+1).
 
 **MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
 
@@ -276,7 +285,7 @@ Per-file differences (cancel out): cleanup_attribute.c (+2, cleanup attr not mod
 
 Over-detection: latent.c (+3, latent propagation FPs), interprocedural.c (+1, duplicate latent). Under-detection: specialization.c (-1, funptr UAF).
 
-**Files matching OCaml (20 clean, NPE+Leaks):** enum.c, frontend.c, memcpy.c, getcwd.c, shift.c, var_arg.c, ternary.c, nullptr.c, lists.c, list_checks.c, uninit.c, assert_failure.c, specialization.c, arithmetic.c, integers.c, abduce.c, struct_values.c, interprocedural.c, memory_leak_more.c, issues_abort_execution.c, traces.c.
+**Files matching OCaml (20 clean, NPE+Leaks):** enum.c, frontend.c, memcpy.c, getcwd.c, shift.c, var_arg.c, ternary.c, nullptr.c, lists.c, list_checks.c, uninit.c, assert_failure.c, specialization.c, arithmetic.c, integers.c, abduce.c, interprocedural.c, memory_leak_more.c, issues_abort_execution.c, traces.c.
 
 **Summary comparison (15 files, via `infer debug --dump-json-summaries`):**
 
@@ -290,7 +299,7 @@ Other mismatches: null_attrs (22 procs, rust missing Invalid attrs), noreturn (2
 ## Known Issues / Gaps
 
 1. **Type verification partial**: Type inference and hole-filling ported. Missing: DFS node ordering, terminator type checking (Ret/Jump SSA args/Throw), Store type-compatibility validation, restore_ssa on ident conflicts.
-2. **to_sil simplified**: Expression conversion handles common cases. Closure, Apply need more work. OCaml ~1200 lines; ours ~600.
+2. **to_sil partial lowering**: Expression conversion handles common cases. Unsupported Closure / Apply / residual If now fail conversion explicitly instead of lowering to placeholder values, but full lowering is still missing. OCaml ~1200 lines; ours ~600.
 3. **Liveness simplified**: No exception handling. Dead store reporter lacks suppression heuristics.
 4. **Pulse interprocedural gaps** vs OCaml:
    - Basic latent issue support (LatentAbortProgram + is_manifest). Missing: LatentInvalidAccess, full is_manifest heuristic

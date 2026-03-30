@@ -34,7 +34,7 @@ use crate::sat_unsat::SatUnsat;
 ///   Populated during analysis whenever memory is read (Load).
 /// - `post`: the procedure's postcondition — the current abstract state.
 /// - `path_condition`: constraints on abstract values.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbductiveDomain {
     /// The pre-condition: what the procedure reads from its inputs.
     /// Populated by `abduce_read` when the analysis dereferences memory.

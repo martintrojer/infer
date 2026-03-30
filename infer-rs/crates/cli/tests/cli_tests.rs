@@ -133,39 +133,57 @@ fn test_pulse_on_safe_sil() {
 
 #[test]
 fn test_multiple_files() {
-    test_harness::skip_without_ocaml_sil!();
-    let dir = ocaml_sil_dir().join("pulse");
-
-    let sil_files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| {
-            let path = e.ok()?.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("sil") {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .take(3) // just test a few
-        .collect();
-
-    assert!(!sil_files.is_empty());
+    let null_deref = test_data_dir().join("pulse/null_deref.sil");
+    let safe = test_data_dir().join("pulse/basic_safe.sil");
+    let dead_store = test_data_dir().join("c-liveness/dead_stores_simple.sil");
 
     let tmp_dir = TempDir::new();
-    let mut args: Vec<&str> = vec!["--pulse-only", "-q", "-o", tmp_dir.to_str().unwrap()];
-    let file_strs: Vec<String> = sil_files
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-    for f in &file_strs {
-        args.push("--capture-textual");
-        args.push(f);
-    }
+    let (code, stdout, stderr) = run_infer_rs(&[
+        "-o",
+        tmp_dir.to_str().unwrap(),
+        "--capture-textual",
+        null_deref.to_str().unwrap(),
+        "--capture-textual",
+        safe.to_str().unwrap(),
+        "--capture-textual",
+        dead_store.to_str().unwrap(),
+    ]);
 
-    let (code, _stdout, stderr) = run_infer_rs(&args);
+    assert_eq!(
+        code, 2,
+        "multiple-file run should surface issues. stderr: {stderr}"
+    );
     assert!(
-        code == 0 || code == 2,
-        "should not crash. code={code} stderr: {stderr}"
+        stdout.contains(IssueTypeId::NullptrDereference.id()),
+        "should report NULL_DEREFERENCE from null_deref.sil: {stdout}"
+    );
+    assert!(
+        stdout.contains(IssueTypeId::DeadStore.id()),
+        "should report DEAD_STORE from dead_stores_simple.sil: {stdout}"
+    );
+    assert!(
+        stderr.contains("across 3 file(s)"),
+        "summary should report all analyzed files: {stderr}"
+    );
+
+    let report = tmp_dir.join("report.json");
+    assert!(report.exists(), "report.json should be created");
+    let content = std::fs::read_to_string(&report).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let issues = parsed
+        .as_array()
+        .expect("report.json should be a JSON array");
+    assert!(
+        issues
+            .iter()
+            .any(|issue| { issue["issue_type"]["id"] == IssueTypeId::NullptrDereference.id() }),
+        "report.json should include NULL_DEREFERENCE: {content}"
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["issue_type"]["id"] == IssueTypeId::DeadStore.id()),
+        "report.json should include DEAD_STORE: {content}"
     );
 }
 

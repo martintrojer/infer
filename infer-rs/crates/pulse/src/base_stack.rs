@@ -18,7 +18,7 @@ use crate::abstract_value::AbstractValue;
 ///
 /// In OCaml this also carries `ValueOrigin` for provenance tracking.
 /// We simplify to just the address for now.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseStack {
     map: HashMap<Var, AbstractValue>,
 }

@@ -21,6 +21,14 @@ pub struct VarUF {
     rank: HashMap<AbstractValue, usize>,
 }
 
+impl PartialEq for VarUF {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_equalities() == other.canonical_equalities()
+    }
+}
+
+impl Eq for VarUF {}
+
 impl VarUF {
     pub fn new() -> Self {
         Self::default()
@@ -99,6 +107,21 @@ impl VarUF {
             .filter(|(k, v)| k != v)
             .map(|(&k, &v)| (k, self.find_immut(v)))
     }
+
+    /// Canonicalize all non-trivial equalities, ignoring implementation
+    /// details like path-compression shape and union ranks.
+    fn canonical_equalities(&self) -> HashMap<AbstractValue, AbstractValue> {
+        self.parent
+            .iter()
+            .filter_map(|(&child, &parent)| {
+                if child == parent {
+                    None
+                } else {
+                    Some((child, self.find_immut(parent)))
+                }
+            })
+            .collect()
+    }
 }
 
 /// The "simpler" variable has lower absolute raw value.
@@ -164,5 +187,22 @@ mod tests {
         let r = uf.find(v1);
         assert_eq!(uf.find(v2), r);
         assert_eq!(uf.find(v3), r);
+    }
+
+    #[test]
+    fn test_equality_ignores_path_compression_shape() {
+        let v1 = AbstractValue::of_raw(1);
+        let v2 = AbstractValue::of_raw(2);
+        let v3 = AbstractValue::of_raw(3);
+
+        let mut left = VarUF::new();
+        left.union(v2, v3);
+        left.union(v1, v2);
+
+        let mut right = VarUF::new();
+        right.union(v1, v2);
+        right.union(v1, v3);
+
+        assert_eq!(left, right);
     }
 }

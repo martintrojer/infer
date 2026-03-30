@@ -11,10 +11,13 @@ use crate::abductive::AbductiveDomain;
 use crate::diagnostic::Diagnostic;
 
 /// The state of an analysis path after executing an instruction.
-/// NOTE: PartialEq always returns false — each disjunct is unique.
-/// This matches OCaml's use of pointer equality (equal_fast) which
-/// is false for independently constructed states.
-#[derive(Clone, Debug)]
+///
+/// We use structural equality here because the disjunctive abstract interpreter
+/// relies on reflexive equality for subset checks and deduplication. OCaml can
+/// get away with pointer identity (`equal_fast`) because unchanged states often
+/// keep the same heap object; in Rust we clone states freely, so pointer-style
+/// equality would make `d <= d` fail and break fixpoint convergence.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionDomain {
     /// Normal execution continues.
     ContinueProgram(AbductiveDomain),
@@ -34,14 +37,6 @@ pub enum ExecutionDomain {
     ExitProgram(AbductiveDomain),
     /// An exception was raised.
     ExceptionRaised(AbductiveDomain),
-}
-
-impl PartialEq for ExecutionDomain {
-    fn eq(&self, _other: &Self) -> bool {
-        // Each disjunct is unique — no structural equality.
-        // Matches OCaml's pointer equality (equal_fast).
-        false
-    }
 }
 
 impl ExecutionDomain {
