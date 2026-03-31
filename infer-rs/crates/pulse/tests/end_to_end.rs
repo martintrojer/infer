@@ -118,6 +118,60 @@ fn analyze_with_spec_loop(
     }
 }
 
+fn run_infer_rs_cli_report(
+    sil_path: &std::path::Path,
+    source_override: Option<&str>,
+    cwd: &std::path::Path,
+) -> Result<String, String> {
+    let infer_rs_bin = test_harness::infer_runner::find_infer_rs_binary()
+        .ok_or_else(|| "could not locate infer-rs binary".to_string())?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock error: {e}"))?
+        .as_nanos();
+    let out_dir = std::env::temp_dir().join(format!(
+        "infer_rs_e2e_cli_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+
+    let output = {
+        let mut cmd = std::process::Command::new(&infer_rs_bin);
+        cmd.current_dir(cwd)
+            .arg("--pulse-only")
+            .arg("--quiet")
+            .arg("-o")
+            .arg(&out_dir);
+        if let Some(source_override) = source_override {
+            cmd.arg("--source-override").arg(source_override);
+        }
+        cmd.arg(sil_path);
+        cmd.output()
+            .map_err(|e| format!("failed to run infer-rs: {e}"))?
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    if !matches!(exit_code, 0 | 2) {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Err(format!(
+            "infer-rs exited with {exit_code}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let report_path = out_dir.join("report.json");
+    let report = if report_path.exists() {
+        std::fs::read_to_string(&report_path)
+            .map_err(|e| format!("failed to read {}: {e}", report_path.display()))?
+    } else {
+        String::new()
+    };
+    let _ = std::fs::remove_dir_all(&out_dir);
+    Ok(report)
+}
+
 /// Collect all Cfun procname references from an instruction and look up summaries.
 fn collect_cfun_refs(
     instr: &sil::instr::Instr,
@@ -1867,6 +1921,54 @@ fn test_e2e_memory_leak() {
             assert!(!has_leak, "{name} should NOT report MEMORY_LEAK_C");
         }
     }
+}
+
+/// Regression: duplicated null-deref reports in `memory_leak.c` must survive
+/// dedup when they have different provenance histories.
+///
+/// Run explicitly:
+///   cargo test -p pulse --test end_to_end test_e2e_memory_leak_realloc_reports_both_null_origins -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_e2e_memory_leak_realloc_reports_both_null_origins() {
+    use test_harness::infer_runner::InferRunner;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let c_dir = test_harness::fixtures::ocaml_c_test_dir().join("pulse");
+    let c_path = c_dir.join("memory_leak.c");
+    if !c_path.exists() {
+        eprintln!("skipping: memory_leak.c not found");
+        return;
+    }
+
+    let sil_path = runner
+        .dump_textual_for_c(&c_path)
+        .expect("dump-textual should succeed for memory_leak.c");
+    let report = run_infer_rs_cli_report(&sil_path, Some("memory_leak.c"), &c_dir)
+        .expect("infer-rs CLI should analyze memory_leak.c");
+    let proc_marker = "\"procedure\": \"realloc_no_check_bad\"";
+    let first_qualifier =
+        "\"qualifier\": \"address could be null (null value originating from line 105) and is dereferenced\"";
+    let second_qualifier =
+        "\"qualifier\": \"address could be null (null value originating from line 119) and is dereferenced\"";
+
+    assert_eq!(
+        report.matches(proc_marker).count(),
+        2,
+        "realloc_no_check_bad should report both null origins, got:\n{report}"
+    );
+    assert!(
+        report.matches(first_qualifier).count() == 1,
+        "missing first null origin in report:\n{report}"
+    );
+    assert!(
+        report.matches(second_qualifier).count() == 1,
+        "missing second null origin in report:\n{report}"
+    );
 }
 
 #[test]

@@ -24,9 +24,11 @@ use crate::diagnostic::Diagnostic;
 use crate::formula::Operand;
 use crate::invalidation::Invalidation;
 use crate::pulse_result::PulseResult;
+use crate::value_history::{HistoryEvent, ValueHistory, ValueWithHistory};
 
 fn materialize_known_zero_invalid(
     addr: AbstractValue,
+    history: &ValueHistory,
     loc: &Location,
     state: &mut AbductiveDomain,
 ) {
@@ -39,7 +41,10 @@ fn materialize_known_zero_invalid(
         state.invalidate(
             addr,
             Invalidation::ConstantDereference(IntLit::zero()),
-            loc.clone(),
+            history.append_event(HistoryEvent::Invalidated {
+                invalidation: Invalidation::ConstantDereference(IntLit::zero()),
+                location: loc.clone(),
+            }),
         );
     }
 }
@@ -52,76 +57,93 @@ pub fn eval(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<AbstractValue, Diagnostic> {
+    match eval_with_history(exp, loc, state) {
+        PulseResult::Ok(value) => PulseResult::Ok(value.addr),
+        PulseResult::Recoverable(value, errors) => PulseResult::Recoverable(value.addr, errors),
+        PulseResult::FatalError(diag, errors) => PulseResult::FatalError(diag, errors),
+    }
+}
+
+/// Evaluate a SIL expression to an abstract value and provenance.
+pub fn eval_with_history(
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<ValueWithHistory, Diagnostic> {
     match exp {
         Exp::Var(id) => {
             let var = Var::LogicalVar(id.clone());
-            let addr = state.eval_var(&var);
-            PulseResult::Ok(addr)
+            PulseResult::Ok(state.eval_var_with_history(&var))
         }
         Exp::Lvar(pvar) => {
             let var = Var::ProgramVar(Box::new(pvar.clone()));
-            let addr = state.eval_var(&var);
-            PulseResult::Ok(addr)
+            PulseResult::Ok(state.eval_var_with_history(&var))
         }
         Exp::Lfield(data, field, _typ) => {
-            let base = match eval(&data.exp, loc, state) {
+            let base = match eval_with_history(&data.exp, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
             // Check validity of base before field access (null.field is a null deref)
-            state.mark_must_be_valid(base);
-            materialize_known_zero_invalid(base, loc, state);
-            if let Err(inv_info) = state.check_valid(base) {
-                let (invalidation, inv_loc) = *inv_info;
+            state.mark_must_be_valid(base.addr);
+            materialize_known_zero_invalid(base.addr, &base.history, loc, state);
+            if let Err(inv_info) = state.check_valid(base.addr) {
+                let (invalidation, invalidation_history) = *inv_info;
                 return PulseResult::Recoverable(
-                    AbstractValue::mk_fresh(),
+                    ValueWithHistory::new(
+                        AbstractValue::mk_fresh(),
+                        ValueHistory::assignment(loc.clone()),
+                    ),
                     vec![Diagnostic::AccessToInvalidAddress {
-                        addr: base,
+                        addr: base.addr,
                         invalidation,
                         access_location: loc.clone(),
-                        invalidation_location: inv_loc,
+                        access_history: base.history.clone(),
+                        invalidation_history,
                     }],
                 );
             }
             let field_access = Access::FieldAccess(field.clone());
-            let target = state.read_heap(base, field_access);
-            PulseResult::Ok(target)
+            PulseResult::Ok(state.read_heap_with_history(base, field_access))
         }
         Exp::Lindex(base_exp, index_exp) => {
-            let base = match eval(base_exp, loc, state) {
+            let base = match eval_with_history(base_exp, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
             // Check validity of base before array access (null[i] is a null deref)
-            state.mark_must_be_valid(base);
-            materialize_known_zero_invalid(base, loc, state);
-            if let Err(inv_info) = state.check_valid(base) {
-                let (invalidation, inv_loc) = *inv_info;
+            state.mark_must_be_valid(base.addr);
+            materialize_known_zero_invalid(base.addr, &base.history, loc, state);
+            if let Err(inv_info) = state.check_valid(base.addr) {
+                let (invalidation, invalidation_history) = *inv_info;
                 return PulseResult::Recoverable(
-                    AbstractValue::mk_fresh(),
+                    ValueWithHistory::new(
+                        AbstractValue::mk_fresh(),
+                        ValueHistory::assignment(loc.clone()),
+                    ),
                     vec![Diagnostic::AccessToInvalidAddress {
-                        addr: base,
+                        addr: base.addr,
                         invalidation,
                         access_location: loc.clone(),
-                        invalidation_location: inv_loc,
+                        access_history: base.history.clone(),
+                        invalidation_history,
                     }],
                 );
             }
-            let index = match eval(index_exp, loc, state) {
+            let index = match eval_with_history(index_exp, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
             // Canonicalize the index: if it's a known constant, use a
             // deterministic abstract value so that store &a[0] and load &a[0]
             // see the same heap edge.
-            let canon_index = state.canonicalize_for_access(index);
+            let canon_index = state.canonicalize_for_access(index.addr);
             let array_access = Access::ArrayAccess(sil::typ::Typ::void(), canon_index);
-            let target = state.read_heap(base, array_access);
-            PulseResult::Ok(target)
+            PulseResult::Ok(state.read_heap_with_history(base, array_access))
         }
         Exp::Const(c) => eval_const(c, loc, state),
         Exp::UnOp(op, inner, _typ) => {
-            let inner_val = match eval(inner, loc, state) {
+            let inner_val = match eval_with_history(inner, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
@@ -129,32 +151,32 @@ pub fn eval(
             match op {
                 sil::unop::Unop::LNot => {
                     // !x: if x is a known constant, fold to 0 or 1
-                    if let Some(c) = state.get_const(inner_val) {
+                    if let Some(c) = state.get_const(inner_val.addr) {
                         let negated = if c == 0 { 1 } else { 0 };
                         let _ = state.and_equal_const(result, negated);
                     }
                 }
                 sil::unop::Unop::Neg => {
                     // -x: if x is a known constant, fold to -x
-                    if let Some(c) = state.get_const(inner_val) {
+                    if let Some(c) = state.get_const(inner_val.addr) {
                         let _ = state.and_equal_const(result, -c);
                     }
                 }
                 sil::unop::Unop::BNot => {
                     // ~x: if x is a known constant, fold to ~x
-                    if let Some(c) = state.get_const(inner_val) {
+                    if let Some(c) = state.get_const(inner_val.addr) {
                         let _ = state.and_equal_const(result, !c);
                     }
                 }
             }
-            PulseResult::Ok(result)
+            PulseResult::Ok(ValueWithHistory::new(result, inner_val.history))
         }
         Exp::BinOp(bop, lhs, rhs) => {
-            let lhs_val = match eval(lhs, loc, state) {
+            let lhs_val = match eval_with_history(lhs, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
-            let rhs_val = match eval(rhs, loc, state) {
+            let rhs_val = match eval_with_history(rhs, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
@@ -163,13 +185,16 @@ pub fn eval(
             let _ = state.and_equal_binop(
                 result,
                 bop.clone(),
-                &Operand::AbstractValue(lhs_val),
-                &Operand::AbstractValue(rhs_val),
+                &Operand::AbstractValue(lhs_val.addr),
+                &Operand::AbstractValue(rhs_val.addr),
             );
-            PulseResult::Ok(result)
+            PulseResult::Ok(ValueWithHistory::new(
+                result,
+                lhs_val.history.merge(&rhs_val.history),
+            ))
         }
-        Exp::Cast(_, inner) => eval(inner, loc, state),
-        Exp::Exn(inner) => eval(inner, loc, state),
+        Exp::Cast(_, inner) => eval_with_history(inner, loc, state),
+        Exp::Exn(inner) => eval_with_history(inner, loc, state),
         Exp::Sizeof(data) => {
             // Try nbytes first (set by some frontends), then compute from type.
             let size = data
@@ -179,21 +204,30 @@ pub fn eval(
             if let Some(n) = size {
                 let v = AbstractValue::mk_fresh();
                 state.and_equal_const(v, n);
-                PulseResult::Ok(v)
+                PulseResult::Ok(ValueWithHistory::new(
+                    v,
+                    ValueHistory::assignment(loc.clone()),
+                ))
             } else {
-                PulseResult::Ok(AbstractValue::mk_fresh())
+                PulseResult::Ok(ValueWithHistory::new(
+                    AbstractValue::mk_fresh(),
+                    ValueHistory::assignment(loc.clone()),
+                ))
             }
         }
-        Exp::Closure(_) => PulseResult::Ok(AbstractValue::mk_fresh()),
+        Exp::Closure(_) => PulseResult::Ok(ValueWithHistory::new(
+            AbstractValue::mk_fresh(),
+            ValueHistory::assignment(loc.clone()),
+        )),
     }
 }
 
-/// Evaluate a constant to an abstract value.
+/// Evaluate a constant to an abstract value and provenance.
 fn eval_const(
     c: &Const,
     loc: &Location,
     state: &mut AbductiveDomain,
-) -> PulseResult<AbstractValue, Diagnostic> {
+) -> PulseResult<ValueWithHistory, Diagnostic> {
     match c {
         Const::Cint(i) => {
             let v = AbstractValue::mk_fresh();
@@ -209,9 +243,21 @@ fn eval_const(
             // be marked invalid — they're not pointer dereferences.
             if i.is_zero() {
                 let inv = Invalidation::ConstantDereference(i.clone());
-                state.invalidate(v, inv, loc.clone());
+                state.invalidate(
+                    v,
+                    inv.clone(),
+                    ValueHistory::invalidated(inv.clone(), loc.clone()),
+                );
+                PulseResult::Ok(ValueWithHistory::new(
+                    v,
+                    ValueHistory::invalidated(inv, loc.clone()),
+                ))
+            } else {
+                PulseResult::Ok(ValueWithHistory::new(
+                    v,
+                    ValueHistory::assignment(loc.clone()),
+                ))
             }
-            PulseResult::Ok(v)
         }
         Const::Cfun(pname) => {
             // Record the procedure name as a Closure attribute so that
@@ -224,9 +270,15 @@ fn eval_const(
                 .post
                 .attrs
                 .add_one(v, crate::attribute::Attribute::Closure(pname.clone()));
-            PulseResult::Ok(v)
+            PulseResult::Ok(ValueWithHistory::new(
+                v,
+                ValueHistory::assignment(loc.clone()),
+            ))
         }
-        Const::Cstr(_) => PulseResult::Ok(AbstractValue::mk_fresh()),
+        Const::Cstr(_) => PulseResult::Ok(ValueWithHistory::new(
+            AbstractValue::mk_fresh(),
+            ValueHistory::assignment(loc.clone()),
+        )),
         Const::Cfloat(f) => {
             let v = AbstractValue::mk_fresh();
             // Convert float to rational for the linear solver.
@@ -235,9 +287,15 @@ fn eval_const(
                 let lin = crate::formula::lin_arith::LinArith::of_q(q);
                 let _ = state.and_equal_linear(v, lin);
             }
-            PulseResult::Ok(v)
+            PulseResult::Ok(ValueWithHistory::new(
+                v,
+                ValueHistory::assignment(loc.clone()),
+            ))
         }
-        Const::Cclass(_) => PulseResult::Ok(AbstractValue::mk_fresh()),
+        Const::Cclass(_) => PulseResult::Ok(ValueWithHistory::new(
+            AbstractValue::mk_fresh(),
+            ValueHistory::assignment(loc.clone()),
+        )),
     }
 }
 
@@ -260,11 +318,24 @@ pub fn eval_deref(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<AbstractValue, Diagnostic> {
-    let addr = match eval(exp, loc, state) {
+    match eval_deref_with_history(exp, loc, state) {
+        PulseResult::Ok(value) => PulseResult::Ok(value.addr),
+        PulseResult::Recoverable(value, errors) => PulseResult::Recoverable(value.addr, errors),
+        PulseResult::FatalError(diag, errors) => PulseResult::FatalError(diag, errors),
+    }
+}
+
+/// Evaluate a dereference and preserve the target provenance.
+pub fn eval_deref_with_history(
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<ValueWithHistory, Diagnostic> {
+    let addr = match eval_with_history(exp, loc, state) {
         PulseResult::Ok(v) => v,
         other => return other,
     };
-    eval_deref_addr(addr, loc, state)
+    eval_deref_addr_with_history(addr, loc, state)
 }
 
 /// Dereference an abstract address: check validity then follow the edge.
@@ -273,23 +344,41 @@ pub fn eval_deref_addr(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<AbstractValue, Diagnostic> {
+    match eval_deref_addr_with_history(
+        ValueWithHistory::new(addr, ValueHistory::epoch()),
+        loc,
+        state,
+    ) {
+        PulseResult::Ok(value) => PulseResult::Ok(value.addr),
+        PulseResult::Recoverable(value, errors) => PulseResult::Recoverable(value.addr, errors),
+        PulseResult::FatalError(diag, errors) => PulseResult::FatalError(diag, errors),
+    }
+}
+
+/// Dereference an abstract address and preserve the target provenance.
+pub fn eval_deref_addr_with_history(
+    addr: ValueWithHistory,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<ValueWithHistory, Diagnostic> {
     // Record that this address must be valid (for interproc pre-condition checks).
     // Cross-ref: OCaml PulseOperations.ml check_addr_access sets MustBeValid.
-    state.mark_must_be_valid(addr);
-    materialize_known_zero_invalid(addr, loc, state);
+    state.mark_must_be_valid(addr.addr);
+    materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
 
     // THE null-deref / use-after-free check
-    if let Err(inv_info) = state.check_valid(addr) {
-        let (invalidation, inv_loc) = *inv_info;
+    if let Err(inv_info) = state.check_valid(addr.addr) {
+        let (invalidation, invalidation_history) = *inv_info;
         return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
-            addr,
+            addr: addr.addr,
             invalidation,
             access_location: loc.clone(),
-            invalidation_location: inv_loc,
+            access_history: addr.history.clone(),
+            invalidation_history,
         });
     }
 
-    let target = state.read_heap(addr, Access::Dereference);
+    let target = state.read_heap_with_history(addr, Access::Dereference);
     PulseResult::Ok(target)
 }
 
@@ -299,15 +388,29 @@ pub fn check_addr_access(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
-    state.mark_must_be_valid(addr);
-    materialize_known_zero_invalid(addr, loc, state);
-    if let Err(inv_info) = state.check_valid(addr) {
-        let (invalidation, inv_loc) = *inv_info;
+    check_addr_access_with_history(
+        ValueWithHistory::new(addr, ValueHistory::epoch()),
+        loc,
+        state,
+    )
+}
+
+/// Check if accessing an address is valid, using its current provenance.
+pub fn check_addr_access_with_history(
+    addr: ValueWithHistory,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<(), Diagnostic> {
+    state.mark_must_be_valid(addr.addr);
+    materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
+    if let Err(inv_info) = state.check_valid(addr.addr) {
+        let (invalidation, invalidation_history) = *inv_info;
         return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
-            addr,
+            addr: addr.addr,
             invalidation,
             access_location: loc.clone(),
-            invalidation_location: inv_loc,
+            access_history: addr.history,
+            invalidation_history,
         });
     }
     PulseResult::Ok(())
@@ -320,11 +423,30 @@ pub fn write_deref(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
-    match check_addr_access(ref_addr, loc, state) {
+    write_deref_with_history(
+        ValueWithHistory::new(ref_addr, ValueHistory::epoch()),
+        ValueWithHistory::new(obj, ValueHistory::epoch()),
+        loc,
+        state,
+    )
+}
+
+/// Write through a pointer, preserving the pointee provenance.
+pub fn write_deref_with_history(
+    ref_addr: ValueWithHistory,
+    obj: ValueWithHistory,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<(), Diagnostic> {
+    match check_addr_access_with_history(ref_addr.clone(), loc, state) {
         PulseResult::Ok(()) => {}
         PulseResult::FatalError(e, errs) => return PulseResult::FatalError(e, errs),
         PulseResult::Recoverable((), errs) => {
-            state.write_heap(ref_addr, Access::Dereference, obj);
+            state.write_heap_with_history(
+                ref_addr.addr,
+                Access::Dereference,
+                ValueWithHistory::new(obj.addr, obj.history.append_assignment(loc.clone())),
+            );
             return PulseResult::Recoverable((), errs);
         }
     }
@@ -336,18 +458,35 @@ pub fn write_deref(
     // overwrites it with the callee's new value.
     // Cross-ref: OCaml PulseOperations.ml write_deref calls write_access
     // which does biabduction (abduce on pre with old value).
-    let pre_target = state.read_heap(ref_addr, Access::Dereference);
+    let pre_target = state.read_heap_with_history(ref_addr.clone(), Access::Dereference);
     // read_heap already added the pre-edge with the "before" value.
     // The pre_target is whatever was there (or a fresh value if nothing).
     let _ = pre_target; // used by read_heap to create pre-edge
-    state.write_heap(ref_addr, Access::Dereference, obj);
+    state.write_heap_with_history(
+        ref_addr.addr,
+        Access::Dereference,
+        ValueWithHistory::new(obj.addr, obj.history.append_assignment(loc.clone())),
+    );
     PulseResult::Ok(())
 }
 
 /// Write the result of a Load into an identifier's stack slot.
 pub fn write_id(id: &sil::ident::Ident, value: AbstractValue, state: &mut AbductiveDomain) {
+    write_id_with_history(
+        id,
+        ValueWithHistory::new(value, ValueHistory::epoch()),
+        state,
+    );
+}
+
+/// Write the result of a Load into an identifier's stack slot with provenance.
+pub fn write_id_with_history(
+    id: &sil::ident::Ident,
+    value: ValueWithHistory,
+    state: &mut AbductiveDomain,
+) {
     let var = Var::LogicalVar(id.clone());
-    state.post.stack.add(var, value);
+    state.post.stack.add_with_history(var, value);
 }
 
 /// Mark an address as invalidated (freed, null, etc.).
@@ -357,7 +496,7 @@ pub fn invalidate(
     loc: Location,
     state: &mut AbductiveDomain,
 ) {
-    state.invalidate(addr, inv, loc);
+    state.invalidate(addr, inv.clone(), ValueHistory::invalidated(inv, loc));
 }
 
 /// Evaluate a constant without marking it as Invalid.
@@ -383,7 +522,11 @@ fn eval_const_no_invalidate(
             PulseResult::Ok(v)
         }
         // For non-integer constants, delegate to normal eval_const
-        other => eval_const(other, &Location::dummy(), state),
+        other => match eval_const(other, &Location::dummy(), state) {
+            PulseResult::Ok(value) => PulseResult::Ok(value.addr),
+            PulseResult::Recoverable(value, errors) => PulseResult::Recoverable(value.addr, errors),
+            PulseResult::FatalError(diag, errors) => PulseResult::FatalError(diag, errors),
+        },
     }
 }
 
@@ -418,6 +561,23 @@ pub fn eval_or_fresh_for_prune(
     match eval_for_prune(exp, loc, state) {
         PulseResult::Ok(v) | PulseResult::Recoverable(v, _) => v,
         PulseResult::FatalError(_, _) => AbstractValue::mk_fresh(),
+    }
+}
+
+/// Evaluate an expression, returning its abstract value and provenance.
+/// On error (e.g. null deref during eval), returns a fresh value with a
+/// best-effort assignment provenance at the current location.
+pub fn eval_or_fresh_with_history(
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> ValueWithHistory {
+    match eval_with_history(exp, loc, state) {
+        PulseResult::Ok(value) | PulseResult::Recoverable(value, _) => value,
+        PulseResult::FatalError(_, _) => ValueWithHistory::new(
+            AbstractValue::mk_fresh(),
+            ValueHistory::assignment(loc.clone()),
+        ),
     }
 }
 

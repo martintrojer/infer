@@ -13,6 +13,7 @@ use std::fmt;
 use sil::var::Var;
 
 use crate::abstract_value::AbstractValue;
+use crate::value_history::{ValueHistory, ValueWithHistory};
 
 /// The stack: maps program/logical variables to their abstract addresses.
 ///
@@ -20,7 +21,7 @@ use crate::abstract_value::AbstractValue;
 /// We simplify to just the address for now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseStack {
-    map: HashMap<Var, AbstractValue>,
+    map: HashMap<Var, ValueWithHistory>,
 }
 
 impl BaseStack {
@@ -30,12 +31,22 @@ impl BaseStack {
 
     /// Look up a variable's abstract address.
     pub fn find(&self, var: &Var) -> Option<AbstractValue> {
-        self.map.get(var).copied()
+        self.find_with_history(var).map(|value| value.addr)
+    }
+
+    /// Look up a variable together with its provenance.
+    pub fn find_with_history(&self, var: &Var) -> Option<&ValueWithHistory> {
+        self.map.get(var)
     }
 
     /// Bind a variable to an abstract address.
     pub fn add(&mut self, var: Var, addr: AbstractValue) {
-        self.map.insert(var, addr);
+        self.add_with_history(var, ValueWithHistory::new(addr, ValueHistory::epoch()));
+    }
+
+    /// Bind a variable to an abstract value and provenance.
+    pub fn add_with_history(&mut self, var: Var, value: ValueWithHistory) {
+        self.map.insert(var, value);
     }
 
     /// Remove a variable binding.
@@ -45,6 +56,11 @@ impl BaseStack {
 
     /// Iterate over all bindings.
     pub fn iter(&self) -> impl Iterator<Item = (&Var, &AbstractValue)> {
+        self.map.iter().map(|(var, value)| (var, &value.addr))
+    }
+
+    /// Iterate over all bindings with provenance.
+    pub fn iter_with_history(&self) -> impl Iterator<Item = (&Var, &ValueWithHistory)> {
         self.map.iter()
     }
 
@@ -59,9 +75,9 @@ impl BaseStack {
 
     /// Substitute abstract values: replace `old` with `new` wherever it appears.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
-        for addr in self.map.values_mut() {
-            if *addr == old {
-                *addr = new;
+        for value in self.map.values_mut() {
+            if value.addr == old {
+                value.addr = new;
             }
         }
     }
@@ -71,11 +87,11 @@ impl fmt::Display for BaseStack {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut entries: Vec<_> = self.map.iter().collect();
         entries.sort_by_key(|(var, _)| format!("{var}"));
-        for (i, (var, addr)) in entries.iter().enumerate() {
+        for (i, (var, value)) in entries.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "&{var}={addr}")?;
+            write!(f, "&{var}={}", value.addr)?;
         }
         Ok(())
     }

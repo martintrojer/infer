@@ -16,13 +16,14 @@ use std::fmt;
 
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
+use crate::value_history::{ValueHistory, ValueWithHistory};
 
 /// Edges from a single heap address: maps accesses to target addresses.
 ///
 /// OCaml uses `RecencyMap` (bounded map). We use `BTreeMap` (unbounded)
 /// for simplicity; can add recency eviction later if needed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Edges(BTreeMap<Access, AbstractValue>);
+pub struct Edges(BTreeMap<Access, ValueWithHistory>);
 
 impl Edges {
     pub fn empty() -> Self {
@@ -30,7 +31,11 @@ impl Edges {
     }
 
     pub fn add(&mut self, access: Access, target: AbstractValue) {
-        self.0.insert(access, target);
+        self.add_with_history(access, ValueWithHistory::new(target, ValueHistory::epoch()));
+    }
+
+    pub fn add_with_history(&mut self, access: Access, value: ValueWithHistory) {
+        self.0.insert(access, value);
     }
 
     pub fn remove(&mut self, access: &Access) {
@@ -38,7 +43,11 @@ impl Edges {
     }
 
     pub fn find(&self, access: &Access) -> Option<AbstractValue> {
-        self.0.get(access).copied()
+        self.find_with_history(access).map(|value| value.addr)
+    }
+
+    pub fn find_with_history(&self, access: &Access) -> Option<&ValueWithHistory> {
+        self.0.get(access)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -46,6 +55,10 @@ impl Edges {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Access, &AbstractValue)> {
+        self.0.iter().map(|(access, value)| (access, &value.addr))
+    }
+
+    pub fn iter_with_history(&self) -> impl Iterator<Item = (&Access, &ValueWithHistory)> {
         self.0.iter()
     }
 
@@ -56,10 +69,12 @@ impl Edges {
     /// Substitute abstract values in edge targets.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
         let mut updated = BTreeMap::new();
-        for (access, target) in std::mem::take(&mut self.0) {
+        for (access, mut value) in std::mem::take(&mut self.0) {
             let access = access.canonicalize(|v| if v == old { new } else { v });
-            let target = if target == old { new } else { target };
-            updated.insert(access, target);
+            if value.addr == old {
+                value.addr = new;
+            }
+            updated.insert(access, value);
         }
         self.0 = updated;
     }
@@ -86,9 +101,33 @@ impl BaseMemory {
         self.graph.entry(src).or_default().add(access, target);
     }
 
+    /// Add an edge together with the target provenance.
+    pub fn add_edge_with_history(
+        &mut self,
+        src: AbstractValue,
+        access: Access,
+        value: ValueWithHistory,
+    ) {
+        self.graph
+            .entry(src)
+            .or_default()
+            .add_with_history(access, value);
+    }
+
     /// Find the target of an edge: `src --access--> ?`.
     pub fn find_edge(&self, src: AbstractValue, access: &Access) -> Option<AbstractValue> {
         self.graph.get(&src).and_then(|edges| edges.find(access))
+    }
+
+    /// Find the target of an edge together with its provenance.
+    pub fn find_edge_with_history(
+        &self,
+        src: AbstractValue,
+        access: &Access,
+    ) -> Option<&ValueWithHistory> {
+        self.graph
+            .get(&src)
+            .and_then(|edges| edges.find_with_history(access))
     }
 
     /// Check if an edge exists.
@@ -155,8 +194,8 @@ impl BaseMemory {
         if let Some(edges) = self.graph.remove(&old) {
             // Merge with existing edges at `new` if any
             let entry = self.graph.entry(new).or_default();
-            for (access, target) in edges.iter() {
-                entry.add(access.clone(), *target);
+            for (access, value) in edges.iter_with_history() {
+                entry.add_with_history(access.clone(), value.clone());
             }
         }
     }

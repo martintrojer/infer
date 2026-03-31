@@ -32,3 +32,4 @@ pub mod specialization;
 pub mod state_cmp;
 pub mod summary;
 pub mod transfer;
+pub mod value_history;

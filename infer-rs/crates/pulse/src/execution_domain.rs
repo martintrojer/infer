@@ -123,19 +123,22 @@ fn diagnostics_compatible(lhs: &Diagnostic, rhs: &Diagnostic) -> bool {
             Diagnostic::AccessToInvalidAddress {
                 invalidation: lhs_invalidation,
                 access_location: lhs_access_location,
-                invalidation_location: lhs_invalidation_location,
+                access_history: lhs_access_history,
+                invalidation_history: lhs_invalidation_history,
                 ..
             },
             Diagnostic::AccessToInvalidAddress {
                 invalidation: rhs_invalidation,
                 access_location: rhs_access_location,
-                invalidation_location: rhs_invalidation_location,
+                access_history: rhs_access_history,
+                invalidation_history: rhs_invalidation_history,
                 ..
             },
         ) => {
             lhs_invalidation == rhs_invalidation
                 && lhs_access_location == rhs_access_location
-                && lhs_invalidation_location == rhs_invalidation_location
+                && lhs_access_history == rhs_access_history
+                && lhs_invalidation_history == rhs_invalidation_history
         }
         (
             Diagnostic::MemoryLeak {

@@ -2,13 +2,18 @@
 
 Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory safety checking (null dereferences, use-after-free, memory leaks).
 
-Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 132. Leaks: expected 20, found 20. UAF: expected 7, found 7.
+Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 134. Leaks: expected 20, found 20. UAF: expected 7, found 7.
 
-Remaining count gaps are `memory_leak.c` (-1 NPE) and `sizeof.c` (+2 NPE). `nullptr.c` count
-parity is now exact again, though its proc-level issue set still differs by one missing report and
-one extra report.
+`memory_leak.c` is now back at parity after history-aware invalid-access provenance/dedup. The
+remaining published NPE delta is:
 
-See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data.
+- `nullptr.c` (+1): one remaining analysis false positive (`FN_nullptr_deref_old_bad`)
+- `sizeof.c` (+2): accepted `--store-textual` / `--export-textual` fidelity limitation. Exported
+  Textual lowers array `sizeof(...)` expressions to `<int[]>` without `nbytes` or array length, so
+  the Rust roundtrip cannot constant-fold those branches.
+
+See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
+[docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.
 
 ## CLI Usage
 

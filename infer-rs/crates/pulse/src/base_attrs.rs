@@ -15,6 +15,7 @@ use sil::location::Location;
 use crate::abstract_value::AbstractValue;
 use crate::attribute::{Attribute, Attributes};
 use crate::invalidation::Invalidation;
+use crate::value_history::ValueHistory;
 
 /// Maps abstract addresses to their attribute sets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -39,12 +40,15 @@ impl BaseAddressAttributes {
 
     /// Check if an address is valid (not invalid).
     ///
-    /// Returns `Ok(())` if valid, or `Err(Box<(invalidation, location)>)` if invalid.
+    /// Returns `Ok(())` if valid, or `Err(Box<(invalidation, history)>)` if invalid.
     /// This is THE null-dereference / use-after-free check.
-    pub fn check_valid(&self, addr: AbstractValue) -> Result<(), Box<(Invalidation, Location)>> {
+    pub fn check_valid(
+        &self,
+        addr: AbstractValue,
+    ) -> Result<(), Box<(Invalidation, ValueHistory)>> {
         if let Some(attrs) = self.map.get(&addr) {
-            if let Some((inv, loc)) = attrs.get_invalid() {
-                return Err(Box::new((inv.clone(), loc.clone())));
+            if let Some((inv, history)) = attrs.get_invalid() {
+                return Err(Box::new((inv.clone(), history.clone())));
             }
         }
         Ok(())
@@ -58,8 +62,8 @@ impl BaseAddressAttributes {
     }
 
     /// Mark an address as invalid.
-    pub fn invalidate(&mut self, addr: AbstractValue, inv: Invalidation, loc: Location) {
-        self.add_one(addr, Attribute::Invalid(inv, loc));
+    pub fn invalidate(&mut self, addr: AbstractValue, inv: Invalidation, history: ValueHistory) {
+        self.add_one(addr, Attribute::Invalid(inv, history));
     }
 
     /// Mark an address as allocated.
@@ -166,7 +170,10 @@ mod tests {
         attrs.invalidate(
             v,
             Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
         let err = attrs.check_valid(v);
         assert!(err.is_err());
@@ -178,7 +185,11 @@ mod tests {
     fn test_check_valid_freed() {
         let mut attrs = BaseAddressAttributes::empty();
         let v = AbstractValue::of_raw(1);
-        attrs.invalidate(v, Invalidation::CFree, Location::dummy());
+        attrs.invalidate(
+            v,
+            Invalidation::CFree,
+            ValueHistory::invalidated(Invalidation::CFree, Location::dummy()),
+        );
         assert!(attrs.check_valid(v).is_err());
     }
 

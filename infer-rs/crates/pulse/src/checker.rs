@@ -25,6 +25,7 @@ use sil::const_val::Const;
 use sil::exp::Exp;
 use sil::ident::{Ident, IdentName};
 use sil::instr::Instr;
+use sil::location::Location;
 use sil::procdesc::{NodeId, Procdesc};
 use sil::procname::Procname;
 use sil::specialization::PulseSpecialization;
@@ -275,7 +276,8 @@ fn exec_instr_with_summaries(
         // empty define in textual but should still be modeled as noreturn)
         if crate::models::has_model(callee_pname) {
             log::debug!("  [call] model: {callee_pname}");
-            return transfer::exec_instr_with_pdesc(Some(pdesc), instr, state);
+            let results = transfer::exec_instr_with_pdesc(Some(pdesc), instr, state.clone());
+            return merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state);
         }
 
         if let Some(callee_summary) = callee_summaries.get(callee_pname) {
@@ -372,7 +374,9 @@ fn exec_instr_with_summaries(
                         state.clone(),
                     );
                     log::debug!("    pre/post #{j}: {} results", applied.len());
-                    results.extend(applied);
+                    results.extend(merge_return_history_from_equal_actuals(
+                        applied, ret_id, args, loc, &state,
+                    ));
                 }
                 return results;
             }
@@ -438,6 +442,73 @@ fn maybe_inline_global_initializer_load(
         ));
     }
     Some(results)
+}
+
+fn merge_return_history_from_equal_actuals(
+    results: Vec<ExecutionDomain>,
+    ret_id: &Ident,
+    args: &[(Exp, sil::typ::Typ)],
+    loc: &Location,
+    state_before_call: &AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    let mut tmp_state = state_before_call.clone();
+    let actuals: Vec<_> = args
+        .iter()
+        .map(|(arg_exp, _)| {
+            crate::operations::eval_or_fresh_with_history(arg_exp, loc, &mut tmp_state)
+        })
+        .collect();
+    let ret_var = sil::var::Var::LogicalVar(ret_id.clone());
+
+    results
+        .into_iter()
+        .map(|mut result| {
+            let state = match &mut result {
+                ExecutionDomain::ContinueProgram(state)
+                | ExecutionDomain::ExitProgram(state)
+                | ExecutionDomain::ExceptionRaised(state) => state,
+                ExecutionDomain::AbortProgram { state, .. }
+                | ExecutionDomain::LatentAbortProgram { state, .. }
+                | ExecutionDomain::LatentInvalidAccess { state, .. } => state,
+            };
+
+            let Some(ret_value) = state.post.stack.find_with_history(&ret_var).cloned() else {
+                return result;
+            };
+
+            let merged_history =
+                actuals
+                    .iter()
+                    .fold(ret_value.history.clone(), |history, actual| {
+                        if values_are_equal_in_state(state, ret_value.addr, actual.addr) {
+                            history.merge(&actual.history)
+                        } else {
+                            history
+                        }
+                    });
+
+            if merged_history != ret_value.history {
+                state.post.stack.add_with_history(
+                    ret_var.clone(),
+                    crate::value_history::ValueWithHistory::new(ret_value.addr, merged_history),
+                );
+            }
+
+            result
+        })
+        .collect()
+}
+
+fn values_are_equal_in_state(
+    state: &AbductiveDomain,
+    lhs: crate::abstract_value::AbstractValue,
+    rhs: crate::abstract_value::AbstractValue,
+) -> bool {
+    state.path_condition.get_var_repr(lhs) == state.path_condition.get_var_repr(rhs)
+        || matches!(
+            (state.get_const(lhs), state.get_const(rhs)),
+            (Some(lhs_const), Some(rhs_const)) if lhs_const == rhs_const
+        )
 }
 
 fn should_inline_global_initializer(

@@ -5,39 +5,39 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-The active line is now the three remaining authoritative NPE count gaps:
+The active analysis gap is now just:
 
-- `memory_leak.c`: missing one duplicated `NULLPTR_DEREFERENCE`
-- `sizeof.c`: two extra `NULLPTR_DEREFERENCE`s
-- `nullptr.c`: `create_null_path2_bad_FN` is restored; the only remaining proc-set mismatch is the
-  extra `FN_nullptr_deref_old_bad`
+- `nullptr.c`: expected `13`, found `14` (`NULLPTR_DEREFERENCE`)
 
-Latest authoritative sweep:
+Accepted store-textual limitation:
 
-- `NPE: expected 131, found 133`
+- `sizeof.c`: expected `0`, found `2` (`NULLPTR_DEREFERENCE`)
+- root cause: exported Textual drops `Sizeof.nbytes` / array extent information and emits
+  `<int[]>`, so Rust receives too little data to fold those branches without a workaround
+- policy: accept and document this as a textual fidelity limit; do not add Pulse-side hacks for it
+
+Latest authoritative sweep after the provenance/history change:
+
+- `NPE: expected 131, found 134`
 - `LEAK: expected 20, found 20`
 - `UAF: expected 7, found 7`
 
-Confirmed again after the latest structural attribute fix:
+Important checkpoint after validating the provenance work:
 
-- `make check` is green on this tree.
-- `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
-  is still exactly:
-  - `NPE: expected 131, found 133`
-  - `LEAK: expected 20, found 20`
-  - `UAF: expected 7, found 7`
-- The file-level diffs are unchanged:
-  - `memory_leak.c`: expected `3`, found `2`
-  - `nullptr.c`: expected `13`, found `14`
-  - `sizeof.c`: expected `0`, found `2`
+- `memory_leak.c` is now at parity (`16` issues total in the store-textual sweep).
+- The previously missing duplicated `realloc_no_check_bad` null report is restored.
+- New focused ignored regression:
+  `cargo test -p pulse --test end_to_end test_e2e_memory_leak_realloc_reports_both_null_origins -- --ignored --nocapture`
+  passes and proves both origin lines (`105`, `119`) survive dedup.
+- `cargo test -p pulse --lib -- --nocapture` is green.
+- `make check` is green.
 
 Current authoritative file-level count diffs:
 
-- `memory_leak.c`: expected `3`, found `2` (`NULLPTR_DEREFERENCE`)
 - `nullptr.c`: expected `13`, found `14` (`NULLPTR_DEREFERENCE`)
 - `sizeof.c`: expected `0`, found `2` (`NULLPTR_DEREFERENCE`)
 
-Latest direct `nullptr.c` proc set after the fix:
+Latest known direct `nullptr.c` proc-set state before this checkpoint:
 
 - gone: `unknown_from_parameters_latent` manifest `NULLPTR_DEREFERENCE`
 - still extra: `FN_nullptr_deref_old_bad`

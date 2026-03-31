@@ -1018,6 +1018,7 @@ mod tests {
     use crate::formula::atom::Atom;
     use crate::formula::lin_arith::LinArith;
     use crate::formula::term::Term;
+    use crate::value_history::ValueHistory;
     use sil::ident::{Ident, IdentName};
     use sil::int_lit::IntLit;
     use sil::location::Location;
@@ -1073,6 +1074,23 @@ mod tests {
         pdesc
     }
 
+    fn invalidation_history(invalidation: &crate::invalidation::Invalidation) -> ValueHistory {
+        ValueHistory::invalidated(invalidation.clone(), Location::dummy())
+    }
+
+    fn dummy_invalid_access_diagnostic(
+        addr: AbstractValue,
+        invalidation: crate::invalidation::Invalidation,
+    ) -> Diagnostic {
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            access_history: ValueHistory::assignment(Location::dummy()),
+            invalidation_history: invalidation_history(&invalidation),
+        }
+    }
+
     #[test]
     fn test_summary_captures_formals() {
         let pdesc = make_pdesc_with_formals(&["x", "y"]);
@@ -1098,12 +1116,10 @@ mod tests {
     fn test_add_specialized_summary_merges_diagnostics_but_hides_abort_from_callers() {
         let pdesc = make_pdesc_with_formals(&[]);
         let state = AbductiveDomain::mk_initial(&pdesc);
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: AbstractValue::of_raw(1),
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            AbstractValue::of_raw(1),
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
         let specialized = PulseSummary {
             pre_posts: vec![PrePost {
                 pre: state.pre.clone(),
@@ -1429,12 +1445,10 @@ mod tests {
             .path_condition
             .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(4)), 1);
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         let summary = PulseSummary::of_proc(
             &pdesc,
@@ -1473,12 +1487,10 @@ mod tests {
             .path_condition
             .and_condition_direct(Atom::Equal(Term::Var(fn_ret), Term::Const(999)), 1);
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         let summary = PulseSummary::of_proc(
             &pdesc,
@@ -1512,12 +1524,10 @@ mod tests {
             .path_condition
             .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(4)), 2);
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         let summary = PulseSummary::of_proc(
             &pdesc,
@@ -1548,15 +1558,11 @@ mod tests {
         astate.invalidate(
             formal_val,
             crate::invalidation::Invalidation::CFree,
-            Location::dummy(),
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
         );
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::CFree,
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic =
+            dummy_invalid_access_diagnostic(formal_val, crate::invalidation::Invalidation::CFree);
 
         let summary = PulseSummary::of_proc(
             &pdesc,
@@ -1590,15 +1596,11 @@ mod tests {
         astate.invalidate(
             formal_val,
             crate::invalidation::Invalidation::CFree,
-            Location::dummy(),
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
         );
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::CFree,
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic =
+            dummy_invalid_access_diagnostic(formal_val, crate::invalidation::Invalidation::CFree);
 
         assert!(matches!(
             classify_abort_kind(&pdesc, &astate, &diagnostic),
@@ -1628,15 +1630,16 @@ mod tests {
         astate.invalidate(
             slot_val,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: slot_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            slot_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         let summary = PulseSummary::of_proc(
             &pdesc,
@@ -1681,15 +1684,16 @@ mod tests {
         astate.invalidate(
             slot_val,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: slot_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            slot_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         assert!(matches!(
             classify_abort_kind(&pdesc, &astate, &diagnostic),
@@ -1709,15 +1713,11 @@ mod tests {
         astate.invalidate(
             formal_val,
             crate::invalidation::Invalidation::CFree,
-            Location::dummy(),
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
         );
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::CFree,
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic =
+            dummy_invalid_access_diagnostic(formal_val, crate::invalidation::Invalidation::CFree);
         let specialized = PulseSummary {
             pre_posts: vec![PrePost {
                 pre: astate.pre.clone(),
@@ -1750,12 +1750,10 @@ mod tests {
         let astate = AbductiveDomain::mk_initial(&pdesc);
         let local_null = AbstractValue::mk_fresh();
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: local_null,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            local_null,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         let summary = PulseSummary::of_proc(
             &pdesc,
@@ -1786,12 +1784,10 @@ mod tests {
             .path_condition
             .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(1)), 1);
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
 
         let summary = PulseSummary::of_proc(
             &pdesc,

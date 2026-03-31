@@ -2,13 +2,18 @@
 
 ## Summary
 
-**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 132. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, per-instruction tracing, OCaml-compatible wrapper/abort/nonnull/skip config flags. funptr.c: 11/11. specialization.c: 5/5. angelism.c: 7/7. cleanup_attribute.c: 0/0.**
+**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, minimal ValueHistory-based diagnostic provenance, per-instruction tracing, and OCaml-compatible wrapper/abort/nonnull/skip config flags. funptr.c: 11/11. specialization.c: 5/5. angelism.c: 7/7. cleanup_attribute.c: 0/0.**
 
 Recent correctness / robustness fixes:
+- Invalid-access diagnostics now carry minimal value provenance histories (a reduced Rust analogue
+  of `PulseValueHistory` / `PulseTrace`), and dedup keys now include history signatures. This
+  restores the missing duplicated `realloc_no_check_bad` report in `memory_leak.c`, so
+  `memory_leak.c` is back at parity in the authoritative sweep.
 - Imported pure-call conditions now translate their remembered function-application dependencies
   through summary application, and summary normalization keeps those pure-call results reachable
   from caller-visible actuals. This fixes the old `unknown_from_parameters_latent` manifest
-  false positive and brings `nullptr.c` back to count parity in the authoritative sweep.
+  false positive; the only remaining `nullptr.c` store-textual mismatch is now the extra
+  `FN_nullptr_deref_old_bad`.
 - Capture metadata recovery now also restores `has_cleanup_attribute` on locals
   from `infer debug --procedures --procedures-attributes`, and Rust now mirrors
   OCaml `cleanup_attribute_store` by marking values stored into cleanup locals
@@ -24,6 +29,10 @@ Recent correctness / robustness fixes:
 - The ignored store-textual sweep now invokes the `infer-rs` CLI once per exported `.sil` from the originating source directory, so the published totals include OCaml-style upward `.inferconfig` discovery.
 - The ignored store-textual sweep now rebuilds `infer-rs` once per test process, eliminating stale
   binary noise from `target/{debug,release}/infer-rs` reuse.
+- Accepted limitation: exported Textual currently loses `Sizeof.nbytes` / array extent information
+  for cases such as `sizeof(c)` and `sizeof(c[0])`, so the authoritative store-textual sweep still
+  over-reports `sizeof.c` by two NPEs. This is a capture/export fidelity limit, not a Pulse
+  workaround target. See `docs/STORE_TEXTUAL.md`.
 - OCaml-style `NewEq` incorporation is now wired back into the abductive state: formula equalities rewrite heap/attrs/tracking sets instead of staying solver-only. This restored the missing aliased-specialization behavior in `specialization.c`.
 - Specialized-alias reasoning now affects actual heap semantics, not just formula representatives: `call_test_alias_bad`, `call_test_unalias_bad`, and `call_may_double_free_if_alias_bad` are all back in the direct `specialization.c` run.
 - `apply_summary` now preserves `AbortProgram` summaries instead of dropping them, matching OCaml `PulseCallOperations.apply_callee` more closely.
@@ -62,7 +71,9 @@ Pulse features:
 - **Function pointer dispatch** via `__call_c_function_ptr` + Closure attributes
 - **Noreturn detection** propagated interprocedurally
 - **Deterministic analysis**: thread-local counters + BTreeMap in core structures
-- **Diagnostic dedup** by invalidation origin (handles duplicate SIL nodes from short-circuit `&&`/`||`)
+- **History-aware invalid-access diagnostics**: minimal provenance paths, formal-to-actual history
+  substitution, and history-sensitive dedup (restores duplicated reports such as
+  `memory_leak.c:realloc_no_check_bad`)
 - **Equality incorporation**: solver-discovered equalities now rewrite `pre`/`post`, heap access indices, attrs, `must_be_valid`, and specialization-tracking sets
 
 ## Migration Phases
@@ -167,6 +178,7 @@ Pulse analysis engine. Depends on `sil`, `diagnostics`, `num-rational`. See [PUL
 | `base_attrs.rs` | `PulseBaseAddressAttributes.ml` | AbstractValue → Attributes map, check_valid |
 | `base_domain.rs` | `PulseBaseDomain.ml` | Composite {stack, heap, attrs} |
 | `abductive.rs` | `PulseAbductiveDomain.ml` | Post-state + formula, validity checking, OCaml-style `NewEq` incorporation |
+| `value_history.rs` | `PulseValueHistory.ml` + `PulseTrace.ml` | Minimal invalid-access provenance paths, formal-to-actual substitution, history-sensitive dedup support |
 | `operations.rs` | `PulseOperations.ml` | eval, eval_deref, write_deref, check_addr_access, eval_or_fresh |
 | `transfer.rs` | `Pulse.ml` | SIL instruction → state transition. Prune, UnOp folding (LNot/Neg/BNot), path sensitivity |
 | `models/mod.rs` | `PulseModels*.ml` | Model dispatch: builtins first, then name-based. Models take priority over summaries |
@@ -175,7 +187,7 @@ Pulse analysis engine. Depends on `sil`, `diagnostics`, `num-rational`. See [PUL
 | `summary.rs` | `PulseSummary.ml` | PulseSummary with Vec<PrePost> (multi-disjunct), specialized summaries, needs_specialization HeapPaths, is_noreturn flag |
 | `specialization.rs` | `PulseSpecialization.ml` | apply() binds HeapPaths to Closure attrs, make_specialization_from_caller(), eval_for_prune |
 | `interproc.rs` | `PulseInterproc.ml` | apply_summary: callee→caller effect propagation, formal-value mapping for write-through-pointer, preserve abort summaries |
-| `diagnostic.rs` | `PulseDiagnostic.ml` | AccessToInvalidAddress, MemoryLeak, RetainCycle |
+| `diagnostic.rs` | `PulseDiagnostic.ml` | History-aware AccessToInvalidAddress, MemoryLeak, RetainCycle |
 | `execution_domain.rs` | `PulseExecutionDomain.ml` | ContinueProgram, AbortProgram, ExitProgram |
 | `checker.rs` | `Pulse.ml` + `PulseCallOperations.ml` | analyze, analyze_with_specialization, select_pre_posts, __call_c_function_ptr dispatch, propagate_specialization_need |
 
@@ -285,27 +297,31 @@ The repo also keeps a separate `capture --dump-textual` sweep as a secondary reg
 
 | Status | Count | Details |
 |---|---|---|
-| OK | 52 | parsed + analyzed, 509 procs, 159 issues |
+| OK | 52 | parsed + analyzed, 509 procs, 162 issues |
 | SKIP | 3 | infinite.c, recursion.c, recursion2.c (fixpoint exhaustion) |
 | FAIL_PARSE | 0 | |
 | TIMEOUT | 0 | |
 
-**NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 131, found 132.**
+**NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 131, found 134.**
 
 Per-file differences:
-- Over-detection: `sizeof.c` (+2)
-- Under-detection: `memory_leak.c` (-1)
+- Over-detection: `nullptr.c` (+1)
+- Accepted store-textual limitation: `sizeof.c` (+2)
 
 Recent wins in this area:
+- `memory_leak.c` now matches OCaml again after the history-aware invalid-access provenance fix;
+  `realloc_no_check_bad` once more reports both null origins (`105` and `119`).
 - `angelism.c` now matches OCaml again (`7` issues) after the by-ref unknown-call fix.
-- `nullptr.c` is now back to count parity after preserving imported pure-call dependencies through
-  summary application and normalization; the remaining mismatch there is issue-set shape only
-  (missing `create_null_path2_bad_FN`, extra `FN_nullptr_deref_old_bad`).
+- `nullptr.c` no longer has the old imported-pure-call false positive; the only remaining
+  store-textual mismatch there is the extra `FN_nullptr_deref_old_bad`.
 - `integers.c`, `nullptr_more.c`, and `offsetof_expr.c` are no longer on the sweep diff list.
 - `funptr.c` now matches OCaml in the store/direct pipeline (`11` issues).
 - `compound_literal.c` and `initlistexpr.c` already match OCaml; their earlier sweep diffs were
   measurement bugs caused by basename suffix matching in the expectation helper.
 - `assert.c` and `ternary.c` remain fixed by OCaml-style prune-condition depth tracking.
+- `sizeof.c` is no longer considered an active Pulse parity task: the exported Textual path drops
+  `Sizeof.nbytes` / array extents and emits `<int[]>`, so Rust receives too little information to
+  fold those branches without adding a workaround. See `docs/STORE_TEXTUAL.md`.
 
 **MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
 
@@ -316,8 +332,6 @@ Direct issue-set note:
   authoritative sweep because the harness runs `infer-rs` from each source file's directory.
 - Additional `.inferconfig` model flags now supported: `pulse-model-abort`,
   `pulse-model-return-nonnull`, and `pulse-model-skip-pattern`.
-- `memory_leak.c` leak parity is now exact in the authoritative sweep; its only remaining mismatch
-  is one missing duplicated `NULLPTR_DEREFERENCE` on `realloc_no_check_bad`.
 - The main remaining root-level `.inferconfig` gap is `pulse-model-returns-copy-pattern`, which
   depends on unnecessary-copy tracking that Rust does not implement yet.
 
@@ -345,7 +359,8 @@ using any exact disjunct/null-attr mismatch counts.
      dependencies now survive summary application; remaining mismatch is `pre_heap_has_assumptions`
      plus latent issue typing/publication parity
    - No aliasing contradiction detection (cross-ref: `PulseInterproc.ml` AliasingWithAllAliases)
-   - No `ValueHistory` threading for error trace reconstruction (cross-ref: `PulseValueHistory.ml`)
+   - Minimal `ValueHistory` threading now exists for invalid-access provenance and dedup, but full
+     OCaml `PulseValueHistory` / `PulseTrace` parity is still missing
    - No global variable handling in summary application
    - Specialization implemented for function pointers; dynamic type specialization for OO not yet done
 5. **Pulse formula**: Union-find + linear arithmetic + atoms + term equalities + atom contradiction + CItv integer intervals + is_int integer reasoning. Missing: simplex tableau, non-linear terms.
@@ -356,22 +371,22 @@ using any exact disjunct/null-attr mismatch counts.
 
 ## What's Next (ranked by impact and tractability)
 
-### 1. Fix `sizeof.c` null-dereference over-reporting
-This is the smallest isolated sweep mismatch left:
+### 1. Finish `nullptr.c` store-textual parity
+The remaining active store-textual analysis gap is now narrow:
 
-- `sizeof.c` (+2): OCaml reports no NPEs here, Rust reports two
-- likely still tied to `sizeof` evaluation or report timing around type-only expressions
-
-### 2. Finish `memory_leak.c` NPE issue-set parity
-Leak parity is now exact there; what remains is one duplicated null-path/report-provenance gap:
-
-- `realloc_no_check_bad` should still produce two `NULLPTR_DEREFERENCE` reports, not one
-
-### 3. Finish `nullptr.c` proc-set parity
-The `nullptr` file count now matches OCaml again, but the remaining proc-level mismatch is:
-
-- missing expected `create_null_path2_bad_FN`
 - extra `FN_nullptr_deref_old_bad`
+
+`create_null_path2_bad_FN` is restored, and the old `unknown_from_parameters_latent` manifest
+false positive is gone.
+
+### 2. Extend ValueHistory / trace parity
+The new minimal provenance layer is enough to restore the duplicated `memory_leak.c`
+`realloc_no_check_bad` reports and improve dedup correctness, but it is still reduced compared with
+OCaml's full `PulseValueHistory` / `PulseTrace` stack.
+
+### 3. Keep `sizeof.c` as an accepted exported-Textual limitation
+Do not add Pulse-side workarounds for this. The current mismatch comes from the capture/export
+boundary losing `Sizeof.nbytes` / array extents before Rust sees the textual SIL.
 
 ### Other latent/reporting follow-up
 The current Rust implementation now has condition-depth tracking, latent invalid-access support,
@@ -386,7 +401,6 @@ gap is narrower:
 
 **Leak compliance (expected 20, found 20):**
 - Leak sweep parity is now exact
-- `memory_leak.c` leak parity is exact too; only its duplicated NPE path still differs
 
 **SIL test gaps (from skipped procs):**
 - Virtual dispatch in loads (2 procs in static_types.sil)

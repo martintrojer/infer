@@ -2,24 +2,25 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE expected 131 found 132, Leaks expected 20 found 20, UAF expected 7 found 7)
+### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE expected 131 found 134, Leaks expected 20 found 20, UAF expected 7 found 7)
 
 Correctness note: keep the semantically correct specialization / latent-invalid-access /
 specialized-summary fixes even when totals move temporarily. The current sweep reflects the real
 remaining count gaps after removing the old basename-matching measurement bug.
 
-**NPE Count Gaps:**
+**Accepted store-textual limitation (documented, not a Pulse workaround target):**
 
-1. **`sizeof.c`** (+2): OCaml reports no NPEs; Rust still reports two. Likely tied to `sizeof`
-   evaluation or report timing around type-only expressions.
-2. **`memory_leak.c`** (-1): remaining duplicated `NULLPTR_DEREFERENCE` on
-   `realloc_no_check_bad`.
+1. **`sizeof.c`** (+2): exported Textual drops `Sizeof.nbytes` / array-length information and
+   emits array `sizeof(...)` expressions as `<int[]>`. Rust faithfully roundtrips that back to
+   `Sizeof { typ = int[]; nbytes = None }`, so Pulse cannot fold the `sizeof(c) > 2` /
+   `sizeof(c) / sizeof(c[0]) != 2` branches. Treat this as a `--store-textual` /
+   `--export-textual` fidelity limit unless the interface preserves richer `Sizeof` data.
 
-**Issue-set parity still open even though the file count now matches:**
+**Remaining analysis gap:**
 
-3. **`nullptr.c`**: `unknown_from_parameters_latent` is fixed and no longer inflates the NPE total,
-   but the proc-level issue set is still off by one missing and one extra report:
-   missing `create_null_path2_bad_FN`, extra `FN_nullptr_deref_old_bad`.
+2. **`nullptr.c`** (+1): `create_null_path2_bad_FN` is restored and `unknown_from_parameters_latent`
+   no longer inflates the manifest NPE count. The remaining store-textual mismatch is the extra
+   `FN_nullptr_deref_old_bad`.
 
 **Leak differences:** none in the authoritative sweep. `MEMORY_LEAK_C` parity is exact.
 
@@ -35,11 +36,10 @@ model shim.
 `recursion2.c` — fixpoint exhaustion.
 
 **Notable recent correctness wins:** `cleanup_attribute.c` now matches OCaml again, `angelism.c`
-is back at parity (`7` issues), `memory_leak.c` leak parity is exact in the authoritative sweep,
-`funptr.c` is at parity (`11` issues), `specialization.c` is back to the direct OCaml issue set,
-`nullptr.c` count parity is exact again after translating pure-call function-application
-dependencies through summary application, and `compound_literal.c` / `initlistexpr.c` already
-match OCaml after fixing the sweep expectation helper to use exact basenames.
+is back at parity (`7` issues), `memory_leak.c` is back at full parity after the history-aware
+diagnostic fix, `funptr.c` is at parity (`11` issues), `specialization.c` is back to the direct
+OCaml issue set, and `compound_literal.c` / `initlistexpr.c` already match OCaml after fixing the
+sweep expectation helper to use exact basenames.
 
 ### Textual pipeline gaps
 
@@ -55,9 +55,11 @@ match OCaml after fixing the sweep expectation helper to use exact basenames.
 ### Pulse gaps
 
 - **Aliasing contradiction detection**: Caller aliasing callee's disjoint formals. Cross-ref: `PulseInterproc.ml` AliasingWithAllAliases.
-- **ValueHistory threading**: Error trace reconstruction. Cross-ref: `PulseValueHistory.ml`.
+- **Full ValueHistory / PulseTrace parity**: Rust now has minimal invalid-access provenance and
+  history-sensitive dedup, but richer OCaml-style trace reconstruction is still incomplete.
 - **Global variable handling** in summary application.
-- **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Remaining gap: `<int[]>` without array length.
+- **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Accepted
+  store-textual limitation: exported `<int[]>` arrives without array length or `nbytes`.
 - **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, callee AbortProgram summaries now propagate again, Rust now has a caller-side latent-invalid-access path, and imported pure-call dependencies now survive summary application/normalization. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, latent issue type reporting, and OCaml-aligned publication timing for any still-propagated abort over-reports.
 
 ## Debugging tools

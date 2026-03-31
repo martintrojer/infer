@@ -54,6 +54,7 @@ impl fmt::Display for BaseDomain {
 mod tests {
     use super::*;
     use crate::access::Access;
+    use crate::value_history::ValueHistory;
     use sil::ident::{Ident, IdentName};
     use sil::int_lit::IntLit;
     use sil::location::Location;
@@ -85,7 +86,10 @@ mod tests {
         dom.attrs.invalidate(
             v2,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
 
         // Verify: following x → v1 --*--> v2, and v2 is invalid

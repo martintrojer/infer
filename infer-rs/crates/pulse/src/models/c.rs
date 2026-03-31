@@ -22,6 +22,7 @@ use crate::invalidation::Invalidation;
 use crate::models::matching::matches_procname_pattern;
 use crate::operations;
 use crate::pulse_result::PulseResult;
+use crate::value_history::ValueHistory;
 
 /// Method names that have C models. Single source of truth —
 /// adding a model means adding the name here AND a dispatch arm below.
@@ -197,17 +198,34 @@ fn fresh_or_null(ret_id: &Ident, loc: &Location, state: AbductiveDomain) -> Vec<
     // Constrain non-null return to be positive so prune(addr = 0) is Unsat.
     // Cross-ref: OCaml PulseModelsImport.ml alloc_not_null_common calls and_positive.
     let _ = ok_state.and_positive(addr);
-    operations::write_id(ret_id, addr, &mut ok_state);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(addr, ValueHistory::assignment(loc.clone())),
+        &mut ok_state,
+    );
 
     let mut fail_state = state;
     let null_val = AbstractValue::mk_fresh();
-    operations::write_id(ret_id, null_val, &mut fail_state);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(
+            null_val,
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
+                loc.clone(),
+            ),
+        ),
+        &mut fail_state,
+    );
     let _ = fail_state.and_equal_const(null_val, 0);
     fail_state.post.attrs.add_one(
         null_val,
         crate::attribute::Attribute::Invalid(
             Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
-            loc.clone(),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
+                loc.clone(),
+            ),
         ),
     );
 
@@ -231,11 +249,25 @@ fn allocate_or_null(
     // Cross-ref: OCaml PulseModelsImport.ml alloc_not_null_common calls and_positive.
     let _ = ok_state.and_positive(addr);
     operations::allocate(addr, allocator, loc.clone(), &mut ok_state);
-    operations::write_id(ret_id, addr, &mut ok_state);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(addr, ValueHistory::assignment(loc.clone())),
+        &mut ok_state,
+    );
 
     let mut fail_state = state;
     let null_val = AbstractValue::mk_fresh();
-    operations::write_id(ret_id, null_val, &mut fail_state);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(
+            null_val,
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
+                loc.clone(),
+            ),
+        ),
+        &mut fail_state,
+    );
     // Constrain null_val = 0 in the formula so prune(val ≠ 0) can eliminate it.
     // Matches OCaml's `and_eq_int ret_addr IntLit.zero` in alloc_common_dsl.
     let _ = fail_state.and_equal_const(null_val, 0);
@@ -243,7 +275,10 @@ fn allocate_or_null(
         null_val,
         crate::attribute::Attribute::Invalid(
             Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
-            loc.clone(),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
+                loc.clone(),
+            ),
         ),
     );
 
@@ -279,9 +314,9 @@ fn invalidate_first_arg(
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
     if let Some((arg_exp, _)) = args.first() {
-        let addr = operations::eval_or_fresh(arg_exp, loc, &mut state);
+        let addr = operations::eval_or_fresh_with_history(arg_exp, loc, &mut state);
 
-        match operations::check_addr_access(addr, loc, &mut state) {
+        match operations::check_addr_access_with_history(addr.clone(), loc, &mut state) {
             PulseResult::FatalError(diag, _) => {
                 return vec![ExecutionDomain::AbortProgram {
                     state: Box::new(state),
@@ -289,9 +324,24 @@ fn invalidate_first_arg(
                 }];
             }
             PulseResult::Recoverable((), errors) => {
-                operations::invalidate(addr, inv, loc.clone(), &mut state);
+                state.invalidate(
+                    addr.addr,
+                    inv.clone(),
+                    addr.history
+                        .append_event(crate::value_history::HistoryEvent::Invalidated {
+                            invalidation: inv.clone(),
+                            location: loc.clone(),
+                        }),
+                );
                 let ret_val = AbstractValue::mk_fresh();
-                operations::write_id(ret_id, ret_val, &mut state);
+                operations::write_id_with_history(
+                    ret_id,
+                    crate::value_history::ValueWithHistory::new(
+                        ret_val,
+                        ValueHistory::assignment(loc.clone()),
+                    ),
+                    &mut state,
+                );
                 let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
                 for diag in errors {
                     results.push(ExecutionDomain::AbortProgram {
@@ -302,13 +352,25 @@ fn invalidate_first_arg(
                 return results;
             }
             PulseResult::Ok(()) => {
-                operations::invalidate(addr, inv, loc.clone(), &mut state);
+                state.invalidate(
+                    addr.addr,
+                    inv.clone(),
+                    addr.history
+                        .append_event(crate::value_history::HistoryEvent::Invalidated {
+                            invalidation: inv,
+                            location: loc.clone(),
+                        }),
+                );
             }
         }
     }
 
     let ret_val = AbstractValue::mk_fresh();
-    operations::write_id(ret_id, ret_val, &mut state);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(ret_val, ValueHistory::assignment(loc.clone())),
+        &mut state,
+    );
     vec![ExecutionDomain::ContinueProgram(state)]
 }
 
@@ -324,18 +386,25 @@ fn free(
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
     if let Some((arg_exp, _)) = args.first() {
-        let addr = operations::eval_or_fresh(arg_exp, loc, &mut state);
+        let addr = operations::eval_or_fresh_with_history(arg_exp, loc, &mut state);
 
         let mut results = Vec::new();
 
         let mut null_state = state.clone();
-        if null_state.and_equal_const(addr, 0).is_sat() {
+        if null_state.and_equal_const(addr.addr, 0).is_sat() {
             let ret_val = AbstractValue::mk_fresh();
-            operations::write_id(ret_id, ret_val, &mut null_state);
+            operations::write_id_with_history(
+                ret_id,
+                crate::value_history::ValueWithHistory::new(
+                    ret_val,
+                    ValueHistory::assignment(loc.clone()),
+                ),
+                &mut null_state,
+            );
             results.push(ExecutionDomain::ContinueProgram(null_state));
         }
 
-        if state.and_positive(addr).is_sat() {
+        if state.and_positive(addr.addr).is_sat() {
             results.extend(invalidate_first_arg(
                 ret_id,
                 args,
@@ -354,7 +423,11 @@ fn free(
 fn cpp_new(ret_id: &Ident, loc: &Location, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
     let addr = AbstractValue::mk_fresh();
     operations::allocate(addr, Allocator::CppNew, loc.clone(), &mut state);
-    operations::write_id(ret_id, addr, &mut state);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(addr, ValueHistory::assignment(loc.clone())),
+        &mut state,
+    );
     vec![ExecutionDomain::ContinueProgram(state)]
 }
 

@@ -29,6 +29,7 @@ use crate::formula::lin_arith::LinArith;
 use crate::formula::{Formula, NewEq, Operand};
 use crate::invalidation::Invalidation;
 use crate::sat_unsat::SatUnsat;
+use crate::value_history::{ValueHistory, ValueWithHistory};
 
 /// The abductive domain: pre-state + post-state + path condition.
 ///
@@ -84,10 +85,14 @@ impl AbductiveDomain {
         for (mangled, _typ, _annot) in &pdesc.formals {
             let addr = AbstractValue::mk_fresh();
             let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
-            let var = Var::ProgramVar(Box::new(pvar));
-            state.post.stack.add(var.clone(), addr);
+            let var = Var::ProgramVar(Box::new(pvar.clone()));
+            let value = ValueWithHistory::new(addr, ValueHistory::formal_argument(pvar));
+            state
+                .post
+                .stack
+                .add_with_history(var.clone(), value.clone());
             state.post.heap.register_address(addr);
-            state.pre.stack.add(var, addr);
+            state.pre.stack.add_with_history(var, value);
             state.pre.heap.register_address(addr);
         }
 
@@ -97,12 +102,18 @@ impl AbductiveDomain {
     /// Look up a variable's abstract address in the stack.
     /// If not found, allocates a fresh address and binds it.
     pub fn eval_var(&mut self, var: &Var) -> AbstractValue {
-        if let Some(addr) = self.post.stack.find(var) {
-            addr
+        self.eval_var_with_history(var).addr
+    }
+
+    /// Look up a variable together with its provenance.
+    pub fn eval_var_with_history(&mut self, var: &Var) -> ValueWithHistory {
+        if let Some(value) = self.post.stack.find_with_history(var) {
+            value.clone()
         } else {
             let addr = AbstractValue::mk_fresh();
-            self.post.stack.add(var.clone(), addr);
-            addr
+            let value = ValueWithHistory::new(addr, ValueHistory::epoch());
+            self.post.stack.add_with_history(var.clone(), value.clone());
+            value
         }
     }
 
@@ -110,27 +121,84 @@ impl AbductiveDomain {
     /// If no edge exists, creates a fresh target and adds the edge.
     /// Also records the read in the pre-state (biabduction).
     pub fn read_heap(&mut self, addr: AbstractValue, access: Access) -> AbstractValue {
-        if let Some(target) = self.post.heap.find_edge(addr, &access) {
-            return target;
+        self.read_heap_with_history(ValueWithHistory::new(addr, ValueHistory::epoch()), access)
+            .addr
+    }
+
+    /// Read through a heap edge and preserve the target provenance.
+    pub fn read_heap_with_history(
+        &mut self,
+        src: ValueWithHistory,
+        access: Access,
+    ) -> ValueWithHistory {
+        if let Some(target) = self.post.heap.find_edge_with_history(src.addr, &access) {
+            return target.clone();
         }
 
         let target = AbstractValue::mk_fresh();
-        self.post.heap.add_edge(addr, access.clone(), target);
+        let value = ValueWithHistory::new(target, src.history.clone());
+        self.post
+            .heap
+            .add_edge_with_history(src.addr, access.clone(), value.clone());
 
         // Mirror OCaml's SafeMemory.eval_edge: only abduce reads rooted in the
         // existing pre-state, and never overwrite the original pre-edge on
         // subsequent reads after the post-state has diverged.
-        if self.pre.heap.get_edges(addr).is_some() {
-            self.pre.heap.add_edge(addr, access, target);
+        if self.pre.heap.get_edges(src.addr).is_some() {
+            self.pre
+                .heap
+                .add_edge_with_history(src.addr, access, value.clone());
             self.pre.heap.register_address(target);
         }
 
-        target
+        value
     }
 
     /// Write through a heap edge: set `addr --access--> value`.
     pub fn write_heap(&mut self, addr: AbstractValue, access: Access, value: AbstractValue) {
-        self.post.heap.add_edge(addr, access, value);
+        self.write_heap_with_history(
+            addr,
+            access,
+            ValueWithHistory::new(value, ValueHistory::epoch()),
+        );
+    }
+
+    /// Write through a heap edge, preserving the target provenance.
+    pub fn write_heap_with_history(
+        &mut self,
+        addr: AbstractValue,
+        access: Access,
+        value: ValueWithHistory,
+    ) {
+        self.post.heap.add_edge_with_history(addr, access, value);
+    }
+
+    /// Best-effort provenance lookup for a value in the current post-state.
+    pub fn history_of_value(&self, addr: AbstractValue) -> Option<ValueHistory> {
+        let repr = self.path_condition.get_var_repr(addr);
+        let mut history: Option<ValueHistory> = None;
+
+        for (_var, value) in self.post.stack.iter_with_history() {
+            if self.path_condition.get_var_repr(value.addr) == repr {
+                history = Some(match history {
+                    Some(existing) => existing.merge(&value.history),
+                    None => value.history.clone(),
+                });
+            }
+        }
+
+        for (_src, edges) in self.post.heap.iter() {
+            for (_access, value) in edges.iter_with_history() {
+                if self.path_condition.get_var_repr(value.addr) == repr {
+                    history = Some(match history {
+                        Some(existing) => existing.merge(&value.history),
+                        None => value.history.clone(),
+                    });
+                }
+            }
+        }
+
+        history
     }
 
     /// Check if dereferencing an address is valid.
@@ -139,15 +207,18 @@ impl AbductiveDomain {
     /// if the address is known to be invalid (null, freed, etc.).
     ///
     /// This is THE null-dereference / use-after-free check.
-    pub fn check_valid(&self, addr: AbstractValue) -> Result<(), Box<(Invalidation, Location)>> {
+    pub fn check_valid(
+        &self,
+        addr: AbstractValue,
+    ) -> Result<(), Box<(Invalidation, ValueHistory)>> {
         let repr = self.path_condition.get_var_repr(addr);
         self.post.attrs.check_valid(repr)
     }
 
     /// Mark an address as invalid (freed, null, etc.).
-    pub fn invalidate(&mut self, addr: AbstractValue, inv: Invalidation, loc: Location) {
+    pub fn invalidate(&mut self, addr: AbstractValue, inv: Invalidation, history: ValueHistory) {
         let repr = self.path_condition.get_var_repr(addr);
-        self.post.attrs.invalidate(repr, inv, loc);
+        self.post.attrs.invalidate(repr, inv, history);
     }
 
     /// Mark an address as allocated.
@@ -192,7 +263,10 @@ impl AbductiveDomain {
                         self.post.attrs.invalidate(
                             repr,
                             Invalidation::ConstantDereference(IntLit::zero()),
-                            Location::dummy(),
+                            ValueHistory::invalidated(
+                                Invalidation::ConstantDereference(IntLit::zero()),
+                                Location::dummy(),
+                            ),
                         );
                     }
                 }
@@ -491,7 +565,10 @@ mod tests {
         state.invalidate(
             null_addr,
             Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
 
         // Checking validity of null should fail
@@ -514,7 +591,11 @@ mod tests {
         assert!(state.check_valid(addr).is_ok());
 
         // Free
-        state.invalidate(addr, Invalidation::CFree, Location::dummy());
+        state.invalidate(
+            addr,
+            Invalidation::CFree,
+            ValueHistory::invalidated(Invalidation::CFree, Location::dummy()),
+        );
         assert!(state.check_valid(addr).is_err());
     }
 
@@ -669,7 +750,10 @@ mod tests {
         state.invalidate(
             null_val,
             Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
 
         // After p = null_val, p should also be known-zero

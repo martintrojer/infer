@@ -17,6 +17,7 @@ use sil::exp::Exp;
 use sil::ident::Ident;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
+use sil::pvar::Pvar;
 use sil::typ::Typ;
 
 use crate::abductive::AbductiveDomain;
@@ -27,6 +28,7 @@ use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::summary::PrePost;
+use crate::value_history::ValueHistory;
 
 /// Apply a callee's summary to the caller's abstract state.
 ///
@@ -46,11 +48,15 @@ pub fn apply_summary(
 ) -> Vec<ExecutionDomain> {
     // Step 1: Build the callee→caller substitution from formals→actuals
     let mut subst: HashMap<AbstractValue, AbstractValue> = HashMap::new();
+    let mut formal_histories: std::collections::BTreeMap<Pvar, ValueHistory> =
+        std::collections::BTreeMap::new();
 
-    for (i, (_formal_pvar, formal_addr)) in pre_post.formals.iter().enumerate() {
+    for (i, (formal_pvar, formal_addr)) in pre_post.formals.iter().enumerate() {
         if let Some((actual_exp, _typ)) = actuals.get(i) {
-            let actual_val = operations::eval_or_fresh(actual_exp, loc, &mut caller_state);
-            subst.insert(*formal_addr, actual_val);
+            let actual_val =
+                operations::eval_or_fresh_with_history(actual_exp, loc, &mut caller_state);
+            subst.insert(*formal_addr, actual_val.addr);
+            formal_histories.insert(formal_pvar.clone(), actual_val.history);
         }
     }
 
@@ -149,10 +155,26 @@ pub fn apply_summary(
     // "return value >= 0") are properly mapped to the caller.
     if let Some(ret_addr) = &pre_post.result {
         let caller_ret = resolve_mut(&mut subst, *ret_addr);
-        operations::write_id(ret_id, caller_ret, &mut caller_state);
+        let ret_history = pre_post
+            .post
+            .history_of_value(*ret_addr)
+            .map(|history| history.map_formals(&formal_histories))
+            .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
+        operations::write_id_with_history(
+            ret_id,
+            crate::value_history::ValueWithHistory::new(caller_ret, ret_history),
+            &mut caller_state,
+        );
     } else {
         let fresh = AbstractValue::mk_fresh();
-        operations::write_id(ret_id, fresh, &mut caller_state);
+        operations::write_id_with_history(
+            ret_id,
+            crate::value_history::ValueWithHistory::new(
+                fresh,
+                ValueHistory::assignment(loc.clone()),
+            ),
+            &mut caller_state,
+        );
     }
 
     // Step 4: Translate callee's formula constraints to caller.
@@ -257,7 +279,7 @@ pub fn apply_summary(
         }
         crate::summary::PrePostKind::LatentInvalidAccess => {
             if let Some(diag) = &pre_post.diagnostic {
-                let diag = translate_diagnostic(diag, &mut subst, &caller_state);
+                let diag = translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories);
                 if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
                     vec![ExecutionDomain::AbortProgram {
@@ -281,13 +303,15 @@ fn translate_diagnostic(
     diagnostic: &Diagnostic,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     caller_state: &AbductiveDomain,
+    formal_histories: &std::collections::BTreeMap<Pvar, ValueHistory>,
 ) -> Diagnostic {
     match diagnostic {
         Diagnostic::AccessToInvalidAddress {
             addr,
             invalidation,
             access_location,
-            invalidation_location,
+            access_history,
+            invalidation_history,
         } => {
             let caller_addr = caller_state
                 .path_condition
@@ -296,7 +320,8 @@ fn translate_diagnostic(
                 addr: caller_addr,
                 invalidation: invalidation.clone(),
                 access_location: access_location.clone(),
-                invalidation_location: invalidation_location.clone(),
+                access_history: access_history.map_formals(formal_histories),
+                invalidation_history: invalidation_history.map_formals(formal_histories),
             }
         }
         _ => diagnostic.clone(),
@@ -324,13 +349,15 @@ fn reify_invalid_access_diagnostic(
         Diagnostic::AccessToInvalidAddress {
             addr,
             access_location,
+            access_history,
             ..
         } => match caller_state.check_valid(addr) {
             Err(inv_info) => Diagnostic::AccessToInvalidAddress {
                 addr,
                 invalidation: inv_info.0,
                 access_location,
-                invalidation_location: inv_info.1,
+                access_history,
+                invalidation_history: inv_info.1,
             },
             Ok(()) => Diagnostic::AccessToInvalidAddress {
                 addr,
@@ -338,7 +365,13 @@ fn reify_invalid_access_diagnostic(
                     sil::int_lit::IntLit::zero(),
                 ),
                 access_location,
-                invalidation_location: Location::dummy(),
+                access_history,
+                invalidation_history: ValueHistory::invalidated(
+                    crate::invalidation::Invalidation::ConstantDereference(
+                        sil::int_lit::IntLit::zero(),
+                    ),
+                    Location::dummy(),
+                ),
             },
         },
         _ => diagnostic,
@@ -405,12 +438,16 @@ fn materialize_pre(
                 if let Err(inv_info) = caller_state.check_valid(caller_addr) {
                     log::debug!("    [materialize_pre] PRE-VIOLATION: callee={callee_addr} caller={caller_addr}");
                     if first_error.is_none() {
+                        let access_history = caller_state
+                            .history_of_value(caller_addr)
+                            .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
                         first_error = Some(Box::new(
                             crate::diagnostic::Diagnostic::AccessToInvalidAddress {
                                 addr: caller_addr,
                                 invalidation: inv_info.0,
                                 access_location: loc.clone(),
-                                invalidation_location: inv_info.1,
+                                access_history,
+                                invalidation_history: inv_info.1,
                             },
                         ));
                     }
@@ -743,6 +780,7 @@ fn translate_attribute(
 mod tests {
     use super::*;
     use crate::attribute::Attribute;
+    use crate::value_history::ValueHistory;
     use sil::ident::IdentName;
     use sil::int_lit::IntLit;
     use sil::mangled::Mangled;
@@ -750,6 +788,23 @@ mod tests {
     use sil::procname::Procname;
     use sil::pvar::Pvar;
     use sil::var::Var;
+
+    fn invalidation_history(invalidation: &crate::invalidation::Invalidation) -> ValueHistory {
+        ValueHistory::invalidated(invalidation.clone(), Location::dummy())
+    }
+
+    fn dummy_invalid_access_diagnostic(
+        addr: AbstractValue,
+        invalidation: crate::invalidation::Invalidation,
+    ) -> Diagnostic {
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            access_history: ValueHistory::assignment(Location::dummy()),
+            invalidation_history: invalidation_history(&invalidation),
+        }
+    }
 
     fn mk_callee_summary_null_return() -> (Procdesc, PrePost) {
         // Simulate: int* callee() { return NULL; }
@@ -763,7 +818,10 @@ mod tests {
         state.invalidate(
             ret_val,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
 
         let pre = state.pre.clone();
@@ -1008,7 +1066,7 @@ mod tests {
         callee_state.invalidate(
             slot_val,
             crate::invalidation::Invalidation::CFree,
-            Location::dummy(),
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
         );
 
         let pre_post = PrePost {
@@ -1163,7 +1221,7 @@ mod tests {
         free_state.invalidate(
             free_slot_val,
             crate::invalidation::Invalidation::CFree,
-            Location::dummy(),
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
         );
 
         let free_summary = PrePost {
@@ -1323,12 +1381,10 @@ mod tests {
         let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
         callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
         let callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
-        let diagnostic = crate::diagnostic::Diagnostic::AccessToInvalidAddress {
-            addr: AbstractValue::of_raw(1),
-            invalidation: crate::invalidation::Invalidation::CFree,
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            AbstractValue::of_raw(1),
+            crate::invalidation::Invalidation::CFree,
+        );
         let pre_post = PrePost {
             pre: callee_state.pre.clone(),
             post: callee_state.clone(),
@@ -1396,12 +1452,10 @@ mod tests {
             1,
         );
 
-        let diagnostic = crate::diagnostic::Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic = dummy_invalid_access_diagnostic(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
         let pre_post = PrePost {
             pre: callee_state.pre.clone(),
             post: callee_state,
@@ -1431,16 +1485,15 @@ mod tests {
             callee_state.invalidate(
                 formal_val,
                 crate::invalidation::Invalidation::CFree,
-                Location::dummy(),
+                ValueHistory::invalidated(
+                    crate::invalidation::Invalidation::CFree,
+                    Location::dummy(),
+                ),
             );
         }
 
-        let diagnostic = Diagnostic::AccessToInvalidAddress {
-            addr: formal_val,
-            invalidation: crate::invalidation::Invalidation::CFree,
-            access_location: Location::dummy(),
-            invalidation_location: Location::dummy(),
-        };
+        let diagnostic =
+            dummy_invalid_access_diagnostic(formal_val, crate::invalidation::Invalidation::CFree);
         let pre_post = PrePost {
             pre: callee_state.pre.clone(),
             post: callee_state,
@@ -1591,7 +1644,7 @@ mod tests {
         caller_state.invalidate(
             caller_formal_val,
             crate::invalidation::Invalidation::CFree,
-            Location::dummy(),
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
         );
         let _ = caller_state.path_condition.and_condition_direct(
             crate::formula::atom::Atom::Equal(

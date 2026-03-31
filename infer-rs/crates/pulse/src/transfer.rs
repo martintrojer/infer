@@ -22,6 +22,7 @@ use crate::abstract_value::AbstractValue;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::pulse_result::PulseResult;
+use crate::value_history::{ValueHistory, ValueWithHistory};
 
 /// Execute a single SIL instruction on the abstract state.
 ///
@@ -82,23 +83,23 @@ fn exec_load(
     );
 
     let result = if needs_deref {
-        operations::eval_deref(rhs_exp, loc, &mut state)
+        operations::eval_deref_with_history(rhs_exp, loc, &mut state)
     } else {
-        operations::eval(rhs_exp, loc, &mut state)
+        operations::eval_with_history(rhs_exp, loc, &mut state)
     };
 
     match result {
         PulseResult::Ok(value) => {
-            operations::write_id(id, value, &mut state);
+            operations::write_id_with_history(id, value.clone(), &mut state);
             // Mark integer-typed loads for integer reasoning.
             // Cross-ref: OCaml Pulse.ml and_is_int_if_integer_type.
             if typ.is_int() {
-                state.path_condition.and_is_int(value);
+                state.path_condition.and_is_int(value.addr);
             }
             vec![ExecutionDomain::ContinueProgram(state)]
         }
         PulseResult::Recoverable(value, errors) => {
-            operations::write_id(id, value, &mut state);
+            operations::write_id_with_history(id, value, &mut state);
             let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
             for diag in errors {
                 results.push(ExecutionDomain::AbortProgram {
@@ -125,7 +126,7 @@ fn exec_store(
     loc: &Location,
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
-    let rhs_val = match operations::eval(rhs_exp, loc, &mut state) {
+    let rhs_val = match operations::eval_with_history(rhs_exp, loc, &mut state) {
         PulseResult::Ok(v) => v,
         PulseResult::FatalError(d, _) => {
             return vec![ExecutionDomain::AbortProgram {
@@ -136,7 +137,7 @@ fn exec_store(
         PulseResult::Recoverable(v, _) => v,
     };
 
-    let (lhs_addr, lhs_errors) = match operations::eval(lhs_exp, loc, &mut state) {
+    let (lhs_addr, lhs_errors) = match operations::eval_with_history(lhs_exp, loc, &mut state) {
         PulseResult::Ok(v) => (v, vec![]),
         PulseResult::FatalError(d, _) => {
             return vec![ExecutionDomain::AbortProgram {
@@ -159,10 +160,10 @@ fn exec_store(
     }
 
     if local_has_cleanup_attribute(pdesc, lhs_exp) {
-        state.always_reachable(rhs_val);
+        state.always_reachable(rhs_val.addr);
     }
 
-    match operations::write_deref(lhs_addr, rhs_val, loc, &mut state) {
+    match operations::write_deref_with_history(lhs_addr, rhs_val, loc, &mut state) {
         PulseResult::Ok(()) => vec![ExecutionDomain::ContinueProgram(state)],
         PulseResult::FatalError(d, _) => vec![ExecutionDomain::AbortProgram {
             state: Box::new(state),
@@ -324,7 +325,12 @@ fn prune_eq_operands(
                 state.invalidate(
                     v,
                     crate::invalidation::Invalidation::ComparedToNullInThisProcedure(loc.clone()),
-                    loc.clone(),
+                    ValueHistory::invalidated(
+                        crate::invalidation::Invalidation::ComparedToNullInThisProcedure(
+                            loc.clone(),
+                        ),
+                        loc.clone(),
+                    ),
                 );
             }
             state.prune_eq_const(v, c, negated).is_sat()
@@ -361,7 +367,11 @@ fn exec_call(
     // Default: treat as unknown — havoc the return value and pointer args.
     log::debug!("  [call] unknown: {fun_exp}");
     let ret_val = AbstractValue::mk_fresh();
-    operations::write_id(ret_id, ret_val, &mut state);
+    operations::write_id_with_history(
+        ret_id,
+        ValueWithHistory::new(ret_val, ValueHistory::assignment(loc.clone())),
+        &mut state,
+    );
     mark_call_result_type(ret_val, ret_typ, &mut state);
 
     // Havoc pointer arguments for C/C++ unknown calls: unknown functions
@@ -473,7 +483,10 @@ mod tests {
         state.invalidate(
             null_val,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
         state
             .post
@@ -513,7 +526,10 @@ mod tests {
         state.invalidate(
             null_val,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         );
         state
             .post

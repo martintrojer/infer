@@ -14,6 +14,7 @@ use sil::location::Location;
 
 use crate::abstract_value::AbstractValue;
 use crate::invalidation::Invalidation;
+use crate::value_history::ValueHistory;
 
 /// A Pulse diagnostic — a bug found during analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,7 +24,8 @@ pub enum Diagnostic {
         addr: AbstractValue,
         invalidation: Invalidation,
         access_location: Location,
-        invalidation_location: Location,
+        access_history: ValueHistory,
+        invalidation_history: ValueHistory,
     },
     /// Memory leak: allocated but never freed.
     MemoryLeak {
@@ -42,24 +44,26 @@ impl Diagnostic {
     /// because the same null pointer can be dereferenced at multiple SIL nodes
     /// that map to the same C source location (e.g., short-circuit `&&`/`||`
     /// generates duplicate load nodes).
-    pub fn dedup_key(&self) -> (String, Location) {
+    pub fn dedup_key(&self) -> String {
         match self {
             Diagnostic::AccessToInvalidAddress {
-                invalidation_location,
+                access_location,
+                access_history,
+                invalidation_history,
                 ..
-            } => (
-                self.get_issue_type_id().id().to_string(),
-                invalidation_location.clone(),
+            } => format!(
+                "{}|{}|{}|{}",
+                self.get_issue_type_id().id(),
+                access_location,
+                access_history.signature(),
+                invalidation_history.signature()
             ),
             Diagnostic::MemoryLeak {
                 allocation_location,
                 ..
-            } => (
-                self.get_issue_type_id().id().to_string(),
-                allocation_location.clone(),
-            ),
+            } => format!("{}|{}", self.get_issue_type_id().id(), allocation_location),
             Diagnostic::RetainCycle { location } => {
-                (self.get_issue_type_id().id().to_string(), location.clone())
+                format!("{}|{}", self.get_issue_type_id().id(), location)
             }
         }
     }
@@ -160,13 +164,50 @@ impl fmt::Display for Diagnostic {
         match self {
             Diagnostic::AccessToInvalidAddress {
                 invalidation,
-                access_location,
+                access_history,
+                invalidation_history,
                 ..
             } => {
-                write!(
-                    f,
-                    "accessing address that {invalidation} at {access_location}"
-                )
+                if invalidation.is_null_deref() {
+                    if let Some((_inv, loc)) = access_history.caller_argument_invalidation() {
+                        return write!(
+                            f,
+                            "address could be null (null value originating from line {}) and is dereferenced",
+                            loc.line
+                        );
+                    }
+                    if let Some((_inv, loc)) = access_history.first_invalidation_before_call() {
+                        return write!(
+                            f,
+                            "address could be null (null value originating from line {}) and is dereferenced",
+                            loc.line
+                        );
+                    }
+                    if let Some((proc, loc)) = access_history.first_call_before_invalidation() {
+                        return write!(
+                            f,
+                            "address could be null (from the call to `{proc}` on line {}) and is dereferenced",
+                            loc.line
+                        );
+                    }
+                    if let Some((_inv, loc)) = invalidation_history.first_invalidation() {
+                        return write!(
+                            f,
+                            "address could be null (null value originating from line {}) and is dereferenced",
+                            loc.line
+                        );
+                    }
+                }
+
+                if let Some((_inv, loc)) = invalidation_history.first_invalidation() {
+                    write!(
+                        f,
+                        "accessing address that {invalidation} from line {}",
+                        loc.line
+                    )
+                } else {
+                    write!(f, "accessing address that {invalidation}")
+                }
             }
             Diagnostic::MemoryLeak { allocator, .. } => {
                 write!(f, "memory allocated via {allocator:?} is leaked")

@@ -22,6 +22,7 @@ use sil::var::Var;
 
 use crate::abstract_value::AbstractValue;
 use crate::invalidation::{Invalidation, MustBeValidReason};
+use crate::value_history::ValueHistory;
 
 /// Timestamp for ordering events in the analysis.
 pub type Timestamp = u64;
@@ -64,7 +65,7 @@ pub enum Attribute {
     /// This address has been initialized.
     Initialized,
     /// This address is invalid (freed, null, etc.).
-    Invalid(Invalidation, Location),
+    Invalid(Invalidation, ValueHistory),
     /// Java resource has been released.
     JavaResourceReleased,
     /// C# resource has been released.
@@ -98,7 +99,7 @@ pub enum Attribute {
 impl fmt::Display for Attribute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Attribute::Invalid(inv, loc) => write!(f, "Invalid({inv}, {loc})"),
+            Attribute::Invalid(inv, history) => write!(f, "Invalid({inv}, {history})"),
             Attribute::MustBeValid(ts, loc, reason) => {
                 write!(f, "MustBeValid({ts}, {loc}, {reason:?})")
             }
@@ -143,9 +144,9 @@ impl Attributes {
     }
 
     /// Find the `Invalid` attribute, if any.
-    pub fn get_invalid(&self) -> Option<(&Invalidation, &Location)> {
+    pub fn get_invalid(&self) -> Option<(&Invalidation, &ValueHistory)> {
         self.0.iter().find_map(|a| match a {
-            Attribute::Invalid(inv, loc) => Some((inv, loc)),
+            Attribute::Invalid(inv, history) => Some((inv, history)),
             _ => None,
         })
     }
@@ -229,7 +230,10 @@ mod tests {
 
         attrs.add(Attribute::Invalid(
             Invalidation::ConstantDereference(IntLit::zero()),
-            Location::dummy(),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
         ));
         let (inv, _loc) = attrs.get_invalid().unwrap();
         assert!(inv.is_null_deref());
@@ -267,11 +271,11 @@ mod tests {
 
         attrs.add(Attribute::Invalid(
             Invalidation::ConstantDereference(IntLit::zero()),
-            loc1,
+            ValueHistory::invalidated(Invalidation::ConstantDereference(IntLit::zero()), loc1),
         ));
         attrs.add(Attribute::Invalid(
             Invalidation::ConstantDereference(IntLit::zero()),
-            loc2,
+            ValueHistory::invalidated(Invalidation::ConstantDereference(IntLit::zero()), loc2),
         ));
 
         let invalid_count = attrs
