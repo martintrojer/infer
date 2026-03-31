@@ -54,6 +54,7 @@ pub struct Checker(pub String);
 /// Each variant's `id()` returns the exact string OCaml uses in `IssueType.ml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IssueTypeId {
+    ComparedToNullAndDereferenced,
     DeadStore,
     NullptrDereference,
     MemoryLeakC,
@@ -70,6 +71,7 @@ impl IssueTypeId {
     /// The string identifier matching OCaml's `IssueType.ml`.
     pub fn id(self) -> &'static str {
         match self {
+            Self::ComparedToNullAndDereferenced => "COMPARED_TO_NULL_AND_DEREFERENCED",
             Self::DeadStore => "DEAD_STORE",
             Self::NullptrDereference => "NULLPTR_DEREFERENCE",
             Self::MemoryLeakC => "MEMORY_LEAK_C",
@@ -92,6 +94,7 @@ impl IssueTypeId {
 
     pub fn category(self) -> Category {
         match self {
+            Self::ComparedToNullAndDereferenced => Category::NullPointerDereference,
             Self::DeadStore => Category::LogicError,
             Self::NullptrDereference => Category::NullPointerDereference,
             Self::MemoryLeakC => Category::ResourceLeak,

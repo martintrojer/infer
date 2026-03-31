@@ -13,7 +13,7 @@ use crate::source_file::SourceFile;
 use crate::typ::TemplateSpecInfo;
 
 /// Program variable kind.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PvarKind {
     /// Local variable or formal parameter.
     Local {
@@ -41,7 +41,7 @@ pub enum PvarKind {
 /// Program variable.
 ///
 /// Mirrors OCaml's `Pvar.t`. There are 4 kinds: local, callee, global, and seed.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pvar {
     pub name: Mangled,
     pub kind: PvarKind,
@@ -77,6 +77,16 @@ impl Pvar {
 
     pub fn is_global(&self) -> bool {
         matches!(self.kind, PvarKind::Global { .. })
+    }
+
+    /// Best-effort Rust analogue of OCaml's `Pvar.get_initializer_pname`.
+    ///
+    /// The current textual pipeline emits C global initializer procedures with
+    /// the `__infer_globals_initializer_<name>` naming convention.
+    pub fn initializer_procname(&self) -> Option<Procname> {
+        self.is_global().then(|| {
+            Procname::c_from_string(&format!("__infer_globals_initializer_{}", self.name.plain))
+        })
     }
 
     pub fn is_local(&self) -> bool {

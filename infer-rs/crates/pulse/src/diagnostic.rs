@@ -86,6 +86,9 @@ impl Diagnostic {
                     IssueTypeId::NullptrDereference
                 } else {
                     match invalidation {
+                        Invalidation::ComparedToNullInThisProcedure(_) => {
+                            IssueTypeId::ComparedToNullAndDereferenced
+                        }
                         Invalidation::CFree | Invalidation::FClose => IssueTypeId::UseAfterFree,
                         Invalidation::CppDelete | Invalidation::CppDeleteArray => {
                             IssueTypeId::UseAfterDelete
@@ -107,6 +110,21 @@ impl Diagnostic {
         self.get_issue_type_id().id()
     }
 
+    fn build_issue_type(&self, latent: bool) -> diagnostics::issue_type::IssueType {
+        let type_id = self.get_issue_type_id();
+        let id = if latent {
+            format!("{}_LATENT", type_id.id())
+        } else {
+            type_id.id().to_string()
+        };
+        diagnostics::issue_type::IssueType {
+            id,
+            severity: type_id.severity(),
+            category: type_id.category(),
+            checker: diagnostics::issue_type::Checker("Pulse".to_string()),
+        }
+    }
+
     /// Get the severity.
     pub fn get_severity(&self) -> diagnostics::issue_type::Severity {
         self.get_issue_type_id().severity()
@@ -119,10 +137,14 @@ impl Diagnostic {
 
     /// Convert to a diagnostics::Issue for reporting.
     pub fn to_issue(&self, procedure: &str) -> diagnostics::issue::Issue {
+        self.to_issue_with_latent(procedure, false)
+    }
+
+    /// Convert to a diagnostics::Issue for reporting, optionally as latent.
+    pub fn to_issue_with_latent(&self, procedure: &str, latent: bool) -> diagnostics::issue::Issue {
         let loc = self.get_location();
-        let type_id = self.get_issue_type_id();
         diagnostics::issue::Issue {
-            issue_type: diagnostics::issue_type::IssueType::from_id(type_id, "Pulse"),
+            issue_type: self.build_issue_type(latent),
             qualifier: format!("{self}"),
             file: format!("{}", loc.file),
             line: loc.line as u32,

@@ -276,6 +276,39 @@ fn test_pulse_detects_null_deref() {
 }
 
 #[test]
+fn test_source_override_sets_reported_file() {
+    let fixture = test_data_dir().join("pulse/null_deref.sil");
+    let tmp_dir = TempDir::new();
+
+    let (code, _stdout, stderr) = run_infer_rs(&[
+        "--pulse-only",
+        "--source-override",
+        "/tmp/override.c",
+        "-o",
+        tmp_dir.to_str().unwrap(),
+        fixture.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        code, 2,
+        "source-override run should still report issues. stderr: {stderr}"
+    );
+
+    let report = tmp_dir.join("report.json");
+    let content = std::fs::read_to_string(&report).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let issues = parsed
+        .as_array()
+        .expect("report.json should be a JSON array");
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["file"] == "/tmp/override.c"),
+        "report.json should use the override path as the file: {content}"
+    );
+}
+
+#[test]
 fn test_pulse_no_issues_on_safe() {
     let fixture = test_data_dir().join("pulse/basic_safe.sil");
     assert!(fixture.exists(), "fixture missing: {}", fixture.display());

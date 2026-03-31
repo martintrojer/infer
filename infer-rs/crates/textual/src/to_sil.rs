@@ -245,6 +245,27 @@ fn procname_to_sil(
     }
 }
 
+fn call_result_typ(lang: Lang, decls: &DeclEnv, proc: &ast::QualifiedProcName) -> typ::Typ {
+    decls
+        .get_proc(proc)
+        .map(|entry| typ_to_sil(lang, &entry.procdecl().result_type.typ))
+        .unwrap_or_else(typ::Typ::void)
+}
+
+fn call_arg_typ(
+    lang: Lang,
+    decls: &DeclEnv,
+    proc: &ast::QualifiedProcName,
+    index: usize,
+) -> typ::Typ {
+    decls
+        .get_proc(proc)
+        .and_then(|entry| entry.procdecl().formals_types.as_ref())
+        .and_then(|formals| formals.get(index))
+        .map(|annotated| typ_to_sil(lang, &annotated.typ))
+        .unwrap_or_else(typ::Typ::void)
+}
+
 /// Mirrors `FieldDeclBridge.to_sil`.
 fn field_to_sil(lang: Lang, field: &ast::FieldDecl) -> strukt::Field {
     let class_name = type_name_to_sil(lang, &field.qualified_name.enclosing_class);
@@ -271,6 +292,7 @@ fn field_to_sil(lang: Lang, field: &ast::FieldDecl) -> strukt::Field {
 fn exp_to_sil_for_prune(
     lang: Lang,
     source_file: &SourceFile,
+    decls: &DeclEnv,
     pname: &procname::Procname,
     e: &ast::Exp,
     fallback_loc: &ast::Location,
@@ -282,6 +304,7 @@ fn exp_to_sil_for_prune(
             exp_to_sil_for_prune(
                 lang,
                 source_file,
+                decls,
                 pname,
                 &args[args.len() - 1],
                 fallback_loc,
@@ -292,25 +315,43 @@ fn exp_to_sil_for_prune(
             // Handle __sil_* builtins → BinOp/UnOp with recursive prune handling
             if let Some(bop) = sil_builtin_to_binop(callee_name) {
                 if args.len() == 2 {
-                    let lhs =
-                        exp_to_sil_for_prune(lang, source_file, pname, &args[0], fallback_loc)?;
-                    let rhs =
-                        exp_to_sil_for_prune(lang, source_file, pname, &args[1], fallback_loc)?;
+                    let lhs = exp_to_sil_for_prune(
+                        lang,
+                        source_file,
+                        decls,
+                        pname,
+                        &args[0],
+                        fallback_loc,
+                    )?;
+                    let rhs = exp_to_sil_for_prune(
+                        lang,
+                        source_file,
+                        decls,
+                        pname,
+                        &args[1],
+                        fallback_loc,
+                    )?;
                     return Ok(exp::Exp::BinOp(bop, Box::new(lhs), Box::new(rhs)));
                 }
             }
             if let Some(uop) = sil_builtin_to_unop(callee_name) {
                 if args.len() == 1 {
-                    let inner =
-                        exp_to_sil_for_prune(lang, source_file, pname, &args[0], fallback_loc)?;
+                    let inner = exp_to_sil_for_prune(
+                        lang,
+                        source_file,
+                        decls,
+                        pname,
+                        &args[0],
+                        fallback_loc,
+                    )?;
                     return Ok(exp::Exp::UnOp(uop, Box::new(inner), None));
                 }
             }
             // Fall back to normal exp_to_sil for non-builtin calls
-            exp_to_sil(lang, source_file, pname, e, fallback_loc)
+            exp_to_sil(lang, source_file, decls, pname, e, fallback_loc)
         }
         // For non-Call expressions, delegate to normal exp_to_sil
-        _ => exp_to_sil(lang, source_file, pname, e, fallback_loc),
+        _ => exp_to_sil(lang, source_file, decls, pname, e, fallback_loc),
     }
 }
 
@@ -331,6 +372,7 @@ fn unsupported_expression_error(exp: &ast::Exp, fallback_loc: &ast::Location) ->
 fn exp_to_sil(
     lang: Lang,
     source_file: &SourceFile,
+    decls: &DeclEnv,
     pname: &procname::Procname,
     e: &ast::Exp,
     fallback_loc: &ast::Location,
@@ -339,7 +381,12 @@ fn exp_to_sil(
         ast::Exp::Var(id) => Ok(exp::Exp::Var(ident_to_sil(*id))),
         ast::Exp::Const(c) => Ok(exp::Exp::Const(const_to_sil(c))),
         ast::Exp::Lvar(name) => {
-            let pv = pvar::Pvar::mk(Mangled::from_string(&name.value), pname.clone());
+            let mangled = Mangled::from_string(&name.value);
+            let pv = if decls.get_global(&name.value).is_some() {
+                pvar::Pvar::mk_global(mangled)
+            } else {
+                pvar::Pvar::mk(mangled, pname.clone())
+            };
             Ok(exp::Exp::Lvar(pv))
         }
         ast::Exp::Load { exp, typ: _ } => {
@@ -347,10 +394,10 @@ fn exp_to_sil(
             // During to_sil conversion, the Let-binding that contains
             // this Load expression will be expanded into a Load instruction.
             // For now, just translate the inner expression.
-            exp_to_sil(lang, source_file, pname, exp, fallback_loc)
+            exp_to_sil(lang, source_file, decls, pname, exp, fallback_loc)
         }
         ast::Exp::Field { exp, field } => {
-            let inner = exp_to_sil(lang, source_file, pname, exp, fallback_loc)?;
+            let inner = exp_to_sil(lang, source_file, decls, pname, exp, fallback_loc)?;
             let class_name = type_name_to_sil(lang, &field.enclosing_class);
             let sil_field = fieldname::Fieldname::make(class_name.clone(), &field.name.value);
             let struct_typ = typ::Typ::mk_struct(class_name);
@@ -364,8 +411,8 @@ fn exp_to_sil(
             ))
         }
         ast::Exp::Index(e1, e2) => {
-            let sil_e1 = exp_to_sil(lang, source_file, pname, e1, fallback_loc)?;
-            let sil_e2 = exp_to_sil(lang, source_file, pname, e2, fallback_loc)?;
+            let sil_e1 = exp_to_sil(lang, source_file, decls, pname, e1, fallback_loc)?;
+            let sil_e2 = exp_to_sil(lang, source_file, decls, pname, e2, fallback_loc)?;
             Ok(exp::Exp::Lindex(Box::new(sil_e1), Box::new(sil_e2)))
         }
         ast::Exp::Call { proc, args, .. } => {
@@ -373,34 +420,28 @@ fn exp_to_sil(
             // Check for __sil_* builtins → BinOp/UnOp expressions
             if let Some(bop) = sil_builtin_to_binop(callee_name) {
                 if args.len() == 2 {
-                    let lhs = exp_to_sil(lang, source_file, pname, &args[0], fallback_loc)?;
-                    let rhs = exp_to_sil(lang, source_file, pname, &args[1], fallback_loc)?;
+                    let lhs = exp_to_sil(lang, source_file, decls, pname, &args[0], fallback_loc)?;
+                    let rhs = exp_to_sil(lang, source_file, decls, pname, &args[1], fallback_loc)?;
                     return Ok(exp::Exp::BinOp(bop, Box::new(lhs), Box::new(rhs)));
                 }
             }
             if let Some(uop) = sil_builtin_to_unop(callee_name) {
                 if args.len() == 1 {
-                    let inner = exp_to_sil(lang, source_file, pname, &args[0], fallback_loc)?;
+                    let inner =
+                        exp_to_sil(lang, source_file, decls, pname, &args[0], fallback_loc)?;
                     return Ok(exp::Exp::UnOp(uop, Box::new(inner), None));
                 }
             }
 
             // __sil_cast(<typ>, val) → Cast(typ, val)
-            // Matches OCaml's Exp.Cast which is stripped at eval time.
-            // Without this, __sil_cast falls through to a Cfun reference
-            // that disconnects the inner value — breaking leak detection
-            // and value propagation through stores.
+            // Cross-ref: OCaml TextualSil.ml ExpBridge.to_sil always lowers
+            // cast builtins to SilExp.Cast; keep the value connected in all
+            // expression contexts, including zero constants.
             if callee_name == "__sil_cast" && args.len() == 2 {
-                // Don't strip casts around zero constants — these create null
-                // paths that need to stay opaque for correct null-deref analysis.
-                let is_zero = matches!(&args[1],
-                    ast::Exp::Const(ast::Const::Int(n)) if *n == num_bigint::BigInt::from(0));
-                if !is_zero {
-                    let typ_arg = exp_to_sil(lang, source_file, pname, &args[0], fallback_loc)?;
-                    let val_arg = exp_to_sil(lang, source_file, pname, &args[1], fallback_loc)?;
-                    if let exp::Exp::Sizeof(data) = &typ_arg {
-                        return Ok(exp::Exp::Cast(data.typ.clone(), Box::new(val_arg)));
-                    }
+                let typ_arg = exp_to_sil(lang, source_file, decls, pname, &args[0], fallback_loc)?;
+                let val_arg = exp_to_sil(lang, source_file, decls, pname, &args[1], fallback_loc)?;
+                if let exp::Exp::Sizeof(data) = &typ_arg {
+                    return Ok(exp::Exp::Cast(data.typ.clone(), Box::new(val_arg)));
                 }
             }
 
@@ -495,6 +536,7 @@ fn terminator_succs(
 fn procdesc_to_sil(
     lang: Lang,
     source_file: &SourceFile,
+    decls: &DeclEnv,
     pdesc: &ast::ProcDesc,
     line_map: Option<&crate::line_map::LineMap>,
 ) -> Result<procdesc::Procdesc, Vec<ConvError>> {
@@ -534,6 +576,7 @@ fn procdesc_to_sil(
             is_constexpr: false,
             is_declared_unused: false,
             is_structured_binding: false,
+            has_cleanup_attribute: false,
         })
         .collect();
 
@@ -547,7 +590,7 @@ fn procdesc_to_sil(
 
         let mut sil_instrs = Vec::new();
         for textual_instr in &node.instrs {
-            match instr_to_sil(lang, source_file, &pname, textual_instr, line_map) {
+            match instr_to_sil(lang, source_file, decls, &pname, textual_instr, line_map) {
                 Ok(Some(sil_instr)) => sil_instrs.push(sil_instr),
                 Ok(None) => {}
                 Err(err) => errors.push(err),
@@ -558,7 +601,7 @@ fn procdesc_to_sil(
         // This mirrors OCaml's `write_to_ret_var` in TextualSil.ml.
         if let ast::Terminator::Ret(ret_exp) = &node.last {
             let ret_pvar = pvar::Pvar::mk(Mangled::from_string("__return"), pname.clone());
-            match exp_to_sil(lang, source_file, &pname, ret_exp, &node.last_loc) {
+            match exp_to_sil(lang, source_file, decls, &pname, ret_exp, &node.last_loc) {
                 Ok(sil_ret_exp) => {
                     let ret_loc = location_to_sil(source_file, &node.last_loc, line_map);
                     sil_instrs.push(instr::Instr::Store {
@@ -601,6 +644,7 @@ fn procdesc_to_sil(
 fn instr_to_sil(
     lang: Lang,
     source_file: &SourceFile,
+    decls: &DeclEnv,
     pname: &procname::Procname,
     textual_instr: &ast::Instr,
     line_map: Option<&crate::line_map::LineMap>,
@@ -615,7 +659,7 @@ fn instr_to_sil(
             loc: l,
         } => {
             let sil_id = ident_to_sil(*id);
-            let sil_exp = exp_to_sil(lang, source_file, pname, exp, l)?;
+            let sil_exp = exp_to_sil(lang, source_file, decls, pname, exp, l)?;
             let sil_typ = typ
                 .as_ref()
                 .map(|t| typ_to_sil(lang, t))
@@ -633,8 +677,8 @@ fn instr_to_sil(
             exp2,
             loc: l,
         } => {
-            let sil_e1 = exp_to_sil(lang, source_file, pname, exp1, l)?;
-            let sil_e2 = exp_to_sil(lang, source_file, pname, exp2, l)?;
+            let sil_e1 = exp_to_sil(lang, source_file, decls, pname, exp1, l)?;
+            let sil_e2 = exp_to_sil(lang, source_file, decls, pname, exp2, l)?;
             let sil_typ = typ
                 .as_ref()
                 .map(|t| typ_to_sil(lang, t))
@@ -654,7 +698,7 @@ fn instr_to_sil(
             // `__sil_ne(__sil_cast(<int>, ptr), __sil_cast(<int>, 0))`).
             // Cross-ref: OCaml TextualSil.ml is_cast_builtin +
             // PulseOperations.prune which evaluates without casts.
-            let sil_exp = exp_to_sil_for_prune(lang, source_file, pname, exp, l)?;
+            let sil_exp = exp_to_sil_for_prune(lang, source_file, decls, pname, exp, l)?;
             Ok(Some(instr::Instr::Prune {
                 exp: sil_exp,
                 loc: loc(l),
@@ -681,6 +725,7 @@ fn instr_to_sil(
                         args,
                         lang,
                         source_file,
+                        decls,
                         pname,
                         ret_id.clone(),
                         l,
@@ -692,18 +737,20 @@ fn instr_to_sil(
                     // Regular call
                     let call_arity = Some(args.len() as i32);
                     let callee = procname_to_sil(lang, proc, call_arity);
+                    let ret_typ = call_result_typ(lang, decls, proc);
                     let fun_exp = exp::Exp::Const(const_val::Const::Cfun(callee));
                     let sil_args: Vec<(exp::Exp, typ::Typ)> = args
                         .iter()
-                        .map(|a| {
+                        .enumerate()
+                        .map(|(i, a)| {
                             Ok((
-                                exp_to_sil(lang, source_file, pname, a, l)?,
-                                typ::Typ::void(),
+                                exp_to_sil(lang, source_file, decls, pname, a, l)?,
+                                call_arg_typ(lang, decls, proc, i),
                             ))
                         })
                         .collect::<Result<Vec<_>, ConvError>>()?;
                     Ok(Some(instr::Instr::Call {
-                        ret: (ret_id, typ::Typ::void()),
+                        ret: (ret_id, ret_typ),
                         fun_exp,
                         args: sil_args,
                         loc: loc(l),
@@ -711,7 +758,7 @@ fn instr_to_sil(
                     }))
                 }
                 _ => {
-                    let sil_exp = exp_to_sil(lang, source_file, pname, exp, l)?;
+                    let sil_exp = exp_to_sil(lang, source_file, decls, pname, exp, l)?;
                     Ok(Some(instr::Instr::Load {
                         id: ret_id,
                         e: sil_exp,
@@ -787,6 +834,7 @@ fn sil_builtin_to_instr(
     args: &[ast::Exp],
     lang: Lang,
     source_file: &SourceFile,
+    decls: &DeclEnv,
     pname: &procname::Procname,
     ret_id: ident::Ident,
     textual_loc: &ast::Location,
@@ -794,8 +842,8 @@ fn sil_builtin_to_instr(
 ) -> Result<Option<instr::Instr>, ConvError> {
     if let Some(bop) = sil_builtin_to_binop(name) {
         if args.len() == 2 {
-            let lhs = exp_to_sil(lang, source_file, pname, &args[0], textual_loc)?;
-            let rhs = exp_to_sil(lang, source_file, pname, &args[1], textual_loc)?;
+            let lhs = exp_to_sil(lang, source_file, decls, pname, &args[0], textual_loc)?;
+            let rhs = exp_to_sil(lang, source_file, decls, pname, &args[1], textual_loc)?;
             return Ok(Some(instr::Instr::Load {
                 id: ret_id,
                 e: exp::Exp::BinOp(bop, Box::new(lhs), Box::new(rhs)),
@@ -807,7 +855,7 @@ fn sil_builtin_to_instr(
 
     if let Some(uop) = sil_builtin_to_unop(name) {
         if args.len() == 1 {
-            let inner = exp_to_sil(lang, source_file, pname, &args[0], textual_loc)?;
+            let inner = exp_to_sil(lang, source_file, decls, pname, &args[0], textual_loc)?;
             return Ok(Some(instr::Instr::Load {
                 id: ret_id,
                 e: exp::Exp::UnOp(uop, Box::new(inner), None),
@@ -824,7 +872,7 @@ fn sil_builtin_to_instr(
                 .iter()
                 .map(|a| {
                     Ok((
-                        exp_to_sil(lang, source_file, pname, a, textual_loc)?,
+                        exp_to_sil(lang, source_file, decls, pname, a, textual_loc)?,
                         typ::Typ::void(),
                     ))
                 })
@@ -862,8 +910,8 @@ fn sil_builtin_to_instr(
 
     // Cast builtin
     if name == "__sil_cast" && args.len() == 2 {
-        let typ_arg = exp_to_sil(lang, source_file, pname, &args[0], textual_loc)?;
-        let val_arg = exp_to_sil(lang, source_file, pname, &args[1], textual_loc)?;
+        let typ_arg = exp_to_sil(lang, source_file, decls, pname, &args[0], textual_loc)?;
+        let val_arg = exp_to_sil(lang, source_file, decls, pname, &args[1], textual_loc)?;
         // Cast(typ, val) — extract the type from the Sizeof expression
         if let exp::Exp::Sizeof(data) = &typ_arg {
             return Ok(Some(instr::Instr::Load {
@@ -888,17 +936,14 @@ fn sil_builtin_to_instr(
 ///
 /// If `line_map` is provided, locations are remapped from textual line numbers
 /// to original source line numbers (from `@[line:col]` or `// .line` directives).
-pub fn module_to_sil(
-    module: &ast::Module,
-    _decls: &DeclEnv,
-) -> Result<(Cfg, Tenv), Vec<ConvError>> {
-    module_to_sil_with_line_map(module, _decls, None)
+pub fn module_to_sil(module: &ast::Module, decls: &DeclEnv) -> Result<(Cfg, Tenv), Vec<ConvError>> {
+    module_to_sil_with_line_map(module, decls, None)
 }
 
 /// Convert a Textual module into SIL Cfg + Tenv with an optional line map.
 pub fn module_to_sil_with_line_map(
     module: &ast::Module,
-    _decls: &DeclEnv,
+    decls: &DeclEnv,
     line_map: Option<&crate::line_map::LineMap>,
 ) -> Result<(Cfg, Tenv), Vec<ConvError>> {
     let lang_str = module.lang().unwrap_or("c");
@@ -915,10 +960,12 @@ pub fn module_to_sil_with_line_map(
                 let (sil_name, sil_struct) = struct_to_sil(lang, s);
                 tenv.insert(sil_name, sil_struct);
             }
-            ast::Decl::Proc(pdesc) => match procdesc_to_sil(lang, &source_file, pdesc, line_map) {
-                Ok(sil_pdesc) => cfg.add_proc_desc(sil_pdesc),
-                Err(mut proc_errors) => errors.append(&mut proc_errors),
-            },
+            ast::Decl::Proc(pdesc) => {
+                match procdesc_to_sil(lang, &source_file, decls, pdesc, line_map) {
+                    Ok(sil_pdesc) => cfg.add_proc_desc(sil_pdesc),
+                    Err(mut proc_errors) => errors.append(&mut proc_errors),
+                }
+            }
             ast::Decl::Global(_) | ast::Decl::Procdecl(_) => {
                 // Globals and declarations don't produce CFG entries
             }
@@ -984,6 +1031,24 @@ define f(x: int, y: int) : int {
         // 4 instructions: 2 loads + 1 call + 1 store(__return)
         let instrs: Vec<_> = pdesc.iter_instrs().collect();
         assert_eq!(instrs.len(), 4);
+        match instrs[2].1 {
+            instr::Instr::Call {
+                ret: (_, ref ret_typ),
+                ref args,
+                ..
+            } => {
+                assert!(
+                    ret_typ.is_int(),
+                    "declared call result type should be preserved"
+                );
+                assert_eq!(args.len(), 2);
+                assert!(
+                    args.iter().all(|(_, typ)| typ.is_int()),
+                    "declared formal types should be preserved on call arguments"
+                );
+            }
+            other => panic!("expected call instruction, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1058,6 +1123,37 @@ type MyClass = { field: int }
 
         let name = typ::TypeName::HackClass(typ::HackClassName("MyClass".into()));
         assert!(tenv.lookup(&name).is_some());
+    }
+
+    #[test]
+    fn test_global_lvar_is_lowered_to_global_pvar() {
+        let src = r#".source_language = "c"
+
+global fp : *int
+
+define f() : *int {
+  #entry:
+    n0 : *int = load &fp
+    ret n0
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        let instrs: Vec<_> = pdesc.iter_instrs().collect();
+        let global_pvar = match instrs[0].1 {
+            instr::Instr::Load {
+                e: exp::Exp::Lvar(ref pv),
+                ..
+            } => pv,
+            other => panic!("expected load from global lvar, got {other:?}"),
+        };
+
+        assert!(
+            global_pvar.is_global(),
+            "expected global pvar, got {global_pvar:?}"
+        );
     }
 
     #[test]

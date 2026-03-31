@@ -2,45 +2,44 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE expected 131 found 139, Leaks expected 20 found 22, UAF expected 7 found 7)
+### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE expected 131 found 132, Leaks expected 20 found 20, UAF expected 7 found 7)
 
 Correctness note: keep the semantically correct specialization / latent-invalid-access /
 specialized-summary fixes even when totals move temporarily. The current sweep reflects the real
 remaining count gaps after removing the old basename-matching measurement bug.
 
-**NPE Over-detection (FPs, +10 gross / +8 net):**
+**NPE Count Gaps:**
 
-1. **Nullptr + integer-ish cluster** (+9): `integers.c` (+2), `nullptr.c` (+2), `nullptr_more.c` (+2), `offsetof_expr.c` (+1), `sizeof.c` (+2).
-2. **angelism.c** (+1): likely still an interprocedural/reporting mismatch.
+1. **`sizeof.c`** (+2): OCaml reports no NPEs; Rust still reports two. Likely tied to `sizeof`
+   evaluation or report timing around type-only expressions.
+2. **`memory_leak.c`** (-1): remaining duplicated `NULLPTR_DEREFERENCE` on
+   `realloc_no_check_bad`.
 
-**NPE Under-detection (FNs, -2 gross):**
+**Issue-set parity still open even though the file count now matches:**
 
-3. **memory_leak.c** (-2): remaining function-pointer-wrapper / null-path issue-set mismatch.
+3. **`nullptr.c`**: `unknown_from_parameters_latent` is fixed and no longer inflates the NPE total,
+   but the proc-level issue set is still off by one missing and one extra report:
+   missing `create_null_path2_bad_FN`, extra `FN_nullptr_deref_old_bad`.
 
-**Leak differences (+2 FPs in sweep):**
+**Leak differences:** none in the authoritative sweep. `MEMORY_LEAK_C` parity is exact.
 
-4. **cleanup_attribute.c** (+2): `__attribute__((cleanup()))` GCC extension still not modeled closely enough.
+Authoritative-sweep note: the ignored store-textual sweep now runs `infer-rs` from each source
+file's directory, so the published totals already include suite-local `.inferconfig` behavior.
 
-**Config / harness follow-up:**
-
-5. **Thread per-suite `.inferconfig` into the ignored sweep harness**: support for
-   `pulse-model-{free,malloc,realloc}-pattern` is implemented, but the ignored store-textual sweep
-   still does not load suite-local `.inferconfig` files. Until that is fixed, config-driven
-   correctness changes will not affect the published sweep totals.
-
-**Masked direct-run issue-set gaps:**
-
-6. **memory_leak.c leak parity is still not truly done**: with
-   `infer/tests/codetoanalyze/c/pulse/.inferconfig`, Rust now recovers `user_malloc_leak_bad` and
-   `test_config_options_no_free_bad`, but pointer-arithmetic / array reachability still produces
-   false positives that happen to cancel in the sweep counts.
+Separate config-surface note: `pulse-model-abort`, `pulse-model-return-nonnull`, and
+`pulse-model-skip-pattern` are now supported. The main remaining root-level `.inferconfig` gap is
+`pulse-model-returns-copy-pattern`, which needs unnecessary-copy tracking rather than a simple
+model shim.
 
 **Skipped files (3):** `infinite.c` (106 procs with infinite loops/Ackermann), `recursion.c`,
 `recursion2.c` — fixpoint exhaustion.
 
-**Notable recent correctness wins:** `funptr.c` is now at parity (`11` issues), `specialization.c`
-is back to the direct OCaml issue set, and `compound_literal.c` / `initlistexpr.c` already match
-OCaml after fixing the sweep expectation helper to use exact basenames.
+**Notable recent correctness wins:** `cleanup_attribute.c` now matches OCaml again, `angelism.c`
+is back at parity (`7` issues), `memory_leak.c` leak parity is exact in the authoritative sweep,
+`funptr.c` is at parity (`11` issues), `specialization.c` is back to the direct OCaml issue set,
+`nullptr.c` count parity is exact again after translating pure-call function-application
+dependencies through summary application, and `compound_literal.c` / `initlistexpr.c` already
+match OCaml after fixing the sweep expectation helper to use exact basenames.
 
 ### Textual pipeline gaps
 
@@ -59,7 +58,7 @@ OCaml after fixing the sweep expectation helper to use exact basenames.
 - **ValueHistory threading**: Error trace reconstruction. Cross-ref: `PulseValueHistory.ml`.
 - **Global variable handling** in summary application.
 - **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Remaining gap: `<int[]>` without array length.
-- **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, callee AbortProgram summaries now propagate again, and Rust now has a caller-side latent-invalid-access path. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, latent issue type reporting, and OCaml-aligned publication timing for any still-propagated abort over-reports.
+- **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, callee AbortProgram summaries now propagate again, Rust now has a caller-side latent-invalid-access path, and imported pure-call dependencies now survive summary application/normalization. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, latent issue type reporting, and OCaml-aligned publication timing for any still-propagated abort over-reports.
 
 ## Debugging tools
 
@@ -70,7 +69,6 @@ OCaml after fixing the sweep expectation helper to use exact basenames.
 ## Code issues
 
 - **`find_return_value` fallback heuristic**: Skips void procs (correct for leak detection). For non-void, takes last Load/Call across ALL nodes.
-- **All call arg types set to `void`** in to_sil: formal types available via PulseSummary.formal_types for havoc decisions.
 - **Prune `is_then_branch` hardcoded to `true`** in to_sil.
 - **`DeclEnv` uses `format!()` as HashMap keys**: Needs location-insensitive key types.
 

@@ -187,12 +187,16 @@ whether the source directory has a `.inferconfig` that changes modeling. The C P
 `pulse-model-free-pattern`, `pulse-model-malloc-pattern`, and
 `pulse-model-realloc-pattern` to model wrapper functions. These patterns use OCaml `Str.regexp`
 syntax from shared Infer configs, for example `\\(my\\|a\\)_malloc`.
+Other supported config-driven models include `pulse-model-abort`,
+`pulse-model-return-nonnull`, and `pulse-model-skip-pattern`.
 
 - For CLI reproduction, pass `--inferconfig-path <path-to-.inferconfig>` explicitly.
-- For library tests or ignored sweeps, make sure the config is initialized the same way if the
-  behavior depends on it.
-- The current ignored store-textual sweep does not automatically load per-suite `.inferconfig`
-  files, so config-driven fixes may need a harness follow-up before they move published totals.
+- For library tests or custom harnesses, make sure config discovery starts from the intended source
+  directory if the behavior depends on `.inferconfig`.
+- The ignored store-textual sweep now mirrors OCaml config discovery by invoking the `infer-rs`
+  CLI once per exported `.sil` from the originating source directory.
+- OCaml walks upward from the starting working directory to filesystem root when searching for
+  `.inferconfig`; it does not stop at `.git` or `.hg`.
 
 ## Relationship to OCaml Codebase
 

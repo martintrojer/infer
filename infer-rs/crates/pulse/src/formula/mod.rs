@@ -825,6 +825,20 @@ mod tests {
     }
 
     #[test]
+    fn test_integer_var_rejects_non_integer_constant_solution() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+
+        f.and_is_int(x);
+        let result = f.and_equal_linear(x, LinArith::of_q(Q::new(1, 2)));
+
+        assert!(
+            result.is_unsat(),
+            "integer-typed variables should reject non-integer constant solutions"
+        );
+    }
+
+    #[test]
     fn test_binop_plus() {
         let mut f = Formula::ttrue();
         let x = AbstractValue::of_raw(1);
@@ -843,6 +857,48 @@ mod tests {
         f.and_equal_const(x, 3);
         f.and_equal_const(y, 4);
         assert_eq!(f.is_known_const(z), Some(Q::from_integer(7)));
+    }
+
+    #[test]
+    fn test_pure_int_fn_app_collision_makes_odd_doubled_sum_unsat() {
+        let mut f = Formula::ttrue();
+        let x1 = AbstractValue::of_raw(1);
+        let x2 = AbstractValue::of_raw(2);
+        let sum = AbstractValue::of_raw(3);
+
+        f.and_is_int(x1);
+        let first = f.and_fn_app(x1, "pure_offset", &[]);
+        assert!(first.is_sat());
+
+        f.and_is_int(x2);
+        let second = f.and_fn_app(x2, "pure_offset", &[]);
+        assert!(
+            second.is_sat(),
+            "repeated pure calls should unify, not fail immediately"
+        );
+        assert_eq!(
+            f.get_var_repr(x2),
+            f.get_var_repr(x1),
+            "repeated pure calls with identical actuals should unify return values"
+        );
+        assert!(
+            f.phi().is_marked_int(x1),
+            "the canonical pure-call result should remain marked integer-typed"
+        );
+
+        let sum_eq = f.and_equal_binop(
+            sum,
+            sil::binop::Binop::PlusA(None),
+            &Operand::AbstractValue(x1),
+            &Operand::AbstractValue(x2),
+        );
+        assert!(sum_eq.is_sat());
+
+        let odd = f.prune_eq_const(sum, 1, false);
+        assert!(
+            odd.is_unsat(),
+            "if pure_offset() is int and pure, pure_offset()+pure_offset()==1 is impossible"
+        );
     }
 
     #[test]

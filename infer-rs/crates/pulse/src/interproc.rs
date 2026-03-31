@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use sil::exp::Exp;
 use sil::ident::Ident;
 use sil::location::Location;
+use sil::procdesc::Procdesc;
 use sil::typ::Typ;
 
 use crate::abductive::AbductiveDomain;
@@ -79,7 +80,15 @@ pub fn apply_summary(
         }
     }
 
-    // Step 1b: Materialize pre-condition — walk the callee's pre-state heap
+    // Step 1b: Map callee globals to caller globals before pre-materialization.
+    // Cross-ref: OCaml PulseInterproc.ml materialize_pre_for_globals.
+    extend_subst_with_callee_globals(pre_post, &mut subst, &mut caller_state);
+
+    // Step 1c: Translate constant array indices into caller-space values.
+    // Cross-ref: OCaml PulseInterproc.ml materialize_pre_from_array_indices.
+    extend_subst_with_callee_array_indices(pre_post, &mut subst, &mut caller_state);
+
+    // Step 1d: Materialize pre-condition — walk the callee's pre-state heap
     // and match against the caller's heap. Check that callee's pre-conditions
     // are satisfied (addresses it reads are valid in the caller).
     // Matches OCaml's `materialize_pre` in PulseInterproc.ml.
@@ -249,7 +258,7 @@ pub fn apply_summary(
         crate::summary::PrePostKind::LatentInvalidAccess => {
             if let Some(diag) = &pre_post.diagnostic {
                 let diag = translate_diagnostic(diag, &mut subst, &caller_state);
-                if latent_invalid_access_is_manifest(&diag, &caller_state) {
+                if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
                     vec![ExecutionDomain::AbortProgram {
                         state: Box::new(caller_state),
@@ -295,6 +304,7 @@ fn translate_diagnostic(
 }
 
 fn latent_invalid_access_is_manifest(
+    caller_pdesc: &Procdesc,
     diagnostic: &Diagnostic,
     caller_state: &AbductiveDomain,
 ) -> bool {
@@ -302,6 +312,7 @@ fn latent_invalid_access_is_manifest(
         diagnostic,
         Diagnostic::AccessToInvalidAddress { addr, .. }
             if caller_state.check_valid(*addr).is_err()
+                && crate::summary::abort_is_manifest(caller_pdesc, caller_state)
     )
 }
 
@@ -410,12 +421,16 @@ fn materialize_pre(
             }
 
             for (access, callee_target) in edges.iter() {
-                let caller_target =
-                    if let Some(existing) = caller_state.post.heap.find_edge(caller_addr, access) {
-                        existing
-                    } else {
-                        resolve_mut(subst, *callee_target)
-                    };
+                let caller_access = translate_access(subst, access, caller_state);
+                let caller_target = if let Some(existing) = caller_state
+                    .post
+                    .heap
+                    .find_edge(caller_addr, &caller_access)
+                {
+                    existing
+                } else {
+                    resolve_mut(subst, *callee_target)
+                };
 
                 subst.entry(*callee_target).or_insert(caller_target);
 
@@ -430,6 +445,54 @@ fn materialize_pre(
         Some(diag) => PreMaterializeResult::PreConditionViolation(diag),
         None => PreMaterializeResult::Ok,
     }
+}
+
+fn extend_subst_with_callee_globals(
+    pre_post: &PrePost,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) {
+    let mut map_globals = |stack: &crate::base_stack::BaseStack| {
+        for (var, addr) in stack.iter() {
+            if !var.is_global() {
+                continue;
+            }
+            let caller_addr = caller_state.eval_var(var);
+            subst.entry(*addr).or_insert(caller_addr);
+        }
+    };
+
+    map_globals(&pre_post.pre.stack);
+    map_globals(&pre_post.post.post.stack);
+}
+
+fn extend_subst_with_callee_array_indices(
+    pre_post: &PrePost,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) {
+    let mut map_indices = |heap: &crate::base_memory::BaseMemory| {
+        for (_addr, edges) in heap.iter() {
+            for (access, _target) in edges.iter() {
+                let Access::ArrayAccess(_, callee_idx) = access else {
+                    continue;
+                };
+                if subst.contains_key(callee_idx) {
+                    continue;
+                }
+                let Some(c) = pre_post.post.get_const(*callee_idx) else {
+                    continue;
+                };
+                let caller_idx = AbstractValue::mk_fresh();
+                let _ = caller_state.and_equal_const(caller_idx, c);
+                let caller_idx = caller_state.canonicalize_for_access(caller_idx);
+                subst.entry(*callee_idx).or_insert(caller_idx);
+            }
+        }
+    };
+
+    map_indices(&pre_post.pre.heap);
+    map_indices(&pre_post.post.post.heap);
 }
 
 fn apply_post_cell(
@@ -448,7 +511,7 @@ fn apply_post_cell(
 
     if let Some(pre_edges) = pre_edges_opt {
         for (access, _) in pre_edges.iter() {
-            let caller_access = translate_access(subst, access);
+            let caller_access = translate_access(subst, access, caller_state);
             caller_edges.remove(&caller_access);
         }
     }
@@ -456,7 +519,7 @@ fn apply_post_cell(
     if let Some(post_edges) = post_edges_opt {
         for (access, callee_target) in post_edges.iter() {
             let caller_target = resolve_mut(subst, *callee_target);
-            let caller_access = translate_access(subst, access);
+            let caller_access = translate_access(subst, access, caller_state);
             caller_edges.add(caller_access, caller_target);
         }
     }
@@ -587,6 +650,48 @@ fn translate_formula(
             return false;
         }
     }
+
+    // Translate remembered pure-function applications so imported conditions
+    // on their results stay connected to caller-visible actuals.
+    // Cross-ref: OCaml PulseFormula.and_callee_formula folds substitutions
+    // through the whole formula, including function-application terms.
+    for (key, ret) in phi.iter_fn_app_eqs() {
+        let Some(&caller_ret) = extended_subst.get(ret) else {
+            continue;
+        };
+        let mut caller_actuals = Vec::with_capacity(key.actuals.len());
+        let mut all_mapped = true;
+        for actual in &key.actuals {
+            match actual {
+                crate::formula::phi::FnAppActual::Const(c) => {
+                    let fresh = crate::abstract_value::AbstractValue::mk_fresh();
+                    if caller_state.and_equal_const(fresh, *c).is_unsat() {
+                        return false;
+                    }
+                    caller_actuals.push(fresh);
+                }
+                crate::formula::phi::FnAppActual::Var(v) => {
+                    let Some(&caller_actual) = extended_subst.get(v) else {
+                        all_mapped = false;
+                        break;
+                    };
+                    caller_actuals.push(caller_actual);
+                }
+            }
+        }
+        if !all_mapped {
+            continue;
+        }
+        if caller_state
+            .path_condition
+            .and_fn_app(caller_ret, &key.callee, &caller_actuals)
+            .is_unsat()
+        {
+            log::debug!("    fn_app: {}({:?}) → UNSAT!", key.callee, key.actuals);
+            return false;
+        }
+    }
+
     for (atom, depth) in callee_formula.conditions() {
         let all_mapped = atom
             .all_vars()
@@ -607,10 +712,15 @@ fn translate_formula(
 }
 
 /// Translate a callee Access to a caller Access (substituting array indices).
-fn translate_access(subst: &HashMap<AbstractValue, AbstractValue>, access: &Access) -> Access {
+fn translate_access(
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    access: &Access,
+    caller_state: &mut AbductiveDomain,
+) -> Access {
     match access {
         Access::ArrayAccess(typ, idx) => {
             let caller_idx = subst.get(idx).copied().unwrap_or(*idx);
+            let caller_idx = caller_state.canonicalize_for_access(caller_idx);
             Access::ArrayAccess(typ.clone(), caller_idx)
         }
         other => other.clone(),
@@ -812,6 +922,334 @@ mod tests {
                     .is_some(),
                 "callee's write through p should materialize in caller's heap"
             );
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_propagates_global_stack_effects() {
+        let callee_pname = Procname::c_from_string("__infer_globals_initializer_fp");
+        let callee_pdesc = Procdesc::new(callee_pname, Typ::void(), Location::dummy());
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let global = Pvar::mk_global(Mangled::from_string("fp"));
+        let global_var = Var::ProgramVar(Box::new(global.clone()));
+        let global_addr = callee_state.eval_var(&global_var);
+        let closure_val = AbstractValue::mk_fresh();
+        callee_state
+            .post
+            .heap
+            .add_edge(global_addr, Access::Dereference, closure_val);
+        callee_state.post.attrs.add_one(
+            closure_val,
+            Attribute::Closure(Procname::c_from_string("assign_NULL")),
+        );
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname, Typ::void(), Location::dummy());
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            let caller_global_addr = s
+                .post
+                .stack
+                .find(&global_var)
+                .expect("caller global should be bound");
+            let closure_addr = s
+                .post
+                .heap
+                .find_edge(caller_global_addr, &Access::Dereference)
+                .expect("initializer should populate the caller global");
+            assert!(s
+                .get_closure_proc_name(closure_addr)
+                .is_some_and(|pname| *pname == Procname::c_from_string("assign_NULL")));
+        } else {
+            panic!("expected a continuing result");
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_materialize_pre_translates_array_indices() {
+        let callee_pname = Procname::c_from_string("free_slot");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(
+            Mangled::from_string("array"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let array_pvar = Pvar::mk(Mangled::from_string("array"), callee_pname);
+        let array_var = Var::ProgramVar(Box::new(array_pvar.clone()));
+        let array_addr = callee_state.post.stack.find(&array_var).unwrap();
+        let array_val = callee_state.read_heap(array_addr, Access::Dereference);
+        let callee_idx = AbstractValue::mk_fresh();
+        let _ = callee_state.and_equal_const(callee_idx, 42);
+        let callee_idx = callee_state.canonicalize_for_access(callee_idx);
+        let slot_val =
+            callee_state.read_heap(array_val, Access::ArrayAccess(Typ::void(), callee_idx));
+        callee_state.invalidate(
+            slot_val,
+            crate::invalidation::Invalidation::CFree,
+            Location::dummy(),
+        );
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(array_pvar.clone(), array_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let actual = Pvar::mk(Mangled::from_string("local_array"), caller_pname);
+        let actual_var = Var::ProgramVar(Box::new(actual.clone()));
+        let actual_addr = caller_state.eval_var(&actual_var);
+        let caller_idx = AbstractValue::mk_fresh();
+        let _ = caller_state.and_equal_const(caller_idx, 42);
+        let caller_idx = caller_state.canonicalize_for_access(caller_idx);
+        let allocated = AbstractValue::mk_fresh();
+        caller_state.post.heap.add_edge(
+            actual_addr,
+            Access::ArrayAccess(Typ::void(), caller_idx),
+            allocated,
+        );
+        caller_state.allocate(
+            allocated,
+            crate::attribute::Allocator::CMalloc,
+            Location::dummy(),
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Lvar(actual), Typ::mk_ptr(Typ::void()))],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            let attrs = s
+                .post
+                .attrs
+                .get(&allocated)
+                .expect("allocated value should keep its attrs");
+            let invalidated: Vec<_> = s
+                .post
+                .attrs
+                .iter()
+                .filter_map(|(addr, attrs)| {
+                    attrs
+                        .get_invalid()
+                        .map(|(inv, _)| (*addr, format!("{inv:?}")))
+                })
+                .collect();
+            assert!(
+                attrs
+                    .get_invalid()
+                    .is_some_and(|(inv, _)| matches!(inv, crate::invalidation::Invalidation::CFree)),
+                "translated array access should invalidate the caller's allocated element; allocated={allocated:?} invalid={invalidated:?}"
+            );
+        } else {
+            panic!("expected a continuing result");
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_canonicalizes_constant_array_indices_in_post() {
+        let writer_pname = Procname::c_from_string("store_slot");
+        let mut writer_pdesc = Procdesc::new(writer_pname.clone(), Typ::void(), Location::dummy());
+        writer_pdesc.formals = vec![
+            (
+                Mangled::from_string("array"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (Mangled::from_string("idx"), Typ::void(), Default::default()),
+        ];
+        let mut writer_state = AbductiveDomain::mk_initial(&writer_pdesc);
+
+        let writer_array_pvar = Pvar::mk(Mangled::from_string("array"), writer_pname.clone());
+        let writer_idx_pvar = Pvar::mk(Mangled::from_string("idx"), writer_pname);
+        let writer_array_addr = writer_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(writer_array_pvar.clone())))
+            .unwrap();
+        let writer_idx_addr = writer_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(writer_idx_pvar.clone())))
+            .unwrap();
+        let writer_array_val = writer_state.read_heap(writer_array_addr, Access::Dereference);
+        let writer_idx_val = writer_state.read_heap(writer_idx_addr, Access::Dereference);
+        let allocated = AbstractValue::mk_fresh();
+        writer_state.post.heap.add_edge(
+            writer_array_val,
+            Access::ArrayAccess(Typ::void(), writer_idx_val),
+            allocated,
+        );
+        writer_state.allocate(
+            allocated,
+            crate::attribute::Allocator::CMalloc,
+            Location::dummy(),
+        );
+
+        let writer_summary = PrePost {
+            pre: writer_state.pre.clone(),
+            post: writer_state,
+            formals: vec![
+                (writer_array_pvar.clone(), writer_array_addr),
+                (writer_idx_pvar.clone(), writer_idx_addr),
+            ],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let free_pname = Procname::c_from_string("free_slot");
+        let mut free_pdesc = Procdesc::new(free_pname.clone(), Typ::void(), Location::dummy());
+        free_pdesc.formals = vec![
+            (
+                Mangled::from_string("array"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (Mangled::from_string("idx"), Typ::void(), Default::default()),
+        ];
+        let mut free_state = AbductiveDomain::mk_initial(&free_pdesc);
+
+        let free_array_pvar = Pvar::mk(Mangled::from_string("array"), free_pname.clone());
+        let free_idx_pvar = Pvar::mk(Mangled::from_string("idx"), free_pname);
+        let free_array_addr = free_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(free_array_pvar.clone())))
+            .unwrap();
+        let free_idx_addr = free_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(free_idx_pvar.clone())))
+            .unwrap();
+        let free_array_val = free_state.read_heap(free_array_addr, Access::Dereference);
+        let free_idx_val = free_state.read_heap(free_idx_addr, Access::Dereference);
+        let free_slot_val = free_state.read_heap(
+            free_array_val,
+            Access::ArrayAccess(Typ::void(), free_idx_val),
+        );
+        free_state.invalidate(
+            free_slot_val,
+            crate::invalidation::Invalidation::CFree,
+            Location::dummy(),
+        );
+
+        let free_summary = PrePost {
+            pre: free_state.pre.clone(),
+            post: free_state,
+            formals: vec![
+                (free_array_pvar, free_array_addr),
+                (free_idx_pvar, free_idx_addr),
+            ],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let caller_array = Pvar::mk(Mangled::from_string("array"), caller_pname);
+        let caller_array_var = Var::ProgramVar(Box::new(caller_array.clone()));
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let actuals = vec![
+            (Exp::Lvar(caller_array.clone()), Typ::mk_ptr(Typ::void())),
+            (
+                Exp::Const(sil::const_val::Const::Cint(IntLit::of_int(42))),
+                Typ::void(),
+            ),
+        ];
+
+        let mut after_write = match apply_summary(
+            &caller_pdesc,
+            &writer_summary,
+            &Ident::create_none(),
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        )
+        .into_iter()
+        .find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        }) {
+            Some(state) => state,
+            None => panic!("writer summary should continue"),
+        };
+
+        let caller_array_addr = after_write
+            .post
+            .stack
+            .find(&caller_array_var)
+            .expect("caller array should be bound");
+        let lookup_idx = AbstractValue::mk_fresh();
+        let _ = after_write.and_equal_const(lookup_idx, 42);
+        let lookup_idx = after_write.canonicalize_for_access(lookup_idx);
+        let caller_allocated = after_write
+            .post
+            .heap
+            .find_edge(
+                caller_array_addr,
+                &Access::ArrayAccess(Typ::void(), lookup_idx),
+            )
+            .expect("writer summary should store under the canonical caller index");
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &free_summary,
+            &Ident::create_none(),
+            &actuals,
+            &Location::dummy(),
+            after_write,
+        );
+
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            let caller_allocated = s.get_var_repr(caller_allocated);
+            let attrs = s
+                .post
+                .attrs
+                .get(&caller_allocated)
+                .expect("allocated value should keep its attrs");
+            assert!(
+                attrs
+                    .get_invalid()
+                    .is_some_and(|(inv, _)| matches!(inv, crate::invalidation::Invalidation::CFree)),
+                "free summary should invalidate the array element stored under the same constant index"
+            );
+        } else {
+            panic!("free summary should continue");
         }
     }
 
@@ -1132,6 +1570,52 @@ mod tests {
             results.as_slice(),
             [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
                 if found.get_issue_type_id() == diagnostics::issue_type::IssueTypeId::UseAfterFree
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_keeps_invalid_access_latent_when_caller_condition_is_imported() {
+        let (pre_post, diagnostic, _formal_pvar) = mk_latent_invalid_access_pre_post(true);
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname.clone());
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar.clone())))
+            .unwrap();
+        let caller_formal_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        caller_state.invalidate(
+            caller_formal_val,
+            crate::invalidation::Invalidation::CFree,
+            Location::dummy(),
+        );
+        let _ = caller_state.path_condition.and_condition_direct(
+            crate::formula::atom::Atom::Equal(
+                crate::formula::term::Term::Var(caller_formal_val),
+                crate::formula::term::Term::Const(4),
+            ),
+            1,
+        );
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(Exp::Lvar(caller_formal_pvar), Typ::void())];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentInvalidAccess { diagnostic: found, .. }]
+                if found.as_ref().get_issue_type_id() == diagnostic.get_issue_type_id()
         ));
     }
 

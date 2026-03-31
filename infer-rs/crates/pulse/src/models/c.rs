@@ -7,7 +7,6 @@
 //!
 //! Mirrors OCaml's `PulseModelsC.ml`.
 
-use regex::Regex;
 use sil::builtin_decl;
 use sil::exp::Exp;
 use sil::ident::Ident;
@@ -20,6 +19,7 @@ use crate::abstract_value::AbstractValue;
 use crate::attribute::Allocator;
 use crate::execution_domain::ExecutionDomain;
 use crate::invalidation::Invalidation;
+use crate::models::matching::matches_procname_pattern;
 use crate::operations;
 use crate::pulse_result::PulseResult;
 
@@ -186,41 +186,6 @@ pub(crate) fn matches_configured_wrapper(callee: &Procname, cfg: &config::InferC
     matches_procname_pattern(callee, cfg.pulse_model_free_pattern.as_deref())
         || matches_procname_pattern(callee, cfg.pulse_model_malloc_pattern.as_deref())
         || matches_procname_pattern(callee, cfg.pulse_model_realloc_pattern.as_deref())
-}
-
-/// Match the procname against an OCaml-configured regex pattern.
-///
-/// OCaml uses `Str.string_match r s 0`, so the pattern must match at the
-/// start of the procname string. Shared `.inferconfig` files also use OCaml
-/// `Str.regexp` syntax such as `\\(my\\|a\\)_malloc`, so translate the subset
-/// of grouping/alternation escapes used in those configs before compiling with
-/// Rust's regex engine.
-fn matches_procname_pattern(callee: &Procname, pattern: Option<&str>) -> bool {
-    let Some(pattern) = pattern else {
-        return false;
-    };
-
-    let translated = translate_ocaml_regex(pattern);
-    let Ok(regex) = Regex::new(&translated) else {
-        return false;
-    };
-    let proc_name = callee.to_string();
-    regex.find(&proc_name).is_some_and(|m| m.start() == 0)
-}
-
-fn translate_ocaml_regex(pattern: &str) -> String {
-    let mut translated = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some('(' | ')' | '|') = chars.peek().copied() {
-                translated.push(chars.next().expect("peeked character should exist"));
-                continue;
-            }
-        }
-        translated.push(ch);
-    }
-    translated
 }
 
 /// Returns two disjuncts: fresh non-null value + null value.
@@ -530,21 +495,27 @@ fn realloc_with_allocator(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     loc: &Location,
-    mut state: AbductiveDomain,
+    state: AbductiveDomain,
     allocator: Allocator,
 ) -> Vec<ExecutionDomain> {
-    // Step 1: Free the old pointer (first arg)
-    if let Some((ptr_exp, _)) = args.first() {
-        let ptr_addr = operations::eval_or_fresh(ptr_exp, loc, &mut state);
-        // Only invalidate if the pointer is valid (not null)
-        // realloc(NULL, size) is equivalent to malloc(size)
-        if state.check_valid(ptr_addr).is_ok() {
-            state.invalidate(ptr_addr, Invalidation::CFree, loc.clone());
+    // Cross-ref: OCaml PulseModelsC.ml realloc_common = free pointer >>= alloc_common.
+    let free_results = if !args.is_empty() {
+        free(&Ident::create_none(), args, loc, state)
+    } else {
+        vec![ExecutionDomain::ContinueProgram(state)]
+    };
+
+    let mut results = Vec::new();
+    for result in free_results {
+        match result {
+            ExecutionDomain::ContinueProgram(state) => {
+                results.extend(allocate_or_null(ret_id, allocator.clone(), loc, state));
+            }
+            other => results.push(other),
         }
     }
 
-    // Step 2: Allocate or return null (same as malloc)
-    allocate_or_null(ret_id, allocator, loc, state)
+    results
 }
 
 /// Model: `memcpy(dest, src, size)` / `memmove(dest, src, size)`.
@@ -759,16 +730,6 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_procname_pattern_uses_ocaml_str_syntax() {
-        let callee = Procname::c_from_string("a_malloc");
-        assert!(matches_procname_pattern(
-            &callee,
-            Some("\\(my\\|a\\)_malloc")
-        ));
-        assert!(!matches_procname_pattern(&callee, Some("^my_malloc$")));
-    }
-
-    #[test]
     fn test_dispatch_routes_custom_malloc_from_config() {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
@@ -817,6 +778,29 @@ mod tests {
         assert!(
             result.is_some(),
             "configured realloc wrapper should dispatch"
+        );
+    }
+
+    #[test]
+    fn test_realloc_splits_on_nullable_input() {
+        let mut state = mk_state();
+        let ptr_id = Ident::create_normal(IdentName::from_string("p"), 0);
+        state.post.stack.add(
+            Var::LogicalVar(ptr_id.clone()),
+            crate::abstract_value::AbstractValue::mk_fresh(),
+        );
+
+        let results = realloc(
+            &Ident::create_normal(IdentName::from_string("n"), 0),
+            &[(Exp::Var(ptr_id), Typ::void())],
+            &Location::dummy(),
+            state,
+        );
+
+        let continue_count = results.iter().filter(|result| result.is_continue()).count();
+        assert_eq!(
+            continue_count, 4,
+            "realloc should split through free(NULL/non-null) and allocate-or-null on each branch"
         );
     }
 

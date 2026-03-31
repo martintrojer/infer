@@ -35,6 +35,10 @@ impl Cfg {
         self.proc_descs.values()
     }
 
+    pub fn iter_proc_descs_mut(&mut self) -> impl Iterator<Item = &mut Procdesc> {
+        self.proc_descs.values_mut()
+    }
+
     pub fn num_procs(&self) -> usize {
         self.proc_descs.len()
     }

@@ -138,6 +138,8 @@ pub struct VarData {
     pub is_constexpr: bool,
     pub is_declared_unused: bool,
     pub is_structured_binding: bool,
+    #[serde(default)]
+    pub has_cleanup_attribute: bool,
 }
 
 /// Procedure description -- a single procedure's control flow graph.
@@ -171,6 +173,12 @@ pub struct Procdesc {
     pub exn_succs: HashMap<NodeId, BTreeSet<NodeId>>,
     /// Whether the procedure is defined (has a body) vs just declared.
     pub is_defined: bool,
+    /// Whether the procedure is known not to return.
+    ///
+    /// Mirrors OCaml ProcAttributes.is_no_return when that metadata is
+    /// available from the capture pipeline.
+    #[serde(default)]
+    pub is_no_return: bool,
 }
 
 impl Procdesc {
@@ -201,6 +209,7 @@ impl Procdesc {
             preds: HashMap::new(),
             exn_succs: HashMap::new(),
             is_defined: true,
+            is_no_return: false,
         }
     }
 

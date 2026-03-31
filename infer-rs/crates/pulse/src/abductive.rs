@@ -162,6 +162,12 @@ impl AbductiveDomain {
         self.post.attrs.initialize(repr);
     }
 
+    /// Keep an address reachable across summary normalization.
+    pub fn always_reachable(&mut self, addr: AbstractValue) {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.post.attrs.always_reachable(repr);
+    }
+
     /// Add a generic attribute to an address.
     pub fn add_attr(&mut self, addr: AbstractValue, attr: Attribute) {
         let repr = self.path_condition.get_var_repr(addr);
@@ -386,6 +392,21 @@ impl AbductiveDomain {
             // false leak reports. The unknown function may take ownership.
             // Cross-ref: OCaml removes allocation attrs in apply_unknown_effect.
             self.post.attrs.remove_allocated(*reachable_addr);
+        }
+    }
+
+    /// For unknown calls on `&slot`, ensure future loads from the slot see a
+    /// fresh post-state value even if the slot had not been materialized yet.
+    pub fn ensure_deref_edge_if_missing(&mut self, addr: AbstractValue) {
+        let addr = self.path_condition.get_var_repr(addr);
+        if self
+            .post
+            .heap
+            .find_edge(addr, &Access::Dereference)
+            .is_none()
+        {
+            let fresh = AbstractValue::mk_fresh();
+            self.post.heap.add_edge(addr, Access::Dereference, fresh);
         }
     }
 

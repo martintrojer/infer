@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// Locates the `infer` binary relative to the workspace root.
 ///
@@ -63,6 +64,112 @@ pub fn find_infer_binary() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Locate the `infer-rs` binary in the current Cargo target directory.
+///
+/// Build the binary once per test process before returning it so explicit
+/// end-to-end paths cannot silently reuse a stale `target/debug/infer-rs`.
+pub fn find_infer_rs_binary() -> Option<PathBuf> {
+    static INFER_RS_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    INFER_RS_BINARY.get_or_init(build_infer_rs_binary).clone()
+}
+
+fn build_infer_rs_binary() -> Option<PathBuf> {
+    let mut target_dir = std::env::current_exe().ok()?;
+    target_dir.pop(); // test binary name
+    if target_dir.file_name().is_some_and(|name| name == "deps") {
+        target_dir.pop(); // target/{debug,release}
+    }
+
+    let exe_name = format!("infer-rs{}", std::env::consts::EXE_SUFFIX);
+    let candidate = target_dir.join(&exe_name);
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())?;
+    let is_release = target_dir.file_name().is_some_and(|name| name == "release");
+
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("infer-rs")
+        .arg("--bin")
+        .arg("infer-rs");
+    if is_release {
+        cmd.arg("--release");
+    }
+
+    let status = cmd.status().ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    candidate.exists().then_some(candidate)
+}
+
+/// Run the `infer-rs` CLI on a single exported textual `.sil` file.
+///
+/// The caller controls `cwd` so config discovery mirrors OCaml's "search from
+/// current working directory upward" behavior for the originating source file.
+/// `source_override` restores the original source path from `manifest.json`.
+pub fn run_infer_rs_on_textual(
+    sil_file: &Path,
+    source_override: Option<&str>,
+    cwd: &Path,
+    results_dir: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let infer_rs_bin =
+        find_infer_rs_binary().ok_or_else(|| "could not locate infer-rs binary".to_string())?;
+
+    let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out_dir = std::env::temp_dir().join(format!("infer_rs_cli_{}_{}", std::process::id(), n));
+    std::fs::create_dir_all(&out_dir).map_err(|e| {
+        format!(
+            "failed to create infer-rs temp output dir {}: {e}",
+            out_dir.display()
+        )
+    })?;
+
+    let output = {
+        let mut cmd = Command::new(&infer_rs_bin);
+        cmd.current_dir(cwd)
+            .arg("--pulse-only")
+            .arg("--quiet")
+            .arg("-o")
+            .arg(&out_dir);
+        if let Some(results_dir) = results_dir {
+            cmd.arg("--results-dir").arg(results_dir);
+        }
+        if let Some(source) = source_override {
+            cmd.arg("--source-override").arg(source);
+        }
+        cmd.arg(sil_file);
+        cmd.output()
+            .map_err(|e| format!("failed to run infer-rs: {e}"))?
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    if !matches!(exit_code, 0 | 2) {
+        return Err(format!(
+            "infer-rs exited with {exit_code}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let report_path = out_dir.join("report.json");
+    let issues = if report_path.exists() {
+        let content = std::fs::read_to_string(&report_path)
+            .map_err(|e| format!("failed to read {}: {e}", report_path.display()))?;
+        let issues = parse_infer_rs_report_json(&content)?;
+        let _ = std::fs::remove_dir_all(&out_dir);
+        issues
+    } else {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        Vec::new()
+    };
+
+    Ok(issues)
 }
 
 /// Result of running OCaml infer on a set of `.sil` files.
@@ -286,7 +393,7 @@ impl InferRunner {
     pub fn store_textual_and_export(
         &self,
         sources: &[&Path],
-    ) -> Result<(Vec<config::manifest::ManifestEntry>, PathBuf), String> {
+    ) -> Result<(Vec<config::manifest::ManifestEntry>, PathBuf, PathBuf), String> {
         let out_dir = self.tmp_dir.join("infer_out");
         let export_dir = self.tmp_dir.join("exported");
         let _ = std::fs::create_dir_all(&self.tmp_dir);
@@ -338,7 +445,7 @@ impl InferRunner {
         let manifest_path = export_dir.join("manifest.json");
         let entries = config::manifest::read_manifest(&manifest_path)?;
 
-        Ok((entries, export_dir))
+        Ok((entries, export_dir, out_dir))
     }
 
     /// Capture `.sil` files without analyzing (capture only).
@@ -428,6 +535,22 @@ pub fn parse_report_json(json: &str) -> Result<Vec<InferIssue>, String> {
     Ok(issues)
 }
 
+/// Parse an infer-rs `report.json` string into issue-type IDs.
+pub fn parse_infer_rs_report_json(json: &str) -> Result<Vec<String>, String> {
+    let raw: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+
+    Ok(raw
+        .iter()
+        .filter_map(|obj| {
+            obj.get("issue_type")
+                .and_then(|issue_type| issue_type.get("id"))
+                .and_then(|id| id.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .collect())
+}
+
 /// Compare two sets of issues, ignoring qualifier text (which can differ).
 ///
 /// Returns a map of `(file, line, bug_type)` → `(in_left, in_right)`.
@@ -498,6 +621,22 @@ mod tests {
         assert_eq!(issues[0].line, 20);
         assert_eq!(issues[1].bug_type, "NULLPTR_DEREFERENCE");
         assert_eq!(issues[1].line, 10);
+    }
+
+    #[test]
+    fn test_parse_infer_rs_report_json() {
+        let json = r#"[
+            {
+                "issue_type": { "id": "NULLPTR_DEREFERENCE" },
+                "file": "test.c"
+            },
+            {
+                "issue_type": { "id": "MEMORY_LEAK_C" },
+                "file": "test.c"
+            }
+        ]"#;
+        let issues = parse_infer_rs_report_json(json).unwrap();
+        assert_eq!(issues, vec!["NULLPTR_DEREFERENCE", "MEMORY_LEAK_C"]);
     }
 
     #[test]

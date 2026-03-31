@@ -5,16 +5,141 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-The active line is the next correctness cluster after fixing latent invalid-access reification,
-specialized-summary publication, and the sweep expectation basename bug.
+The active line is now the three remaining authoritative NPE count gaps:
+
+- `memory_leak.c`: missing one duplicated `NULLPTR_DEREFERENCE`
+- `sizeof.c`: two extra `NULLPTR_DEREFERENCE`s
+- `nullptr.c`: `create_null_path2_bad_FN` is restored; the only remaining proc-set mismatch is the
+  extra `FN_nullptr_deref_old_bad`
 
 Latest authoritative sweep:
 
-- `NPE: expected 131, found 139`
-- `LEAK: expected 20, found 22`
+- `NPE: expected 131, found 133`
+- `LEAK: expected 20, found 20`
 - `UAF: expected 7, found 7`
 
+Confirmed again after the latest structural attribute fix:
+
+- `make check` is green on this tree.
+- `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+  is still exactly:
+  - `NPE: expected 131, found 133`
+  - `LEAK: expected 20, found 20`
+  - `UAF: expected 7, found 7`
+- The file-level diffs are unchanged:
+  - `memory_leak.c`: expected `3`, found `2`
+  - `nullptr.c`: expected `13`, found `14`
+  - `sizeof.c`: expected `0`, found `2`
+
+Current authoritative file-level count diffs:
+
+- `memory_leak.c`: expected `3`, found `2` (`NULLPTR_DEREFERENCE`)
+- `nullptr.c`: expected `13`, found `14` (`NULLPTR_DEREFERENCE`)
+- `sizeof.c`: expected `0`, found `2` (`NULLPTR_DEREFERENCE`)
+
+Latest direct `nullptr.c` proc set after the fix:
+
+- gone: `unknown_from_parameters_latent` manifest `NULLPTR_DEREFERENCE`
+- still extra: `FN_nullptr_deref_old_bad`
+
+Latest structural correctness work:
+
+- `crates/pulse/src/attribute.rs`
+  now uses payload-sensitive ordering for `Allocator` / `Attribute` instead of
+  variant-tag-only ordering.
+- Supporting `Ord` derives were added on the SIL key types needed by the
+  attribute set (`Location`, `Fieldname`, `IdentKind`, `Procname` family,
+  `Pvar`, `Var`, etc.).
+- New regression test:
+  `attribute::tests::test_distinct_invalid_attributes_are_preserved`
+  proves two distinct `Invalid(...)` attrs on one value are no longer dropped.
+- Important outcome: this did **not** change the authoritative sweep and did
+  **not** make `realloc_no_check_bad` report twice on a fresh direct
+  `memory_leak.sil` run.
+- Conclusion: the remaining `memory_leak.c` gap is still missing
+  access/invalidation trace/value-history provenance, not just attribute-set
+  collapsing.
+
+Harness status:
+
+- `crates/test-harness/src/infer_runner.rs` now builds `infer-rs` once per test
+  process via `OnceLock`, so the ignored store-textual sweep no longer silently
+  reuses a stale `target/{debug,release}/infer-rs`.
+- Older `NPE 134` readings were partly stale-binary noise, but the current
+  confirmed sweep on this tree after the recent null-materialization work is
+  `NPE 133 / LEAK 20 / UAF 7`.
+- `make check` is green on this tree.
+
+Rejected experiment:
+
+- Changing Rust diagnostic dedup to key on `(issue_type, invalidation_location, AbstractValue)`
+  made direct `memory_leak.c` show both `realloc_no_check_bad` null reports, but it was wrong.
+- The same change exploded the store-textual sweep to `NPE: expected 131, found 154`, with obvious
+  clone reports in `latent.c`, `list_checks.c`, `integers.c`, `nullptr.c`, and others.
+- This was reverted. The real missing piece is trace/message provenance, not raw address identity.
+
 What improved this turn:
+
+- `traces.c` is back to parity (`6` issues total, `5` manifest NPEs).
+- The fix was not to weaken summary classification globally. That regressed
+  `angelism.c` and `funptr.c`.
+- The correct edit is narrower and only affects non-exit abort publication in
+  `crates/pulse/src/checker.rs`:
+  - build a temporary normalized abort pre/post
+  - if the abort is on a value newly written into caller-owned memory through a
+    true by-ref formal (`**`-style outparam), keep it latent
+  - otherwise preserve the existing manifest/latent behavior
+- Supporting regression/unit coverage now exists in `crates/pulse/src/summary.rs`
+  for both sides of that boundary:
+  - direct formal invalid accesses stay manifest for the non-exit reporter
+  - post-written by-ref invalid accesses stay latent, including repr-canonicalized values
+- Current focused validations after this fix:
+  - `cargo test -p pulse classify_abort_kind --lib -- --nocapture`
+  - `cargo test -p pulse caller_visible_invalid_access --lib -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+
+- `nullptr.c` no longer has count parity, but the move is correctness-positive:
+  `create_null_path2_bad_FN` is restored and only the old recency false
+  positive remains.
+- The fix was not another manifestness special-case. The real missing piece was
+  pure-call dependency propagation through summaries:
+  - `crates/pulse/src/interproc.rs`
+    `translate_formula` now also replays remembered `fn_app_eqs` into the
+    caller path condition when translating a callee formula
+  - `crates/pulse/src/summary.rs`
+    summary normalization now treats pure-call results as reachable from their
+    caller-visible actual arguments
+- This matches OCaml more closely: imported conditions such as
+  `unknown(x) == 999` stay connected to the caller formal instead of being
+  dropped as dead formula state during summary normalization.
+- Focused regressions now pass:
+  - `cargo test -p pulse --lib -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+- Authoritative sweep progression for this checkpoint:
+  - before the pure-call interproc fix: `NPE 133 / LEAK 20 / UAF 7`
+  - after the pure-call interproc fix: `NPE 132 / LEAK 20 / UAF 7`
+
+- `angelism.c` is now back at parity (`7` NPEs) after fixing the unknown by-ref slot semantics.
+- The correct fix was not summary-level skipping. The first attempt marked formal slots with an
+  `UnknownEffect`-style summary escape hatch, but that wrongly removed both:
+  - the stale false positive `call_by_ref_actual_already_in_footprint_ok`
+  - and the real expected report `call_by_ref_actual_already_in_footprint_bad`
+- The correct edit is narrower and matches the intended semantics better:
+  - keep the normal formal-value-to-actual mapping in interproc
+  - at unknown/empty-body call sites, when the actual expression is an lvalue address
+    (`Lvar` / `Lfield` / `Lindex`), ensure the root has a fresh post-state `Dereference`
+    edge if one was missing
+  - this makes later loads from `&param` observe an unknown rewritten slot value without
+    erasing pre-call accesses that should still map back to the caller actual
+- Focused regressions now pass:
+  - `cargo test -p pulse test_apply_summary_removes_caller_edges_missing_from_callee_post --lib -- --nocapture`
+  - `cargo test -p pulse test_apply_summary_materialize_pre_translates_array_indices --lib -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_unknown_call_havoc -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_unknown_call_havoc_on_by_ref_formal_slot -- --nocapture`
+- Authoritative sweep progression for this checkpoint:
+  - stale binary before the harness fix: `NPE 134 / LEAK 22 / UAF 7`
+  - current sweep on this tree: `NPE 133 / LEAK 20 / UAF 7`
 
 - `specialization.c` regained the missing `USE_AFTER_FREE` in
   `call_may_double_free_if_alias_bad` after adding a Rust analogue of OCaml's latent-invalid-access
@@ -30,17 +155,78 @@ What improved this turn:
   `pulse-model-free-pattern`, `pulse-model-malloc-pattern`, and
   `pulse-model-realloc-pattern`, including the OCaml `Str` grouping/alternation syntax used by
   shared `.inferconfig` files such as `\\(my\\|a\\)_malloc`.
+- Rust now also supports the generic config-driven model flags `pulse-model-abort`,
+  `pulse-model-return-nonnull`, and `pulse-model-skip-pattern`, wired through both `.inferconfig`
+  parsing and CLI overrides.
+- The ignored store-textual sweep now invokes the `infer-rs` CLI per exported `.sil` from the
+  originating source directory, with `--source-override` used only to preserve the original
+  manifest source filename in reports.
+- OCaml `.inferconfig` lookup was confirmed to walk upward from the starting working directory to
+  filesystem root. The harness bug was the starting directory, not a `.git` / `.hg` boundary.
+- Textual `Lvar` lowering now matches OCaml `TextualSil.ml`:
+  - `crates/textual/src/to_sil.rs` threads `DeclEnv` through expression lowering
+  - declared globals now become `Pvar::mk_global(...)` instead of always being local pvars
+  - focused regression test added: `test_global_lvar_is_lowered_to_global_pvar`
+- The synthetic global function-pointer initializer path now works end to end:
+  - initializer summaries preserve the global stack binding for `fp`
+  - the spec-loop driver now also seeds target summaries from `Closure(...)` attrs published by
+    global initializer summaries
+  - focused regression test now passes:
+    `cargo test -p pulse --test end_to_end test_e2e_global_function_pointer_initializer_is_inlined -- --nocapture`
+- `memory_leak.c` regained the previously missing wrapper-through-global leak reports:
+  - `malloc_ptr_leak_bad`
+  - `malloc_ptr_no_check_leak_bad`
+  - and regained one missing NPE on the `malloc_via_ptr` path
+- `memory_leak.c` array-wrapper false positives are now gone after two array-index fixes:
+  - interproc post translation now canonicalizes translated constant array indices
+  - summary normalization now preserves formula facts for array-index values used in retained heap
+    accesses
+- direct `memory_leak.c` is now down to a single proc-level mismatch:
+  - missing one duplicated `NULLPTR_DEREFERENCE` on `realloc_no_check_bad`
+  - leak proc set is now at parity
+- `cleanup_attribute.c` is now back at parity after mirroring OCaml's
+  cleanup-local metadata and store behavior:
+  - CLI capture metadata recovery now restores local `has_cleanup_attribute`
+    flags from `infer debug --procedures --procedures-attributes`
+  - Pulse store handling now marks values stored into cleanup locals as
+    `AlwaysReachable`
+  - summary normalization now keeps the transitive closure of
+    `AlwaysReachable` addresses out of leak reporting
+- Correctness-first note: these fixes make the aggregate sweep numbers temporarily worse because
+  they recover real issues before the remaining false positives are removed.
+- The unknown pure-int call parity work is now split into two confirmed fixes:
+  - `crates/pulse/src/formula/phi.rs`
+    `add_linear_eq` now re-solves substituted linear equations through `add_linear_eq` instead of
+    reinserting them raw. This is the Rust-side analogue of OCaml re-normalizing propagated linear
+    equalities; it fixes the missed `IsInt` contradiction on indirect substitutions such as
+    `x = sum / 2` then `sum = 1`.
+  - `crates/textual/src/to_sil.rs`
+    regular Textual calls now preserve procdecl-based return and formal argument types instead of
+    hardcoding `Typ::void()`. This matches OCaml `TextualSil.ml` call lowering and fixes the
+    straight-line regression where empty-body pure C calls returning `int` failed to contribute
+    integer facts in Pulse.
+- New focused regressions now pass:
+  - `cargo test -p pulse --lib -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_empty_body_pure_int_call_preserves_integer_reasoning -- --nocapture`
+  - `cargo test -p textual to_sil::tests::test_conversion_with_calls -- --nocapture`
+- `crates/textual/src/to_sil.rs`
+  general expression lowering now always maps `__sil_cast(<typ>, value)` to `Exp::Cast`,
+  including zero constants. This matches OCaml `TextualSil.ml`; the previous Rust-only
+  zero-cast workaround was incorrect and kept values like `__sil_cast(<int>, 0)` opaque.
+- The cast correction fixed the remaining exported-textual `offsetof_expr.c` false positive:
+  `FN_test_offsetof_expr_nonlit_bad` is now gone, and `offsetof_expr.c` dropped off the sweep
+  diff list entirely.
+- Authoritative sweep progression this turn:
+  - before these fixes: `NPE 140 / LEAK 22 / UAF 7`
+  - after unknown-call int + procdecl call typing: `NPE 138 / LEAK 22 / UAF 7`
+  - after removing the zero-cast workaround: `NPE 137 / LEAK 22 / UAF 7`
 
 What is still open:
 
-- `cleanup_attribute.c` has `+2` leaks.
-- `memory_leak.c` is short by `2` NPEs and over by `1` leak.
-- `angelism.c` has `+1` NPE.
-- `integers.c` has `+2` NPEs.
-- `nullptr.c` has `+2` NPEs.
-- `nullptr_more.c` has `+2` NPEs.
-- `offsetof_expr.c` has `+1` NPE.
+- `memory_leak.c` is now short by `1` NPE and has leak count parity.
 - `sizeof.c` has `+2` NPEs.
+- `nullptr.c` no longer affects the aggregate NPE count, but its proc set is
+  still off by one missing and one extra report.
 
 Current strongest diagnosis:
 
@@ -72,19 +258,79 @@ Current strongest diagnosis:
    - diagnostics already represented by latent specialized pre/posts must NOT be merged
    - otherwise we reintroduce false extra callee reports such as `may_double_free_if_alias`
 
-6. The next real mismatch clusters are now:
-   - `cleanup_attribute.c` / `memory_leak.c` for leak behavior
+6. The Textual global lowering gap was real and is now fixed:
+   - OCaml `TextualSil.ml` resolves `Lvar` via `TextualDecls.get_global`
+   - Rust had been lowering every `Lvar` to a local `Pvar`
+   - this prevented `var.is_global()` checks from ever firing in Pulse
+   - the fix should stay; do not regress it to improve totals
+
+7. The remaining `memory_leak.c` mismatch is now much narrower and more honest:
+   - expected `NULLPTR_DEREFERENCE` procs:
+     - `malloc_ptr_no_check_leak_bad`
+     - `realloc_no_check_bad` (twice)
+   - actual Rust `NULLPTR_DEREFERENCE` procs:
+     - `malloc_ptr_no_check_leak_bad`
+     - `realloc_no_check_bad` (once)
+   - leak proc set now matches expected after:
+     - global function-pointer initializer visibility
+     - canonical post translation of constant array indices
+     - preserving array-index formula facts in normalized summaries
+   - OCaml-style last-chance pointer-arithmetic leak suppression
+   - the remaining subproblem is the missing duplicated null-path on `realloc_no_check_bad`
+
+8. The rejected dedup experiment clarified the actual diagnostic gap:
+   - OCaml issue dedup is effectively keyed by issue kind plus message (`err_desc`) plus location
+   - the two OCaml `realloc_no_check_bad` reports survive because their traces/messages differ
+   - Rust `Diagnostic::AccessToInvalidAddress` currently only carries `{addr, invalidation,
+     access_location, invalidation_location}`
+   - without some analogue of OCaml trace/history/message provenance, Rust cannot distinguish the
+     wanted `realloc_no_check_bad` duplicate from bogus loop/unroll clones
+   - do not reintroduce raw-address-based dedup as a workaround
+
+9. The next real mismatch clusters are now:
+   - `memory_leak.c` for the one remaining duplicated `realloc` null path
+   - `cleanup_attribute.c` for cleanup-attribute leak behavior
    - `nullptr*`, integer, `offsetof`, and `sizeof` over-reporting for NPE behavior
 
-7. `memory_leak.c` is now known to include a config-driven component:
-   - with `--inferconfig-path ../infer/tests/codetoanalyze/c/pulse/.inferconfig`, Rust recovers
-     `user_malloc_leak_bad` and `test_config_options_no_free_bad`
-   - this confirms part of the old gap was missing support for
-     `pulse-model-{malloc,realloc,free}-pattern`, not a Pulse core transfer bug
-   - `malloc_ptr_{leak,no_check_leak}_bad` remain separate and are not fixed by this config work
-   - the current ignored sweep test still uses the library pipeline directly and does not yet load
-     the per-suite `.inferconfig`, so this config support will not change sweep totals until that is
-     threaded through
+10. `.inferconfig` audit status:
+   - for the current `infer/tests/codetoanalyze/c/pulse/.inferconfig`, there are no additional
+     missing flags beyond the now-supported wrapper model keys
+   - the main remaining root-level config gap is `pulse-model-returns-copy-pattern`, which appears
+     in `/.inferconfig` and the `pulse_messages_{c,cpp}` test configs
+   - `pulse-model-return-nonnull`, `pulse-model-skip-pattern`, and `pulse-model-abort` are now
+     implemented correctly as generic config-driven models
+   - other missing Pulse config keys found in Infer test configs are mostly outside the current C
+     null/UAF/leak parity scope: `pulse-specialization-partial`, `pulse-model-return-this`,
+     `pulse-model-{release,deep-release}-pattern`, and taint-related config
+   - several additional Pulse flags are used directly in test Makefiles rather than `.inferconfig`,
+     including `pulse-model-return-nullable`, `pulse-model-return-first-arg`,
+     `pulse-model-unknown-pure`, `pulse-model-unreachable`, `pulse-model-alloc-pattern`, and
+     `pulse-model-transfer-ownership`
+
+11. Current exported-textual status after the latest fixes:
+
+12. `sizeof.c` now looks like a Textual-roundtrip representation gap, not a
+    straightforward Pulse bug:
+    - exported `sizeof.sil` serializes the problematic conditions as raw type
+      expressions such as `__sil_gt(<int[]>, 2)` and
+      `__sil_divf(<int[]>, <int>)`
+    - Rust currently lowers any stray `Exp::Typ` to `Exp::Sizeof`, but OCaml
+      `TextualSil.ExpBridge.to_sil` does not allow raw `Typ` outside specific
+      builtins
+    - the exported Textual type also loses array-length information
+      (`char c[2]` becomes `c: int[]`), so `sizeof(c)` cannot currently be
+      reconstructed faithfully from the exported `.sil` alone
+    - this means `sizeof.c` is unlikely to be fixed by a small Pulse-only edit;
+      the eventual fix probably belongs in the Textual bridge or by threading
+      additional capture metadata into the Rust pipeline
+   - `sizeof.sil` is unchanged and still reports the same 2 false `NULLPTR_DEREFERENCE`s.
+     This still looks like store-textual information loss around raw type expressions such as
+     `<int[]>`, not a Pulse arithmetic bug.
+   - `offsetof_expr.sil` now reports only:
+     - `test_offsetof_expr_bad` (expected)
+   - The zero-cast special-casing in Rust `Textual` lowering was the real root cause of the
+     spurious `FN_test_offsetof_expr_nonlit_bad` report; do not reintroduce it as a workaround for
+     null-path handling.
 
 ## Non-Negotiable Guidance
 
@@ -97,13 +343,23 @@ Current strongest diagnosis:
 
 - `crates/ondemand/src/summary.rs`
 - `crates/cli/src/main.rs`
+- `crates/cli/tests/cli_tests.rs`
+- `crates/config/src/lib.rs`
 - `crates/pulse/src/checker.rs`
 - `crates/pulse/src/formula/mod.rs`
 - `crates/pulse/src/interproc.rs`
+- `crates/pulse/src/models/c.rs`
+- `crates/pulse/src/models/configured.rs`
+- `crates/pulse/src/models/matching.rs`
 - `crates/pulse/src/specialization.rs`
 - `crates/pulse/src/summary.rs`
 - `crates/pulse/src/transfer.rs`
 - `crates/pulse/tests/end_to_end.rs`
+- `crates/textual/src/to_sil.rs`
+- `crates/test-harness/src/infer_runner.rs`
+- `README.md`
+- `docs/STATUS.md`
+- `TODO.md`
 - `LOG.md`
 
 ## Confirmed Changes Already Made
@@ -202,8 +458,24 @@ Current strongest diagnosis:
       - `call_test_unalias_bad` now reports `NULLPTR_DEREFERENCE`
       - `call_may_double_free_if_alias_bad` now reports `USE_AFTER_FREE`
       - `may_double_free_if_alias` itself stays issue-free while keeping an alias-specialized summary
+- `cargo test -p infer-rs --test cli_tests test_source_override_sets_reported_file -- --nocapture`
+  - passed
+- `cargo test -p test-harness --lib`
+  - passed
+- `cargo test -p textual test_global_lvar_is_lowered_to_global_pvar -- --nocapture`
+  - passed
+- `cargo test -p pulse --test end_to_end test_e2e_global_function_pointer_initializer_is_inlined -- --nocapture`
+  - passed after the global-lowering and initializer-target fixes
+- focused array / summary regressions:
+  - `cargo test -p pulse apply_summary_canonicalizes_constant_array_indices_in_post --lib -- --nocapture`
+    - passed
+  - `cargo test -p pulse normalize_keeps_formula_for_reachable_array_index_constants --lib -- --nocapture`
+    - passed
+  - `cargo test -p pulse normalize_suppresses_leak_reachable_via_field_access --lib -- --nocapture`
+    - passed
+- latest authoritative sweep:
   - `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
-    - `NPE: expected 135, found 139`
+    - `NPE: expected 131, found 140`
     - `LEAK: expected 20, found 22`
     - `UAF: expected 7, found 7`
 
@@ -217,10 +489,9 @@ cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ig
 
 Current file-level diffs from the latest sweep:
 
-- NPE under: `compound_literal.c` (-1), `initlistexpr.c` (-3), `memory_leak.c` (-2)
-- NPE over: `angelism.c` (+1), `integers.c` (+2), `nullptr.c` (+2),
-  `nullptr_more.c` (+2), `offsetof_expr.c` (+1), `sizeof.c` (+2)
-- LEAK over: `cleanup_attribute.c` (+2), `memory_leak.c` (+1)
+- NPE under: `memory_leak.c` (-1)
+- NPE over: `angelism.c` (+1), `nullptr.c` (+2), `nullptr_more.c` (+2), `sizeof.c` (+2)
+- LEAK over: `cleanup_attribute.c` (+2)
 - UAF parity is now exact
 
 ## Relevant OCaml Cross-References
@@ -249,31 +520,28 @@ Current file-level diffs from the latest sweep:
 
 ### What was just confirmed
 
-- The latest `Formula::simplify` fix is correct and stable.
-- Summary conditions now preserve caller-relevant atom shape instead of normalizing through `phi`.
-- `interprocedural.c` is back to the expected 6 issues.
-- `latent.c` count is back in line with OCaml.
-- Specialization requests must be collected from the real fixpoint caller state; the previous
-  replay-based request builder was wrong.
-- Specialized alias equalities belong in `phi` (`and_equal`), not as imported depth-1 conditions.
-- The missing `specialization.c` UAF was not a specialization bug; it was the missing latent
-  invalid-access path.
-- `funptr.c` is no longer missing its callee-side specialized diagnostic.
+- The harness fix is semantically correct: published totals must reflect OCaml-style upward
+  `.inferconfig` search from each source directory, not a process-global test config.
+- The old `20 vs 22` leak total was partially masked by missing config-driven models in the sweep.
+- `memory_leak.c` is now the real next leak target because config loading is already correct there.
+- `interprocedural.c`, `latent.c`, `funptr.c`, and `specialization.c` stay fixed after the harness
+  change.
 
 ### Immediate next edits
 
-- Keep the specialization-request collector that runs during the real fixpoint.
-- When touching either path, cross-check against:
+- Keep the correctness-first harness/config changes even though they made the published leak count
+  worse.
+- When touching the next leak path, cross-check against:
   - `infer/src/pulse/PulseSummary.ml`
   - `infer/src/pulse/PulseAbductiveDomain.ml`
   - `infer/src/pulse/PulseCallOperations.ml`
+  - `infer/src/pulse/PulseModelsC.ml`
 
 Largest current authoritative diffs:
 
-- NPE under: `compound_literal.c` (-1), `initlistexpr.c` (-3), `memory_leak.c` (-2)
-- NPE over: `angelism.c` (+1), `integers.c` (+2), `nullptr.c` (+2), `nullptr_more.c` (+2),
-  `offsetof_expr.c` (+1), `sizeof.c` (+2)
-- LEAK over: `cleanup_attribute.c` (+2), `memory_leak.c` (+1)
+- NPE under: `memory_leak.c` (-1)
+- NPE over: `angelism.c` (+1), `nullptr.c` (+2), `nullptr_more.c` (+2), `sizeof.c` (+2)
+- LEAK over: `cleanup_attribute.c` (+2)
 - UAF parity is exact
 
 ### Still-open structural hypothesis
@@ -287,8 +555,8 @@ interproc mismatch if the next targeted bug points back into summary materializa
 ## Most Likely Next Steps
 
 1. Keep the correctness-first fixes even where totals are still worse than OCaml.
-2. Revisit the remaining summary/materialization mismatches behind `initlistexpr.c`,
-   `compound_literal.c`, and the `nullptr*` / `integers.c` over-reports.
+2. Compare Rust leak filtering/reachability against OCaml on `memory_leak.c`, especially
+   pointer-arithmetic and array-free paths.
 3. Re-run the ignored sweep after each correctness change and update `TODO.md` / `STATUS.md` only
    from the new authoritative counts.
 

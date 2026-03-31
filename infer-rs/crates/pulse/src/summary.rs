@@ -136,6 +136,22 @@ pub(crate) fn abort_is_manifest(pdesc: &Procdesc, astate: &AbductiveDomain) -> b
     pre_post_is_manifest(pdesc, &pp)
 }
 
+pub(crate) fn classify_abort_kind(
+    pdesc: &Procdesc,
+    astate: &AbductiveDomain,
+    diagnostic: &Diagnostic,
+) -> PrePostKind {
+    let mut pp = build_pre_post(
+        pdesc,
+        astate.clone(),
+        PrePostKind::AbortProgram,
+        Some(diagnostic.clone()),
+    );
+    let _ = pp.normalize();
+    classify_non_exit_abort_pre_post(pdesc, &mut pp);
+    pp.kind
+}
+
 impl PrePost {
     /// Restore formal/global/return variable views in the post-state before
     /// summary filtering.
@@ -245,6 +261,42 @@ impl PrePost {
         reachable
     }
 
+    fn collect_reachable_array_indices(
+        &self,
+        heap_reachable: &std::collections::HashSet<AbstractValue>,
+    ) -> std::collections::HashSet<AbstractValue> {
+        let mut indices = std::collections::HashSet::new();
+
+        let mut collect = |heap: &crate::base_memory::BaseMemory| {
+            for (addr, edges) in heap.iter() {
+                if !heap_reachable.contains(addr) {
+                    continue;
+                }
+                for (access, target) in edges.iter() {
+                    if !heap_reachable.contains(target) {
+                        continue;
+                    }
+                    if let Access::ArrayAccess(_, idx) = access {
+                        indices.insert(self.post.path_condition.get_var_repr(*idx));
+                    }
+                }
+            }
+        };
+
+        collect(&self.pre.heap);
+        collect(&self.post.post.heap);
+        indices
+    }
+
+    fn collect_always_reachable_from_post_attrs(&self) -> std::collections::HashSet<AbstractValue> {
+        self.post
+            .post
+            .attrs
+            .iter()
+            .filter_map(|(addr, attrs)| attrs.is_always_reachable().then_some(*addr))
+            .collect()
+    }
+
     /// Normalize the summary by discarding unreachable state.
     ///
     /// Matches OCaml's `discard_unreachable_ ~for_summary:true` which trims
@@ -263,26 +315,37 @@ impl PrePost {
 
         self.restore_formals_for_summary();
 
-        // The caller-visible summary surface is rooted in the pre stack and
-        // the return value. The post stack has been reduced to globals/return
-        // plus restored pre bindings above, so we intentionally do not seed
-        // from arbitrary post locals here.
+        // The caller-visible summary surface is rooted in the visible stack:
+        // restored pre bindings, globals, and the return slot. After
+        // restore_formals_for_summary() there are no arbitrary post locals
+        // left, so the remaining post stack bindings should stay reachable.
         let mut summary_roots: Vec<AbstractValue> =
             self.pre.stack.iter().map(|(_, addr)| *addr).collect();
+        summary_roots.extend(self.post.post.stack.iter().map(|(_, addr)| *addr));
         summary_roots.extend(self.formals.iter().map(|(_, addr)| *addr));
         if let Some(rv) = self.result {
             summary_roots.push(rv);
         }
 
-        let reachable = self.collect_reachable_from_seeds(summary_roots, true, true);
+        let mut reachable = self.collect_reachable_from_seeds(summary_roots, true, true);
+        let always_reachable = self.collect_reachable_from_seeds(
+            self.collect_always_reachable_from_post_attrs(),
+            false,
+            true,
+        );
+        reachable.extend(always_reachable);
+
         let canonical_reachable: HashSet<_> = reachable
             .iter()
             .map(|addr| self.post.path_condition.get_var_repr(*addr))
             .collect();
         let mut heap_reachable = reachable.clone();
         heap_reachable.extend(canonical_reachable.iter().copied());
+        let mut formula_seeds = canonical_reachable.clone();
+        formula_seeds.extend(self.collect_reachable_array_indices(&heap_reachable));
+        let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
 
-        let leaks = self.check_memory_leaks(&reachable, &locally_reachable);
+        let leaks = self.check_memory_leaks(&formula_reachable, &locally_reachable);
 
         self.pre.heap.retain_reachable(&heap_reachable);
         self.pre.attrs.retain_reachable(&canonical_reachable);
@@ -295,8 +358,6 @@ impl PrePost {
             .need_dynamic_type_specialization
             .retain(|addr| canonical_reachable.contains(addr));
 
-        let formula_reachable =
-            expand_formula_reachable(&self.post.path_condition, &canonical_reachable);
         self.post.path_condition.simplify(&formula_reachable);
 
         leaks
@@ -318,11 +379,16 @@ impl PrePost {
         locally_reachable: &std::collections::HashSet<AbstractValue>,
     ) -> Vec<Diagnostic> {
         let mut leaks = Vec::new();
+        let canonical_locally_reachable: std::collections::HashSet<_> = locally_reachable
+            .iter()
+            .map(|addr| self.post.path_condition.get_var_repr(*addr))
+            .collect();
         for (addr, attrs) in self.post.post.attrs.iter() {
-            if !locally_reachable.contains(addr) {
+            let addr = self.post.path_condition.get_var_repr(*addr);
+            if !canonical_locally_reachable.contains(&addr) {
                 continue;
             }
-            if summary_reachable.contains(addr) {
+            if summary_reachable.contains(&addr) {
                 continue;
             }
             let Some((allocator, alloc_loc)) = attrs.get_allocated() else {
@@ -334,13 +400,53 @@ impl PrePost {
                     continue;
                 }
             }
+            if self.reaches_live_via_pointer_arithmetic(addr, summary_reachable) {
+                continue;
+            }
             leaks.push(Diagnostic::MemoryLeak {
-                addr: *addr,
+                addr,
                 allocator: allocator.clone(),
                 allocation_location: alloc_loc.clone(),
             });
         }
         leaks
+    }
+
+    fn reaches_live_via_pointer_arithmetic(
+        &self,
+        root: AbstractValue,
+        live_addresses: &std::collections::HashSet<AbstractValue>,
+    ) -> bool {
+        if live_addresses.contains(&root) {
+            return true;
+        }
+
+        let mut visited = std::collections::HashSet::new();
+        let mut worklist = vec![root];
+
+        while let Some(addr) = worklist.pop() {
+            let addr = self.post.path_condition.get_var_repr(addr);
+            if !visited.insert(addr) {
+                continue;
+            }
+            let Some(edges) = self.post.post.heap.get_edges(addr) else {
+                continue;
+            };
+            for (access, target) in edges.iter() {
+                match access {
+                    Access::FieldAccess(_) | Access::ArrayAccess(_, _) => {
+                        let target = self.post.path_condition.get_var_repr(*target);
+                        if live_addresses.contains(&target) {
+                            return true;
+                        }
+                        worklist.push(target);
+                    }
+                    Access::Dereference => {}
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -550,6 +656,21 @@ fn pre_post_is_manifest(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
     proc_is_entry_point(pdesc) || is_manifest(pre_post)
 }
 
+fn classify_non_exit_abort_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
+    if pre_post.kind != PrePostKind::AbortProgram {
+        return;
+    }
+
+    if !proc_is_entry_point(pdesc)
+        && proc_has_by_ref_formal(pdesc)
+        && pre_post_has_post_only_caller_visible_invalid_access(pre_post)
+    {
+        pre_post.kind = PrePostKind::LatentInvalidAccess;
+    } else if !pre_post_is_manifest(pdesc, pre_post) {
+        pre_post.kind = PrePostKind::LatentAbortProgram;
+    }
+}
+
 fn pre_post_has_caller_visible_invalid_access(pre_post: &mut PrePost) -> bool {
     let Some(diag_addr) = pre_post.diagnostic.as_ref().and_then(|diag| match diag {
         Diagnostic::AccessToInvalidAddress { addr, .. } => {
@@ -568,13 +689,79 @@ fn pre_post_has_caller_visible_invalid_access(pre_post: &mut PrePost) -> bool {
         return false;
     }
 
-    pre_post
-        .collect_reachable_from_seeds(pre_post.pre.stack.iter().map(|(_, addr)| *addr), true, true)
-        .contains(&diag_addr)
+    let canonicalize = |addrs: std::collections::HashSet<AbstractValue>,
+                        pre_post: &PrePost|
+     -> std::collections::HashSet<AbstractValue> {
+        addrs
+            .into_iter()
+            .map(|addr| pre_post.post.path_condition.get_var_repr(addr))
+            .collect()
+    };
+
+    let caller_visible = canonicalize(
+        pre_post.collect_reachable_from_seeds(
+            pre_post.pre.stack.iter().map(|(_, addr)| *addr),
+            true,
+            true,
+        ),
+        pre_post,
+    );
+
+    caller_visible.contains(&diag_addr)
+}
+
+fn pre_post_has_post_only_caller_visible_invalid_access(pre_post: &mut PrePost) -> bool {
+    let Some(diag_addr) = pre_post.diagnostic.as_ref().and_then(|diag| match diag {
+        Diagnostic::AccessToInvalidAddress { addr, .. } => {
+            Some(pre_post.post.path_condition.get_var_repr(*addr))
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    if !pre_post.post.must_be_valid.contains(&diag_addr) {
+        return false;
+    }
+
+    let canonicalize = |addrs: std::collections::HashSet<AbstractValue>,
+                        pre_post: &PrePost|
+     -> std::collections::HashSet<AbstractValue> {
+        addrs
+            .into_iter()
+            .map(|addr| pre_post.post.path_condition.get_var_repr(addr))
+            .collect()
+    };
+
+    let pre_visible = canonicalize(
+        pre_post.collect_reachable_from_seeds(
+            pre_post.pre.stack.iter().map(|(_, addr)| *addr),
+            true,
+            false,
+        ),
+        pre_post,
+    );
+    let caller_visible = canonicalize(
+        pre_post.collect_reachable_from_seeds(
+            pre_post.pre.stack.iter().map(|(_, addr)| *addr),
+            true,
+            true,
+        ),
+        pre_post,
+    );
+
+    caller_visible.contains(&diag_addr) && !pre_visible.contains(&diag_addr)
 }
 
 fn proc_is_entry_point(pdesc: &Procdesc) -> bool {
     pdesc.proc_name.get_method_name() == "main"
+}
+
+fn proc_has_by_ref_formal(pdesc: &Procdesc) -> bool {
+    pdesc
+        .formals
+        .iter()
+        .any(|(_, typ, _)| typ.strip_ptr().is_some_and(|pointee| pointee.is_pointer()))
 }
 
 fn atom_is_ground(atom: &crate::formula::atom::Atom) -> bool {
@@ -639,6 +826,37 @@ fn expand_formula_reachable(
                 && reachable.insert(lhs_repr)
             {
                 worklist.push(lhs_repr);
+            }
+        }
+
+        // Cross-ref: OCaml PulseFormula.DeadVariables.build_var_graph keeps
+        // function-application results connected to their actual arguments.
+        // Without this, imported conditions on pure-call results can be
+        // dropped during summary normalization even when the actuals are
+        // caller-visible formals, which makes latent caller-dependent errors
+        // look manifest.
+        for (key, ret) in phi.iter_fn_app_eqs() {
+            let ret_repr = phi.get_repr(*ret);
+            let mut connected = ret_repr == repr;
+            let mut actual_reprs = Vec::new();
+            for actual in &key.actuals {
+                let crate::formula::phi::FnAppActual::Var(actual) = actual else {
+                    continue;
+                };
+                let actual_repr = phi.get_repr(*actual);
+                connected |= actual_repr == repr;
+                actual_reprs.push(actual_repr);
+            }
+            if !connected {
+                continue;
+            }
+            if reachable.insert(ret_repr) {
+                worklist.push(ret_repr);
+            }
+            for actual_repr in actual_reprs {
+                if reachable.insert(actual_repr) {
+                    worklist.push(actual_repr);
+                }
             }
         }
     }
@@ -1030,6 +1248,110 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_keeps_formula_for_reachable_array_index_constants() {
+        let pdesc = make_pdesc_with_formals(&["array"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let array_pvar = Pvar::mk(Mangled::from_string("array"), pdesc.proc_name.clone());
+        let array_var = Var::ProgramVar(Box::new(array_pvar.clone()));
+        let array_stack_addr = astate.post.stack.find(&array_var).unwrap();
+        let array_val = astate.read_heap(array_stack_addr, Access::Dereference);
+        let index = AbstractValue::mk_fresh();
+        let _ = astate.and_equal_const(index, 42);
+        let allocated = AbstractValue::mk_fresh();
+        astate.write_heap(
+            array_val,
+            Access::ArrayAccess(Typ::void(), index),
+            allocated,
+        );
+        astate.allocate(allocated, Allocator::CMalloc, Location::dummy());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(array_pvar, array_stack_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert_eq!(
+            pp.post.get_const(index),
+            Some(42),
+            "array index constants on retained heap accesses should survive summary normalization"
+        );
+    }
+
+    #[test]
+    fn test_normalize_suppresses_leak_reachable_via_field_access() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let local_root = AbstractValue::mk_fresh();
+        let returned_field = AbstractValue::mk_fresh();
+        let local_var = Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0));
+        let field = sil::fieldname::Fieldname::make(
+            sil::typ::TypeName::CStruct(sil::qualified_cpp_name::QualifiedCppName::from_string(
+                "fat_ptr",
+            )),
+            "data",
+        );
+
+        astate.post.stack.add(local_var, local_root);
+        astate.allocate(local_root, Allocator::CMalloc, Location::dummy());
+        astate.write_heap(local_root, Access::FieldAccess(field), returned_field);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(returned_field),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let leaks = pp.normalize();
+
+        assert!(
+            leaks.iter()
+                .all(|diag| !matches!(diag, Diagnostic::MemoryLeak { .. })),
+            "an allocated root should not leak if a returned field can still reach it via pointer arithmetic"
+        );
+    }
+
+    #[test]
+    fn test_normalize_suppresses_leak_for_always_reachable_address() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let local_root = AbstractValue::mk_fresh();
+        let local_value = AbstractValue::mk_fresh();
+        let local_var = Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0));
+
+        astate.post.stack.add(local_var, local_root);
+        astate.write_heap(local_root, Access::Dereference, local_value);
+        astate.allocate(local_value, Allocator::CMalloc, Location::dummy());
+        astate.always_reachable(local_value);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let leaks = pp.normalize();
+
+        assert!(
+            leaks
+                .iter()
+                .all(|diag| !matches!(diag, Diagnostic::MemoryLeak { .. })),
+            "AlwaysReachable addresses should be excluded from leak reporting"
+        );
+    }
+
+    #[test]
     fn test_is_manifest_ignores_local_prune_on_formal_value() {
         let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
         let _ = pre_post
@@ -1118,7 +1440,7 @@ mod tests {
             &pdesc,
             &[ExecutionDomain::AbortProgram {
                 state: Box::new(astate),
-                diagnostic: Box::new(diagnostic),
+                diagnostic: Box::new(diagnostic.clone()),
             }],
             vec![],
             false,
@@ -1127,6 +1449,50 @@ mod tests {
         assert!(
             summary.diagnostics.is_empty(),
             "latent aborts should stay in the summary but not be published as manifest diagnostics"
+        );
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::LatentAbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_of_proc_keeps_fn_app_dependent_abort_latent() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let fn_ret = AbstractValue::mk_fresh();
+        assert!(astate
+            .path_condition
+            .and_fn_app(fn_ret, "unknown", &[formal_val])
+            .is_sat());
+        let _ = astate
+            .path_condition
+            .and_condition_direct(Atom::Equal(Term::Var(fn_ret), Term::Const(999)), 1);
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic.clone()),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "imported conditions on pure-call results derived from formals should stay latent"
         );
         assert!(matches!(
             summary.pre_posts[0].kind,
@@ -1196,7 +1562,7 @@ mod tests {
             &pdesc,
             &[ExecutionDomain::AbortProgram {
                 state: Box::new(astate),
-                diagnostic: Box::new(diagnostic),
+                diagnostic: Box::new(diagnostic.clone()),
             }],
             vec![],
             false,
@@ -1208,6 +1574,125 @@ mod tests {
         );
         assert!(matches!(
             summary.pre_posts[0].kind,
+            PrePostKind::LatentInvalidAccess
+        ));
+    }
+
+    #[test]
+    fn test_classify_abort_kind_reports_direct_formal_invalid_access_manifest() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        astate.mark_must_be_valid(formal_val);
+        astate.invalidate(
+            formal_val,
+            crate::invalidation::Invalidation::CFree,
+            Location::dummy(),
+        );
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: formal_val,
+            invalidation: crate::invalidation::Invalidation::CFree,
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        assert!(matches!(
+            classify_abort_kind(&pdesc, &astate, &diagnostic),
+            PrePostKind::AbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_of_proc_keeps_caller_visible_invalid_access_latent_through_repr() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+
+        // Store a caller-visible value into the slot behind the formal, then
+        // force its formula representative to be a different abstract value.
+        let alias = AbstractValue::mk_fresh();
+        let slot_val = AbstractValue::mk_fresh();
+        astate.write_heap(formal_val, Access::Dereference, slot_val);
+        astate.mark_must_be_valid(slot_val);
+        assert!(
+            astate.and_equal(slot_val, alias).is_sat(),
+            "equal caller-visible values should stay satisfiable"
+        );
+        astate.invalidate(
+            slot_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            Location::dummy(),
+        );
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: slot_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "caller-visible invalid accesses should stay latent even after repr canonicalization"
+        );
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::LatentInvalidAccess
+        ));
+    }
+
+    #[test]
+    fn test_classify_abort_kind_keeps_post_written_invalid_access_latent_through_repr() {
+        let pname = Procname::c_from_string("test_proc");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::mk_ptr(Typ::void())),
+            Default::default(),
+        )];
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+
+        let alias = AbstractValue::mk_fresh();
+        let slot_val = AbstractValue::mk_fresh();
+        astate.write_heap(formal_val, Access::Dereference, slot_val);
+        astate.mark_must_be_valid(slot_val);
+        assert!(astate.and_equal(slot_val, alias).is_sat());
+        astate.invalidate(
+            slot_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            Location::dummy(),
+        );
+
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: slot_val,
+            invalidation: crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: Location::dummy(),
+            invalidation_location: Location::dummy(),
+        };
+
+        assert!(matches!(
+            classify_abort_kind(&pdesc, &astate, &diagnostic),
             PrePostKind::LatentInvalidAccess
         ));
     }

@@ -27,7 +27,7 @@ use crate::invalidation::{Invalidation, MustBeValidReason};
 pub type Timestamp = u64;
 
 /// How an address was allocated.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Allocator {
     CMalloc,
     CRealloc,
@@ -45,7 +45,7 @@ pub enum Allocator {
 ///
 /// Mirrors OCaml's `Attribute.t`. All variants from the OCaml code are
 /// included to avoid artificial limitations.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Attribute {
     /// Address of a C++ temporary variable.
     AddressOfCppTemporary(Var),
@@ -93,77 +93,6 @@ pub enum Attribute {
     UsedAsBranchCond(Procname, Location),
     /// Written to at this timestamp.
     WrittenTo(Timestamp, Location),
-}
-
-impl PartialOrd for Allocator {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Allocator {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.disc_index().cmp(&other.disc_index())
-    }
-}
-
-impl PartialOrd for Attribute {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Attribute {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.disc_index().cmp(&other.disc_index())
-    }
-}
-
-impl Allocator {
-    fn disc_index(&self) -> u8 {
-        match self {
-            Self::CMalloc => 0,
-            Self::CRealloc => 1,
-            Self::CppNew => 2,
-            Self::CppNewArray => 3,
-            Self::JavaResource(_) => 4,
-            Self::CSharpResource(_) => 5,
-            Self::HackAsync => 6,
-            Self::CustomMalloc(_) => 7,
-            Self::CustomRealloc(_) => 8,
-            Self::CustomFree(_) => 9,
-        }
-    }
-}
-
-impl Attribute {
-    fn disc_index(&self) -> u8 {
-        match self {
-            Self::AddressOfCppTemporary(_) => 0,
-            Self::AddressOfStackVariable(_, _) => 1,
-            Self::Allocated(_, _) => 2,
-            Self::AlwaysReachable => 3,
-            Self::Closure(_) => 4,
-            Self::EndOfCollection => 5,
-            Self::InReportedRetainCycle => 6,
-            Self::Initialized => 7,
-            Self::Invalid(_, _) => 8,
-            Self::JavaResourceReleased => 9,
-            Self::CSharpResourceReleased => 10,
-            Self::AwaitedAwaitable => 11,
-            Self::MustBeAwaited => 12,
-            Self::MustBeInitialized(_, _) => 13,
-            Self::MustBeValid(_, _, _) => 14,
-            Self::ReturnedFromUnknown(_) => 15,
-            Self::StaticType(_) => 16,
-            Self::StdMoved => 17,
-            Self::StdVectorReserve => 18,
-            Self::Uninitialized => 19,
-            Self::UnreachableAt(_) => 20,
-            Self::UsedAsBranchCond(_, _) => 21,
-            Self::WrittenTo(_, _) => 22,
-        }
-    }
 }
 
 impl fmt::Display for Attribute {
@@ -254,6 +183,13 @@ impl Attributes {
         self.0.iter().any(|a| matches!(a, Attribute::Initialized))
     }
 
+    /// Check if this address should be kept reachable across summary creation.
+    pub fn is_always_reachable(&self) -> bool {
+        self.0
+            .iter()
+            .any(|a| matches!(a, Attribute::AlwaysReachable))
+    }
+
     /// Check if this address has been std::move'd.
     pub fn is_std_moved(&self) -> bool {
         self.0.iter().any(|a| matches!(a, Attribute::StdMoved))
@@ -273,6 +209,7 @@ impl Attributes {
 mod tests {
     use super::*;
     use sil::int_lit::IntLit;
+    use sil::source_file::SourceFile;
 
     #[test]
     fn test_attributes_basic() {
@@ -308,5 +245,39 @@ mod tests {
         assert!(attrs.is_initialized());
         assert!(attrs.is_allocated());
         assert_eq!(attrs.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_distinct_invalid_attributes_are_preserved() {
+        let mut attrs = Attributes::empty();
+        let loc1 = Location {
+            file: SourceFile::new("a.c"),
+            line: 10,
+            col: 1,
+            macro_file_opt: None,
+            macro_line: -1,
+        };
+        let loc2 = Location {
+            file: SourceFile::new("a.c"),
+            line: 20,
+            col: 1,
+            macro_file_opt: None,
+            macro_line: -1,
+        };
+
+        attrs.add(Attribute::Invalid(
+            Invalidation::ConstantDereference(IntLit::zero()),
+            loc1,
+        ));
+        attrs.add(Attribute::Invalid(
+            Invalidation::ConstantDereference(IntLit::zero()),
+            loc2,
+        ));
+
+        let invalid_count = attrs
+            .iter()
+            .filter(|attr| matches!(attr, Attribute::Invalid(_, _)))
+            .count();
+        assert_eq!(invalid_count, 2);
     }
 }

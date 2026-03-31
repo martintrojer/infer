@@ -14,7 +14,7 @@ use crate::typ::{
 
 // ---- Java procedure names ----
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum JavaKind {
     NonStatic,
     Static,
@@ -23,7 +23,7 @@ pub enum JavaKind {
 /// Java procedure name.
 ///
 /// Mirrors OCaml's `Procname.Java.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct JavaProcname {
     pub class_name: JavaClassName,
     pub method_name: String,
@@ -34,14 +34,14 @@ pub struct JavaProcname {
 
 // ---- C# procedure names ----
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CSharpKind {
     NonStatic,
     Static,
 }
 
 /// C# procedure name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CSharpProcname {
     pub class_name: String,
     pub method_name: String,
@@ -53,7 +53,7 @@ pub struct CSharpProcname {
 /// ObjC/C++ method kind.
 ///
 /// Mirrors OCaml's `Procname.ObjC_Cpp.kind`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ObjcCppKind {
     CPPMethod(Option<String>),
     CPPConstructor(Option<String>),
@@ -70,7 +70,7 @@ pub type ClangParameter = Option<TypeName>;
 /// ObjC/C++ procedure name.
 ///
 /// Mirrors OCaml's `Procname.ObjC_Cpp.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjcCppProcname {
     pub class_name: TypeName,
     pub kind: ObjcCppKind,
@@ -82,7 +82,7 @@ pub struct ObjcCppProcname {
 // ---- Erlang procedure names ----
 
 /// Erlang procedure name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ErlangProcname {
     pub module_name: String,
     pub function_name: String,
@@ -92,7 +92,7 @@ pub struct ErlangProcname {
 // ---- Hack procedure names ----
 
 /// Hack procedure name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HackProcname {
     pub class_name: Option<HackClassName>,
     pub function_name: String,
@@ -102,7 +102,7 @@ pub struct HackProcname {
 // ---- Python procedure names ----
 
 /// Python procedure name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PythonProcname {
     pub class_name: Option<String>,
     pub function_name: String,
@@ -112,7 +112,7 @@ pub struct PythonProcname {
 // ---- Swift procedure names ----
 
 /// Swift procedure name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SwiftProcname {
     pub class_name: Option<String>,
     pub method_name: String,
@@ -124,7 +124,7 @@ pub struct SwiftProcname {
 /// Procedure name covering all supported languages.
 ///
 /// Mirrors OCaml's `Procname.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Procname {
     /// ObjC block.
     Block(ObjcBlockSig),

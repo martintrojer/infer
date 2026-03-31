@@ -19,11 +19,13 @@
 //!    `infer-rs --pulse-only file.sil`
 //!    Analyzes the given .sil files directly.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
 use diagnostics::issue::IssueLog;
+use sil::procname::Procname;
 
 /// infer-rs: Rust implementation of the Infer static analyzer.
 ///
@@ -35,6 +37,10 @@ struct Cli {
     /// .sil files to analyze directly (bypasses capture/export).
     #[arg(long = "capture-textual", value_name = "FILE")]
     capture_textual: Vec<PathBuf>,
+
+    /// Override the reported source file for direct .sil analysis.
+    #[arg(long = "source-override", hide = true)]
+    source_override: Option<String>,
 
     /// Positional args: .sil files, or after `--` the build command.
     #[arg(value_name = "ARG", trailing_var_arg = true)]
@@ -59,6 +65,18 @@ struct Cli {
     /// Regex of methods to model as wrappers to `realloc(3)`.
     #[arg(long = "pulse-model-realloc-pattern")]
     pulse_model_realloc_pattern: Option<String>,
+
+    /// Exact procnames to model as non-returning calls.
+    #[arg(long = "pulse-model-abort")]
+    pulse_model_abort: Vec<String>,
+
+    /// Regex of methods to model as returning a non-null value.
+    #[arg(long = "pulse-model-return-nonnull")]
+    pulse_model_return_nonnull: Option<String>,
+
+    /// Regex of methods to skip and treat as unknown calls.
+    #[arg(long = "pulse-model-skip-pattern")]
+    pulse_model_skip_pattern: Option<String>,
 
     /// Output directory for report.json and exported textual.
     #[arg(short = 'o', long = "output", default_value = "infer-rs-out")]
@@ -130,6 +148,15 @@ impl Cli {
         if let Some(v) = &self.pulse_model_realloc_pattern {
             c.pulse_model_realloc_pattern = Some(v.clone());
         }
+        if !self.pulse_model_abort.is_empty() {
+            c.pulse_model_abort = self.pulse_model_abort.clone();
+        }
+        if let Some(v) = &self.pulse_model_return_nonnull {
+            c.pulse_model_return_nonnull = Some(v.clone());
+        }
+        if let Some(v) = &self.pulse_model_skip_pattern {
+            c.pulse_model_skip_pattern = Some(v.clone());
+        }
         if self.quiet {
             c.quiet = true;
         }
@@ -192,6 +219,59 @@ struct AnalysisFile {
     source: Option<String>,
 }
 
+/// Procedure metadata recovered from the original capture database.
+///
+/// Store-textual export drops some proc and local attributes such as
+/// `is_no_return` and `has_cleanup_attribute`.
+/// When we still have the originating `capture.db`, recover those facts from
+/// `infer debug --procedures --procedures-attributes` and re-apply them after
+/// Textual-to-SIL conversion.
+#[derive(Clone, Debug, Default)]
+struct CaptureProcMetadata {
+    no_return: HashSet<(String, String)>,
+    cleanup_locals: HashSet<(String, String, String)>,
+}
+
+impl CaptureProcMetadata {
+    fn insert_no_return(&mut self, source_file: &str, proc_name: &str) {
+        for source_key in canonical_source_keys(source_file) {
+            self.no_return.insert((source_key, proc_name.to_string()));
+        }
+    }
+
+    fn insert_cleanup_local(&mut self, source_file: &str, proc_name: &str, local_name: &str) {
+        for source_key in canonical_source_keys(source_file) {
+            self.cleanup_locals
+                .insert((source_key, proc_name.to_string(), local_name.to_string()));
+        }
+    }
+
+    fn is_no_return(&self, source_file: &str, proc_name: &Procname) -> bool {
+        let proc_name = proc_name.to_string();
+        canonical_source_keys(source_file)
+            .into_iter()
+            .any(|source_key| self.no_return.contains(&(source_key, proc_name.clone())))
+    }
+
+    fn local_has_cleanup_attribute(
+        &self,
+        source_file: &str,
+        proc_name: &Procname,
+        local_name: &str,
+    ) -> bool {
+        let proc_name = proc_name.to_string();
+        canonical_source_keys(source_file)
+            .into_iter()
+            .any(|source_key| {
+                self.cleanup_locals.contains(&(
+                    source_key,
+                    proc_name.clone(),
+                    local_name.to_string(),
+                ))
+            })
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -219,18 +299,21 @@ fn main() {
     }
 
     let mode = cli.mode();
-    let files: Vec<AnalysisFile> = match mode {
+    let (files, metadata_results_dir): (Vec<AnalysisFile>, Option<PathBuf>) = match mode {
         Mode::CaptureAndAnalyze(ref build_cmd) => {
             let infer_out = cli
                 .results_dir
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("infer-out"));
             run_capture(build_cmd, &infer_out, cli.infer_bin.as_deref(), cfg.quiet);
-            export_textual(
-                &infer_out,
-                &cli.out_dir,
-                cli.infer_bin.as_deref(),
-                cfg.quiet,
+            (
+                export_textual(
+                    &infer_out,
+                    &cli.out_dir,
+                    cli.infer_bin.as_deref(),
+                    cfg.quiet,
+                ),
+                Some(infer_out),
             )
         }
         Mode::AnalyzeExisting => {
@@ -246,29 +329,68 @@ fn main() {
                 );
                 process::exit(1);
             }
-            export_textual(
-                &infer_out,
-                &cli.out_dir,
-                cli.infer_bin.as_deref(),
-                cfg.quiet,
+            (
+                export_textual(
+                    &infer_out,
+                    &cli.out_dir,
+                    cli.infer_bin.as_deref(),
+                    cfg.quiet,
+                ),
+                Some(infer_out),
             )
         }
-        Mode::DirectSil(paths) => paths
-            .into_iter()
-            .map(|p| AnalysisFile {
-                sil_path: p,
-                source: None,
-            })
-            .collect(),
+        Mode::DirectSil(paths) => (
+            paths
+                .into_iter()
+                .enumerate()
+                .map(|(idx, p)| AnalysisFile {
+                    sil_path: p,
+                    source: if idx == 0 {
+                        cli.source_override.clone()
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+            cli.results_dir.clone(),
+        ),
     };
 
     if files.is_empty() {
         eprintln!("error: no .sil files to analyze");
         process::exit(1);
     }
+    if cli.source_override.is_some() && files.len() != 1 {
+        eprintln!("error: --source-override requires exactly one .sil file");
+        process::exit(1);
+    }
 
     let run_pulse = cfg.pulse_only || !cfg.liveness_only;
     let run_liveness = cfg.liveness_only || !cfg.pulse_only;
+    let capture_proc_metadata = match metadata_results_dir.as_deref() {
+        Some(results_dir) if has_capture_db(results_dir) => {
+            let infer = find_infer(cli.infer_bin.as_deref());
+            Some(
+                load_capture_proc_metadata(results_dir, &infer).unwrap_or_else(|e| {
+                    eprintln!(
+                        "error: failed to load capture metadata from {}: {e}",
+                        results_dir.display()
+                    );
+                    process::exit(1);
+                }),
+            )
+        }
+        Some(results_dir) => {
+            if !cfg.quiet {
+                eprintln!(
+                    "warning: no capture.db found in {}, skipping proc metadata augmentation",
+                    results_dir.display()
+                );
+            }
+            None
+        }
+        None => None,
+    };
 
     let mut all_issues = IssueLog::new();
     let mut total_procs = 0;
@@ -279,7 +401,13 @@ fn main() {
             eprintln!("Analyzing {}", af.sil_path.display());
         }
 
-        match analyze_file(&af.sil_path, af.source.as_deref(), run_pulse, run_liveness) {
+        match analyze_file(
+            &af.sil_path,
+            af.source.as_deref(),
+            capture_proc_metadata.as_ref(),
+            run_pulse,
+            run_liveness,
+        ) {
             Ok((log, num_procs)) => {
                 total_procs += num_procs;
                 total_files += 1;
@@ -415,6 +543,161 @@ fn run_capture(build_cmd: &[String], infer_out: &Path, infer_bin: Option<&Path>,
     }
 }
 
+fn has_capture_db(results_dir: &Path) -> bool {
+    results_dir.join("capture.db").exists() || results_dir.join("capture.db-wal").exists()
+}
+
+fn load_capture_proc_metadata(
+    results_dir: &Path,
+    infer_bin: &Path,
+) -> Result<CaptureProcMetadata, String> {
+    let output = std::process::Command::new(infer_bin)
+        .arg("debug")
+        .arg("--results-dir")
+        .arg(results_dir)
+        .arg("--procedures")
+        .arg("--procedures-attributes")
+        .arg("--select")
+        .arg("all")
+        .output()
+        .map_err(|e| format!("failed to run infer debug: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(parse_capture_proc_metadata(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_capture_proc_metadata(debug_output: &str) -> CaptureProcMetadata {
+    fn finish_proc(
+        metadata: &mut CaptureProcMetadata,
+        current_proc: &mut Option<String>,
+        current_source: &mut Option<String>,
+        current_is_no_return: &mut bool,
+        current_cleanup_locals: &mut Vec<String>,
+    ) {
+        if let (Some(proc_name), Some(source_file)) =
+            (current_proc.as_deref(), current_source.as_deref())
+        {
+            if *current_is_no_return {
+                metadata.insert_no_return(source_file, proc_name);
+            }
+            for local_name in current_cleanup_locals.drain(..) {
+                metadata.insert_cleanup_local(source_file, proc_name, &local_name);
+            }
+        }
+        *current_proc = None;
+        *current_source = None;
+        *current_is_no_return = false;
+        current_cleanup_locals.clear();
+    }
+
+    fn extract_cleanup_locals(line: &str) -> Vec<String> {
+        let mut locals = Vec::new();
+        let mut search_start = 0;
+        let needle = "has_cleanup_attribute= true";
+        let name_needle = "name= ";
+        while let Some(attr_rel) = line[search_start..].find(needle) {
+            let attr_idx = search_start + attr_rel;
+            if let Some(name_idx) = line[..attr_idx].rfind(name_needle) {
+                let name_start = name_idx + name_needle.len();
+                if let Some(name) = line[name_start..]
+                    .split([';', '}', ']', ','])
+                    .next()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    locals.push(name.to_string());
+                }
+            }
+            search_start = attr_idx + needle.len();
+        }
+        locals
+    }
+
+    let mut metadata = CaptureProcMetadata::default();
+    let mut current_proc = None;
+    let mut current_source = None;
+    let mut current_is_no_return = false;
+    let mut current_cleanup_locals = Vec::new();
+
+    for line in debug_output.lines().chain(std::iter::once("")) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            finish_proc(
+                &mut metadata,
+                &mut current_proc,
+                &mut current_source,
+                &mut current_is_no_return,
+                &mut current_cleanup_locals,
+            );
+            continue;
+        }
+
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            finish_proc(
+                &mut metadata,
+                &mut current_proc,
+                &mut current_source,
+                &mut current_is_no_return,
+                &mut current_cleanup_locals,
+            );
+            current_proc = Some(trimmed.to_string());
+            continue;
+        }
+
+        if let Some(source_file) = trimmed.strip_prefix("source_file: ") {
+            current_source = Some(source_file.to_string());
+            continue;
+        }
+
+        if trimmed == "; is_no_return= true" || trimmed == "is_no_return= true" {
+            current_is_no_return = true;
+        }
+
+        current_cleanup_locals.extend(extract_cleanup_locals(trimmed));
+    }
+
+    metadata
+}
+
+fn canonical_source_keys(source_file: &str) -> Vec<String> {
+    let mut keys = vec![source_file.to_string()];
+    if let Some(base) = Path::new(source_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        if keys.iter().all(|existing| existing != base) {
+            keys.push(base.to_string());
+        }
+    }
+    keys
+}
+
+fn apply_capture_proc_metadata(
+    sil_cfg: &mut sil::cfg::Cfg,
+    source_file: &str,
+    metadata: &CaptureProcMetadata,
+) {
+    for pdesc in sil_cfg.iter_proc_descs_mut() {
+        if metadata.is_no_return(source_file, &pdesc.proc_name) {
+            pdesc.is_no_return = true;
+        }
+        for local in &mut pdesc.locals {
+            if metadata.local_has_cleanup_attribute(
+                source_file,
+                &pdesc.proc_name,
+                &local.name.plain,
+            ) {
+                local.has_cleanup_attribute = true;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +712,141 @@ mod tests {
         assert_ne!(
             workspace_relative_infer(&ws_root),
             ws_root.join("infer/bin/infer")
+        );
+    }
+
+    #[test]
+    fn test_parse_capture_proc_metadata_extracts_no_return() {
+        let debug_output = r#"no_ret
+  source_file: nullptr_more.c
+  defined: true
+  attributes:
+    { proc_name= no_ret
+    ; translation_unit= nullptr_more.c
+    ; formals= []
+    ; is_defined= true
+    ; loc= nullptr_more.c:137:1
+    ; locals= []
+    ; ret_type= void
+    ; proc_id= no_ret }
+
+will_not_return
+  source_file: nullptr_more.c
+  defined: false
+  attributes:
+    { proc_name= will_not_return
+    ; translation_unit= nullptr_more.c
+    ; formals= []
+    ; is_no_return= true
+    ; loc= nullptr_more.c:127:1
+    ; locals= []
+    ; ret_type= void
+    ; proc_id= will_not_return }
+"#;
+
+        let metadata = parse_capture_proc_metadata(debug_output);
+
+        assert!(metadata.is_no_return(
+            "/tmp/some/path/nullptr_more.c",
+            &Procname::c_from_string("will_not_return")
+        ));
+        assert!(!metadata.is_no_return(
+            "/tmp/some/path/nullptr_more.c",
+            &Procname::c_from_string("no_ret")
+        ));
+    }
+
+    #[test]
+    fn test_parse_capture_proc_metadata_extracts_cleanup_locals() {
+        let debug_output = r#"cleanup_malloc_ok
+  source_file: cleanup_attribute.c
+  defined: true
+  attributes:
+    { proc_name= cleanup_malloc_ok
+    ; translation_unit= cleanup_attribute.c
+    ; formals= []
+    ; is_defined= true
+    ; loc= cleanup_attribute.c:16:1
+    ; locals= [{ name= x; typ= int*; modify_in_block= false; is_declared_unused= false; is_structured_binding= false; has_cleanup_attribute= true }]
+    ; ret_type= void
+    ; proc_id= cleanup_malloc_ok }
+
+plain_local
+  source_file: cleanup_attribute.c
+  defined: true
+  attributes:
+    { proc_name= plain_local
+    ; translation_unit= cleanup_attribute.c
+    ; formals= []
+    ; is_defined= true
+    ; loc= cleanup_attribute.c:40:1
+    ; locals= [{ name= y; typ= int*; modify_in_block= false; is_declared_unused= false; is_structured_binding= false; has_cleanup_attribute= false }]
+    ; ret_type= void
+    ; proc_id= plain_local }
+"#;
+
+        let metadata = parse_capture_proc_metadata(debug_output);
+
+        assert!(metadata.local_has_cleanup_attribute(
+            "/tmp/some/path/cleanup_attribute.c",
+            &Procname::c_from_string("cleanup_malloc_ok"),
+            "x"
+        ));
+        assert!(!metadata.local_has_cleanup_attribute(
+            "/tmp/some/path/cleanup_attribute.c",
+            &Procname::c_from_string("plain_local"),
+            "y"
+        ));
+    }
+
+    #[test]
+    fn test_apply_capture_proc_metadata_marks_procdesc() {
+        let pname = Procname::c_from_string("will_not_return");
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(sil::procdesc::Procdesc::new(
+            pname.clone(),
+            sil::typ::Typ::void(),
+            sil::location::Location::dummy(),
+        ));
+
+        let mut metadata = CaptureProcMetadata::default();
+        metadata.insert_no_return("nullptr_more.c", "will_not_return");
+        apply_capture_proc_metadata(&mut cfg, "/tmp/src/nullptr_more.c", &metadata);
+
+        assert!(
+            cfg.get_proc_desc(&pname)
+                .expect("proc should exist")
+                .is_no_return
+        );
+    }
+
+    #[test]
+    fn test_apply_capture_proc_metadata_marks_cleanup_locals() {
+        let pname = Procname::c_from_string("cleanup_malloc_ok");
+        let mut pdesc = sil::procdesc::Procdesc::new(
+            pname.clone(),
+            sil::typ::Typ::void(),
+            sil::location::Location::dummy(),
+        );
+        pdesc.locals.push(sil::procdesc::VarData {
+            name: sil::mangled::Mangled::from_string("x"),
+            typ: sil::typ::Typ::int(sil::typ::IKind::IInt),
+            modify_in_block: false,
+            is_constexpr: false,
+            is_declared_unused: false,
+            is_structured_binding: false,
+            has_cleanup_attribute: false,
+        });
+
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(pdesc);
+
+        let mut metadata = CaptureProcMetadata::default();
+        metadata.insert_cleanup_local("cleanup_attribute.c", "cleanup_malloc_ok", "x");
+        apply_capture_proc_metadata(&mut cfg, "/tmp/src/cleanup_attribute.c", &metadata);
+
+        assert!(
+            cfg.get_proc_desc(&pname).expect("proc should exist").locals[0].has_cleanup_attribute
         );
     }
 }
@@ -514,6 +932,7 @@ fn read_manifest(manifest_path: &Path, base_dir: &Path) -> Vec<AnalysisFile> {
 fn analyze_file(
     path: &Path,
     source_override: Option<&str>,
+    capture_proc_metadata: Option<&CaptureProcMetadata>,
     run_pulse: bool,
     run_liveness: bool,
 ) -> Result<(IssueLog, usize), String> {
@@ -547,9 +966,13 @@ fn analyze_file(
         Some(&line_map)
     };
 
-    let (sil_cfg, tenv) =
+    let (mut sil_cfg, tenv) =
         textual::to_sil::module_to_sil_with_line_map(&module, &decls, line_map_ref)
             .map_err(|e| format!("conversion errors: {e:?}"))?;
+
+    if let Some(metadata) = capture_proc_metadata {
+        apply_capture_proc_metadata(&mut sil_cfg, &module.source_file, metadata);
+    }
 
     let mut log = IssueLog::new();
     let num_procs = sil_cfg.num_procs();
@@ -641,6 +1064,47 @@ fn collect_cfun_summaries(
     }
 }
 
+fn collect_global_initializer_refs(
+    instr: &sil::instr::Instr,
+    out: &mut std::collections::HashSet<sil::procname::Procname>,
+) {
+    if let sil::instr::Instr::Load {
+        e: sil::exp::Exp::Lvar(pvar),
+        typ,
+        ..
+    } = instr
+    {
+        if pvar.is_global() && is_pointer_to_function_typ(typ) {
+            if let Some(init_pname) = pvar.initializer_procname() {
+                out.insert(init_pname);
+            }
+        }
+    }
+}
+
+fn is_pointer_to_function_typ(typ: &sil::typ::Typ) -> bool {
+    matches!(
+        &*typ.desc,
+        sil::typ::TypeDesc::Tptr(inner, _) if matches!(&*inner.desc, sil::typ::TypeDesc::Tfun(_))
+    )
+}
+
+fn collect_summary_closure_summaries(
+    summary: &pulse::summary::PulseSummary,
+    ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
+) {
+    for pre_post in &summary.pre_posts {
+        for (_addr, attrs) in pre_post.post.post.attrs.iter() {
+            if let Some(pname) = attrs.get_closure_proc_name() {
+                if let Some(summary) = ctx.summaries.get(pname) {
+                    out.entry(pname.clone()).or_insert(summary);
+                }
+            }
+        }
+    }
+}
+
 /// Analyze with the specialization loop, matching the test's behavior.
 ///
 /// 1. Analyze normally
@@ -658,8 +1122,20 @@ fn analyze_with_spec_loop(
     const MAX_SPEC_DEPTH: usize = 5;
 
     let mut callee_summaries = std::collections::HashMap::new();
+    let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
         collect_cfun_summaries(instr, ctx, &mut callee_summaries);
+        collect_global_initializer_refs(instr, &mut global_initializers);
+    }
+    for init_pname in global_initializers {
+        let Some(init_pdesc) = ctx.cfg.get_proc_desc(&init_pname) else {
+            continue;
+        };
+        let summary = ctx.summaries.get_or_compute(&init_pname, || {
+            analyze_with_spec_loop(init_pdesc, ctx, None, depth + 1)
+        });
+        collect_summary_closure_summaries(&summary, ctx, &mut callee_summaries);
+        callee_summaries.entry(init_pname).or_insert(summary);
     }
     if let Some(spec) = specialization {
         for type_name in spec.dynamic_types.values() {

@@ -12,7 +12,7 @@ use crate::source_file::SourceFile;
 /// Location in the original source file.
 ///
 /// Mirrors OCaml's `Location.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Location {
     /// The name of the source file.
     pub file: SourceFile,

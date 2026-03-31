@@ -23,6 +23,7 @@ use diagnostics::issue::IssueLog;
 
 use sil::const_val::Const;
 use sil::exp::Exp;
+use sil::ident::{Ident, IdentName};
 use sil::instr::Instr;
 use sil::procdesc::{NodeId, Procdesc};
 use sil::procname::Procname;
@@ -113,7 +114,10 @@ pub fn analyze_with_specialization_and_requests(
         }
         for d in &state.post.disjuncts {
             if let ExecutionDomain::AbortProgram { state, diagnostic } = d {
-                if crate::summary::abort_is_manifest(pdesc, state) {
+                if matches!(
+                    crate::summary::classify_abort_kind(pdesc, state, diagnostic),
+                    crate::summary::PrePostKind::AbortProgram
+                ) {
                     let key = diagnostic.dedup_key();
                     if seen_diags.insert(key) {
                         diagnostics.push(diagnostic.as_ref().clone());
@@ -148,9 +152,10 @@ pub fn analyze_with_specialization_and_requests(
         }
     }
 
-    // A procedure is noreturn if it has disjuncts at exit but none are
-    // ContinueProgram (all paths end in ExitProgram or AbortProgram)
-    let is_noreturn = has_any_disjuncts && !has_continue;
+    // Cross-ref: OCaml consults ProcAttributes.is_no_return at call sites in
+    // Pulse.ml, so preserve that source-level fact even when the exported
+    // Textual body is empty and would otherwise analyze as a normal return.
+    let is_noreturn = pdesc.is_no_return || (has_any_disjuncts && !has_continue);
 
     let summary = PulseSummary::of_proc(pdesc, &exit_disjuncts, diagnostics, is_noreturn);
     let spec_requests = pulse_tf.spec_requests.into_inner();
@@ -245,8 +250,14 @@ fn exec_instr_with_summaries(
     callee_summaries: &HashMap<Procname, PulseSummary>,
     spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
 ) -> Vec<ExecutionDomain> {
+    if let Some(results) =
+        maybe_inline_global_initializer_load(pdesc, instr, state.clone(), callee_summaries)
+    {
+        return results;
+    }
+
     if let Instr::Call {
-        ret: (ret_id, _),
+        ret: (ret_id, ret_typ),
         fun_exp: Exp::Const(Const::Cfun(callee_pname)),
         args,
         loc,
@@ -264,7 +275,7 @@ fn exec_instr_with_summaries(
         // empty define in textual but should still be modeled as noreturn)
         if crate::models::has_model(callee_pname) {
             log::debug!("  [call] model: {callee_pname}");
-            return transfer::exec_instr(instr, state);
+            return transfer::exec_instr_with_pdesc(Some(pdesc), instr, state);
         }
 
         if let Some(callee_summary) = callee_summaries.get(callee_pname) {
@@ -290,6 +301,11 @@ fn exec_instr_with_summaries(
                 }
             }
 
+            if callee_summary.is_noreturn {
+                log::debug!("  [call] noreturn: {callee_pname}");
+                return vec![ExecutionDomain::ExitProgram(state)];
+            }
+
             // Empty-body callees (extern stubs): treat as unknown with
             // type-aware havoc. Only pointer-typed formals get havoced.
             // Cross-ref: OCaml PulseCallOperations.ml should_havoc checks Tptr.
@@ -298,6 +314,9 @@ fn exec_instr_with_summaries(
 
                 let ret_val = crate::abstract_value::AbstractValue::mk_fresh();
                 crate::operations::write_id(ret_id, ret_val, &mut state);
+                if ret_typ.is_int() {
+                    state.path_condition.and_is_int(ret_val);
+                }
                 let mut is_pure = true;
                 let mut actual_vals = Vec::new();
                 for (i, (arg_exp, _arg_typ)) in args.iter().enumerate() {
@@ -310,6 +329,9 @@ fn exec_instr_with_summaries(
                     if formal_is_ptr {
                         is_pure = false;
                         state.apply_unknown_effect(arg_val);
+                        crate::operations::refresh_unknown_lvalue_root(
+                            arg_exp, arg_val, &mut state,
+                        );
                     }
                 }
                 // Pure functions (no pointer args havoced): record
@@ -326,11 +348,6 @@ fn exec_instr_with_summaries(
                     }
                 }
                 return vec![ExecutionDomain::ContinueProgram(state)];
-            }
-
-            if callee_summary.is_noreturn {
-                log::debug!("  [call] noreturn: {callee_pname}");
-                return vec![ExecutionDomain::ExitProgram(state)];
             }
 
             // Propagate needs_specialization from callee to caller.
@@ -364,7 +381,90 @@ fn exec_instr_with_summaries(
         }
     }
 
-    transfer::exec_instr(instr, state)
+    transfer::exec_instr_with_pdesc(Some(pdesc), instr, state)
+}
+
+fn maybe_inline_global_initializer_load(
+    pdesc: &Procdesc,
+    instr: &Instr,
+    state: AbductiveDomain,
+    callee_summaries: &HashMap<Procname, PulseSummary>,
+) -> Option<Vec<ExecutionDomain>> {
+    let Instr::Load {
+        e: Exp::Lvar(pvar),
+        typ,
+        loc,
+        ..
+    } = instr
+    else {
+        return None;
+    };
+
+    if !should_inline_global_initializer(pvar, typ, &state) {
+        return None;
+    }
+
+    let init_pname = pvar.initializer_procname()?;
+    if pdesc.proc_name == init_pname {
+        return None;
+    }
+    let init_summary = callee_summaries.get(&init_pname)?;
+    if init_summary.pre_posts.is_empty() {
+        return None;
+    }
+
+    let init_ret = Ident::create_normal(IdentName::from_string("__global_init"), -1);
+    let mut initialized_states = Vec::new();
+    for pre_post in &init_summary.pre_posts {
+        for result in
+            crate::interproc::apply_summary(pdesc, pre_post, &init_ret, &[], loc, state.clone())
+        {
+            if let ExecutionDomain::ContinueProgram(astate) = result {
+                initialized_states.push(astate);
+            }
+        }
+    }
+
+    if initialized_states.is_empty() {
+        return None;
+    }
+
+    let mut results = Vec::new();
+    for initialized in initialized_states {
+        results.extend(transfer::exec_instr_with_pdesc(
+            Some(pdesc),
+            instr,
+            initialized,
+        ));
+    }
+    Some(results)
+}
+
+fn should_inline_global_initializer(
+    pvar: &sil::pvar::Pvar,
+    typ: &sil::typ::Typ,
+    state: &AbductiveDomain,
+) -> bool {
+    if !pvar.is_global() || !is_pointer_to_function(typ) {
+        return false;
+    }
+
+    let var = sil::var::Var::ProgramVar(Box::new(pvar.clone()));
+    let Some(addr) = state.post.stack.find(&var) else {
+        return true;
+    };
+    state
+        .post
+        .heap
+        .find_edge(addr, &crate::access::Access::Dereference)
+        .is_none()
+}
+
+fn is_pointer_to_function(typ: &sil::typ::Typ) -> bool {
+    matches!(
+        &*typ.desc,
+        sil::typ::TypeDesc::Tptr(inner, _) if matches!(&*inner.desc, sil::typ::TypeDesc::Tfun(_))
+    )
 }
 
 /// Propagate needs_specialization from callee to caller.
@@ -496,7 +596,7 @@ fn exec_call_c_function_ptr(
                 loc: loc.clone(),
                 flags: sil::call_flags::CallFlags::default(),
             };
-            return transfer::exec_instr(&call_instr, state);
+            return transfer::exec_instr_with_pdesc(Some(pdesc), &call_instr, state);
         }
 
         // Then check summaries
@@ -535,6 +635,7 @@ fn exec_call_c_function_ptr(
     for (arg_exp, _arg_typ) in actual_args {
         let arg_val = crate::operations::eval_or_fresh(arg_exp, loc, &mut state);
         state.apply_unknown_effect(arg_val);
+        crate::operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
     }
     vec![ExecutionDomain::ContinueProgram(state)]
 }

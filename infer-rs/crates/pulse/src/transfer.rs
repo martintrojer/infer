@@ -15,6 +15,7 @@ use sil::const_val::Const;
 use sil::exp::Exp;
 use sil::instr::Instr;
 use sil::location::Location;
+use sil::procdesc::Procdesc;
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
@@ -28,17 +29,26 @@ use crate::pulse_result::PulseResult;
 /// produce exactly one ContinueProgram; error-finding instructions
 /// may produce an AbortProgram.
 pub fn exec_instr(instr: &Instr, state: AbductiveDomain) -> Vec<ExecutionDomain> {
+    exec_instr_with_pdesc(None, instr, state)
+}
+
+/// Execute a single SIL instruction with access to the enclosing procedure.
+pub fn exec_instr_with_pdesc(
+    pdesc: Option<&Procdesc>,
+    instr: &Instr,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
     match instr {
         Instr::Load { id, e, loc, typ } => exec_load(id, e, typ, loc, state),
-        Instr::Store { e1, e2, loc, .. } => exec_store(e1, e2, loc, state),
+        Instr::Store { e1, e2, loc, .. } => exec_store(pdesc, e1, e2, loc, state),
         Instr::Prune { exp, loc, .. } => exec_prune(exp, loc, state),
         Instr::Call {
-            ret: (ret_id, _),
+            ret: (ret_id, ret_typ),
             fun_exp,
             args,
             loc,
             ..
-        } => exec_call(ret_id, fun_exp, args, loc, state),
+        } => exec_call(ret_id, ret_typ, fun_exp, args, loc, state),
         Instr::Metadata(_) => vec![ExecutionDomain::ContinueProgram(state)],
     }
 }
@@ -109,6 +119,7 @@ fn exec_load(
 
 /// Store: `*lhs_exp = rhs_exp`
 fn exec_store(
+    pdesc: Option<&Procdesc>,
     lhs_exp: &Exp,
     rhs_exp: &Exp,
     loc: &Location,
@@ -147,6 +158,10 @@ fn exec_store(
         return results;
     }
 
+    if local_has_cleanup_attribute(pdesc, lhs_exp) {
+        state.always_reachable(rhs_val);
+    }
+
     match operations::write_deref(lhs_addr, rhs_val, loc, &mut state) {
         PulseResult::Ok(()) => vec![ExecutionDomain::ContinueProgram(state)],
         PulseResult::FatalError(d, _) => vec![ExecutionDomain::AbortProgram {
@@ -164,6 +179,17 @@ fn exec_store(
             results
         }
     }
+}
+
+fn local_has_cleanup_attribute(pdesc: Option<&Procdesc>, lhs_exp: &Exp) -> bool {
+    let (Some(pdesc), Exp::Lvar(pvar)) = (pdesc, lhs_exp) else {
+        return false;
+    };
+
+    pdesc
+        .locals
+        .iter()
+        .any(|local| local.has_cleanup_attribute && pvar.is_local() && local.name == pvar.name)
 }
 
 /// Prune: add a path condition constraint.
@@ -292,6 +318,15 @@ fn prune_eq_operands(
         ) => state.prune_eq(v1, v2, negated).is_sat(),
         (crate::formula::Operand::AbstractValue(v), crate::formula::Operand::ConstOperand(c))
         | (crate::formula::Operand::ConstOperand(c), crate::formula::Operand::AbstractValue(v)) => {
+            if !negated && c == 0 {
+                // Cross-ref: OCaml PulseOperations.prune records an explicit
+                // ComparedToNull invalidation on equality-to-null branches.
+                state.invalidate(
+                    v,
+                    crate::invalidation::Invalidation::ComparedToNullInThisProcedure(loc.clone()),
+                    loc.clone(),
+                );
+            }
             state.prune_eq_const(v, c, negated).is_sat()
         }
         (crate::formula::Operand::ConstOperand(c1), crate::formula::Operand::ConstOperand(c2)) => {
@@ -310,6 +345,7 @@ fn prune_eq_operands(
 /// Unknown functions get a fresh return value.
 fn exec_call(
     ret_id: &sil::ident::Ident,
+    ret_typ: &sil::typ::Typ,
     fun_exp: &Exp,
     args: &[(Exp, sil::typ::Typ)],
     loc: &Location,
@@ -326,21 +362,54 @@ fn exec_call(
     log::debug!("  [call] unknown: {fun_exp}");
     let ret_val = AbstractValue::mk_fresh();
     operations::write_id(ret_id, ret_val, &mut state);
+    mark_call_result_type(ret_val, ret_typ, &mut state);
 
     // Havoc pointer arguments for C/C++ unknown calls: unknown functions
     // may modify memory reachable from their arguments. For each actual,
     // evaluate it and replace all reachable heap edge targets with fresh
     // values. Only applies to C — Hack/Java/Python use ShouldOnlyHavocResources.
     // Cross-ref: OCaml PulseCallOperations.ml unknown_call + havoc_actual_if_ptr.
-    let should_havoc = matches!(fun_exp, Exp::Const(sil::const_val::Const::Cfun(p)) if p.is_c());
-    if should_havoc {
+    let callee_name = match fun_exp {
+        Exp::Const(sil::const_val::Const::Cfun(p)) if p.is_c() => Some(format!("{p}")),
+        _ => None,
+    };
+    if let Some(callee_name) = callee_name {
+        let mut is_pure = true;
+        let mut actual_vals = Vec::with_capacity(args.len());
         for (arg_exp, _arg_typ) in args {
             let arg_val = operations::eval_or_fresh(arg_exp, loc, &mut state);
-            state.apply_unknown_effect(arg_val);
+            actual_vals.push(arg_val);
+            if _arg_typ.is_pointer() {
+                is_pure = false;
+                state.apply_unknown_effect(arg_val);
+                operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
+            }
+        }
+        // Pure unknown calls should keep stable FunctionApplication results
+        // when called with the same actuals.
+        // Cross-ref: OCaml PulseCallOperations.ml unknown_call.
+        if is_pure
+            && state
+                .path_condition
+                .and_fn_app(ret_val, &callee_name, &actual_vals)
+                .is_unsat()
+        {
+            return vec![];
         }
     }
 
     vec![ExecutionDomain::ContinueProgram(state)]
+}
+
+fn mark_call_result_type(
+    ret_val: AbstractValue,
+    ret_typ: &sil::typ::Typ,
+    state: &mut AbductiveDomain,
+) {
+    // Cross-ref: OCaml Pulse.ml and_is_int_if_integer_type.
+    if ret_typ.is_int() {
+        state.path_condition.and_is_int(ret_val);
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +541,99 @@ mod tests {
     }
 
     #[test]
+    fn test_store_to_formula_known_zero_detects_error() {
+        let mut state = mk_state();
+        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
+        let stack_addr = crate::abstract_value::AbstractValue::mk_fresh();
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(pvar.clone())), stack_addr);
+        let p_val = state.read_heap(stack_addr, Access::Dereference);
+        assert!(state.and_equal_const(p_val, 0).is_sat());
+        assert!(
+            state.check_valid(p_val).is_ok(),
+            "formula-only null should not require a preexisting Invalid attr"
+        );
+
+        let id = Ident::create_normal(IdentName::from_string("n"), 0);
+        state.post.stack.add(Var::LogicalVar(id.clone()), p_val);
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Var(id)),
+            typ: Typ::void(),
+            e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(42)))),
+            loc: Location::dummy(),
+        };
+        let results = exec_instr(&instr, state);
+        let has_abort = results.iter().any(|r| match r {
+            ExecutionDomain::AbortProgram { diagnostic, .. } => {
+                matches!(
+                    diagnostic.as_ref(),
+                    Diagnostic::AccessToInvalidAddress { .. }
+                )
+            }
+            _ => false,
+        });
+        assert!(
+            has_abort,
+            "storing through an address that is provably null should abort"
+        );
+    }
+
+    #[test]
+    fn test_store_to_cleanup_local_marks_rhs_always_reachable() {
+        let pname = Procname::c_from_string("test");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let cleanup_pvar = Pvar::mk(Mangled::from_string("x"), pname.clone());
+        pdesc.locals.push(sil::procdesc::VarData {
+            name: cleanup_pvar.name.clone(),
+            typ: Typ::int(sil::typ::IKind::IInt),
+            modify_in_block: false,
+            is_constexpr: false,
+            is_declared_unused: false,
+            is_structured_binding: false,
+            has_cleanup_attribute: true,
+        });
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let allocated = crate::abstract_value::AbstractValue::mk_fresh();
+        state.allocate(
+            allocated,
+            crate::attribute::Allocator::CMalloc,
+            Location::dummy(),
+        );
+
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Lvar(cleanup_pvar)),
+            typ: Typ::void(),
+            e2: Box::new(Exp::Var(Ident::create_normal(
+                IdentName::from_string("rhs"),
+                0,
+            ))),
+            loc: Location::dummy(),
+        };
+        state.post.stack.add(
+            Var::LogicalVar(Ident::create_normal(IdentName::from_string("rhs"), 0)),
+            allocated,
+        );
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+
+        let has_always_reachable = results.iter().any(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => state
+                .post
+                .attrs
+                .get(&allocated)
+                .is_some_and(|attrs| attrs.is_always_reachable()),
+            _ => false,
+        });
+        assert!(
+            has_always_reachable,
+            "storing into a cleanup local should keep the RHS always reachable"
+        );
+    }
+
+    #[test]
     fn test_call_produces_fresh_return() {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
@@ -576,6 +738,46 @@ mod tests {
                 )),
                 Some(&0),
                 "prune conditions should preserve literal constants instead of collapsing to Var=Var"
+            );
+        } else {
+            panic!("expected ContinueProgram");
+        }
+    }
+
+    #[test]
+    fn test_prune_eq_zero_records_compared_to_null_invalidation() {
+        let mut state = mk_state();
+        let p = AbstractValue::mk_fresh();
+        let id = Ident::create_normal(IdentName::from_string("p"), 0);
+        let loc = Location::dummy();
+        state.post.stack.add(Var::LogicalVar(id.clone()), p);
+
+        let instr = Instr::Prune {
+            exp: Exp::BinOp(
+                sil::binop::Binop::Eq,
+                Box::new(Exp::Var(id)),
+                Box::new(Exp::Const(Const::Cint(IntLit::zero()))),
+            ),
+            loc: loc.clone(),
+            is_then_branch: true,
+            if_kind: sil::instr::IfKind::If,
+        };
+        let results = exec_instr(&instr, state);
+
+        assert_eq!(results.len(), 1);
+        if let ExecutionDomain::ContinueProgram(s) = &results[0] {
+            let Some(attrs) = s.post.attrs.get(&p) else {
+                panic!("expected compared-to-null invalidation on pruned value");
+            };
+            assert!(
+                matches!(
+                    attrs.get_invalid(),
+                    Some((
+                        crate::invalidation::Invalidation::ComparedToNullInThisProcedure(found),
+                        _
+                    )) if *found == loc
+                ),
+                "prune(p == 0) should record a ComparedToNull invalidation"
             );
         } else {
             panic!("expected ContinueProgram");

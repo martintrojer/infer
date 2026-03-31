@@ -107,6 +107,21 @@ pub struct InferConfig {
     #[serde(rename = "pulse-model-realloc-pattern")]
     pub pulse_model_realloc_pattern: Option<String>,
 
+    /// Exact procnames that should be modelled as non-returning calls.
+    /// OCaml: `--pulse-model-abort` (default empty)
+    #[serde(rename = "pulse-model-abort")]
+    pub pulse_model_abort: Vec<String>,
+
+    /// Regex of methods modelled as returning a non-null value.
+    /// OCaml: `--pulse-model-return-nonnull` (default none)
+    #[serde(rename = "pulse-model-return-nonnull")]
+    pub pulse_model_return_nonnull: Option<String>,
+
+    /// Regex of methods to skip and treat as unknown calls.
+    /// OCaml: `--pulse-model-skip-pattern` (default none)
+    #[serde(rename = "pulse-model-skip-pattern")]
+    pub pulse_model_skip_pattern: Option<String>,
+
     // ---- Abstract interpretation ----
     /// Maximum number of widenings before the fixpoint engine gives up.
     /// OCaml: hardcoded `Config.max_widens = 10000`
@@ -144,6 +159,9 @@ impl Default for InferConfig {
             pulse_model_free_pattern: None,
             pulse_model_malloc_pattern: None,
             pulse_model_realloc_pattern: None,
+            pulse_model_abort: Vec::new(),
+            pulse_model_return_nonnull: None,
+            pulse_model_skip_pattern: None,
             max_widens: 10_000,
             debug_level_analysis: 0,
             jobs: None,
@@ -231,6 +249,9 @@ mod tests {
         assert!(config.pulse_model_free_pattern.is_none());
         assert!(config.pulse_model_malloc_pattern.is_none());
         assert!(config.pulse_model_realloc_pattern.is_none());
+        assert!(config.pulse_model_abort.is_empty());
+        assert!(config.pulse_model_return_nonnull.is_none());
+        assert!(config.pulse_model_skip_pattern.is_none());
         assert!(!config.quiet);
     }
 
@@ -249,7 +270,10 @@ mod tests {
         let json = r#"{
             "pulse-model-free-pattern": "^my_free$",
             "pulse-model-malloc-pattern": "\\(my\\|a\\)_malloc",
-            "pulse-model-realloc-pattern": "my_realloc"
+            "pulse-model-realloc-pattern": "my_realloc",
+            "pulse-model-abort": ["ns1::ns2::fun_abort"],
+            "pulse-model-return-nonnull": "Handle::get",
+            "pulse-model-skip-pattern": "skip_model::SkipAll::.*\\|.*SkipSome<.*>::skip_me"
         }"#;
         let config = InferConfig::from_json(json);
         assert_eq!(
@@ -263,6 +287,15 @@ mod tests {
         assert_eq!(
             config.pulse_model_realloc_pattern.as_deref(),
             Some("my_realloc")
+        );
+        assert_eq!(config.pulse_model_abort, vec!["ns1::ns2::fun_abort"]);
+        assert_eq!(
+            config.pulse_model_return_nonnull.as_deref(),
+            Some("Handle::get")
+        );
+        assert_eq!(
+            config.pulse_model_skip_pattern.as_deref(),
+            Some("skip_model::SkipAll::.*\\|.*SkipSome<.*>::skip_me")
         );
     }
 

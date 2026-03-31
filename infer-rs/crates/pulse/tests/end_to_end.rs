@@ -40,8 +40,20 @@ fn analyze_with_spec_loop(
     const MAX_SPEC_DEPTH: usize = 5;
 
     let mut callee_summaries = std::collections::HashMap::new();
+    let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
         collect_cfun_refs(instr, &ctx.summaries, &mut callee_summaries);
+        collect_global_initializer_refs(instr, &mut global_initializers);
+    }
+    for init_pname in global_initializers {
+        let Some(init_pdesc) = ctx.cfg.get_proc_desc(&init_pname) else {
+            continue;
+        };
+        let summary = ctx.summaries.get_or_compute(&init_pname, || {
+            analyze_with_spec_loop(init_pdesc, ctx, None, depth + 1)
+        });
+        collect_summary_closure_refs(&summary, &ctx.summaries, &mut callee_summaries);
+        callee_summaries.entry(init_pname).or_insert(summary);
     }
     // When specialization is provided, add summaries for the target procedures
     // referenced in the specialization's dynamic_types. These are the functions
@@ -127,6 +139,47 @@ fn collect_cfun_refs(
             collect_cfun_refs_exp(e, store, out);
         }
         _ => {}
+    }
+}
+
+fn collect_global_initializer_refs(
+    instr: &sil::instr::Instr,
+    out: &mut std::collections::HashSet<sil::procname::Procname>,
+) {
+    if let sil::instr::Instr::Load {
+        e: sil::exp::Exp::Lvar(pvar),
+        typ,
+        ..
+    } = instr
+    {
+        if pvar.is_global() && is_pointer_to_function_typ(typ) {
+            if let Some(init_pname) = pvar.initializer_procname() {
+                out.insert(init_pname);
+            }
+        }
+    }
+}
+
+fn is_pointer_to_function_typ(typ: &sil::typ::Typ) -> bool {
+    matches!(
+        &*typ.desc,
+        sil::typ::TypeDesc::Tptr(inner, _) if matches!(&*inner.desc, sil::typ::TypeDesc::Tfun(_))
+    )
+}
+
+fn collect_summary_closure_refs(
+    summary: &pulse::summary::PulseSummary,
+    store: &ondemand::summary::SummaryStore<pulse::summary::PulseSummary>,
+    out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
+) {
+    for pre_post in &summary.pre_posts {
+        for (_addr, attrs) in pre_post.post.post.attrs.iter() {
+            if let Some(pname) = attrs.get_closure_proc_name() {
+                if let Some(summary) = store.get(pname) {
+                    out.entry(pname.clone()).or_insert(summary);
+                }
+            }
+        }
     }
 }
 
@@ -873,6 +926,62 @@ fn test_e2e_exit_noreturn() {
 }
 
 #[test]
+fn test_e2e_capture_metadata_noreturn_stub() {
+    let mut tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "c"
+        define no_return() : void {
+          #entry:
+            ret null
+        }
+        define no_return_wrapper() : void {
+          #entry:
+            n0 = no_return()
+            ret null
+        }
+        define direct_no_return_ok() : void {
+          local p: *int
+          #entry:
+            store &p <- 0 : *int
+            n0 = no_return()
+            n1 : *int = load &p
+            n2 : int = load n1
+            ret null
+        }
+        define indirect_no_return_ok() : void {
+          local p: *int
+          #entry:
+            store &p <- 0 : *int
+            n0 = no_return_wrapper()
+            n1 : *int = load &p
+            n2 : int = load n1
+            ret null
+        }
+    "#,
+    );
+
+    tm.cfg
+        .proc_descs
+        .get_mut(&sil::procname::Procname::c_from_string("no_return"))
+        .expect("no_return proc should exist")
+        .is_no_return = true;
+
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    for name in ["direct_no_return_ok", "indirect_no_return_ok"] {
+        let found = store
+            .to_vec()
+            .into_iter()
+            .find(|(p, _)| format!("{p}").contains(name));
+        assert!(
+            found.is_some_and(|(_, s)| s.diagnostics.is_empty()),
+            "{name} should have no issues after metadata-marked noreturn call"
+        );
+    }
+}
+
+#[test]
 fn test_e2e_fopen_null_deref() {
     let tm = textual_utils::parse_and_convert(
         r#"
@@ -1161,6 +1270,151 @@ fn test_e2e_interproc_path_condition() {
     );
 }
 
+#[test]
+fn test_e2e_empty_body_pure_int_call_preserves_integer_reasoning() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare pure_offset() : int
+        define impossible_sum_ok() : int {
+          local p: *int
+          #entry:
+            n0 = pure_offset()
+            n1 = pure_offset()
+            n2 = __sil_plusa_int(n0, n1)
+            jmp then_, else_
+          #then_:
+            prune __sil_eq(n2, 1)
+            store &p <- 0:*int
+            n3:*int = load &p
+            n4:int = load n3
+            ret n4
+          #else_:
+            prune __sil_lnot(__sil_eq(n2, 1))
+            ret 0
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}").contains("impossible_sum_ok"))
+        .map(|(_, s)| s)
+        .expect("impossible_sum_ok summary missing");
+    assert!(
+        summary.diagnostics.is_empty(),
+        "impossible_sum_ok should have no diagnostics: repeated pure int calls imply x + x != 1"
+    );
+}
+
+#[test]
+fn test_e2e_looped_empty_body_pure_int_call_preserves_integer_reasoning() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare pure_offset() : int
+        define impossible_loop_sum_ok() : int {
+          local i: int, sum: int, p: *int
+          #entry:
+            store &sum <- 0:int
+            store &i <- 0:int
+            jmp loop_cond
+          #loop_cond:
+            n0:int = load &i
+            jmp loop_body, loop_exit
+          #loop_body:
+            prune __sil_lt(n0, 2)
+            n1 = pure_offset()
+            n2:int = load &sum
+            store &sum <- __sil_plusa_int(n2, n1):int
+            n3:int = load &i
+            store &i <- __sil_plusa_int(n3, 1):int
+            jmp loop_cond
+          #loop_exit:
+            prune __sil_lnot(__sil_lt(n0, 2))
+            n4:int = load &sum
+            jmp then_, else_
+          #then_:
+            prune __sil_eq(n4, 1)
+            store &p <- 0:*int
+            n5:*int = load &p
+            n6:int = load n5
+            ret n6
+          #else_:
+            prune __sil_lnot(__sil_eq(n4, 1))
+            ret 0
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}").contains("impossible_loop_sum_ok"))
+        .map(|(_, s)| s)
+        .expect("impossible_loop_sum_ok summary missing");
+    assert!(
+        summary.diagnostics.is_empty(),
+        "impossible_loop_sum_ok should have no diagnostics: looped pure int calls imply x + x != 1"
+    );
+}
+
+#[test]
+fn test_e2e_offsetof_shaped_pure_int_loop_preserves_integer_reasoning() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare __builtin_offsetof() : int
+        define impossible_offsetof_like_ok() : int {
+          local p: *int, i: int, sum: int
+          #entry:
+            store &sum <- __sil_cast(<int>, 0):int
+            store &i <- 0:int
+            jmp loop_cond
+          #loop_cond:
+            n0:int = load &i
+            jmp loop_body, loop_exit
+          #loop_body:
+            prune __sil_lt(n0, 2)
+            n1 = __builtin_offsetof()
+            n2:int = load &sum
+            store &sum <- __sil_plusa_ulong(n2, n1):int
+            n3:int = load &i
+            store &i <- __sil_plusa_int(n3, 1):int
+            jmp loop_cond
+          #loop_exit:
+            prune __sil_lnot(__sil_lt(n0, 2))
+            n4:int = load &sum
+            jmp then_, else_
+          #then_:
+            prune __sil_eq(n4, __sil_cast(<int>, 1))
+            store &p <- 0:*int
+            n5:*int = load &p
+            n6:int = load n5
+            ret n6
+          #else_:
+            prune __sil_lnot(__sil_eq(n4, __sil_cast(<int>, 1)))
+            ret 0
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}").contains("impossible_offsetof_like_ok"))
+        .map(|(_, s)| s)
+        .expect("impossible_offsetof_like_ok summary missing");
+    assert!(
+        summary.diagnostics.is_empty(),
+        "impossible_offsetof_like_ok should have no diagnostics: exported offsetof shape should still imply x + x != 1"
+    );
+}
+
 /// Test function pointer dispatch via __call_c_function_ptr + __sil_cfun.
 ///
 /// Tests that the dispatch infrastructure works: __sil_cfun creates Closure
@@ -1428,6 +1682,119 @@ fn test_e2e_unknown_call_havoc() {
     }
 }
 
+#[test]
+fn test_e2e_unknown_call_havoc_on_by_ref_formal_slot() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare external_slot(**int) : *void
+        define by_ref_slot_ok(param: *int) : void {
+          #entry:
+            n0 = external_slot(&param)
+            n1:*int = load &param
+            n2:int = load n1
+            ret null
+        }
+        define by_ref_slot_bad(param: *int) : void {
+          #entry:
+            n0:*int = load &param
+            n1:int = load n0
+            n2 = external_slot(&param)
+            ret null
+        }
+        define caller_ok() : void {
+          #entry:
+            n0 = by_ref_slot_ok(0)
+            ret null
+        }
+        define main() : void {
+          #entry:
+            n0 = by_ref_slot_bad(0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let caller_ok = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}").contains("caller_ok"));
+    assert!(
+        caller_ok.as_ref().is_some_and(|(_, s)| s
+            .diagnostics
+            .iter()
+            .all(|d| d.get_issue_type_id() != IssueTypeId::NullptrDereference)),
+        "caller_ok should stay clean after an unknown call on `&param`"
+    );
+
+    let main_bad = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "main");
+    assert!(
+        main_bad.as_ref().is_some_and(|(_, s)| s
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
+        "main should still report the null dereference that happens before the unknown call"
+    );
+}
+
+#[test]
+fn test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare unknown(int) : int
+        define unknown_conditional_dereference(x: int, p: *int) : void {
+          #entry:
+            n0:int = load &x
+            n1 = unknown(n0)
+            jmp then_, else_
+          #then_:
+            prune __sil_eq(n1, 999)
+            n2:*int = load &p
+            store n2 <- 42:int
+            ret null
+          #else_:
+            prune __sil_lnot(__sil_eq(n1, 999))
+            ret null
+        }
+        define unknown_from_parameters_latent(x: int) : void {
+          #entry:
+            n0:int = load &x
+            _ = unknown_conditional_dereference(n0, 0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}").contains("unknown_from_parameters_latent"))
+        .map(|(_, summary)| summary)
+        .expect("unknown_from_parameters_latent summary should exist");
+
+    assert!(
+        summary.diagnostics.is_empty(),
+        "caller-dependent precondition violation should stay latent, not manifest"
+    );
+    assert!(
+        summary.pre_posts.iter().any(|pp| {
+            matches!(pp.kind, pulse::summary::PrePostKind::LatentAbortProgram)
+                && pp
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+        }),
+        "summary should keep a latent abort pre/post for the imported pure-call condition"
+    );
+}
+
 /// Test memory leak detection: malloc without free should report MEMORY_LEAK_C.
 #[test]
 fn test_e2e_memory_leak() {
@@ -1500,6 +1867,53 @@ fn test_e2e_memory_leak() {
             assert!(!has_leak, "{name} should NOT report MEMORY_LEAK_C");
         }
     }
+}
+
+#[test]
+fn test_e2e_global_function_pointer_initializer_is_inlined() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        declare __call_c_function_ptr((fun _ -> _)) : *int
+
+        global fp: void
+
+        define return_null() : *int {
+          #entry:
+            ret 0
+        }
+
+        define __infer_globals_initializer_fp() : void {
+          #entry:
+            _ = __sil_metadata_variable_lifetime_begins(&fp, <*(fun _ -> _)>)
+            store &fp <- __sil_cfun("return_null"):*(fun _ -> _)
+            ret null
+        }
+
+        define call_via_global_bad() : void {
+          #entry:
+            n0:*(fun _ -> _) = load &fp
+            n1 = __call_c_function_ptr(n0)
+            n2:int = load n1
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let bad = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}").contains("call_via_global_bad"))
+        .expect("call_via_global_bad summary should exist");
+    assert!(
+        bad.1
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "global function-pointer initializer should be visible before loading fp"
+    );
 }
 
 #[test]
@@ -1669,7 +2083,8 @@ fn test_store_textual_sweep() {
     let c_refs: Vec<&std::path::Path> = c_paths.iter().map(|p| p.as_path()).collect();
 
     eprintln!("Capturing {} C files with --store-textual...", c_refs.len());
-    let (manifest_entries, export_dir) = match runner.store_textual_and_export(&c_refs) {
+    let (manifest_entries, export_dir, results_dir) = match runner.store_textual_and_export(&c_refs)
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("FAIL: store_textual_and_export: {e}");
@@ -1686,7 +2101,7 @@ fn test_store_textual_sweep() {
     let skip_files = ["infinite.c", "recursion.c", "recursion2.c"];
 
     let mut ok = 0;
-    let mut fail_parse = 0;
+    let mut fail_analyze = 0;
     let mut fail_timeout = 0;
     let mut total_procs = 0;
     let mut total_issues = 0;
@@ -1707,65 +2122,42 @@ fn test_store_textual_sweep() {
 
         let sil_path = export_dir.join(&entry.sil);
         let source_file = entry.source.clone();
+        let source_dir = std::path::Path::new(&source_file)
+            .parent()
+            .unwrap_or(c_dir.as_path())
+            .to_path_buf();
+        let infer_results_dir = results_dir.clone();
+        let proc_count = entry.procedures.len();
 
-        match std::panic::catch_unwind(|| {
-            // Parse with line map for correct source locations
-            let src = std::fs::read_to_string(&sil_path).unwrap();
-            let filename = sil_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("test.sil");
-            let mut module = textual::parse_module(&src, filename).unwrap();
-            module.source_file = source_file;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let issues = test_harness::infer_runner::run_infer_rs_on_textual(
+                &sil_path,
+                Some(&source_file),
+                &source_dir,
+                Some(&infer_results_dir),
+            );
+            let _ = tx.send((proc_count, issues));
+        });
 
-            let (decls, _) = textual::decls::DeclEnv::from_module(&module);
-            textual::transform::run(&mut module, &decls);
-
-            let line_map = textual::line_map::LineMap::create(&src);
-            let lm_ref = if line_map.is_empty() {
-                None
-            } else {
-                Some(&line_map)
-            };
-            let (cfg, tenv) =
-                textual::to_sil::module_to_sil_with_line_map(&module, &decls, lm_ref).unwrap();
-            (cfg, tenv)
-        }) {
-            Err(_) => {
-                eprintln!("  FAIL_PARSE {source_name}");
-                fail_parse += 1;
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok((n_procs, Ok(issues))) => {
+                handle.join().ok();
+                let n_issues = issues.len();
+                eprintln!("  OK {source_name}: {n_procs} procs, {n_issues} issues");
+                ok += 1;
+                total_procs += n_procs;
+                total_issues += n_issues;
+                file_results.insert(source_name.to_string(), issues);
             }
-            Ok((cfg, tenv)) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let handle = std::thread::spawn(move || {
-                    let checker = PulseInterChecker;
-                    let (store, _) = ondemand::runner::run_inter(&checker, &cfg, &tenv);
-                    let mut n_procs = 0;
-                    let mut issues = Vec::new();
-                    for (_pname, summary) in store.to_vec() {
-                        n_procs += 1;
-                        for d in &summary.diagnostics {
-                            issues.push(d.get_issue_type().to_string());
-                        }
-                    }
-                    let _ = tx.send((n_procs, issues));
-                });
-
-                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                    Ok((n_procs, issues)) => {
-                        handle.join().ok();
-                        let n_issues = issues.len();
-                        eprintln!("  OK {source_name}: {n_procs} procs, {n_issues} issues");
-                        ok += 1;
-                        total_procs += n_procs;
-                        total_issues += n_issues;
-                        file_results.insert(source_name.to_string(), issues);
-                    }
-                    Err(_) => {
-                        eprintln!("  TIMEOUT {source_name}");
-                        fail_timeout += 1;
-                    }
-                }
+            Ok((_n_procs, Err(e))) => {
+                handle.join().ok();
+                eprintln!("  FAIL_ANALYZE {source_name}: {e}");
+                fail_analyze += 1;
+            }
+            Err(_) => {
+                eprintln!("  TIMEOUT {source_name}");
+                fail_timeout += 1;
             }
         }
     }
@@ -1808,7 +2200,7 @@ fn test_store_textual_sweep() {
     }
 
     eprintln!("\n=== Store-textual sweep ===");
-    eprintln!("  OK: {ok}, FAIL_PARSE: {fail_parse}, TIMEOUT: {fail_timeout}");
+    eprintln!("  OK: {ok}, FAIL_ANALYZE: {fail_analyze}, TIMEOUT: {fail_timeout}");
     eprintln!("  {total_procs} procs analyzed, {total_issues} issues found");
     assert!(ok > 0, "should have at least one passing file");
 }

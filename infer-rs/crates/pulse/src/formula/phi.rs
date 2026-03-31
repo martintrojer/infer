@@ -375,15 +375,23 @@ impl Phi {
             return SatUnsat::Sat(new_eqs);
         }
 
-        // Substitute x in all existing equations
+        // Substitute x in all existing equations, then re-solve them through
+        // add_linear_eq so non-integer constants and newly exposed equalities
+        // are handled consistently.
         let mut updated_eqs = Vec::new();
         for (&v, lin) in &self.linear_eqs {
             if lin.get_coefficient(x).is_some() {
-                updated_eqs.push((v, lin.subst_var(x, &solution)));
+                let substed = lin.subst_var(x, &solution);
+                let normalized = self.normalize_linear(&substed);
+                updated_eqs.push((v, normalized));
             }
         }
         for (v, new_lin) in updated_eqs {
-            self.linear_eqs.insert(v, new_lin);
+            self.linear_eqs.remove(&v);
+            match self.add_linear_eq(v, new_lin) {
+                SatUnsat::Unsat => return SatUnsat::Unsat,
+                SatUnsat::Sat(eqs) => new_eqs.extend(eqs),
+            }
         }
 
         // Substitute x in atoms
@@ -675,6 +683,24 @@ mod tests {
         // y = 0 → x should be 1
         phi.and_const_eq(y, 0);
         assert_eq!(phi.get_known_const(x), Some(Q::from_integer(1)));
+    }
+
+    #[test]
+    fn test_add_linear_eq_rejects_non_integer_solution_from_substitution() {
+        let mut phi = Phi::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let sum = AbstractValue::of_raw(3);
+
+        phi.mark_is_int(x);
+        assert!(phi
+            .add_linear_eq(x, LinArith::of_var(sum).mult_scalar(&Q::new(1, 2)))
+            .is_sat());
+
+        let result = phi.add_linear_eq(sum, LinArith::of_int(1));
+        assert!(
+            result.is_unsat(),
+            "substituting sum=1 into x=sum/2 should reject x=1/2 when x is integer-typed"
+        );
     }
 
     #[test]

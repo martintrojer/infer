@@ -12,6 +12,7 @@
 
 use sil::const_val::Const;
 use sil::exp::Exp;
+use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::var::Var;
 
@@ -23,6 +24,25 @@ use crate::diagnostic::Diagnostic;
 use crate::formula::Operand;
 use crate::invalidation::Invalidation;
 use crate::pulse_result::PulseResult;
+
+fn materialize_known_zero_invalid(
+    addr: AbstractValue,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) {
+    // Cross-ref: OCaml eventually materializes a manifest abort summary for
+    // paths such as `if (p) { ... } *p = 42` on the `p == 0` branch. Rust was
+    // only catching the forward direction (must-be-valid, then later deduced
+    // equal to 0). When the value was already known zero before the access, we
+    // need to record the null invalidation at the access point as well.
+    if state.check_valid(addr).is_ok() && state.is_known_zero(addr) {
+        state.invalidate(
+            addr,
+            Invalidation::ConstantDereference(IntLit::zero()),
+            loc.clone(),
+        );
+    }
+}
 
 /// Evaluate a SIL expression to an abstract value.
 ///
@@ -50,6 +70,7 @@ pub fn eval(
             };
             // Check validity of base before field access (null.field is a null deref)
             state.mark_must_be_valid(base);
+            materialize_known_zero_invalid(base, loc, state);
             if let Err(inv_info) = state.check_valid(base) {
                 let (invalidation, inv_loc) = *inv_info;
                 return PulseResult::Recoverable(
@@ -73,6 +94,7 @@ pub fn eval(
             };
             // Check validity of base before array access (null[i] is a null deref)
             state.mark_must_be_valid(base);
+            materialize_known_zero_invalid(base, loc, state);
             if let Err(inv_info) = state.check_valid(base) {
                 let (invalidation, inv_loc) = *inv_info;
                 return PulseResult::Recoverable(
@@ -219,6 +241,16 @@ fn eval_const(
     }
 }
 
+/// Unknown calls on `&slot` can overwrite the slot's value itself.
+/// If the slot had not been read before the call, create a fresh post-state
+/// dereference edge so later loads observe the unknown write without adding a
+/// spurious pre-condition on the incoming value.
+pub fn refresh_unknown_lvalue_root(exp: &Exp, addr: AbstractValue, state: &mut AbductiveDomain) {
+    if matches!(exp, Exp::Lvar(_) | Exp::Lfield(..) | Exp::Lindex(..)) {
+        state.ensure_deref_edge_if_missing(addr);
+    }
+}
+
 /// Evaluate a dereference: `*exp`.
 ///
 /// Evaluates the expression, then checks validity and follows the
@@ -244,6 +276,7 @@ pub fn eval_deref_addr(
     // Record that this address must be valid (for interproc pre-condition checks).
     // Cross-ref: OCaml PulseOperations.ml check_addr_access sets MustBeValid.
     state.mark_must_be_valid(addr);
+    materialize_known_zero_invalid(addr, loc, state);
 
     // THE null-deref / use-after-free check
     if let Err(inv_info) = state.check_valid(addr) {
@@ -267,6 +300,7 @@ pub fn check_addr_access(
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
     state.mark_must_be_valid(addr);
+    materialize_known_zero_invalid(addr, loc, state);
     if let Err(inv_info) = state.check_valid(addr) {
         let (invalidation, inv_loc) = *inv_info;
         return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {

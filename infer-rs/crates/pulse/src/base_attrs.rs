@@ -77,6 +77,11 @@ impl BaseAddressAttributes {
         self.add_one(addr, Attribute::Initialized);
     }
 
+    /// Mark an address as always reachable.
+    pub fn always_reachable(&mut self, addr: AbstractValue) {
+        self.add_one(addr, Attribute::AlwaysReachable);
+    }
+
     /// Mark an address as written to.
     pub fn mark_written_to(&mut self, addr: AbstractValue, timestamp: u64, loc: Location) {
         self.add_one(addr, Attribute::WrittenTo(timestamp, loc));

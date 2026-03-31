@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Kind of identifiers.
 ///
 /// Mirrors OCaml's `Ident.kind`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum IdentKind {
     /// Normal temporary variable.
     Normal,

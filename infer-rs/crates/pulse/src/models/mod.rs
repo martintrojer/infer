@@ -12,6 +12,8 @@
 //! using `sil::builtin_decl` for identity-based matching.
 
 pub mod c;
+pub mod configured;
+pub mod matching;
 
 use std::sync::LazyLock;
 
@@ -42,6 +44,7 @@ static MODELED_FUNCTIONS: LazyLock<std::collections::HashSet<&'static str>> = La
 /// Check if a callee has any model (cheap, no cloning).
 pub fn has_model(callee: &Procname) -> bool {
     MODELED_FUNCTIONS.contains(callee.get_method_name())
+        || configured::has_model(callee, config::get())
         || c::matches_configured_wrapper(callee, config::get())
 }
 
@@ -62,7 +65,11 @@ pub fn dispatch(
     }
 
     // Try each language module in order
-    if let Some(results) = c::dispatch(callee, ret_id, args, loc, state) {
+    if let Some(results) = c::dispatch(callee, ret_id, args, loc, state.clone()) {
+        return Some(results);
+    }
+
+    if let Some(results) = configured::dispatch(callee, ret_id, args, loc, state) {
         return Some(results);
     }
 

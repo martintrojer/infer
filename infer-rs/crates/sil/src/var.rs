@@ -13,7 +13,7 @@ use crate::pvar::Pvar;
 /// Single abstraction for all the kinds of variables in SIL.
 ///
 /// Mirrors OCaml's `Var.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Var {
     /// Logical (temporary) variable.
     LogicalVar(Ident),

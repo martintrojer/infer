@@ -12,7 +12,7 @@ use crate::typ::TypeName;
 /// Names for fields of class/struct/union.
 ///
 /// Mirrors OCaml's `Fieldname.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Fieldname {
     pub class_name: TypeName,
     pub field_name: String,
