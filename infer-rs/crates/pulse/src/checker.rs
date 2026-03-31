@@ -152,7 +152,6 @@ pub fn analyze_with_specialization_and_requests(
             }
         }
     }
-
     // Cross-ref: OCaml consults ProcAttributes.is_no_return at call sites in
     // Pulse.ml, so preserve that source-level fact even when the exported
     // Textual body is empty and would otherwise analyze as a normal return.
@@ -247,7 +246,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
 fn exec_instr_with_summaries(
     pdesc: &Procdesc,
     instr: &Instr,
-    mut state: AbductiveDomain,
+    state: AbductiveDomain,
     callee_summaries: &HashMap<Procname, PulseSummary>,
     spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
 ) -> Vec<ExecutionDomain> {
@@ -265,11 +264,20 @@ fn exec_instr_with_summaries(
         ..
     } = instr
     {
+        let callsite = CallSite {
+            pdesc,
+            ret_id,
+            ret_typ,
+            args,
+            loc,
+            spec_requests,
+        };
+
         // __call_c_function_ptr(funptr, args...): resolve the function
         // pointer to a procname via Closure attribute, then dispatch.
         // Cross-ref: OCaml PulseModelsC.ml call_c_function_ptr.
         if callee_pname.get_method_name() == "__call_c_function_ptr" {
-            return exec_call_c_function_ptr(pdesc, ret_id, args, loc, state, callee_summaries);
+            return exec_call_c_function_ptr(callsite, state, callee_summaries);
         }
 
         // Models take priority over summaries (e.g., exit() may have an
@@ -281,107 +289,14 @@ fn exec_instr_with_summaries(
         }
 
         if let Some(callee_summary) = callee_summaries.get(callee_pname) {
-            if let (Some(requests), Some(first_pp)) =
-                (spec_requests, callee_summary.pre_posts.first())
-            {
-                if let Some(spec) = crate::specialization::make_specialization_from_caller(
-                    &callee_summary.needs_specialization,
-                    &state,
-                    &first_pp.formals,
-                    &callee_summary.formal_types,
-                    args,
-                ) {
-                    if callee_summary.get_specialized(&spec).is_none() {
-                        let mut requests = requests.borrow_mut();
-                        if !requests
-                            .iter()
-                            .any(|(pname, existing)| pname == callee_pname && existing == &spec)
-                        {
-                            requests.push((callee_pname.clone(), spec));
-                        }
-                    }
-                }
-            }
-
-            if callee_summary.is_noreturn {
-                log::debug!("  [call] noreturn: {callee_pname}");
-                return vec![ExecutionDomain::ExitProgram(state)];
-            }
-
-            // Empty-body callees (extern stubs): treat as unknown with
-            // type-aware havoc. Only pointer-typed formals get havoced.
-            // Cross-ref: OCaml PulseCallOperations.ml should_havoc checks Tptr.
-            if callee_summary.is_empty_body && callee_pname.is_c() {
-                log::debug!("  [call] empty-body havoc: {callee_pname}");
-
-                let ret_val = crate::abstract_value::AbstractValue::mk_fresh();
-                crate::operations::write_id(ret_id, ret_val, &mut state);
-                if ret_typ.is_int() {
-                    state.path_condition.and_is_int(ret_val);
-                }
-                let mut is_pure = true;
-                let mut actual_vals = Vec::new();
-                for (i, (arg_exp, _arg_typ)) in args.iter().enumerate() {
-                    let arg_val = crate::operations::eval_or_fresh(arg_exp, loc, &mut state);
-                    actual_vals.push(arg_val);
-                    let formal_is_ptr = callee_summary
-                        .formal_types
-                        .get(i)
-                        .is_some_and(|t| t.is_pointer());
-                    if formal_is_ptr {
-                        is_pure = false;
-                        state.apply_unknown_effect(arg_val);
-                        crate::operations::refresh_unknown_lvalue_root(
-                            arg_exp, arg_val, &mut state,
-                        );
-                    }
-                }
-                // Pure functions (no pointer args havoced): record
-                // FunctionApplication so f(x)==f(x) is detected.
-                // Cross-ref: OCaml PulseCallOperations.ml L220-235.
-                if is_pure {
-                    let callee_name = format!("{callee_pname}");
-                    if state
-                        .path_condition
-                        .and_fn_app(ret_val, &callee_name, &actual_vals)
-                        .is_unsat()
-                    {
-                        return vec![];
-                    }
-                }
-                return vec![ExecutionDomain::ContinueProgram(state)];
-            }
-
-            // Propagate needs_specialization from callee to caller.
-            if !callee_summary.needs_specialization.is_empty() {
-                propagate_specialization_need(callee_summary, args, loc, &mut state);
-            }
-
-            let pre_posts = select_pre_posts(callee_summary, args, &state);
-            if !pre_posts.is_empty() {
-                log::debug!(
-                    "  [call] applying {} pre/posts for {callee_pname}",
-                    pre_posts.len()
-                );
-                let mut results = Vec::new();
-                for (j, pre_post) in pre_posts.iter().enumerate() {
-                    let applied = crate::interproc::apply_summary(
-                        pdesc,
-                        pre_post,
-                        ret_id,
-                        args,
-                        loc,
-                        state.clone(),
-                    );
-                    log::debug!("    pre/post #{j}: {} results", applied.len());
-                    results.extend(merge_return_history_from_equal_actuals(
-                        applied, ret_id, args, loc, &state,
-                    ));
-                }
-                return results;
-            }
-
-            log::debug!("  [call] no applicable pre/posts for {callee_pname}");
+            return exec_known_callee_summary(
+                KnownCalleeCall {
+                    callee_pname,
+                    callee_summary,
+                    callsite,
+                },
+                state,
+            );
         }
     }
 
@@ -442,6 +357,23 @@ fn maybe_inline_global_initializer_load(
         ));
     }
     Some(results)
+}
+
+#[derive(Clone, Copy)]
+struct CallSite<'a> {
+    pdesc: &'a Procdesc,
+    ret_id: &'a sil::ident::Ident,
+    ret_typ: &'a sil::typ::Typ,
+    args: &'a [(Exp, sil::typ::Typ)],
+    loc: &'a sil::location::Location,
+    spec_requests: Option<&'a RefCell<Vec<(Procname, PulseSpecialization)>>>,
+}
+
+#[derive(Clone, Copy)]
+struct KnownCalleeCall<'a> {
+    callee_pname: &'a Procname,
+    callee_summary: &'a PulseSummary,
+    callsite: CallSite<'a>,
 }
 
 fn merge_return_history_from_equal_actuals(
@@ -584,6 +516,85 @@ fn propagate_specialization_need(
     }
 }
 
+fn infer_caller_specialization(
+    callee_summary: &PulseSummary,
+    actuals: &[(Exp, sil::typ::Typ)],
+    caller_state: &crate::abductive::AbductiveDomain,
+) -> Option<PulseSpecialization> {
+    let first_pp = callee_summary.pre_posts.first()?;
+    crate::specialization::make_specialization_from_caller(
+        &callee_summary.needs_specialization,
+        caller_state,
+        &first_pp.formals,
+        &callee_summary.formal_types,
+        actuals,
+    )
+}
+
+fn queue_specialization_request(
+    spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
+    callee_pname: &Procname,
+    callee_summary: &PulseSummary,
+    spec: PulseSpecialization,
+) {
+    if callee_summary.get_specialized(&spec).is_some() {
+        return;
+    }
+    let Some(requests) = spec_requests else {
+        return;
+    };
+    let mut requests = requests.borrow_mut();
+    if !requests
+        .iter()
+        .any(|(pname, existing)| pname == callee_pname && existing == &spec)
+    {
+        requests.push((callee_pname.clone(), spec));
+    }
+}
+
+fn heap_path_sort_key(path: &sil::specialization::HeapPath) -> String {
+    format!("{path}")
+}
+
+fn canonicalize_alias_groups(
+    mut groups: Vec<Vec<sil::specialization::HeapPath>>,
+) -> Vec<Vec<sil::specialization::HeapPath>> {
+    for group in &mut groups {
+        group.sort_by_key(heap_path_sort_key);
+        group.dedup_by(|left, right| heap_path_sort_key(left) == heap_path_sort_key(right));
+    }
+    groups.retain(|group| group.len() > 1);
+    groups.sort_by_key(|group| {
+        group
+            .iter()
+            .map(heap_path_sort_key)
+            .collect::<Vec<_>>()
+            .join(" = ")
+    });
+    groups.dedup_by(|left, right| {
+        left.iter().map(heap_path_sort_key).collect::<Vec<_>>()
+            == right.iter().map(heap_path_sort_key).collect::<Vec<_>>()
+    });
+    groups
+}
+
+fn merge_alias_groups(
+    merged: &mut Vec<Vec<sil::specialization::HeapPath>>,
+    new_groups: Vec<Vec<sil::specialization::HeapPath>>,
+) {
+    merged.extend(new_groups);
+    *merged = canonicalize_alias_groups(std::mem::take(merged));
+}
+
+fn specialization_with_aliases(
+    base_spec: &PulseSpecialization,
+    alias_groups: Vec<Vec<sil::specialization::HeapPath>>,
+) -> PulseSpecialization {
+    let mut spec = base_spec.clone();
+    spec.aliases = Some(canonicalize_alias_groups(alias_groups));
+    spec
+}
+
 /// Extract the root Pvar from a HeapPath.
 fn extract_root_pvar(path: &sil::specialization::HeapPath) -> Option<&sil::pvar::Pvar> {
     use sil::specialization::HeapPath;
@@ -593,32 +604,179 @@ fn extract_root_pvar(path: &sil::specialization::HeapPath) -> Option<&sil::pvar:
     }
 }
 
-/// Select the best pre/posts for a callee summary, potentially using
-/// a specialized version if the caller provides relevant Closure info.
+/// Select the best currently available pre/posts for a callee summary.
 ///
-/// Cross-ref: OCaml PulseCallOperations.ml iter_call which tries
-/// dynamic type specialization when needed.
-fn select_pre_posts<'a>(
+/// Cross-ref: OCaml `iter_call` starts from the current specialization state
+/// and falls back to the unspecialized summary when that specialized summary
+/// has not been computed yet.
+fn select_pre_posts_and_specialization<'a>(
     callee_summary: &'a PulseSummary,
-    actuals: &[(Exp, sil::typ::Typ)],
-    caller_state: &crate::abductive::AbductiveDomain,
-) -> &'a [crate::summary::PrePost] {
-    // Check if the caller can provide either alias or dynamic-type specialization.
-    if let Some(first_pp) = callee_summary.pre_posts.first() {
-        if let Some(spec) = crate::specialization::make_specialization_from_caller(
-            &callee_summary.needs_specialization,
-            caller_state,
-            &first_pp.formals,
-            &callee_summary.formal_types,
-            actuals,
-        ) {
-            if let Some(specialized) = callee_summary.get_specialized(&spec) {
-                return specialized;
-            }
+    caller_spec: Option<&PulseSpecialization>,
+) -> (&'a [crate::summary::PrePost], PulseSpecialization) {
+    if let Some(spec) = caller_spec {
+        if let Some(specialized) = callee_summary.get_specialized(spec) {
+            return (specialized, spec.clone());
         }
     }
 
-    &callee_summary.pre_posts
+    (&callee_summary.pre_posts, PulseSpecialization::bottom())
+}
+
+fn apply_pre_posts_with_specialization_loop(
+    known_callee: KnownCalleeCall<'_>,
+    caller_state: &crate::abductive::AbductiveDomain,
+    initial_pre_posts: &[crate::summary::PrePost],
+    initial_spec: PulseSpecialization,
+) -> Vec<ExecutionDomain> {
+    // Cross-ref: OCaml `PulseCallOperations.iter_call` first tries the
+    // currently available summary, then turns alias contradictions from
+    // `PulseInterproc.apply_summary` into alias specialization requests or an
+    // immediate retry if the specialized summary is already cached.
+    let CallSite {
+        pdesc,
+        ret_id,
+        args,
+        loc,
+        spec_requests,
+        ..
+    } = known_callee.callsite;
+    let callee_pname = known_callee.callee_pname;
+    let callee_summary = known_callee.callee_summary;
+    let mut current_pre_posts = initial_pre_posts;
+    let mut current_spec = initial_spec;
+    let mut tried_specs: Vec<PulseSpecialization> = Vec::new();
+
+    loop {
+        if current_pre_posts.is_empty() {
+            return vec![];
+        }
+
+        log::debug!(
+            "  [call] applying {} pre/posts for {callee_pname} with specialization {current_spec}",
+            current_pre_posts.len()
+        );
+
+        let mut results = Vec::new();
+        let mut alias_groups = Vec::new();
+        for (j, pre_post) in current_pre_posts.iter().enumerate() {
+            let outcome = crate::interproc::apply_summary_with_aliasing(
+                pdesc,
+                pre_post,
+                ret_id,
+                args,
+                loc,
+                caller_state.clone(),
+            );
+            log::debug!("    pre/post #{j}: {} results", outcome.results.len());
+            results.extend(outcome.results);
+            if let Some(groups) = outcome.alias_specialization {
+                merge_alias_groups(&mut alias_groups, groups);
+            }
+        }
+
+        if !results.is_empty() || alias_groups.is_empty() {
+            return results;
+        }
+
+        let next_spec = specialization_with_aliases(&current_spec, alias_groups);
+        if next_spec == current_spec || tried_specs.iter().any(|spec| spec == &next_spec) {
+            return vec![];
+        }
+        tried_specs.push(next_spec.clone());
+
+        if let Some(specialized) = callee_summary.get_specialized(&next_spec) {
+            log::debug!("  [call] retrying {callee_pname} with alias specialization {next_spec}");
+            current_spec = next_spec;
+            current_pre_posts = specialized;
+            continue;
+        }
+
+        log::debug!("  [call] requesting alias specialization {next_spec}");
+        queue_specialization_request(spec_requests, callee_pname, callee_summary, next_spec);
+        return vec![];
+    }
+}
+
+fn exec_known_callee_summary(
+    known_callee: KnownCalleeCall<'_>,
+    mut state: crate::abductive::AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    let CallSite {
+        pdesc: _,
+        ret_id,
+        ret_typ,
+        args,
+        loc,
+        spec_requests,
+    } = known_callee.callsite;
+    let callee_pname = known_callee.callee_pname;
+    let callee_summary = known_callee.callee_summary;
+    let caller_spec = infer_caller_specialization(callee_summary, args, &state);
+    if let Some(spec) = caller_spec.clone() {
+        queue_specialization_request(spec_requests, callee_pname, callee_summary, spec);
+    }
+
+    if callee_summary.is_noreturn {
+        log::debug!("  [call] noreturn: {callee_pname}");
+        return vec![ExecutionDomain::ExitProgram(state)];
+    }
+
+    // Empty-body callees (extern stubs): treat as unknown with type-aware
+    // havoc. Only pointer-typed formals get havoced.
+    // Cross-ref: OCaml PulseCallOperations.ml should_havoc checks Tptr.
+    if callee_summary.is_empty_body && callee_pname.is_c() {
+        log::debug!("  [call] empty-body havoc: {callee_pname}");
+
+        let ret_val = crate::abstract_value::AbstractValue::mk_fresh();
+        crate::operations::write_id(ret_id, ret_val, &mut state);
+        if ret_typ.is_int() {
+            state.path_condition.and_is_int(ret_val);
+        }
+        let mut is_pure = true;
+        let mut actual_vals = Vec::new();
+        for (i, (arg_exp, _arg_typ)) in args.iter().enumerate() {
+            let arg_val = crate::operations::eval_or_fresh(arg_exp, loc, &mut state);
+            actual_vals.push(arg_val);
+            let formal_is_ptr = callee_summary
+                .formal_types
+                .get(i)
+                .is_some_and(|t| t.is_pointer());
+            if formal_is_ptr {
+                is_pure = false;
+                state.apply_unknown_effect(arg_val);
+                crate::operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
+            }
+        }
+        // Pure functions (no pointer args havoced): record FunctionApplication
+        // so f(x)==f(x) is detected. Cross-ref: OCaml
+        // PulseCallOperations.ml L220-235.
+        if is_pure {
+            let callee_name = format!("{callee_pname}");
+            if state
+                .path_condition
+                .and_fn_app(ret_val, &callee_name, &actual_vals)
+                .is_unsat()
+            {
+                return vec![];
+            }
+        }
+        return vec![ExecutionDomain::ContinueProgram(state)];
+    }
+
+    if !callee_summary.needs_specialization.is_empty() {
+        propagate_specialization_need(callee_summary, args, loc, &mut state);
+    }
+
+    let (pre_posts, active_spec) =
+        select_pre_posts_and_specialization(callee_summary, caller_spec.as_ref());
+    if pre_posts.is_empty() {
+        log::debug!("  [call] no applicable pre/posts for {callee_pname}");
+        return vec![];
+    }
+
+    let results =
+        apply_pre_posts_with_specialization_loop(known_callee, &state, pre_posts, active_spec);
+    merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state)
 }
 
 /// Handle `__call_c_function_ptr(funptr, args...)`.
@@ -630,13 +788,18 @@ fn select_pre_posts<'a>(
 ///
 /// Cross-ref: OCaml PulseModelsC.ml call_c_function_ptr.
 fn exec_call_c_function_ptr(
-    pdesc: &Procdesc,
-    ret_id: &sil::ident::Ident,
-    args: &[(Exp, sil::typ::Typ)],
-    loc: &sil::location::Location,
+    callsite: CallSite<'_>,
     mut state: crate::abductive::AbductiveDomain,
     callee_summaries: &HashMap<Procname, PulseSummary>,
 ) -> Vec<ExecutionDomain> {
+    let CallSite {
+        pdesc,
+        ret_id,
+        ret_typ,
+        args,
+        loc,
+        spec_requests,
+    } = callsite;
     // First arg is the function pointer, rest are the actual arguments
     let (funptr_exp, actual_args) = match args.split_first() {
         Some(((fp_exp, _), rest)) => (fp_exp, rest),
@@ -661,7 +824,7 @@ fn exec_call_c_function_ptr(
         // First check models
         if crate::models::has_model(&target_pname) {
             let call_instr = Instr::Call {
-                ret: (ret_id.clone(), sil::typ::Typ::void()),
+                ret: (ret_id.clone(), ret_typ.clone()),
                 fun_exp: Exp::Const(Const::Cfun(target_pname)),
                 args: actual_args.to_vec(),
                 loc: loc.clone(),
@@ -676,23 +839,21 @@ fn exec_call_c_function_ptr(
             callee_summaries.contains_key(&target_pname)
         );
         if let Some(callee_summary) = callee_summaries.get(&target_pname) {
-            if callee_summary.is_noreturn {
-                return vec![ExecutionDomain::ExitProgram(state)];
-            }
-            if !callee_summary.pre_posts.is_empty() {
-                let mut results = Vec::new();
-                for pre_post in &callee_summary.pre_posts {
-                    results.extend(crate::interproc::apply_summary(
+            return exec_known_callee_summary(
+                KnownCalleeCall {
+                    callee_pname: &target_pname,
+                    callee_summary,
+                    callsite: CallSite {
                         pdesc,
-                        pre_post,
                         ret_id,
-                        actual_args,
+                        ret_typ,
+                        args: actual_args,
                         loc,
-                        state.clone(),
-                    ));
-                }
-                return results;
-            }
+                        spec_requests,
+                    },
+                },
+                state,
+            );
         }
     }
 
@@ -724,9 +885,13 @@ pub fn to_issue_log(summary: &PulseSummary, proc_name: &str) -> IssueLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abstract_value::AbstractValue;
+    use crate::access::Access;
+    use crate::summary::{PrePost, PrePostKind};
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
     use sil::exp::Exp;
+    use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
     use sil::instr::Instr;
     use sil::int_lit::IntLit;
@@ -735,7 +900,102 @@ mod tests {
     use sil::procdesc::{NodeKind, StmtNodeKind};
     use sil::procname::Procname;
     use sil::pvar::Pvar;
+    use sil::qualified_cpp_name::QualifiedCppName;
+    use sil::specialization::{HeapPath, PulseSpecialization};
     use sil::typ::Typ;
+
+    fn formal_value_heap_path(formal_pvar: &Pvar) -> HeapPath {
+        HeapPath::Dereference(Box::new(HeapPath::Pvar(formal_pvar.clone())))
+    }
+
+    fn make_alias_specialization_summary(
+        with_cached_specialization: bool,
+    ) -> (Procname, PulseSummary, PulseSpecialization, Fieldname) {
+        let node_struct = sil::typ::TypeName::CStruct(QualifiedCppName::from_string("node"));
+        let next_field = Fieldname::make(node_struct, "next");
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname.clone());
+
+        let mut unspecialized_state = crate::abductive::AbductiveDomain::mk_initial(&callee_pdesc);
+        let unspecialized_formal_addr = unspecialized_state
+            .post
+            .stack
+            .find(&sil::var::Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val =
+            unspecialized_state.read_heap(unspecialized_formal_addr, Access::Dereference);
+        let next_val =
+            unspecialized_state.read_heap(formal_val, Access::FieldAccess(next_field.clone()));
+        unspecialized_state.read_heap(next_val, Access::Dereference);
+        let unspecialized_pre_post = PrePost {
+            pre: unspecialized_state.pre.clone(),
+            post: unspecialized_state,
+            formals: vec![(formal_pvar.clone(), unspecialized_formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let alias_spec = PulseSpecialization {
+            aliases: Some(vec![vec![
+                formal_value_heap_path(&formal_pvar),
+                HeapPath::FieldAccess(
+                    next_field.clone(),
+                    Box::new(formal_value_heap_path(&formal_pvar)),
+                ),
+            ]]),
+            dynamic_types: HashMap::new(),
+        };
+
+        let specialized = if with_cached_specialization {
+            let mut specialized_state =
+                crate::abductive::AbductiveDomain::mk_initial(&callee_pdesc);
+            let specialized_formal_addr = specialized_state
+                .post
+                .stack
+                .find(&sil::var::Var::ProgramVar(Box::new(formal_pvar.clone())))
+                .unwrap();
+            let specialized_formal_val =
+                specialized_state.read_heap(specialized_formal_addr, Access::Dereference);
+            let written = AbstractValue::mk_fresh();
+            specialized_state.write_heap(specialized_formal_val, Access::Dereference, written);
+            vec![(
+                alias_spec.clone(),
+                vec![PrePost {
+                    pre: specialized_state.pre.clone(),
+                    post: specialized_state,
+                    formals: vec![(formal_pvar.clone(), specialized_formal_addr)],
+                    result: None,
+                    kind: PrePostKind::ContinueProgram,
+                    diagnostic: None,
+                }],
+            )]
+        } else {
+            Vec::new()
+        };
+
+        (
+            callee_pname,
+            PulseSummary {
+                pre_posts: vec![unspecialized_pre_post],
+                specialized,
+                diagnostics: vec![],
+                is_noreturn: false,
+                needs_specialization: HashMap::new(),
+                is_empty_body: false,
+                formal_types: vec![Typ::mk_ptr(Typ::void())],
+            },
+            alias_spec,
+            next_field,
+        )
+    }
 
     /// Build: void f() { int *p = NULL; *p = 42; }
     fn make_null_deref_proc() -> Procdesc {
@@ -948,6 +1208,41 @@ mod tests {
         pdesc
     }
 
+    fn make_formal_deref_proc() -> Procdesc {
+        let pname = Procname::c_from_string("formal_deref");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+
+        let formal = Pvar::mk(Mangled::from_string("x"), pname);
+        let n0 = Ident::create_normal(IdentName::from_string("n"), 0);
+        let instrs = vec![
+            Instr::Load {
+                id: n0.clone(),
+                e: Exp::Lvar(formal),
+                typ: Typ::mk_ptr(Typ::void()),
+                loc: Location::dummy(),
+            },
+            Instr::Store {
+                e1: Box::new(Exp::Var(n0)),
+                typ: Typ::void(),
+                e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(42)))),
+                loc: Location::dummy(),
+            },
+        ];
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            instrs,
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
+
     #[test]
     fn test_interprocedural_null_deref() {
         let callee_pdesc = make_returns_null_proc();
@@ -990,6 +1285,128 @@ mod tests {
             caller_summary.diagnostics.is_empty(),
             "safe callee should not cause issues in caller. diagnostics: {:?}",
             caller_summary.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_formal_deref_does_not_publish_manifest_diagnostic() {
+        let pdesc = make_formal_deref_proc();
+        let summary = analyze(&pdesc);
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "caller-controlled formal dereference should stay latent, got {:?}",
+            summary.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_requests_alias_specialization_from_contradiction() {
+        let (callee_pname, callee_summary, alias_spec, next_field) =
+            make_alias_specialization_summary(false);
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(sil::var::Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+        caller_state
+            .post
+            .heap
+            .add_edge(x_addr, Access::FieldAccess(next_field), x_addr);
+        let requests = RefCell::new(Vec::new());
+        let ret_id = Ident::create_none();
+        let ret_typ = Typ::void();
+        let args = [(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))];
+        let loc = Location::dummy();
+
+        let results = exec_known_callee_summary(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    spec_requests: Some(&requests),
+                },
+            },
+            caller_state,
+        );
+
+        assert!(
+            results.is_empty(),
+            "missing cached alias specialization should defer the call, got {results:?}"
+        );
+        assert_eq!(
+            requests.into_inner(),
+            vec![(callee_pname, alias_spec)],
+            "alias contradiction should enqueue the OCaml-style alias specialization request"
+        );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_uses_cached_alias_specialization() {
+        let (callee_pname, callee_summary, _alias_spec, next_field) =
+            make_alias_specialization_summary(true);
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(sil::var::Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+        caller_state
+            .post
+            .heap
+            .add_edge(x_addr, Access::FieldAccess(next_field), x_addr);
+        let requests = RefCell::new(Vec::new());
+        let ret_id = Ident::create_none();
+        let ret_typ = Typ::void();
+        let args = [(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))];
+        let loc = Location::dummy();
+
+        let results = exec_known_callee_summary(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    spec_requests: Some(&requests),
+                },
+            },
+            caller_state,
+        );
+
+        let continue_state = results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("cached alias specialization should be retried immediately");
+        assert!(
+            continue_state
+                .post
+                .heap
+                .find_edge(x_addr, &Access::Dereference)
+                .is_some(),
+            "specialized summary effect should apply after alias-specialized retry"
+        );
+        assert!(
+            requests.into_inner().is_empty(),
+            "cached specialization should avoid re-enqueueing the same alias request"
         );
     }
 

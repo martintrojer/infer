@@ -309,6 +309,146 @@ impl Phi {
         SatUnsat::Sat(Vec::new())
     }
 
+    /// Normalize an atom against the current phi without recording it.
+    ///
+    /// Cross-ref: OCaml `PulseFormula.ml` `prune_atom` normalizes a translated
+    /// condition against the current caller-side phi before remembering it.
+    pub(crate) fn normalize_condition_atom(&self, atom: &Atom) -> Atom {
+        self.resolve_atom(atom)
+    }
+
+    /// Summary-time condition simplification.
+    ///
+    /// Cross-ref: OCaml `PulseFormula.QuantifierElimination.subst_var_atoms_for_conditions`.
+    /// Keep caller-visible precondition variables as-written, but substitute
+    /// other variables through the current phi so exported summaries do not
+    /// remember dead alias/equality bookkeeping.
+    pub(crate) fn simplify_condition_atom_for_summary(
+        &self,
+        atom: &Atom,
+        precondition_vocabulary: &HashSet<AbstractValue>,
+    ) -> Atom {
+        fn is_preferred_visible_var(lhs: AbstractValue, rhs: AbstractValue) -> bool {
+            if lhs.is_unrestricted() && rhs.is_restricted() {
+                true
+            } else if lhs.is_restricted() && rhs.is_unrestricted() {
+                false
+            } else {
+                lhs.raw().unsigned_abs() < rhs.raw().unsigned_abs()
+            }
+        }
+
+        fn visible_summary_var(
+            phi: &Phi,
+            v: AbstractValue,
+            precondition_vocabulary: &HashSet<AbstractValue>,
+        ) -> Option<AbstractValue> {
+            if precondition_vocabulary.contains(&v) {
+                return Some(v);
+            }
+
+            let repr = phi.get_repr(v);
+            precondition_vocabulary
+                .iter()
+                .copied()
+                .filter(|candidate| phi.get_repr(*candidate) == repr)
+                .min_by(|lhs, rhs| {
+                    if is_preferred_visible_var(*lhs, *rhs) {
+                        std::cmp::Ordering::Less
+                    } else if is_preferred_visible_var(*rhs, *lhs) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+        }
+
+        fn simplify_term(
+            phi: &Phi,
+            term: &Term,
+            precondition_vocabulary: &HashSet<AbstractValue>,
+        ) -> Term {
+            match term {
+                Term::Var(v) => {
+                    if let Some(visible_var) = visible_summary_var(phi, *v, precondition_vocabulary)
+                    {
+                        Term::Var(visible_var)
+                    } else {
+                        phi.resolve_term(term)
+                    }
+                }
+                Term::Const(_) => term.clone(),
+                Term::Add(a, b) => {
+                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    let b = simplify_term(phi, b, precondition_vocabulary);
+                    match (a.as_const(), b.as_const()) {
+                        (Some(x), Some(y)) => Term::Const(x + y),
+                        _ => Term::Add(Box::new(a), Box::new(b)),
+                    }
+                }
+                Term::Sub(a, b) => {
+                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    let b = simplify_term(phi, b, precondition_vocabulary);
+                    match (a.as_const(), b.as_const()) {
+                        (Some(x), Some(y)) => Term::Const(x - y),
+                        _ => Term::Sub(Box::new(a), Box::new(b)),
+                    }
+                }
+                Term::Mult(a, b) => {
+                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    let b = simplify_term(phi, b, precondition_vocabulary);
+                    match (a.as_const(), b.as_const()) {
+                        (Some(x), Some(y)) => Term::Const(x * y),
+                        _ => Term::Mult(Box::new(a), Box::new(b)),
+                    }
+                }
+                Term::Neg(a) => {
+                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    if let Some(x) = a.as_const() {
+                        Term::Const(-x)
+                    } else {
+                        Term::Neg(Box::new(a))
+                    }
+                }
+                Term::Not(a) => {
+                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    if let Some(x) = a.as_const() {
+                        Term::Const(if x == 0 { 1 } else { 0 })
+                    } else {
+                        Term::Not(Box::new(a))
+                    }
+                }
+                Term::IsZero(a) => {
+                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    if let Some(x) = a.as_const() {
+                        Term::Const(if x == 0 { 1 } else { 0 })
+                    } else {
+                        Term::IsZero(Box::new(a))
+                    }
+                }
+            }
+        }
+
+        match atom {
+            Atom::Equal(a, b) => Atom::Equal(
+                simplify_term(self, a, precondition_vocabulary),
+                simplify_term(self, b, precondition_vocabulary),
+            ),
+            Atom::NotEqual(a, b) => Atom::NotEqual(
+                simplify_term(self, a, precondition_vocabulary),
+                simplify_term(self, b, precondition_vocabulary),
+            ),
+            Atom::LessEqual(a, b) => Atom::LessEqual(
+                simplify_term(self, a, precondition_vocabulary),
+                simplify_term(self, b, precondition_vocabulary),
+            ),
+            Atom::LessThan(a, b) => Atom::LessThan(
+                simplify_term(self, a, precondition_vocabulary),
+                simplify_term(self, b, precondition_vocabulary),
+            ),
+        }
+    }
+
     /// Simplify: remove constraints mentioning unreachable variables.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
         let var_eqs = &self.var_eqs;

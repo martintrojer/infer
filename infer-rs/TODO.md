@@ -2,7 +2,7 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (store-textual sweep: 52/55 files, NPE expected 131 found 134, Leaks expected 20 found 20, UAF expected 7 found 7)
+### Compliance gaps by impact (authoritative store-textual sweep: 52/55 files analyzed, 3 skipped for fixpoint exhaustion; NPE expected 131 found 132, Leaks expected 20 found 20, UAF expected 7 found 7)
 
 Correctness note: keep the semantically correct specialization / latent-invalid-access /
 specialized-summary fixes even when totals move temporarily. The current sweep reflects the real
@@ -16,12 +16,17 @@ remaining count gaps after removing the old basename-matching measurement bug.
    `sizeof(c) / sizeof(c[0]) != 2` branches. Treat this as a `--store-textual` /
    `--export-textual` fidelity limit unless the interface preserves richer `Sizeof` data.
 
-**Accepted correctness-positive divergence from OCaml:**
+**Current active NPE file diffs (correctness work, not workaround targets):**
 
-2. **`nullptr.c`** (+1): `create_null_path2_bad_FN` is restored and `unknown_from_parameters_latent`
-   no longer inflates the manifest NPE count. The only remaining file-level mismatch is the extra
-   `FN_nullptr_deref_old_bad`, which is a real bug that OCaml intentionally misses because of the
-   recency limitation documented in the source comment.
+2. **`latent.c`** (+1): current sweep is `6` vs expected `5`. This is a remaining
+   latent-vs-manifest publication mismatch.
+
+3. **`nullptr.c`** (-1): current sweep is `12` vs expected `13`. The earlier
+   `unknown_from_parameters_latent` false positive is gone, but the file is no longer an accepted
+   "+1 real bug" divergence under the current latent/manifest work.
+
+4. **`traces.c`** (-1): current sweep is `4` vs expected `5`. This is another remaining
+   latent/report-publication mismatch.
 
 **Leak differences:** none in the authoritative sweep. `MEMORY_LEAK_C` parity is exact.
 
@@ -39,17 +44,30 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
 **Skipped files (3):** `infinite.c` (106 procs with infinite loops/Ackermann), `recursion.c`,
 `recursion2.c` — fixpoint exhaustion.
 
-**Notable recent correctness wins:** `cleanup_attribute.c` now matches OCaml again, `angelism.c`
-is back at parity (`7` issues), `memory_leak.c` is back at full parity after the history-aware
-diagnostic fix, `funptr.c` is at parity (`11` issues), `specialization.c` is back to the direct
-OCaml issue set, unspecialized interproc summary application now rejects alias-collapsed callee
-heap roots in the OCaml `AliasingWithAllAliases` cases, the global function-pointer initializer
-end-to-end path is deterministic again after recursively analyzing closure targets from initializer
-summaries, and `compound_literal.c` / `initlistexpr.c` already match OCaml after fixing the sweep
-expectation helper to use exact basenames.
+**Active OCaml-backed correctness focus:**
 
-There are no remaining active store-textual count fixes to pursue without either degrading
-precision (`nullptr.c`) or patching over exported-Textual fidelity loss (`sizeof.c`).
+7. **`manifest_use_after_free`**: Rust still publishes an extra manifest NPE where OCaml keeps
+   only the manifest `AbortProgram(CFree)`.
+
+8. **`access_use_after_free_bad`**: Rust still misses the manifest
+   `AbortProgram(ConstantDereference on l->next)` that OCaml keeps.
+
+9. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: Rust and OCaml
+   still diverge on which latent null paths survive call chains and reify as manifest reports.
+
+Recent groundwork that should stay in place even though the current NPE total moved down:
+- interproc formula import now mirrors OCaml `PulseFormula.and_callee_formula` more closely
+  (shared substitution across the whole callee formula, remembered `conditions` imported first)
+- summary normalization now uses `simplify_for_summary(precondition_vocabulary, keep)` and includes
+  OCaml-style `pre_heap_has_assumptions`
+- latent invalid-access classification is now narrower than "any caller-visible constant deref":
+  pre-existing caller-controlled values can stay latent, true by-ref/outparam slot writes can stay
+  latent, and ordinary callee-written field nulls stay manifest again
+- this narrowing restored the direct `.sil` `store_bad` / `use_not_modeled_bad` regressions and
+  brought `angelism.c` and `funptr.c` back to parity in the authoritative sweep
+
+Remaining active store-textual work is concentrated in the latent/manifest invalid-access cluster
+above. Do not try to "fix" `sizeof.c` in Pulse.
 
 ### Textual pipeline gaps
 
@@ -68,7 +86,13 @@ precision (`nullptr.c`) or patching over exported-Textual fidelity loss (`sizeof
   history-sensitive dedup, but richer OCaml-style trace reconstruction is still incomplete.
 - **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Accepted
   store-textual limitation: exported `<int[]>` arrives without array length or `nbytes`.
-- **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, callee AbortProgram summaries now propagate again, Rust now has a caller-side latent-invalid-access path, and imported pure-call dependencies now survive summary application/normalization. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, latent issue type reporting, and OCaml-aligned publication timing for any still-propagated abort over-reports.
+- **Latent vs manifest invalid-access parity / report timing**: latent/base publishing is now
+  routed through summary classification, prune conditions now carry OCaml-style call-depth
+  provenance, callee `AbortProgram` summaries now propagate again, Rust now has a caller-side
+  `LatentInvalidAccess` path, imported pure-call dependencies now survive summary
+  application/normalization, and `pre_heap_has_assumptions` parity is implemented. Remaining:
+  `manifest_use_after_free`, `access_use_after_free_bad`, wrapper/cycle null paths such as
+  `traverse_and_crash_if_equal_to_root`, and richer OCaml-style latent issue typing/traces.
 
 ## Debugging tools
 

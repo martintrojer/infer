@@ -72,9 +72,12 @@ impl Formula {
 
     /// Add a translated callee condition and remember its call depth.
     pub fn and_condition_direct(&mut self, atom: Atom, depth: usize) -> SatUnsat<Vec<NewEq>> {
+        let normalized_condition = self.normalize_condition_atom(&atom);
         let result = self.enforce_condition_atom(&atom);
         if result.is_sat() {
-            self.record_condition_if_meaningful(atom, depth);
+            if let Some(atom) = normalized_condition {
+                self.record_condition_if_meaningful(atom, depth);
+            }
         }
         result
     }
@@ -257,13 +260,16 @@ impl Formula {
                 operand_to_term(&op2, &self.phi),
             )
         };
+        let normalized_condition = self.normalize_condition_atom(&condition_atom);
         let result = if negated {
             self.and_not_equal(&op1, &op2)
         } else {
             self.phi.and_var_equal(v1, v2)
         };
         if result.is_sat() {
-            self.record_condition_if_meaningful(condition_atom, depth);
+            if let Some(atom) = normalized_condition {
+                self.record_condition_if_meaningful(atom, depth);
+            }
         }
         result
     }
@@ -274,9 +280,12 @@ impl Formula {
             operand_to_term(op1, &self.phi),
             operand_to_term(op2, &self.phi),
         );
+        let normalized_condition = self.normalize_condition_atom(&atom);
         let result = self.and_less_than(op1, op2);
         if result.is_sat() {
-            self.record_condition_if_meaningful(atom, 0);
+            if let Some(atom) = normalized_condition {
+                self.record_condition_if_meaningful(atom, 0);
+            }
         }
         result
     }
@@ -287,9 +296,12 @@ impl Formula {
             operand_to_term(op1, &self.phi),
             operand_to_term(op2, &self.phi),
         );
+        let normalized_condition = self.normalize_condition_atom(&atom);
         let result = self.and_less_equal(op1, op2);
         if result.is_sat() {
-            self.record_condition_if_meaningful(atom, 0);
+            if let Some(atom) = normalized_condition {
+                self.record_condition_if_meaningful(atom, 0);
+            }
         }
         result
     }
@@ -343,21 +355,36 @@ impl Formula {
         // (truthy) or v = 0 (falsy), resolve back to the comparison and add
         // the appropriate atom. This matches OCaml's prune_binop which looks
         // up term_eqs to derive constraints from boolean results.
-        let mut condition_atom = None;
+        let mut comparison_condition_atom = None;
         if c == 0 {
             if let Some(teq) = self.phi.term_eqs.get(&v).cloned() {
-                condition_atom = if negated {
+                comparison_condition_atom = if negated {
                     // prune(v ≠ 0) i.e. v is truthy → the comparison is true
                     comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, false, &self.phi)
                 } else {
                     // prune(v = 0) i.e. v is falsy → the comparison is false (negate it)
                     comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, true, &self.phi)
                 };
-                if let Some(atom) = condition_atom.clone() {
-                    if self.phi.and_atom(atom).is_unsat() {
-                        return SatUnsat::Unsat;
-                    }
-                }
+            }
+        }
+
+        let condition_atom = comparison_condition_atom.clone().unwrap_or_else(|| {
+            if negated {
+                Atom::NotEqual(
+                    operand_to_term(&Operand::AbstractValue(v), &self.phi),
+                    Term::Const(c),
+                )
+            } else {
+                Atom::Equal(
+                    operand_to_term(&Operand::AbstractValue(v), &self.phi),
+                    Term::Const(c),
+                )
+            }
+        });
+        let normalized_condition = self.normalize_condition_atom(&condition_atom);
+        if let Some(atom) = comparison_condition_atom {
+            if self.phi.and_atom(atom).is_unsat() {
+                return SatUnsat::Unsat;
             }
         }
 
@@ -368,20 +395,9 @@ impl Formula {
         };
 
         if result.is_sat() {
-            let atom = condition_atom.unwrap_or_else(|| {
-                if negated {
-                    Atom::NotEqual(
-                        operand_to_term(&Operand::AbstractValue(v), &self.phi),
-                        Term::Const(c),
-                    )
-                } else {
-                    Atom::Equal(
-                        operand_to_term(&Operand::AbstractValue(v), &self.phi),
-                        Term::Const(c),
-                    )
-                }
-            });
-            self.record_condition_if_meaningful(atom, 0);
+            if let Some(atom) = normalized_condition {
+                self.record_condition_if_meaningful(atom, 0);
+            }
         }
 
         result
@@ -547,6 +563,44 @@ impl Formula {
         self.conditions = conditions;
     }
 
+    /// Summary-specific simplification.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.filter_for_summary` calls
+    /// `PulseFormula.simplify ~precondition_vocabulary ~keep` so exported
+    /// summaries keep caller-visible conditions in their original shape but
+    /// substitute away callee-local condition variables.
+    pub fn simplify_for_summary(
+        &mut self,
+        precondition_vocabulary: &HashSet<AbstractValue>,
+        keep: &HashSet<AbstractValue>,
+    ) {
+        self.phi.simplify(keep);
+
+        let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
+        for (atom, depth) in std::mem::take(&mut self.conditions) {
+            let atom = self
+                .phi
+                .simplify_condition_atom_for_summary(&atom, precondition_vocabulary);
+            if atom.is_trivially_true() == Some(true) {
+                continue;
+            }
+            if atom
+                .all_vars()
+                .into_iter()
+                .all(|v| keep.contains(&self.phi.get_repr(v)))
+            {
+                match conditions.get_mut(&atom) {
+                    Some(existing_depth) => *existing_depth = (*existing_depth).min(depth),
+                    None => {
+                        conditions.insert(atom, depth);
+                    }
+                }
+            }
+        }
+
+        self.conditions = conditions;
+    }
+
     fn record_condition_if_meaningful(&mut self, atom: Atom, depth: usize) {
         if atom.is_trivially_true() == Some(true) {
             return;
@@ -556,6 +610,15 @@ impl Formula {
             None => {
                 self.conditions.insert(atom, depth);
             }
+        }
+    }
+
+    fn normalize_condition_atom(&self, atom: &Atom) -> Option<Atom> {
+        let normalized = self.phi.normalize_condition_atom(atom);
+        if normalized.is_trivially_true() == Some(true) {
+            None
+        } else {
+            Some(normalized)
         }
     }
 
@@ -793,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simplify_keeps_condition_shape_without_phi_normalization() {
+    fn test_simplify_keeps_original_nontrivial_local_condition_shape() {
         let mut f = Formula::ttrue();
         let x = AbstractValue::of_raw(1);
         let y = AbstractValue::of_raw(2);
@@ -806,6 +869,74 @@ mod tests {
             f.conditions()
                 .contains_key(&Atom::Equal(Term::Var(x), Term::Var(y))),
             "conditions should keep their original variables instead of collapsing to x = x"
+        );
+    }
+
+    #[test]
+    fn test_simplify_for_summary_drops_redundant_non_precondition_equality() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+
+        assert!(f.prune_eq(x, y, false).is_sat());
+        f.simplify_for_summary(&HashSet::from([x]), &HashSet::from([x]));
+
+        assert!(
+            f.conditions().is_empty(),
+            "summary simplification should drop equality conditions that only mention dead callee-local aliases"
+        );
+    }
+
+    #[test]
+    fn test_simplify_for_summary_rewrites_dead_const_guard_to_visible_alias() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+
+        assert!(f.prune_eq_const(y, 0, false).is_sat());
+        assert!(f.and_equal_vars(x, y).is_sat());
+        f.simplify_for_summary(&HashSet::from([x]), &HashSet::from([x]));
+
+        assert_eq!(
+            f.conditions().get(&Atom::Equal(Term::Var(x), Term::Const(0))),
+            Some(&0),
+            "summary simplification should rewrite dead condition vars onto the visible precondition alias instead of erasing the caller-controlled guard"
+        );
+    }
+
+    #[test]
+    fn test_and_condition_direct_drops_imported_tautology_after_normalization() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+
+        assert!(f.and_equal_vars(x, y).is_sat());
+        assert!(f
+            .and_condition_direct(Atom::Equal(Term::Var(x), Term::Var(y)), 1)
+            .is_sat());
+
+        assert!(
+            f.conditions().is_empty(),
+            "imported conditions already implied by phi should not stay as tautological remembered conditions"
+        );
+    }
+
+    #[test]
+    fn test_and_condition_direct_normalizes_imported_condition_to_known_constant() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+
+        assert!(f.and_equal_const(y, 0).is_sat());
+        assert!(f
+            .and_condition_direct(Atom::Equal(Term::Var(x), Term::Var(y)), 2)
+            .is_sat());
+
+        assert_eq!(
+            f.conditions()
+                .get(&Atom::Equal(Term::Var(x), Term::Const(0))),
+            Some(&2),
+            "imported conditions should be remembered in normalized caller-space form"
         );
     }
 

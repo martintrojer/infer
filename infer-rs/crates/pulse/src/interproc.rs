@@ -18,6 +18,7 @@ use sil::ident::Ident;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
+use sil::specialization::HeapPath;
 use sil::typ::Typ;
 
 use crate::abductive::AbductiveDomain;
@@ -29,6 +30,12 @@ use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::summary::PrePost;
 use crate::value_history::ValueHistory;
+
+#[derive(Debug, Default)]
+pub(crate) struct ApplySummaryOutcome {
+    pub(crate) results: Vec<ExecutionDomain>,
+    pub(crate) alias_specialization: Option<Vec<Vec<HeapPath>>>,
+}
 
 /// Apply a callee's summary to the caller's abstract state.
 ///
@@ -44,10 +51,22 @@ pub fn apply_summary(
     ret_id: &Ident,
     actuals: &[(Exp, Typ)],
     loc: &Location,
-    mut caller_state: AbductiveDomain,
+    caller_state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
+    apply_summary_with_aliasing(caller_pdesc, pre_post, ret_id, actuals, loc, caller_state).results
+}
+
+pub(crate) fn apply_summary_with_aliasing(
+    caller_pdesc: &sil::procdesc::Procdesc,
+    pre_post: &PrePost,
+    ret_id: &Ident,
+    actuals: &[(Exp, Typ)],
+    loc: &Location,
+    mut caller_state: AbductiveDomain,
+) -> ApplySummaryOutcome {
     // Step 1: Build the callee→caller substitution from formals→actuals
     let mut subst: HashMap<AbstractValue, AbstractValue> = HashMap::new();
+    let mut callee_heap_paths: HashMap<AbstractValue, Option<HeapPath>> = HashMap::new();
     let mut formal_histories: std::collections::BTreeMap<Pvar, ValueHistory> =
         std::collections::BTreeMap::new();
 
@@ -57,6 +76,7 @@ pub fn apply_summary(
                 operations::eval_or_fresh_with_history(actual_exp, loc, &mut caller_state);
             subst.insert(*formal_addr, actual_val.addr);
             formal_histories.insert(formal_pvar.clone(), actual_val.history);
+            callee_heap_paths.entry(*formal_addr).or_insert(None);
         }
     }
 
@@ -74,12 +94,24 @@ pub fn apply_summary(
     // formal values correctly correspond to actual values.
     {
         let pre_heap = &pre_post.pre.heap;
-        let subst_snapshot: Vec<_> = subst.iter().map(|(k, v)| (*k, *v)).collect();
-        for (formal_stack_addr, actual_val) in &subst_snapshot {
+        let subst_snapshot: Vec<_> = pre_post
+            .formals
+            .iter()
+            .filter_map(|(formal_pvar, formal_stack_addr)| {
+                subst
+                    .get(formal_stack_addr)
+                    .copied()
+                    .map(|actual_val| (formal_pvar, *formal_stack_addr, actual_val))
+            })
+            .collect();
+        for (formal_pvar, formal_stack_addr, actual_val) in &subst_snapshot {
             if let Some(edges) = pre_heap.get_edges(*formal_stack_addr) {
                 for (access, target) in edges.iter() {
                     if matches!(access, Access::Dereference) {
                         subst.entry(*target).or_insert(*actual_val);
+                        callee_heap_paths
+                            .entry(*target)
+                            .or_insert_with(|| Some(pvar_heap_path(formal_pvar)));
                     }
                 }
             }
@@ -88,11 +120,21 @@ pub fn apply_summary(
 
     // Step 1b: Map callee globals to caller globals before pre-materialization.
     // Cross-ref: OCaml PulseInterproc.ml materialize_pre_for_globals.
-    extend_subst_with_callee_globals(pre_post, &mut subst, &mut caller_state);
+    extend_subst_with_callee_globals(
+        pre_post,
+        &mut subst,
+        &mut callee_heap_paths,
+        &mut caller_state,
+    );
 
     // Step 1c: Translate constant array indices into caller-space values.
     // Cross-ref: OCaml PulseInterproc.ml materialize_pre_from_array_indices.
-    extend_subst_with_callee_array_indices(pre_post, &mut subst, &mut caller_state);
+    extend_subst_with_callee_array_indices(
+        pre_post,
+        &mut subst,
+        &mut callee_heap_paths,
+        &mut caller_state,
+    );
 
     // Step 1d: Materialize pre-condition — walk the callee's pre-state heap
     // and match against the caller's heap. Check that callee's pre-conditions
@@ -108,6 +150,7 @@ pub fn apply_summary(
         &pre_post.post,
         &formal_stack_addrs,
         &mut subst,
+        &mut callee_heap_paths,
         &mut caller_state,
         loc,
     ) {
@@ -116,6 +159,7 @@ pub fn apply_summary(
             caller_addr,
             callee_addr,
             other_callee_addr,
+            alias_groups,
         } => {
             // Cross-ref: OCaml `PulseInterproc.apply_summary` turns
             // `AliasingWithAllAliases` into an inapplicable pre/post so the
@@ -124,7 +168,10 @@ pub fn apply_summary(
             log::debug!(
                 "[apply_summary] rejected due to aliasing contradiction: caller={caller_addr} callee={callee_addr} other={other_callee_addr}"
             );
-            return vec![];
+            return ApplySummaryOutcome {
+                results: vec![],
+                alias_specialization: alias_groups,
+            };
         }
         PreMaterializeResult::Ok => None,
     };
@@ -203,7 +250,7 @@ pub fn apply_summary(
     );
     if !translate_formula(&pre_post.post.path_condition, &subst, &mut caller_state) {
         log::debug!("[apply_summary] → rejected (Unsat)");
-        return vec![]; // pre_post inapplicable to this caller state
+        return ApplySummaryOutcome::default(); // pre_post inapplicable to this caller state
     }
     log::debug!("[apply_summary] → accepted (Sat)");
 
@@ -235,22 +282,28 @@ pub fn apply_summary(
     }
     if let Some(diag) = pre_error {
         return if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
-            vec![ExecutionDomain::AbortProgram {
-                state: Box::new(caller_state),
-                diagnostic: Box::new(diag),
-            }]
+            ApplySummaryOutcome {
+                results: vec![ExecutionDomain::AbortProgram {
+                    state: Box::new(caller_state),
+                    diagnostic: Box::new(diag),
+                }],
+                alias_specialization: None,
+            }
         } else {
-            vec![ExecutionDomain::LatentAbortProgram {
-                state: Box::new(caller_state),
-                diagnostic: Box::new(diag),
-            }]
+            ApplySummaryOutcome {
+                results: vec![ExecutionDomain::LatentAbortProgram {
+                    state: Box::new(caller_state),
+                    diagnostic: Box::new(diag),
+                }],
+                alias_specialization: None,
+            }
         };
     }
 
     // Return the same execution domain kind as the callee's pre_post.
     // Cross-ref: OCaml PulseCallOperations.ml apply_callee dispatches
     // on the callee's execution state to determine the caller's state.
-    match pre_post.kind {
+    let results = match pre_post.kind {
         crate::summary::PrePostKind::ExitProgram => {
             vec![ExecutionDomain::ExitProgram(caller_state)]
         }
@@ -310,6 +363,11 @@ pub fn apply_summary(
                 vec![]
             }
         }
+    };
+
+    ApplySummaryOutcome {
+        results,
+        alias_specialization: None,
     }
 }
 
@@ -418,19 +476,100 @@ enum PreMaterializeResult {
         caller_addr: AbstractValue,
         callee_addr: AbstractValue,
         other_callee_addr: AbstractValue,
+        alias_groups: Option<Vec<Vec<HeapPath>>>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AliasConflict {
+    caller_addr: AbstractValue,
+    callee_addr: AbstractValue,
+    other_callee_addr: AbstractValue,
 }
 
 #[derive(Default)]
 struct CallerAliasRoots {
     // Callee roots that have their own heap cell in the summary pre.
-    pre_backed: HashSet<AbstractValue>,
+    pre_backed: HashMap<AbstractValue, Option<HeapPath>>,
     // Callee roots that have their own heap cell in the summary post.
-    post_backed: HashSet<AbstractValue>,
+    post_backed: HashMap<AbstractValue, Option<HeapPath>>,
+}
+
+struct AliasingCheck<'a> {
+    callee_pre: &'a crate::base_domain::BaseDomain,
+    callee_post: &'a AbductiveDomain,
+    formal_stack_addrs: &'a std::collections::HashSet<AbstractValue>,
 }
 
 fn callee_heap_contains(heap: &crate::base_memory::BaseMemory, addr: AbstractValue) -> bool {
     heap.get_edges(addr).is_some()
+}
+
+fn pvar_heap_path(pvar: &Pvar) -> HeapPath {
+    HeapPath::Dereference(Box::new(HeapPath::Pvar(pvar.clone())))
+}
+
+fn extend_heap_path(parent: Option<&HeapPath>, access: &Access) -> Option<HeapPath> {
+    let parent = parent?.clone();
+    match access {
+        Access::FieldAccess(field) => Some(HeapPath::FieldAccess(field.clone(), Box::new(parent))),
+        Access::Dereference => Some(HeapPath::Dereference(Box::new(parent))),
+        Access::ArrayAccess(_, _) => None,
+    }
+}
+
+fn heap_path_sort_key(path: &HeapPath) -> String {
+    format!("{path}")
+}
+
+fn canonicalize_alias_groups(mut groups: Vec<Vec<HeapPath>>) -> Vec<Vec<HeapPath>> {
+    for group in &mut groups {
+        group.sort_by_key(heap_path_sort_key);
+        group.dedup_by(|left, right| heap_path_sort_key(left) == heap_path_sort_key(right));
+    }
+    groups.retain(|group| group.len() > 1);
+    groups.sort_by_key(|group| {
+        group
+            .iter()
+            .map(heap_path_sort_key)
+            .collect::<Vec<_>>()
+            .join(" = ")
+    });
+    groups.dedup_by(|left, right| {
+        left.iter().map(heap_path_sort_key).collect::<Vec<_>>()
+            == right.iter().map(heap_path_sort_key).collect::<Vec<_>>()
+    });
+    groups
+}
+
+fn record_conflicting_paths(
+    seen: &HashMap<AbstractValue, Option<HeapPath>>,
+    caller_repr: AbstractValue,
+    callee_addr: AbstractValue,
+    current_path: Option<&HeapPath>,
+    alias_groups: &mut HashMap<AbstractValue, HashSet<HeapPath>>,
+    first_conflict: &mut Option<AliasConflict>,
+) -> Result<(), AliasConflict> {
+    for (&other_callee_addr, other_path) in seen {
+        if other_callee_addr == callee_addr {
+            continue;
+        }
+        let conflict = AliasConflict {
+            caller_addr: caller_repr,
+            callee_addr,
+            other_callee_addr,
+        };
+        first_conflict.get_or_insert(conflict);
+        match (current_path, other_path.as_ref()) {
+            (Some(current_path), Some(other_path)) => {
+                let group = alias_groups.entry(caller_repr).or_default();
+                group.insert(current_path.clone());
+                group.insert(other_path.clone());
+            }
+            _ => return Err(conflict),
+        }
+    }
+    Ok(())
 }
 
 /// Detect when multiple distinct callee heap roots collapse onto the same
@@ -448,55 +587,61 @@ fn callee_heap_contains(heap: &crate::base_memory::BaseMemory, addr: AbstractVal
 /// order so the result stays deterministic even when the initial substitution
 /// is explored in a different order.
 fn find_aliasing_contradiction(
-    callee_pre: &crate::base_domain::BaseDomain,
-    callee_post: &AbductiveDomain,
-    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    aliasing: &AliasingCheck<'_>,
     caller_alias_roots: &mut HashMap<AbstractValue, CallerAliasRoots>,
-    caller_addr: AbstractValue,
+    callee_heap_paths: &HashMap<AbstractValue, Option<HeapPath>>,
+    alias_groups: &mut HashMap<AbstractValue, HashSet<HeapPath>>,
+    first_conflict: &mut Option<AliasConflict>,
+    caller_repr: AbstractValue,
     callee_addr: AbstractValue,
-    caller_state: &AbductiveDomain,
-) -> Option<AbstractValue> {
-    if formal_stack_addrs.contains(&callee_addr) {
-        return None;
+) -> Result<(), AliasConflict> {
+    if aliasing.formal_stack_addrs.contains(&callee_addr) {
+        return Ok(());
     }
 
-    let caller_repr = caller_state.get_var_repr(caller_addr);
-    let in_pre = callee_heap_contains(&callee_pre.heap, callee_addr);
-    let in_post = callee_heap_contains(&callee_post.post.heap, callee_addr);
+    let in_pre = callee_heap_contains(&aliasing.callee_pre.heap, callee_addr);
+    let in_post = callee_heap_contains(&aliasing.callee_post.post.heap, callee_addr);
     if !in_pre && !in_post {
         // OCaml only raises the alias contradiction when the aliased callee
         // values are meaningful heap roots in the summary; otherwise equality
         // can be handled as normal caller-side aliasing.
-        return None;
+        return Ok(());
     }
 
     let seen = caller_alias_roots.entry(caller_repr).or_default();
+    let current_path = callee_heap_paths
+        .get(&callee_addr)
+        .and_then(|path| path.as_ref());
 
     if in_pre {
-        if let Some(other) = seen
-            .pre_backed
-            .iter()
-            .copied()
-            .find(|other| *other != callee_addr)
-        {
-            return Some(other);
-        }
-        seen.pre_backed.insert(callee_addr);
+        record_conflicting_paths(
+            &seen.pre_backed,
+            caller_repr,
+            callee_addr,
+            current_path,
+            alias_groups,
+            first_conflict,
+        )?;
+        seen.pre_backed
+            .entry(callee_addr)
+            .or_insert_with(|| current_path.cloned());
     }
 
     if in_post {
-        if let Some(other) = seen
-            .post_backed
-            .iter()
-            .copied()
-            .find(|other| *other != callee_addr)
-        {
-            return Some(other);
-        }
-        seen.post_backed.insert(callee_addr);
+        record_conflicting_paths(
+            &seen.post_backed,
+            caller_repr,
+            callee_addr,
+            current_path,
+            alias_groups,
+            first_conflict,
+        )?;
+        seen.post_backed
+            .entry(callee_addr)
+            .or_insert_with(|| current_path.cloned());
     }
 
-    None
+    Ok(())
 }
 
 fn materialize_pre(
@@ -504,11 +649,19 @@ fn materialize_pre(
     callee_post: &AbductiveDomain,
     formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_heap_paths: &mut HashMap<AbstractValue, Option<HeapPath>>,
     caller_state: &mut AbductiveDomain,
     loc: &Location,
 ) -> PreMaterializeResult {
     let mut visited = std::collections::HashSet::new();
     let mut caller_alias_roots: HashMap<AbstractValue, CallerAliasRoots> = HashMap::new();
+    let mut alias_groups: HashMap<AbstractValue, HashSet<HeapPath>> = HashMap::new();
+    let mut first_alias_conflict = None;
+    let aliasing = AliasingCheck {
+        callee_pre,
+        callee_post,
+        formal_stack_addrs,
+    };
     let mut worklist: Vec<AbstractValue> = subst.keys().copied().collect();
     // Record first error but continue walking the pre (matching OCaml's
     // first_error field in call_state). OCaml (PulseInterproc.ml:601-624):
@@ -522,19 +675,21 @@ fn materialize_pre(
         }
 
         let caller_addr = resolve_mut(subst, callee_addr);
-        if let Some(other_callee_addr) = find_aliasing_contradiction(
-            callee_pre,
-            callee_post,
-            formal_stack_addrs,
+        let caller_repr = caller_state.get_var_repr(caller_addr);
+        if let Err(conflict) = find_aliasing_contradiction(
+            &aliasing,
             &mut caller_alias_roots,
-            caller_addr,
+            callee_heap_paths,
+            &mut alias_groups,
+            &mut first_alias_conflict,
+            caller_repr,
             callee_addr,
-            caller_state,
         ) {
             return PreMaterializeResult::AliasingContradiction {
-                caller_addr: caller_state.get_var_repr(caller_addr),
-                callee_addr,
-                other_callee_addr,
+                caller_addr: conflict.caller_addr,
+                callee_addr: conflict.callee_addr,
+                other_callee_addr: conflict.other_callee_addr,
+                alias_groups: None,
             };
         }
 
@@ -585,11 +740,36 @@ fn materialize_pre(
                 };
 
                 subst.entry(*callee_target).or_insert(caller_target);
+                let parent_path = callee_heap_paths
+                    .get(&callee_addr)
+                    .and_then(|path| path.as_ref());
+                let child_path = extend_heap_path(parent_path, access);
+                callee_heap_paths
+                    .entry(*callee_target)
+                    .or_insert(child_path);
 
                 if !visited.contains(callee_target) {
                     worklist.push(*callee_target);
                 }
             }
+        }
+    }
+
+    if !alias_groups.is_empty() {
+        let alias_groups = canonicalize_alias_groups(
+            alias_groups
+                .into_values()
+                .map(|group| group.into_iter().collect())
+                .collect(),
+        );
+        if !alias_groups.is_empty() {
+            let conflict = first_alias_conflict.expect("alias groups should have a first conflict");
+            return PreMaterializeResult::AliasingContradiction {
+                caller_addr: conflict.caller_addr,
+                callee_addr: conflict.callee_addr,
+                other_callee_addr: conflict.other_callee_addr,
+                alias_groups: Some(alias_groups),
+            };
         }
     }
 
@@ -602,6 +782,7 @@ fn materialize_pre(
 fn extend_subst_with_callee_globals(
     pre_post: &PrePost,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_heap_paths: &mut HashMap<AbstractValue, Option<HeapPath>>,
     caller_state: &mut AbductiveDomain,
 ) {
     let mut map_globals = |stack: &crate::base_stack::BaseStack| {
@@ -611,6 +792,11 @@ fn extend_subst_with_callee_globals(
             }
             let caller_addr = caller_state.eval_var(var);
             subst.entry(*addr).or_insert(caller_addr);
+            if let Some(pvar) = var.get_pvar() {
+                callee_heap_paths
+                    .entry(*addr)
+                    .or_insert_with(|| Some(pvar_heap_path(pvar)));
+            }
         }
     };
 
@@ -621,6 +807,7 @@ fn extend_subst_with_callee_globals(
 fn extend_subst_with_callee_array_indices(
     pre_post: &PrePost,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_heap_paths: &mut HashMap<AbstractValue, Option<HeapPath>>,
     caller_state: &mut AbductiveDomain,
 ) {
     let mut map_indices = |heap: &crate::base_memory::BaseMemory| {
@@ -639,6 +826,7 @@ fn extend_subst_with_callee_array_indices(
                 let _ = caller_state.and_equal_const(caller_idx, c);
                 let caller_idx = caller_state.canonicalize_for_access(caller_idx);
                 subst.entry(*callee_idx).or_insert(caller_idx);
+                callee_heap_paths.entry(*callee_idx).or_insert(None);
             }
         }
     };
@@ -704,13 +892,60 @@ fn translate_formula(
     caller_state: &mut AbductiveDomain,
 ) -> bool {
     let phi = &callee_formula.phi();
+    let mut extended_subst = subst.clone();
+    let mut ensure_formula_var = |callee_v: AbstractValue| {
+        extended_subst
+            .entry(callee_v)
+            .or_insert_with(|| callee_v.mk_fresh_same_kind());
+    };
+
+    // Cross-ref: OCaml `PulseFormula.and_callee_formula` uses the same
+    // substitution builder for both remembered conditions and the rest of the
+    // callee phi. Any previously unseen callee value gets a fresh caller value
+    // of the same kind instead of being resolved away eagerly.
+    for atom in callee_formula.conditions().keys() {
+        for v in atom.all_vars() {
+            ensure_formula_var(v);
+        }
+    }
+    for (&callee_v, lin) in &phi.linear_eqs {
+        ensure_formula_var(callee_v);
+        for dep in lin.vars.keys() {
+            ensure_formula_var(*dep);
+        }
+    }
+    for atom in &phi.atoms {
+        for v in atom.all_vars() {
+            ensure_formula_var(v);
+        }
+    }
+    for (key, ret) in phi.iter_fn_app_eqs() {
+        ensure_formula_var(*ret);
+        for actual in &key.actuals {
+            let crate::formula::phi::FnAppActual::Var(v) = actual else {
+                continue;
+            };
+            ensure_formula_var(*v);
+        }
+    }
+
+    // Cross-ref: OCaml `PulseFormula.and_callee_formula` conjoins remembered
+    // conditions before importing the rest of the callee phi so caller-visible
+    // guards do not get trivialized by freshly imported equalities.
+    for (atom, depth) in callee_formula.conditions() {
+        let translated = atom.translate(|v| *extended_subst.get(&v).expect("formula subst"));
+        log::debug!("    condition[{depth}]: {atom} → {translated}");
+        let sat = caller_state.and_condition_direct(translated, depth + 1);
+        if sat.is_unsat() {
+            log::debug!("    → UNSAT!");
+            return false;
+        }
+    }
 
     // Translate linear equations: for each callee_v = lin_expr,
     // translate all variables in the linear expression to caller space
     for (&callee_v, lin) in &phi.linear_eqs {
-        let Some(&caller_v) = subst.get(&callee_v) else {
-            continue;
-        };
+        let caller_v = *extended_subst.get(&callee_v).expect("formula subst");
         // Check if it's a constant
         if let Some(q) = lin.get_as_const() {
             let c = *q.numer() / *q.denom();
@@ -721,17 +956,16 @@ fn translate_formula(
         }
         // Check if it's a single variable
         if let Some(callee_other) = lin.get_as_var() {
-            if let Some(&caller_other) = subst.get(&callee_other) {
-                if caller_state.and_equal(caller_v, caller_other).is_unsat() {
-                    return false;
-                }
+            let caller_other = *extended_subst.get(&callee_other).expect("formula subst");
+            if caller_state.and_equal(caller_v, caller_other).is_unsat() {
+                return false;
             }
             continue;
         }
         // For more complex linear expressions, translate if all vars are in subst
-        let all_vars_mapped = lin.vars.keys().all(|v| subst.contains_key(v));
+        let all_vars_mapped = lin.vars.keys().all(|v| extended_subst.contains_key(v));
         if all_vars_mapped {
-            let translated = lin.translate(|v| subst.get(&v).copied().unwrap_or(v));
+            let translated = lin.translate(|v| *extended_subst.get(&v).expect("formula subst"));
             if caller_state
                 .and_equal_linear(caller_v, translated)
                 .is_unsat()
@@ -741,44 +975,6 @@ fn translate_formula(
         }
     }
 
-    // Build extended subst: add callee constants not in formal→actual subst.
-    // This handles atoms like `x >= 0` where `0` is a callee-local abstract
-    // value not in the subst. Without this, atoms with callee constants
-    // are either skipped or translated with dangling callee values.
-    // Cross-ref: OCaml PulseInterproc.ml translates formula with full
-    // variable resolution.
-    let mut extended_subst = subst.clone();
-    for atom in &phi.atoms {
-        for v in atom.all_vars() {
-            extended_subst.entry(v).or_insert_with(|| {
-                if let Some(q) = phi.get_known_const(v) {
-                    if q.is_integer() {
-                        let c = *q.numer() / *q.denom();
-                        let fresh = crate::abstract_value::AbstractValue::mk_fresh();
-                        caller_state.and_equal_const(fresh, c);
-                        return fresh;
-                    }
-                }
-                v // unmapped, keep as-is (will be filtered by all_mapped check)
-            });
-        }
-    }
-    for atom in callee_formula.conditions().keys() {
-        for v in atom.all_vars() {
-            extended_subst.entry(v).or_insert_with(|| {
-                if let Some(q) = phi.get_known_const(v) {
-                    if q.is_integer() {
-                        let c = *q.numer() / *q.denom();
-                        let fresh = crate::abstract_value::AbstractValue::mk_fresh();
-                        caller_state.and_equal_const(fresh, c);
-                        return fresh;
-                    }
-                }
-                v // unmapped, keep as-is (will be filtered by all_mapped check)
-            });
-        }
-    }
-    // Translate atoms using extended subst
     log::debug!(
         "  [translate_formula] atoms={}, conditions={}, subst_size={}, extended_subst_size={}",
         phi.atoms.len(),
@@ -843,23 +1039,6 @@ fn translate_formula(
             return false;
         }
     }
-
-    for (atom, depth) in callee_formula.conditions() {
-        let all_mapped = atom
-            .all_vars()
-            .iter()
-            .all(|v| extended_subst.contains_key(v));
-        if !all_mapped {
-            continue;
-        }
-        let translated = atom.translate(|v| extended_subst.get(&v).copied().unwrap_or(v));
-        log::debug!("    condition[{depth}]: {atom} → {translated}");
-        let sat = caller_state.and_condition_direct(translated, depth + 1);
-        if sat.is_unsat() {
-            log::debug!("    → UNSAT!");
-            return false;
-        }
-    }
     true
 }
 
@@ -896,12 +1075,14 @@ mod tests {
     use super::*;
     use crate::attribute::Attribute;
     use crate::value_history::ValueHistory;
+    use sil::fieldname::Fieldname;
     use sil::ident::IdentName;
     use sil::int_lit::IntLit;
     use sil::mangled::Mangled;
     use sil::procdesc::Procdesc;
     use sil::procname::Procname;
     use sil::pvar::Pvar;
+    use sil::qualified_cpp_name::QualifiedCppName;
     use sil::var::Var;
 
     fn invalidation_history(invalidation: &crate::invalidation::Invalidation) -> ValueHistory {
@@ -1167,6 +1348,89 @@ mod tests {
         assert!(
             results.is_empty(),
             "unspecialized summary should be rejected when aliased actuals collapse disjoint callee formals"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_reports_heap_path_alias_specialization() {
+        let node_struct = sil::typ::TypeName::CStruct(QualifiedCppName::from_string("node"));
+        let next_field = Fieldname::make(node_struct, "next");
+
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        // Cross-ref: OCaml records aliasing while materializing the callee
+        // precondition. Build the cycle through PRE edges, not only POST
+        // writes, so the Rust contradiction follows the same path.
+        let next_val = callee_state.read_heap(p_val, Access::FieldAccess(next_field.clone()));
+        callee_state.read_heap(next_val, Access::Dereference);
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(p_pvar.clone(), p_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+        caller_state
+            .post
+            .heap
+            .add_edge(x_addr, Access::FieldAccess(next_field.clone()), x_addr);
+
+        let outcome = apply_summary_with_aliasing(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(
+            outcome.results.is_empty(),
+            "unspecialized summary should be rejected, got {:?}",
+            outcome.results
+        );
+        let alias_groups = outcome
+            .alias_specialization
+            .expect("supported heap-path alias contradiction should request specialization");
+        let alias_groups: Vec<Vec<String>> = alias_groups
+            .into_iter()
+            .map(|group| group.into_iter().map(|path| format!("{path}")).collect())
+            .collect();
+        assert_eq!(
+            alias_groups,
+            vec![vec![
+                format!("{}", pvar_heap_path(&p_pvar)),
+                format!(
+                    "{}",
+                    HeapPath::FieldAccess(next_field.clone(), Box::new(pvar_heap_path(&p_pvar)))
+                )
+            ]]
         );
     }
 
@@ -1774,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_summary_keeps_still_latent_abort_as_latent() {
+    fn test_apply_summary_keeps_latent_abort_when_imported_condition_depends_on_caller() {
         let (pre_post, diagnostic) = mk_latent_abort_pre_post();
 
         let caller_pname = Procname::c_from_string("caller");
@@ -1795,11 +2059,18 @@ mod tests {
             caller_state,
         );
 
-        assert!(matches!(
-            results.as_slice(),
-            [ExecutionDomain::LatentAbortProgram { diagnostic: found, .. }]
-                if found.as_ref() == &diagnostic
-        ));
+        // Cross-ref: OCaml `PulseFormula.and_callee_formula` imports remembered
+        // conditions before the rest of the callee phi. The imported `*p == 4`
+        // guard is therefore still caller-controlled here and must remain
+        // latent until some caller proves `x == 4`.
+        assert!(
+            matches!(
+                results.as_slice(),
+                [ExecutionDomain::LatentAbortProgram { diagnostic: found, .. }]
+                    if found.as_ref() == &diagnostic
+            ),
+            "expected caller-dependent imported condition to keep latent abort, got {results:?}"
+        );
     }
 
     #[test]
@@ -1993,7 +2264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_summary_keeps_latent_precondition_violation_as_latent() {
+    fn test_apply_summary_keeps_latent_precondition_violation_when_flag_depends_on_caller() {
         let pre_post = mk_latent_precondition_pre_post();
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2020,10 +2291,13 @@ mod tests {
             caller_state,
         );
 
-        assert!(matches!(
-            results.as_slice(),
-            [ExecutionDomain::LatentAbortProgram { .. }]
-        ));
+        assert!(
+            matches!(
+                results.as_slice(),
+                [ExecutionDomain::LatentAbortProgram { .. }]
+            ),
+            "expected caller-dependent precondition violation to stay latent, got {results:?}"
+        );
     }
 
     #[test]

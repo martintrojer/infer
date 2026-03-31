@@ -1875,6 +1875,192 @@ fn test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent() {
     );
 }
 
+#[test]
+fn test_e2e_cyclic_field_write_reifies_latent_abort_in_caller() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        type node = {next: *node}
+        define traverse_one_step_and_crash_if_equal_to_root(p: *node) : void {
+          local old_p: *node, crash: *int
+          #entry:
+            n0:*node = load &p
+            store &old_p <- n0:*node
+            n1:*node = load &p
+            n2:*node = load n1.node.next
+            store &p <- n2:*node
+            n3:*node = load &old_p
+            n4:*node = load &p
+            jmp equal, notequal
+          #equal:
+            prune __sil_eq(n3, n4)
+            store &crash <- 0:*int
+            n5:*int = load &crash
+            store n5 <- 42:int
+            ret null
+          #notequal:
+            prune __sil_lnot(__sil_eq(n3, n4))
+            ret null
+        }
+        define crash_after_one_node_bad(q: *node) : void {
+          #entry:
+            n0:*node = load &q
+            n1:*node = load &q
+            store n1.node.next <- n0:*node
+            _ = traverse_one_step_and_crash_if_equal_to_root(n0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let traverse = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}").contains("traverse_one_step"))
+        .map(|(_, summary)| summary)
+        .expect("traverse summary should exist");
+    assert!(
+        traverse.diagnostics.is_empty(),
+        "callee should keep the null dereference latent before the caller shape is known"
+    );
+
+    let caller = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}").contains("crash_after_one_node_bad"))
+        .map(|(_, summary)| summary)
+        .expect("caller summary should exist");
+    assert!(
+        caller
+            .pre_posts
+            .iter()
+            .any(|pp| pp.kind == pulse::summary::PrePostKind::AbortProgram),
+        "caller should reify the latent abort once it writes the one-node cycle"
+    );
+    assert!(
+        caller
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "caller should publish the reified null dereference"
+    );
+}
+
+#[test]
+fn test_e2e_latent_chain_stays_latent_until_manifest_callsite() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        define latent_dereference(a: int, p: *int) : void {
+          #entry:
+            n0:int = load &a
+            jmp then_, else_
+          #then_:
+            prune __sil_eq(n0, 4)
+            n1:*int = load &p
+            store n1 <- 42:int
+            ret null
+          #else_:
+            prune __sil_lnot(__sil_eq(n0, 4))
+            ret null
+        }
+        define propagate_latent_1_latent(a1: int) : void {
+          #entry:
+            n0:int = load &a1
+            _ = latent_dereference(n0, 0)
+            ret null
+        }
+        define propagate_latent_2_latent(a2: int) : void {
+          #entry:
+            n0:int = load &a2
+            _ = propagate_latent_1_latent(n0)
+            ret null
+        }
+        define propagate_latent_3_latent(a3: int) : void {
+          #entry:
+            n0:int = load &a3
+            _ = propagate_latent_2_latent(n0)
+            ret null
+        }
+        define make_latent_manifest() : void {
+          #entry:
+            _ = propagate_latent_3_latent(4)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summaries = store.to_vec();
+
+    let direct = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}").contains("latent_dereference"))
+        .map(|(_, summary)| summary)
+        .expect("latent_dereference summary should exist");
+    assert!(
+        direct.diagnostics.is_empty(),
+        "latent_dereference should export only preconditions, not a manifest report"
+    );
+
+    for proc_name in [
+        "propagate_latent_1_latent",
+        "propagate_latent_2_latent",
+        "propagate_latent_3_latent",
+    ] {
+        let summary = summaries
+            .iter()
+            .find(|(pname, _)| format!("{pname}").contains(proc_name))
+            .map(|(_, summary)| summary)
+            .unwrap_or_else(|| panic!("{proc_name} summary should exist"));
+        let kinds: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.kind))
+            .collect();
+        let conditions: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.post.path_condition.conditions()))
+            .collect();
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "{proc_name} should stay latent, got diagnostics={:?} kinds={kinds:?} conditions={conditions:?}",
+            summary
+                .diagnostics
+                .iter()
+                .map(|d| d.get_issue_type())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            summary.pre_posts.iter().any(|pp| {
+                matches!(
+                    pp.kind,
+                    pulse::summary::PrePostKind::LatentAbortProgram
+                        | pulse::summary::PrePostKind::LatentInvalidAccess
+                )
+            }),
+            "{proc_name} should keep a latent pre/post, got kinds={kinds:?} conditions={conditions:?}"
+        );
+    }
+
+    let manifest = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}").contains("make_latent_manifest"))
+        .map(|(_, summary)| summary)
+        .expect("make_latent_manifest summary should exist");
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "make_latent_manifest should publish the reified null dereference"
+    );
+}
+
 /// Test memory leak detection: malloc without free should report MEMORY_LEAK_C.
 #[test]
 fn test_e2e_memory_leak() {
