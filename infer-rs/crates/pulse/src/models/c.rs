@@ -192,7 +192,11 @@ pub(crate) fn matches_configured_wrapper(callee: &Procname, cfg: &config::InferC
 /// Returns two disjuncts: fresh non-null value + null value.
 /// Used for functions like fopen/getcwd that may return NULL on failure
 /// but whose return values are NOT tracked as heap allocations.
-fn fresh_or_null(ret_id: &Ident, loc: &Location, state: AbductiveDomain) -> Vec<ExecutionDomain> {
+pub(crate) fn fresh_or_null(
+    ret_id: &Ident,
+    loc: &Location,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
     let mut ok_state = state.clone();
     let addr = AbstractValue::mk_fresh();
     // Constrain non-null return to be positive so prune(addr = 0) is Unsat.

@@ -5,8 +5,16 @@
 
 //! End-to-end Pulse tests: Textual .sil → parse → to_sil → Pulse → diagnostics.
 
+use std::sync::{LazyLock, Mutex};
+
 use diagnostics::issue_type::IssueTypeId;
 use test_harness::textual_utils;
+
+// The end-to-end test binary exercises shared global analysis state (for
+// example thread-local abstract-value allocation and global metadata caches).
+// Running its per-procedure analyzers concurrently across unrelated tests is
+// currently flaky, so serialize analysis inside this integration binary.
+static ANALYZE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Adapter for running Pulse through the ondemand interprocedural runner.
 struct PulseInterChecker;
@@ -21,6 +29,9 @@ impl ondemand::checker::InterChecker for PulseInterChecker {
         pdesc: &sil::procdesc::Procdesc,
         ctx: &ondemand::checker::AnalysisContext<Self::Summary>,
     ) -> Self::Summary {
+        let _guard = ANALYZE_LOCK
+            .lock()
+            .expect("end-to-end analyze lock poisoned");
         analyze_with_spec_loop(pdesc, ctx, None, 0)
     }
 }
@@ -1968,6 +1979,50 @@ fn test_e2e_memory_leak_realloc_reports_both_null_origins() {
     assert!(
         report.matches(second_qualifier).count() == 1,
         "missing second null origin in report:\n{report}"
+    );
+}
+
+/// Regression: keep reporting the real null dereference in
+/// `FN_nullptr_deref_old_bad`, even though OCaml's `issues.exp` intentionally
+/// omits it as a known false negative caused by recency forgetting.
+///
+/// Run explicitly:
+///   cargo test -p pulse --test end_to_end test_e2e_nullptr_old_vector_element_is_still_tracked -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_e2e_nullptr_old_vector_element_is_still_tracked() {
+    use test_harness::infer_runner::InferRunner;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let c_dir = test_harness::fixtures::ocaml_c_test_dir().join("pulse");
+    let c_path = c_dir.join("nullptr.c");
+    if !c_path.exists() {
+        eprintln!("skipping: nullptr.c not found");
+        return;
+    }
+
+    let sil_path = runner
+        .dump_textual_for_c(&c_path)
+        .expect("dump-textual should succeed for nullptr.c");
+    let report = run_infer_rs_cli_report(&sil_path, Some("nullptr.c"), &c_dir)
+        .expect("infer-rs CLI should analyze nullptr.c");
+
+    let proc_marker = "\"procedure\": \"FN_nullptr_deref_old_bad\"";
+    let qualifier =
+        "\"qualifier\": \"address could be null (null value originating from line 72) and is dereferenced\"";
+
+    assert_eq!(
+        report.matches(proc_marker).count(),
+        1,
+        "FN_nullptr_deref_old_bad should stay reported as a real bug, got:\n{report}"
+    );
+    assert!(
+        report.matches(qualifier).count() == 1,
+        "missing expected old-element null-deref qualifier:\n{report}"
     );
 }
 

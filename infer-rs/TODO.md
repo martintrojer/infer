@@ -16,21 +16,25 @@ remaining count gaps after removing the old basename-matching measurement bug.
    `sizeof(c) / sizeof(c[0]) != 2` branches. Treat this as a `--store-textual` /
    `--export-textual` fidelity limit unless the interface preserves richer `Sizeof` data.
 
-**Remaining analysis gap:**
+**Accepted correctness-positive divergence from OCaml:**
 
 2. **`nullptr.c`** (+1): `create_null_path2_bad_FN` is restored and `unknown_from_parameters_latent`
-   no longer inflates the manifest NPE count. The remaining store-textual mismatch is the extra
-   `FN_nullptr_deref_old_bad`.
+   no longer inflates the manifest NPE count. The only remaining file-level mismatch is the extra
+   `FN_nullptr_deref_old_bad`, which is a real bug that OCaml intentionally misses because of the
+   recency limitation documented in the source comment.
 
 **Leak differences:** none in the authoritative sweep. `MEMORY_LEAK_C` parity is exact.
 
 Authoritative-sweep note: the ignored store-textual sweep now runs `infer-rs` from each source
 file's directory, so the published totals already include suite-local `.inferconfig` behavior.
 
-Separate config-surface note: `pulse-model-abort`, `pulse-model-return-nonnull`, and
-`pulse-model-skip-pattern` are now supported. The main remaining root-level `.inferconfig` gap is
-`pulse-model-returns-copy-pattern`, which needs unnecessary-copy tracking rather than a simple
-model shim.
+Separate config-surface note: `pulse-model-abort`, `pulse-model-unreachable`,
+`pulse-model-return-nonnull`, `pulse-model-return-this`, `pulse-model-return-first-arg`,
+`pulse-model-return-nullable`, `pulse-model-skip-pattern`, and `pulse-model-unknown-pure` are now
+supported. The remaining `.inferconfig` gaps found in the current repo audit are copy-specific:
+root/build-system `pulse-model-returns-copy-pattern` and C++ `pulse-model-cheap-copy-type`, both
+of which need the OCaml unnecessary-copy pipeline rather than a simple model shim. Language-specific
+`pulse-model-{release,deep-release}-pattern` remain out of the current C null/UAF/leak scope.
 
 **Skipped files (3):** `infinite.c` (106 procs with infinite loops/Ackermann), `recursion.c`,
 `recursion2.c` — fixpoint exhaustion.
@@ -40,6 +44,9 @@ is back at parity (`7` issues), `memory_leak.c` is back at full parity after the
 diagnostic fix, `funptr.c` is at parity (`11` issues), `specialization.c` is back to the direct
 OCaml issue set, and `compound_literal.c` / `initlistexpr.c` already match OCaml after fixing the
 sweep expectation helper to use exact basenames.
+
+There are no remaining active store-textual count fixes to pursue without either degrading
+precision (`nullptr.c`) or patching over exported-Textual fidelity loss (`sizeof.c`).
 
 ### Textual pipeline gaps
 

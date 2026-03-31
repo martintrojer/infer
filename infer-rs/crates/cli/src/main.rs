@@ -70,13 +70,33 @@ struct Cli {
     #[arg(long = "pulse-model-abort")]
     pulse_model_abort: Vec<String>,
 
+    /// Exact procnames to model as unreachable.
+    #[arg(long = "pulse-model-unreachable")]
+    pulse_model_unreachable: Vec<String>,
+
     /// Regex of methods to model as returning a non-null value.
     #[arg(long = "pulse-model-return-nonnull")]
     pulse_model_return_nonnull: Option<String>,
 
+    /// Regex of methods to model as returning the receiver (`this` / `self`).
+    #[arg(long = "pulse-model-return-this")]
+    pulse_model_return_this: Option<String>,
+
+    /// Regex of methods to model as returning the first source-language arg.
+    #[arg(long = "pulse-model-return-first-arg")]
+    pulse_model_return_first_arg: Option<String>,
+
+    /// Regex of methods to model as returning either null or a fresh value.
+    #[arg(long = "pulse-model-return-nullable")]
+    pulse_model_return_nullable: Option<String>,
+
     /// Regex of methods to skip and treat as unknown calls.
     #[arg(long = "pulse-model-skip-pattern")]
     pulse_model_skip_pattern: Option<String>,
+
+    /// Regexes of methods to model as unknown pure calls.
+    #[arg(long = "pulse-model-unknown-pure")]
+    pulse_model_unknown_pure: Vec<String>,
 
     /// Output directory for report.json and exported textual.
     #[arg(short = 'o', long = "output", default_value = "infer-rs-out")]
@@ -151,11 +171,26 @@ impl Cli {
         if !self.pulse_model_abort.is_empty() {
             c.pulse_model_abort = self.pulse_model_abort.clone();
         }
+        if !self.pulse_model_unreachable.is_empty() {
+            c.pulse_model_unreachable = self.pulse_model_unreachable.clone();
+        }
         if let Some(v) = &self.pulse_model_return_nonnull {
             c.pulse_model_return_nonnull = Some(v.clone());
         }
+        if let Some(v) = &self.pulse_model_return_this {
+            c.pulse_model_return_this = Some(v.clone());
+        }
+        if let Some(v) = &self.pulse_model_return_first_arg {
+            c.pulse_model_return_first_arg = Some(v.clone());
+        }
+        if let Some(v) = &self.pulse_model_return_nullable {
+            c.pulse_model_return_nullable = Some(v.clone());
+        }
         if let Some(v) = &self.pulse_model_skip_pattern {
             c.pulse_model_skip_pattern = Some(v.clone());
+        }
+        if !self.pulse_model_unknown_pure.is_empty() {
+            c.pulse_model_unknown_pure = self.pulse_model_unknown_pure.clone();
         }
         if self.quiet {
             c.quiet = true;

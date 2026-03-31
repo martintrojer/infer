@@ -188,7 +188,11 @@ whether the source directory has a `.inferconfig` that changes modeling. The C P
 `pulse-model-realloc-pattern` to model wrapper functions. These patterns use OCaml `Str.regexp`
 syntax from shared Infer configs, for example `\\(my\\|a\\)_malloc`.
 Other supported config-driven models include `pulse-model-abort`,
-`pulse-model-return-nonnull`, and `pulse-model-skip-pattern`.
+`pulse-model-unreachable`, `pulse-model-return-{nonnull,this,first-arg,nullable}`,
+`pulse-model-skip-pattern`, and `pulse-model-unknown-pure`.
+`pulse-model-returns-copy-pattern` and `pulse-model-cheap-copy-type` are not simple generic
+models; they depend on the OCaml unnecessary-copy pipeline and should not be "implemented" with
+placeholder behavior.
 
 - For CLI reproduction, pass `--inferconfig-path <path-to-.inferconfig>` explicitly.
 - For library tests or custom harnesses, make sure config discovery starts from the intended source

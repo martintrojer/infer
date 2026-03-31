@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, minimal ValueHistory-based diagnostic provenance, per-instruction tracing, and OCaml-compatible wrapper/abort/nonnull/skip config flags. funptr.c: 11/11. specialization.c: 5/5. angelism.c: 7/7. cleanup_attribute.c: 0/0.**
+**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, minimal ValueHistory-based diagnostic provenance, per-instruction tracing, and expanded OCaml-compatible config-driven model flags. funptr.c: 11/11. specialization.c: 5/5. angelism.c: 7/7. cleanup_attribute.c: 0/0.**
 
 Recent correctness / robustness fixes:
 - Invalid-access diagnostics now carry minimal value provenance histories (a reduced Rust analogue
@@ -25,10 +25,18 @@ Recent correctness / robustness fixes:
 - Added a Rust analogue of OCaml's latent-invalid-access flow and caller-side reification, which restores the missing aliased UAF behavior in `specialization.c` without turning callee-only paths into manifest base reports.
 - Specialized summaries are now published back into the owning ondemand summary store, which restores `funptr.c` parity in the direct CLI/store pipeline.
 - The store-textual sweep expectation helper now matches exact basenames instead of suffixes, which removed fake `compound_literal.c` / `initlistexpr.c` diffs caused by filename collisions.
-- OCaml-compatible `pulse-model-free-pattern`, `pulse-model-malloc-pattern`, `pulse-model-realloc-pattern`, `pulse-model-abort`, `pulse-model-return-nonnull`, and `pulse-model-skip-pattern` flags are now supported through `.inferconfig` and CLI overrides. Regex-based flags accept the shared `Str.regexp` syntax used by Infer test suites.
+- OCaml-compatible `pulse-model-free-pattern`, `pulse-model-malloc-pattern`,
+  `pulse-model-realloc-pattern`, `pulse-model-abort`, `pulse-model-unreachable`,
+  `pulse-model-return-{nonnull,this,first-arg,nullable}`, `pulse-model-skip-pattern`, and
+  `pulse-model-unknown-pure` flags are now supported through `.inferconfig` and CLI overrides.
+  Regex-based flags accept the shared `Str.regexp` syntax used by Infer test suites.
 - The ignored store-textual sweep now invokes the `infer-rs` CLI once per exported `.sil` from the originating source directory, so the published totals include OCaml-style upward `.inferconfig` discovery.
 - The ignored store-textual sweep now rebuilds `infer-rs` once per test process, eliminating stale
   binary noise from `target/{debug,release}/infer-rs` reuse.
+- The `crates/pulse/tests/end_to_end.rs` integration binary now serializes analysis runs behind a
+  local mutex. Parallel execution inside one test process was flaky (for example the global
+  function-pointer initializer test), while serialized execution is stable and keeps `make check`
+  deterministic.
 - Accepted limitation: exported Textual currently loses `Sizeof.nbytes` / array extent information
   for cases such as `sizeof(c)` and `sizeof(c[0])`, so the authoritative store-textual sweep still
   over-reports `sizeof.c` by two NPEs. This is a capture/export fidelity limit, not a Pulse
@@ -66,7 +74,7 @@ Pulse features:
 - **Formula solver**: union-find, linear arithmetic, atoms, term equalities, CItv integer intervals, `is_int` reasoning, LessThan implication checks, FunctionApplication tracking
 - **Path-sensitive constant folding**: comparison ops, Mult/DivI/DivF/Mod, Shiftlt/Shiftrt, BAnd/BOr/BXor
 - **`__sil_*` builtin conversion**: 23+ binops, 3 unops, allocate, cast, cfun
-- **C models + generic configured models**: malloc/free/realloc, new/delete, exit/abort/\_\_assert\_rtn (noreturn), fopen/getcwd (null/non-null), memcpy/memmove, \_\_builtin\_expect, 18 stdio arg checks, config-driven malloc/free/realloc wrapper matching, and config-driven abort / return-nonnull / skip modeling via OCaml-compatible `.inferconfig` flags
+- **C models + generic configured models**: malloc/free/realloc, new/delete, exit/abort/\_\_assert\_rtn (noreturn), fopen/getcwd (null/non-null), memcpy/memmove, \_\_builtin\_expect, 18 stdio arg checks, config-driven malloc/free/realloc wrapper matching, and config-driven abort / unreachable / return-nonnull / return-this / return-first-arg / return-nullable / skip / unknown-pure modeling via OCaml-compatible `.inferconfig` flags
 - **Memory leak detection**: unreachable allocated-not-freed addresses at summary creation, `find_return_value` void fix, `getcwd` conditional alloc, `is_known_nonzero` atom check, custom allocator tracking for config-driven wrappers
 - **Function pointer dispatch** via `__call_c_function_ptr` + Closure attributes
 - **Noreturn detection** propagated interprocedurally
@@ -183,7 +191,7 @@ Pulse analysis engine. Depends on `sil`, `diagnostics`, `num-rational`. See [PUL
 | `transfer.rs` | `Pulse.ml` | SIL instruction → state transition. Prune, UnOp folding (LNot/Neg/BNot), path sensitivity |
 | `models/mod.rs` | `PulseModels*.ml` | Model dispatch: builtins first, then name-based. Models take priority over summaries |
 | `models/c.rs` | `PulseModelsC.ml` | C models: malloc/free, new/delete, exit/abort (noreturn), fopen (null/non-null), 18 stdio arg-validity checks |
-| `models/configured.rs` | `PulseModelsImport.ml` | Generic config-driven models: abort, return-nonnull, skip-pattern |
+| `models/configured.rs` | `PulseModelsImport.ml` | Generic config-driven models: abort, unreachable, return-{nonnull,this,first-arg,nullable}, skip-pattern, unknown-pure |
 | `summary.rs` | `PulseSummary.ml` | PulseSummary with Vec<PrePost> (multi-disjunct), specialized summaries, needs_specialization HeapPaths, is_noreturn flag |
 | `specialization.rs` | `PulseSpecialization.ml` | apply() binds HeapPaths to Closure attrs, make_specialization_from_caller(), eval_for_prune |
 | `interproc.rs` | `PulseInterproc.ml` | apply_summary: callee→caller effect propagation, formal-value mapping for write-through-pointer, preserve abort summaries |
@@ -305,7 +313,7 @@ The repo also keeps a separate `capture --dump-textual` sweep as a secondary reg
 **NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 131, found 134.**
 
 Per-file differences:
-- Over-detection: `nullptr.c` (+1)
+- Accepted correctness-positive divergence: `nullptr.c` (+1)
 - Accepted store-textual limitation: `sizeof.c` (+2)
 
 Recent wins in this area:
@@ -313,7 +321,8 @@ Recent wins in this area:
   `realloc_no_check_bad` once more reports both null origins (`105` and `119`).
 - `angelism.c` now matches OCaml again (`7` issues) after the by-ref unknown-call fix.
 - `nullptr.c` no longer has the old imported-pure-call false positive; the only remaining
-  store-textual mismatch there is the extra `FN_nullptr_deref_old_bad`.
+  file-level mismatch there is the extra `FN_nullptr_deref_old_bad`, which is a real bug that
+  OCaml intentionally misses because of recency forgetting in that test.
 - `integers.c`, `nullptr_more.c`, and `offsetof_expr.c` are no longer on the sweep diff list.
 - `funptr.c` now matches OCaml in the store/direct pipeline (`11` issues).
 - `compound_literal.c` and `initlistexpr.c` already match OCaml; their earlier sweep diffs were
@@ -331,9 +340,13 @@ Direct issue-set note:
 - `pulse-model-{free,malloc,realloc}-pattern` support is now implemented and reflected in the
   authoritative sweep because the harness runs `infer-rs` from each source file's directory.
 - Additional `.inferconfig` model flags now supported: `pulse-model-abort`,
-  `pulse-model-return-nonnull`, and `pulse-model-skip-pattern`.
-- The main remaining root-level `.inferconfig` gap is `pulse-model-returns-copy-pattern`, which
-  depends on unnecessary-copy tracking that Rust does not implement yet.
+  `pulse-model-unreachable`, `pulse-model-return-{nonnull,this,first-arg,nullable}`,
+  `pulse-model-skip-pattern`, and `pulse-model-unknown-pure`.
+- The remaining `.inferconfig` gaps found in the current repo audit are copy-specific:
+  root/build-system `pulse-model-returns-copy-pattern` and C++ `pulse-model-cheap-copy-type`,
+  which depend on unnecessary-copy tracking that Rust does not implement yet.
+- Language-specific `.inferconfig` gaps outside the current C null/UAF/leak scope remain:
+  `pulse-model-{release,deep-release}-pattern`.
 
 **USE_AFTER_FREE comparison vs OCaml `issues.exp`: expected 7, found 7.**
 
@@ -364,25 +377,26 @@ using any exact disjunct/null-attr mismatch counts.
    - No global variable handling in summary application
    - Specialization implemented for function pointers; dynamic type specialization for OO not yet done
 5. **Pulse formula**: Union-find + linear arithmetic + atoms + term equalities + atom contradiction + CItv integer intervals + is_int integer reasoning. Missing: simplex tableau, non-linear terms.
-6. **Pulse models**: C models cover malloc/free/realloc, config-driven malloc/free/realloc wrappers via `.inferconfig`, config-driven abort/return-nonnull/skip models, new/delete, exit/abort/__infer_fail/__assert_rtn (noreturn), fopen (null/non-null), memcpy/memmove (dest+src validity), 18 stdio arg checks, `__call_c_function_ptr` (function pointer dispatch). Missing: list API, `pulse-model-returns-copy-pattern`. No Java, Hack, ObjC models.
+6. **Pulse models**: C models cover malloc/free/realloc, config-driven malloc/free/realloc wrappers via `.inferconfig`, config-driven abort/unreachable/return-{nonnull,this,first-arg,nullable}/skip/unknown-pure models, new/delete, exit/abort/__infer_fail/__assert_rtn (noreturn), fopen (null/non-null), memcpy/memmove (dest+src validity), 18 stdio arg checks, `__call_c_function_ptr` (function pointer dispatch). Missing: list API, copy-tracker-driven `pulse-model-{returns-copy-pattern,cheap-copy-type}` support, and language-specific release/deep-release models. No Java, Hack, ObjC models.
 7. **No summary persistence**: In-memory only. Optional disk persistence planned.
 8. **Closure-to-object transform**: Closures left as-is rather than transformed to object allocations.
 9. **Tenv annotations**: `.final`, `.abstract`, `.kind`, `.constant` struct attributes not handled in to_sil.
 
 ## What's Next (ranked by impact and tractability)
 
-### 1. Finish `nullptr.c` store-textual parity
-The remaining active store-textual analysis gap is now narrow:
-
-- extra `FN_nullptr_deref_old_bad`
-
-`create_null_path2_bad_FN` is restored, and the old `unknown_from_parameters_latent` manifest
-false positive is gone.
-
-### 2. Extend ValueHistory / trace parity
+### 1. Extend ValueHistory / trace parity
 The new minimal provenance layer is enough to restore the duplicated `memory_leak.c`
 `realloc_no_check_bad` reports and improve dedup correctness, but it is still reduced compared with
 OCaml's full `PulseValueHistory` / `PulseTrace` stack.
+
+### 2. Keep accepted sweep deltas documented, not "fixed"
+Two published store-textual differences are now intentionally accepted:
+
+- `nullptr.c` (+1): correctness-positive divergence; Rust reports the real
+  `FN_nullptr_deref_old_bad` null dereference
+- `sizeof.c` (+2): exported-Textual fidelity limitation
+
+Do not add workaround logic just to drive the published NPE count back down.
 
 ### 3. Keep `sizeof.c` as an accepted exported-Textual limitation
 Do not add Pulse-side workarounds for this. The current mismatch comes from the capture/export

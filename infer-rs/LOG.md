@@ -5,9 +5,28 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-The active analysis gap is now just:
+There is no remaining active store-textual count fix to pursue right now.
+
+Config-surface follow-up:
+
+- Rust now also supports the OCaml-style generic config-driven model flags
+  `pulse-model-unreachable`, `pulse-model-return-this`,
+  `pulse-model-return-first-arg`, `pulse-model-return-nullable`, and
+  `pulse-model-unknown-pure`, wired through both `.inferconfig` parsing and
+  CLI overrides
+- do not claim support for `pulse-model-returns-copy-pattern` or
+  `pulse-model-cheap-copy-type`; both require the missing non-disjunctive
+  unnecessary-copy tracker
+- `crates/pulse/tests/end_to_end.rs` now serializes analysis behind a local
+  mutex because the integration binary was flaky under parallel test execution;
+  isolated runs and `--test-threads=1` were already green
+
+Accepted correctness-positive divergence:
 
 - `nullptr.c`: expected `13`, found `14` (`NULLPTR_DEREFERENCE`)
+- root cause: Rust reports the real `FN_nullptr_deref_old_bad` null dereference, while OCaml's
+  own source comment documents that it intentionally misses this because of recency forgetting
+- policy: keep the Rust report; do not add imprecision just to match OCaml's false negative
 
 Accepted store-textual limitation:
 
@@ -156,7 +175,9 @@ What improved this turn:
   `pulse-model-realloc-pattern`, including the OCaml `Str` grouping/alternation syntax used by
   shared `.inferconfig` files such as `\\(my\\|a\\)_malloc`.
 - Rust now also supports the generic config-driven model flags `pulse-model-abort`,
-  `pulse-model-return-nonnull`, and `pulse-model-skip-pattern`, wired through both `.inferconfig`
+  `pulse-model-unreachable`, `pulse-model-return-nonnull`, `pulse-model-return-this`,
+  `pulse-model-return-first-arg`, `pulse-model-return-nullable`,
+  `pulse-model-skip-pattern`, and `pulse-model-unknown-pure`, wired through both `.inferconfig`
   parsing and CLI overrides.
 - The ignored store-textual sweep now invokes the `infer-rs` CLI per exported `.sil` from the
   originating source directory, with `--source-override` used only to preserve the original
@@ -295,16 +316,17 @@ Current strongest diagnosis:
 10. `.inferconfig` audit status:
    - for the current `infer/tests/codetoanalyze/c/pulse/.inferconfig`, there are no additional
      missing flags beyond the now-supported wrapper model keys
-   - the main remaining root-level config gap is `pulse-model-returns-copy-pattern`, which appears
-     in `/.inferconfig` and the `pulse_messages_{c,cpp}` test configs
-   - `pulse-model-return-nonnull`, `pulse-model-skip-pattern`, and `pulse-model-abort` are now
-     implemented correctly as generic config-driven models
+   - the remaining copy-specific `.inferconfig` gaps are `pulse-model-returns-copy-pattern`,
+     which appears in `/.inferconfig` and the `pulse_messages_{c,cpp}` test configs, and
+     `pulse-model-cheap-copy-type` in `infer/tests/codetoanalyze/cpp/pulse/.inferconfig`
+   - `pulse-model-abort`, `pulse-model-unreachable`,
+     `pulse-model-return-{nonnull,this,first-arg,nullable}`, `pulse-model-skip-pattern`, and
+     `pulse-model-unknown-pure` are now implemented correctly as generic config-driven models
    - other missing Pulse config keys found in Infer test configs are mostly outside the current C
-     null/UAF/leak parity scope: `pulse-specialization-partial`, `pulse-model-return-this`,
+     null/UAF/leak parity scope: `pulse-specialization-partial`,
      `pulse-model-{release,deep-release}-pattern`, and taint-related config
-   - several additional Pulse flags are used directly in test Makefiles rather than `.inferconfig`,
-     including `pulse-model-return-nullable`, `pulse-model-return-first-arg`,
-     `pulse-model-unknown-pure`, `pulse-model-unreachable`, `pulse-model-alloc-pattern`, and
+   - several additional Pulse flags are still used directly in test Makefiles rather than
+     `.inferconfig`, including `pulse-model-alloc-pattern` and
      `pulse-model-transfer-ownership`
 
 11. Current exported-textual status after the latest fixes:

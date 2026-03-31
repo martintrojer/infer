@@ -112,15 +112,43 @@ pub struct InferConfig {
     #[serde(rename = "pulse-model-abort")]
     pub pulse_model_abort: Vec<String>,
 
+    /// Exact procnames that should be treated as unreachable.
+    /// OCaml: `--pulse-model-unreachable` (default empty)
+    #[serde(rename = "pulse-model-unreachable")]
+    pub pulse_model_unreachable: Vec<String>,
+
     /// Regex of methods modelled as returning a non-null value.
     /// OCaml: `--pulse-model-return-nonnull` (default none)
     #[serde(rename = "pulse-model-return-nonnull")]
     pub pulse_model_return_nonnull: Option<String>,
 
+    /// Regex of methods modelled as returning the receiver (`this` / `self`).
+    /// OCaml: `--pulse-model-return-this` (default none)
+    #[serde(rename = "pulse-model-return-this")]
+    pub pulse_model_return_this: Option<String>,
+
+    /// Regex of methods modelled as returning the first source-language
+    /// argument. For Java/ObjC instance methods this is SIL actual index 1.
+    /// OCaml: `--pulse-model-return-first-arg` (default none)
+    #[serde(rename = "pulse-model-return-first-arg")]
+    pub pulse_model_return_first_arg: Option<String>,
+
+    /// Regex of methods modelled as returning either null or a fresh
+    /// non-null value.
+    /// OCaml: `--pulse-model-return-nullable` (default none)
+    #[serde(rename = "pulse-model-return-nullable")]
+    pub pulse_model_return_nullable: Option<String>,
+
     /// Regex of methods to skip and treat as unknown calls.
     /// OCaml: `--pulse-model-skip-pattern` (default none)
     #[serde(rename = "pulse-model-skip-pattern")]
     pub pulse_model_skip_pattern: Option<String>,
+
+    /// Regexes of methods to model as unknown pure calls. These should keep
+    /// pointer actuals stable and return a FunctionApplication result.
+    /// OCaml: `--pulse-model-unknown-pure` (default empty)
+    #[serde(rename = "pulse-model-unknown-pure")]
+    pub pulse_model_unknown_pure: Vec<String>,
 
     // ---- Abstract interpretation ----
     /// Maximum number of widenings before the fixpoint engine gives up.
@@ -160,8 +188,13 @@ impl Default for InferConfig {
             pulse_model_malloc_pattern: None,
             pulse_model_realloc_pattern: None,
             pulse_model_abort: Vec::new(),
+            pulse_model_unreachable: Vec::new(),
             pulse_model_return_nonnull: None,
+            pulse_model_return_this: None,
+            pulse_model_return_first_arg: None,
+            pulse_model_return_nullable: None,
             pulse_model_skip_pattern: None,
+            pulse_model_unknown_pure: Vec::new(),
             max_widens: 10_000,
             debug_level_analysis: 0,
             jobs: None,
@@ -250,8 +283,13 @@ mod tests {
         assert!(config.pulse_model_malloc_pattern.is_none());
         assert!(config.pulse_model_realloc_pattern.is_none());
         assert!(config.pulse_model_abort.is_empty());
+        assert!(config.pulse_model_unreachable.is_empty());
         assert!(config.pulse_model_return_nonnull.is_none());
+        assert!(config.pulse_model_return_this.is_none());
+        assert!(config.pulse_model_return_first_arg.is_none());
+        assert!(config.pulse_model_return_nullable.is_none());
         assert!(config.pulse_model_skip_pattern.is_none());
+        assert!(config.pulse_model_unknown_pure.is_empty());
         assert!(!config.quiet);
     }
 
@@ -272,8 +310,13 @@ mod tests {
             "pulse-model-malloc-pattern": "\\(my\\|a\\)_malloc",
             "pulse-model-realloc-pattern": "my_realloc",
             "pulse-model-abort": ["ns1::ns2::fun_abort"],
+            "pulse-model-unreachable": ["handle_failure"],
             "pulse-model-return-nonnull": "Handle::get",
-            "pulse-model-skip-pattern": "skip_model::SkipAll::.*\\|.*SkipSome<.*>::skip_me"
+            "pulse-model-return-this": "ModelClass.initWith:",
+            "pulse-model-return-first-arg": "release\\|.*release:",
+            "pulse-model-return-nullable": "dangerous",
+            "pulse-model-skip-pattern": "skip_model::SkipAll::.*\\|.*SkipSome<.*>::skip_me",
+            "pulse-model-unknown-pure": ["get_value_pure", "read_only_helper"]
         }"#;
         let config = InferConfig::from_json(json);
         assert_eq!(
@@ -289,13 +332,30 @@ mod tests {
             Some("my_realloc")
         );
         assert_eq!(config.pulse_model_abort, vec!["ns1::ns2::fun_abort"]);
+        assert_eq!(config.pulse_model_unreachable, vec!["handle_failure"]);
         assert_eq!(
             config.pulse_model_return_nonnull.as_deref(),
             Some("Handle::get")
         );
         assert_eq!(
+            config.pulse_model_return_this.as_deref(),
+            Some("ModelClass.initWith:")
+        );
+        assert_eq!(
+            config.pulse_model_return_first_arg.as_deref(),
+            Some("release\\|.*release:")
+        );
+        assert_eq!(
+            config.pulse_model_return_nullable.as_deref(),
+            Some("dangerous")
+        );
+        assert_eq!(
             config.pulse_model_skip_pattern.as_deref(),
             Some("skip_model::SkipAll::.*\\|.*SkipSome<.*>::skip_me")
+        );
+        assert_eq!(
+            config.pulse_model_unknown_pure,
+            vec!["get_value_pure", "read_only_helper"]
         );
     }
 

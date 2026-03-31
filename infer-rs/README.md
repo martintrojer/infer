@@ -7,7 +7,9 @@ Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, fou
 `memory_leak.c` is now back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
 
-- `nullptr.c` (+1): one remaining analysis false positive (`FN_nullptr_deref_old_bad`)
+- `nullptr.c` (+1): accepted correctness-positive divergence. Rust reports the real
+  `FN_nullptr_deref_old_bad` null dereference that OCaml intentionally misses because of recency
+  forgetting in that test.
 - `sizeof.c` (+2): accepted `--store-textual` / `--export-textual` fidelity limitation. Exported
   Textual lowers array `sizeof(...)` expressions to `<int[]>` without `nbytes` or array length, so
   the Rust roundtrip cannot constant-fold those branches.
@@ -68,16 +70,24 @@ infer-rs --pulse-only *.sil
 | `--debug-level-analysis N` | 0=quiet, 1=per-instruction, 2=full state dumps |
 | `--inferconfig-path FILE` | Path to .inferconfig file |
 | `--pulse-model-abort PROCNAME` | Model an exact procname as non-returning (repeatable) |
+| `--pulse-model-unreachable PROCNAME` | Model an exact procname as unreachable (repeatable) |
 | `--pulse-model-free-pattern REGEX` | Model matching functions as wrappers to `free(3)` |
 | `--pulse-model-malloc-pattern REGEX` | Model matching functions as wrappers to `malloc(3)` |
 | `--pulse-model-realloc-pattern REGEX` | Model matching functions as wrappers to `realloc(3)` |
 | `--pulse-model-return-nonnull REGEX` | Model matching functions as returning a non-null value |
+| `--pulse-model-return-this REGEX` | Model matching methods as returning `this` / `self` |
+| `--pulse-model-return-first-arg REGEX` | Model matching methods as returning the first source-language arg |
+| `--pulse-model-return-nullable REGEX` | Model matching methods as returning null-or-non-null |
 | `--pulse-model-skip-pattern REGEX` | Skip matching functions and treat them as unknown calls |
+| `--pulse-model-unknown-pure REGEX` | Model matching functions as unknown pure calls (repeatable) |
 
-`pulse-model-{free,malloc,realloc}-pattern`, `pulse-model-return-nonnull`, and
-`pulse-model-skip-pattern` are compatible with OCaml Infer's shared `.inferconfig` files,
+`pulse-model-{free,malloc,realloc}-pattern`,
+`pulse-model-return-{nonnull,this,first-arg,nullable}`, `pulse-model-skip-pattern`, and
+`pulse-model-unknown-pure` are compatible with OCaml Infer's shared `.inferconfig` files,
 including the `Str.regexp` syntax used in test suites such as `\\(my\\|a\\)_malloc`.
-`pulse-model-abort` follows OCaml's exact-procname list semantics.
+`pulse-model-{abort,unreachable}` follow OCaml's exact-procname list semantics.
+`pulse-model-returns-copy-pattern` is still intentionally unsupported because Rust does not yet
+implement OCaml's non-disjunctive unnecessary-copy tracking.
 
 ### infer binary discovery
 

@@ -178,6 +178,26 @@ impl Procname {
         matches!(self, Procname::C(_))
     }
 
+    pub fn is_objc_instance_method(&self) -> bool {
+        matches!(
+            self,
+            Procname::ObjcCpp(ObjcCppProcname {
+                kind: ObjcCppKind::ObjCInstanceMethod,
+                ..
+            })
+        )
+    }
+
+    pub fn is_objc_class_method(&self) -> bool {
+        matches!(
+            self,
+            Procname::ObjcCpp(ObjcCppProcname {
+                kind: ObjcCppKind::ObjCClassMethod,
+                ..
+            })
+        )
+    }
+
     /// Create a simple C function procname from a string.
     pub fn c_from_string(name: &str) -> Self {
         Procname::C(CFunctionSig {
