@@ -53,6 +53,10 @@ infer-rs --pulse-only file.sil
 infer-rs --pulse-only *.sil
 ```
 
+When multiple `.sil` files are passed, `infer-rs` parses them in parallel, merges the resulting
+`Cfg`/`Tenv`, and then runs analysis once over the unified program so cross-file calls can resolve
+to in-memory summaries.
+
 ### CLI flags
 
 | Flag | Description |
@@ -146,9 +150,10 @@ infer-rs/
 
 1. OCaml's `infer capture --store-textual` captures C/C++ source and stores textual SIL in `capture.db`
 2. `infer debug --export-textual` exports `.sil` files + `manifest.json` mapping source→sil→procedures
-3. `infer-rs` parses textual SIL, transforms, and converts to SIL
-4. Pulse analysis runs: WTO fixpoint with disjunctive domain, biabduction, interprocedural summary application
-5. Reports NULLPTR_DEREFERENCE, USE_AFTER_FREE, MEMORY_LEAK_C issues with original source file paths
+3. `infer-rs` parses textual SIL files in parallel, transforms them, and converts each module to SIL
+4. The per-file `Cfg`/`Tenv` results are merged into one in-memory program
+5. Pulse analysis runs: WTO fixpoint with disjunctive domain, biabduction, interprocedural summary application
+6. Reports NULLPTR_DEREFERENCE, USE_AFTER_FREE, MEMORY_LEAK_C issues with original source file paths
 
 ## Key Design Decisions
 

@@ -73,6 +73,9 @@ Recent correctness / robustness fixes:
 - CLI infer autodiscovery now matches the repo layout and checks sibling `../infer/bin/infer`.
 - Unsupported Textual `Closure` / `Apply` / residual `If` expressions now fail conversion explicitly instead of lowering to placeholder `0`.
 - OCaml capture parity, CLI multi-file, and inline Pulse smoke tests now assert concrete behavior instead of mostly "did not crash".
+- The multi-file CLI path now parses `.sil` inputs in parallel, merges their `Cfg`/`Tenv`, and runs
+  Pulse once over the unified program so cross-file calls can reuse summaries across file
+  boundaries.
 
 Three CLI modes:
 - **Full pipeline**: `infer-rs --pulse-only -- clang -c file.c` (capture + export + analyze)
@@ -236,7 +239,7 @@ Parallel analysis runner. Depends on `sil`, `absint`, `rayon`, `dashmap`.
 | `checker.rs` | `registerCheckers.ml` | `IntraChecker`, `InterChecker` (with `analyze_specialized`), `FileChecker` traits. `AnalysisContext` includes Cfg for specialization re-analysis. |
 | `summary.rs` | `Summary.ml` | `SummaryStore<S>` with `DashMap<Procname, Arc<OnceLock<S>>>` for blocking dedup |
 | `callgraph.rs` | `SyntacticCallGraph.ml` | Call graph from Cfg, bottom-up wave scheduling with SCC cycle detection |
-| `runner.rs` | `ondemand.ml` | `run_intra`, `run_inter` (blocking dedup), `run_file_callbacks`, `run_parallel` |
+| `runner.rs` | `ondemand.ml` | `run_intra`, `run_inter`, `run_inter_merged` (blocking dedup), `run_file_callbacks`, `run_parallel` |
 
 ### diagnostics crate
 Issue reporting types. Depends on `sil`.

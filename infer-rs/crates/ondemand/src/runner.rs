@@ -114,6 +114,20 @@ pub fn run_inter<C: InterChecker>(
     (store, stats)
 }
 
+/// Merge multiple `(Cfg, Tenv)` pairs, then run interprocedural analysis once
+/// over the unified program.
+pub fn run_inter_merged<C: InterChecker>(
+    checker: &C,
+    cfgs: Vec<(Cfg, Tenv)>,
+) -> (SummaryStore<C::Summary>, RunStats) {
+    let (mut merged_cfg, mut merged_tenv) = (Cfg::new(), Tenv::new());
+    for (cfg, tenv) in cfgs {
+        merged_cfg.merge(cfg);
+        merged_tenv.merge(tenv);
+    }
+    run_inter(checker, &merged_cfg, &merged_tenv)
+}
+
 /// Run an analysis function on all procedures in parallel (closure-based API).
 ///
 /// Simpler alternative to the trait-based API for one-off analyses.
@@ -323,6 +337,65 @@ mod tests {
         // b calls a (depends on scheduling order — either 1 or 2)
         assert!(store.contains(&Procname::c_from_string("a")));
         assert!(store.contains(&Procname::c_from_string("b")));
+    }
+
+    /// Interprocedural checker that depends on both the merged call graph and
+    /// the merged type environment.
+    struct TenvDepthChecker;
+
+    impl InterChecker for TenvDepthChecker {
+        type Summary = u32;
+
+        fn id(&self) -> &str {
+            "tenv_depth"
+        }
+
+        fn analyze(&self, pdesc: &Procdesc, ctx: &AnalysisContext<u32>) -> u32 {
+            let mut max_callee_depth: u32 = 0;
+            for (_node_id, instr) in pdesc.iter_instrs() {
+                if let Instr::Call { fun_exp, .. } = instr {
+                    if let Exp::Const(Const::Cfun(callee)) = fun_exp {
+                        if let Some(callee_depth) = ctx.summaries.get(callee) {
+                            max_callee_depth = max_callee_depth.max(callee_depth);
+                        }
+                    }
+                }
+            }
+            ctx.tenv.len() as u32 + max_callee_depth
+        }
+    }
+
+    #[test]
+    fn test_run_inter_merged_unifies_cfg_and_tenv() {
+        let mut cfg_left = Cfg::new();
+        cfg_left.add_proc_desc(mk_simple_proc("leaf"));
+        let mut tenv_left = Tenv::new();
+        tenv_left.insert(
+            sil::typ::TypeName::CStruct(sil::qualified_cpp_name::QualifiedCppName::from_string(
+                "Left",
+            )),
+            sil::strukt::Struct::default(),
+        );
+
+        let mut cfg_right = Cfg::new();
+        cfg_right.add_proc_desc(mk_calling_proc("top", "leaf"));
+        let mut tenv_right = Tenv::new();
+        tenv_right.insert(
+            sil::typ::TypeName::CStruct(sil::qualified_cpp_name::QualifiedCppName::from_string(
+                "Right",
+            )),
+            sil::strukt::Struct::default(),
+        );
+
+        let (store, stats) = run_inter_merged(
+            &TenvDepthChecker,
+            vec![(cfg_left, tenv_left), (cfg_right, tenv_right)],
+        );
+
+        assert_eq!(stats.total_procs, 2);
+        assert_eq!(stats.analyzed_procs, 2);
+        assert_eq!(store.get(&Procname::c_from_string("leaf")), Some(2));
+        assert_eq!(store.get(&Procname::c_from_string("top")), Some(4));
     }
 
     #[test]

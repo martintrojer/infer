@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,22 @@ pub struct Tenv {
 impl Tenv {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn merge(&mut self, other: Tenv) {
+        for (name, newer) in other.types {
+            match self.types.entry(name) {
+                Entry::Vacant(entry) => {
+                    entry.insert(newer);
+                }
+                Entry::Occupied(mut entry) => {
+                    let typename = entry.key().clone();
+                    let current_slot = entry.get_mut();
+                    let current = std::mem::take(current_slot);
+                    *current_slot = Struct::merge(&typename, newer, current);
+                }
+            }
+        }
     }
 
     /// Look up a struct definition by type name.
@@ -72,5 +88,95 @@ impl Tenv {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annot::AnnotItem;
+    use crate::fieldname::Fieldname;
+    use crate::qualified_cpp_name::QualifiedCppName;
+    use crate::strukt::Field;
+    use crate::typ::{IKind, JavaClassName, Typ};
+
+    fn mk_type(name: &str) -> TypeName {
+        TypeName::CStruct(QualifiedCppName::from_string(name))
+    }
+
+    #[test]
+    fn test_merge_extends_types() {
+        let mut lhs = Tenv::new();
+        lhs.insert(mk_type("left"), Struct::default());
+
+        let mut rhs = Tenv::new();
+        rhs.insert(mk_type("right"), Struct::default());
+
+        lhs.merge(rhs);
+
+        assert!(lhs.contains(&mk_type("left")));
+        assert!(lhs.contains(&mk_type("right")));
+        assert_eq!(lhs.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_prefers_non_dummy_c_struct() {
+        let name = mk_type("dup");
+        let mut lhs = Tenv::new();
+        let mut left = Struct::default();
+        left.dummy = false;
+        lhs.insert(name.clone(), left);
+
+        let mut rhs = Tenv::new();
+        let mut right = Struct::default();
+        right.dummy = true;
+        rhs.insert(name.clone(), right);
+
+        lhs.merge(rhs);
+
+        assert!(!lhs.lookup(&name).expect("merged type should exist").dummy);
+    }
+
+    #[test]
+    fn test_merge_combines_duplicate_java_type() {
+        let name = TypeName::JavaClass(JavaClassName("Example".to_string()));
+        let mut lhs = Tenv::new();
+        lhs.insert(
+            name.clone(),
+            Struct {
+                fields: vec![Field {
+                    name: Fieldname::make(name.clone(), "lhs_field"),
+                    typ: Typ::int(IKind::IInt),
+                    annot: AnnotItem::empty(),
+                }],
+                ..Struct::default()
+            },
+        );
+
+        let mut rhs = Tenv::new();
+        rhs.insert(
+            name.clone(),
+            Struct {
+                fields: vec![Field {
+                    name: Fieldname::make(name.clone(), "rhs_field"),
+                    typ: Typ::void(),
+                    annot: AnnotItem::empty(),
+                }],
+                ..Struct::default()
+            },
+        );
+
+        lhs.merge(rhs);
+
+        let merged = lhs.lookup(&name).expect("merged type should exist");
+        assert_eq!(merged.fields.len(), 2);
+        assert!(merged
+            .fields
+            .iter()
+            .any(|field| field.name.field_name == "lhs_field"));
+        assert!(merged
+            .fields
+            .iter()
+            .any(|field| field.name.field_name == "rhs_field"));
     }
 }

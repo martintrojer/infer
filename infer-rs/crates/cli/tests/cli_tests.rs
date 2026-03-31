@@ -188,6 +188,67 @@ fn test_multiple_files() {
 }
 
 #[test]
+fn test_multiple_files_unify_cross_file_pulse_analysis() {
+    let inputs = TempDir::new();
+    let callee = inputs.join("callee.sil");
+    let caller = inputs.join("caller.sil");
+
+    std::fs::write(
+        &callee,
+        r#".source_language = "java"
+
+type cell = { value:int }
+
+define .static callee_return_null(): *cell {
+  #entry:
+    ret null
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &caller,
+        r#".source_language = "java"
+
+type cell = { value:int }
+
+declare .static callee_return_null(): *cell
+
+define .static caller_bad(): void {
+  #entry:
+    n0 = callee_return_null()
+    n1: int = load n0.cell.value
+    ret null
+}
+"#,
+    )
+    .unwrap();
+
+    let out_dir = TempDir::new();
+    let (code, stdout, stderr) = run_infer_rs(&[
+        "--pulse-only",
+        "-o",
+        out_dir.to_str().unwrap(),
+        caller.to_str().unwrap(),
+        callee.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        code, 2,
+        "cross-file unified analysis should surface the caller-side null dereference. stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(IssueTypeId::NullptrDereference.id()),
+        "expected NULL_DEREFERENCE from the cross-file call: {stdout}"
+    );
+    assert!(
+        stdout.contains("caller_bad"),
+        "expected the cross-file issue to be reported on caller_bad: {stdout}"
+    );
+}
+
+#[test]
 fn test_quiet_mode() {
     let fixture = test_data_dir().join("c-liveness/dead_stores_simple.sil");
     let tmp_dir = TempDir::new();

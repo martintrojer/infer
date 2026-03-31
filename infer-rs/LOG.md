@@ -687,3 +687,33 @@ If resuming after compaction:
    - `infer/src/pulse/PulseAbductiveDomain.ml`
    - `infer/src/pulse/PulseInterproc.ml`
    - `infer/src/pulse/PulseFormula.ml`
+
+## Active Work: Unified Cross-File Analysis
+
+- Goal:
+  parse multiple `.sil` files in parallel, then analyze one merged program so Pulse summaries flow
+  across file boundaries.
+
+- Implemented so far:
+  - `Cfg::merge(&mut self, other: Cfg)`
+  - `Tenv::merge(&mut self, other: Tenv)`
+  - `ondemand::runner::run_inter_merged`
+  - CLI split into `parse_file(...)` + merged analysis over successful parses
+  - CLI regression test proving caller/callee cross-file Pulse propagation
+
+- Important merge conclusion:
+  OCaml's full merge machinery is broader because of its capture/database architecture, but the core
+  need is not a SQLite artifact. Rust now also merges per-file `Cfg`/`Tenv` values in-memory after
+  parallel parse, so duplicate typenames are real here too. Blind `HashMap::extend` makes duplicate
+  type handling order-dependent.
+
+- Current Rust stance:
+  keep the semantic part that prevents information loss when multiple units contribute the same
+  type; do not cargo-cult every OCaml merge corner unless Rust starts producing the same duplicate
+  shapes.
+
+- Validation status:
+  - `cargo test -p sil --lib` passed after switching `Tenv::merge` away from raw overwrite
+  - `cargo test -p ondemand --lib` passed
+  - `cargo test -p infer-rs --test cli_tests test_multiple_files_unify_cross_file_pulse_analysis`
+    passed

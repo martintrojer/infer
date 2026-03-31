@@ -25,6 +25,7 @@ use std::process;
 
 use clap::Parser;
 use diagnostics::issue::IssueLog;
+use rayon::prelude::*;
 use sil::procname::Procname;
 
 /// infer-rs: Rust implementation of the Infer static analyzer.
@@ -254,6 +255,11 @@ struct AnalysisFile {
     source: Option<String>,
 }
 
+struct ParsedAnalysisUnit {
+    cfg: sil::cfg::Cfg,
+    tenv: sil::tenv::Tenv,
+}
+
 /// Procedure metadata recovered from the original capture database.
 ///
 /// Store-textual export drops some proc and local attributes such as
@@ -429,27 +435,58 @@ fn main() {
 
     let mut all_issues = IssueLog::new();
     let mut total_procs = 0;
-    let mut total_files = 0;
 
-    for af in &files {
-        if !cfg.quiet {
+    if !cfg.quiet {
+        for af in &files {
             eprintln!("Analyzing {}", af.sil_path.display());
         }
+    }
 
-        match analyze_file(
-            &af.sil_path,
-            af.source.as_deref(),
-            capture_proc_metadata.as_ref(),
-            run_pulse,
-            run_liveness,
-        ) {
-            Ok((log, num_procs)) => {
-                total_procs += num_procs;
-                total_files += 1;
-                all_issues.merge(log);
+    let parse_results: Vec<_> = files
+        .par_iter()
+        .map(|af| {
+            (
+                af.sil_path.clone(),
+                parse_file(af, capture_proc_metadata.as_ref()),
+            )
+        })
+        .collect();
+
+    let mut parsed_units = Vec::new();
+    for (sil_path, result) in parse_results {
+        match result {
+            Ok(unit) => parsed_units.push(unit),
+            Err(e) => eprintln!("error: {}: {e}", sil_path.display()),
+        }
+    }
+
+    let total_files = parsed_units.len();
+    if total_files > 0 {
+        let (merged_cfg, merged_tenv) = merge_parsed_units(parsed_units);
+        total_procs = merged_cfg.num_procs();
+
+        if run_pulse {
+            if config::get().pulse_intraprocedural_only {
+                for pdesc in merged_cfg.iter_proc_descs() {
+                    let summary = pulse::checker::analyze(pdesc);
+                    all_issues.merge(pulse::checker::to_issue_log(
+                        &summary,
+                        &format!("{}", pdesc.proc_name),
+                    ));
+                }
+            } else {
+                let checker = PulseInterChecker;
+                let (store, _stats) =
+                    ondemand::runner::run_inter(&checker, &merged_cfg, &merged_tenv);
+                for (pname, summary) in store.to_vec() {
+                    all_issues.merge(pulse::checker::to_issue_log(&summary, &format!("{pname}")));
+                }
             }
-            Err(e) => {
-                eprintln!("error: {}: {e}", af.sil_path.display());
+        }
+
+        if run_liveness {
+            for pdesc in merged_cfg.iter_proc_descs() {
+                all_issues.merge(analyses::liveness::report_dead_stores(pdesc));
             }
         }
     }
@@ -964,15 +1001,24 @@ fn read_manifest(manifest_path: &Path, base_dir: &Path) -> Vec<AnalysisFile> {
 // Analysis
 // ---------------------------------------------------------------------------
 
-fn analyze_file(
-    path: &Path,
-    source_override: Option<&str>,
+fn merge_parsed_units(units: Vec<ParsedAnalysisUnit>) -> (sil::cfg::Cfg, sil::tenv::Tenv) {
+    let mut merged_cfg = sil::cfg::Cfg::new();
+    let mut merged_tenv = sil::tenv::Tenv::new();
+    for unit in units {
+        merged_cfg.merge(unit.cfg);
+        merged_tenv.merge(unit.tenv);
+    }
+    (merged_cfg, merged_tenv)
+}
+
+fn parse_file(
+    analysis_file: &AnalysisFile,
     capture_proc_metadata: Option<&CaptureProcMetadata>,
-    run_pulse: bool,
-    run_liveness: bool,
-) -> Result<(IssueLog, usize), String> {
-    let src = std::fs::read_to_string(path).map_err(|e| format!("failed to read: {e}"))?;
-    let filename = path
+) -> Result<ParsedAnalysisUnit, String> {
+    let src = std::fs::read_to_string(&analysis_file.sil_path)
+        .map_err(|e| format!("failed to read: {e}"))?;
+    let filename = analysis_file
+        .sil_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("input.sil");
@@ -981,7 +1027,7 @@ fn analyze_file(
         textual::parse_module(&src, filename).map_err(|e| format!("parse error: {e}"))?;
 
     // Override source_file with original filename from manifest
-    if let Some(source) = source_override {
+    if let Some(source) = analysis_file.source.as_deref() {
         module.source_file = source.to_string();
     }
 
@@ -1009,34 +1055,7 @@ fn analyze_file(
         apply_capture_proc_metadata(&mut sil_cfg, &module.source_file, metadata);
     }
 
-    let mut log = IssueLog::new();
-    let num_procs = sil_cfg.num_procs();
-
-    if run_pulse {
-        if config::get().pulse_intraprocedural_only {
-            for pdesc in sil_cfg.iter_proc_descs() {
-                let summary = pulse::checker::analyze(pdesc);
-                log.merge(pulse::checker::to_issue_log(
-                    &summary,
-                    &format!("{}", pdesc.proc_name),
-                ));
-            }
-        } else {
-            let checker = PulseInterChecker;
-            let (store, _stats) = ondemand::runner::run_inter(&checker, &sil_cfg, &tenv);
-            for (pname, summary) in store.to_vec() {
-                log.merge(pulse::checker::to_issue_log(&summary, &format!("{pname}")));
-            }
-        }
-    }
-
-    if run_liveness {
-        for pdesc in sil_cfg.iter_proc_descs() {
-            log.merge(analyses::liveness::report_dead_stores(pdesc));
-        }
-    }
-
-    Ok((log, num_procs))
+    Ok(ParsedAnalysisUnit { cfg: sil_cfg, tenv })
 }
 
 /// Collect Cfun summaries from all expressions in an instruction.
