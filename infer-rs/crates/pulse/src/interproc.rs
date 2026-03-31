@@ -112,6 +112,20 @@ pub fn apply_summary(
         loc,
     ) {
         PreMaterializeResult::PreConditionViolation(diag) => Some(*diag),
+        PreMaterializeResult::AliasingContradiction {
+            caller_addr,
+            callee_addr,
+            other_callee_addr,
+        } => {
+            // Cross-ref: OCaml `PulseInterproc.apply_summary` turns
+            // `AliasingWithAllAliases` into an inapplicable pre/post so the
+            // caller can rely on alias specialization instead of forcing the
+            // unspecialized summary through.
+            log::debug!(
+                "[apply_summary] rejected due to aliasing contradiction: caller={caller_addr} callee={callee_addr} other={other_callee_addr}"
+            );
+            return vec![];
+        }
         PreMaterializeResult::Ok => None,
     };
 
@@ -398,6 +412,91 @@ enum PreMaterializeResult {
     /// Pre-condition violation — the callee dereferences a formal
     /// that is invalid (null/freed) in the caller's state.
     PreConditionViolation(Box<crate::diagnostic::Diagnostic>),
+    /// Caller aliasing collapses callee heap roots that must stay disjoint.
+    /// The unspecialized pre/post is therefore inapplicable.
+    AliasingContradiction {
+        caller_addr: AbstractValue,
+        callee_addr: AbstractValue,
+        other_callee_addr: AbstractValue,
+    },
+}
+
+#[derive(Default)]
+struct CallerAliasRoots {
+    // Callee roots that have their own heap cell in the summary pre.
+    pre_backed: HashSet<AbstractValue>,
+    // Callee roots that have their own heap cell in the summary post.
+    post_backed: HashSet<AbstractValue>,
+}
+
+fn callee_heap_contains(heap: &crate::base_memory::BaseMemory, addr: AbstractValue) -> bool {
+    heap.get_edges(addr).is_some()
+}
+
+/// Detect when multiple distinct callee heap roots collapse onto the same
+/// caller representative.
+///
+/// Cross-ref: OCaml `PulseInterproc.visit` records alias groups in
+/// `call_state.aliases` and `apply_summary` rejects the unspecialized summary
+/// with `AliasingWithAllAliases`. The Rust port keeps the check smaller: once
+/// two distinct callee addresses that both own heap structure in the same
+/// summary phase (pre or post) map to one caller representative, we reject the
+/// unspecialized pre/post and let higher-level specialization logic handle the
+/// aliased call.
+///
+/// The tracking is keyed by the caller representative rather than traversal
+/// order so the result stays deterministic even when the initial substitution
+/// is explored in a different order.
+fn find_aliasing_contradiction(
+    callee_pre: &crate::base_domain::BaseDomain,
+    callee_post: &AbductiveDomain,
+    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    caller_alias_roots: &mut HashMap<AbstractValue, CallerAliasRoots>,
+    caller_addr: AbstractValue,
+    callee_addr: AbstractValue,
+    caller_state: &AbductiveDomain,
+) -> Option<AbstractValue> {
+    if formal_stack_addrs.contains(&callee_addr) {
+        return None;
+    }
+
+    let caller_repr = caller_state.get_var_repr(caller_addr);
+    let in_pre = callee_heap_contains(&callee_pre.heap, callee_addr);
+    let in_post = callee_heap_contains(&callee_post.post.heap, callee_addr);
+    if !in_pre && !in_post {
+        // OCaml only raises the alias contradiction when the aliased callee
+        // values are meaningful heap roots in the summary; otherwise equality
+        // can be handled as normal caller-side aliasing.
+        return None;
+    }
+
+    let seen = caller_alias_roots.entry(caller_repr).or_default();
+
+    if in_pre {
+        if let Some(other) = seen
+            .pre_backed
+            .iter()
+            .copied()
+            .find(|other| *other != callee_addr)
+        {
+            return Some(other);
+        }
+        seen.pre_backed.insert(callee_addr);
+    }
+
+    if in_post {
+        if let Some(other) = seen
+            .post_backed
+            .iter()
+            .copied()
+            .find(|other| *other != callee_addr)
+        {
+            return Some(other);
+        }
+        seen.post_backed.insert(callee_addr);
+    }
+
+    None
 }
 
 fn materialize_pre(
@@ -409,6 +508,7 @@ fn materialize_pre(
     loc: &Location,
 ) -> PreMaterializeResult {
     let mut visited = std::collections::HashSet::new();
+    let mut caller_alias_roots: HashMap<AbstractValue, CallerAliasRoots> = HashMap::new();
     let mut worklist: Vec<AbstractValue> = subst.keys().copied().collect();
     // Record first error but continue walking the pre (matching OCaml's
     // first_error field in call_state). OCaml (PulseInterproc.ml:601-624):
@@ -422,6 +522,21 @@ fn materialize_pre(
         }
 
         let caller_addr = resolve_mut(subst, callee_addr);
+        if let Some(other_callee_addr) = find_aliasing_contradiction(
+            callee_pre,
+            callee_post,
+            formal_stack_addrs,
+            &mut caller_alias_roots,
+            caller_addr,
+            callee_addr,
+            caller_state,
+        ) {
+            return PreMaterializeResult::AliasingContradiction {
+                caller_addr: caller_state.get_var_repr(caller_addr),
+                callee_addr,
+                other_callee_addr,
+            };
+        }
 
         if let Some(edges) = callee_pre.heap.get_edges(callee_addr) {
             // Only check validity for addresses the callee actually
@@ -980,6 +1095,158 @@ mod tests {
                     .is_some(),
                 "callee's write through p should materialize in caller's heap"
             );
+        }
+    }
+
+    #[test]
+    fn test_apply_summary_rejects_aliasing_disjoint_formals() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![
+            (
+                Mangled::from_string("p"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("q"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+        ];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname.clone());
+        let q_pvar = Pvar::mk(Mangled::from_string("q"), callee_pname);
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let q_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(q_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        let q_val = callee_state.read_heap(q_addr, Access::Dereference);
+        callee_state.write_heap(p_val, Access::Dereference, AbstractValue::mk_fresh());
+        callee_state.write_heap(q_val, Access::Dereference, AbstractValue::mk_fresh());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(p_pvar, p_addr), (q_pvar, q_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let shared_actual = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let shared_addr = AbstractValue::mk_fresh();
+        caller_state.post.stack.add(
+            Var::ProgramVar(Box::new(shared_actual.clone())),
+            shared_addr,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[
+                (Exp::Lvar(shared_actual.clone()), Typ::mk_ptr(Typ::void())),
+                (Exp::Lvar(shared_actual), Typ::mk_ptr(Typ::void())),
+            ],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(
+            results.is_empty(),
+            "unspecialized summary should be rejected when aliased actuals collapse disjoint callee formals"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_allows_aliased_actuals_when_extra_formal_is_unused() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![
+            (
+                Mangled::from_string("p"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("q"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+        ];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname.clone());
+        let q_pvar = Pvar::mk(Mangled::from_string("q"), callee_pname);
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let q_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(q_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        let written = AbstractValue::mk_fresh();
+        callee_state.and_equal_const(written, 42);
+        callee_state.write_heap(p_val, Access::Dereference, written);
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(p_pvar, p_addr), (q_pvar, q_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let shared_actual = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let shared_addr = AbstractValue::mk_fresh();
+        caller_state.post.stack.add(
+            Var::ProgramVar(Box::new(shared_actual.clone())),
+            shared_addr,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[
+                (Exp::Lvar(shared_actual.clone()), Typ::mk_ptr(Typ::void())),
+                (Exp::Lvar(shared_actual), Typ::mk_ptr(Typ::void())),
+            ],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        if let Some(ExecutionDomain::ContinueProgram(s)) = results.iter().find(|r| r.is_continue())
+        {
+            assert!(
+                s.post
+                    .heap
+                    .find_edge(shared_addr, &Access::Dereference)
+                    .is_some(),
+                "unused aliased extra formals should not make the summary inapplicable"
+            );
+        } else {
+            panic!("summary should still apply when only one aliased formal is heap-backed");
         }
     }
 

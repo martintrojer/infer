@@ -63,7 +63,25 @@ fn analyze_with_spec_loop(
         let summary = ctx.summaries.get_or_compute(&init_pname, || {
             analyze_with_spec_loop(init_pdesc, ctx, None, depth + 1)
         });
-        collect_summary_closure_refs(&summary, &ctx.summaries, &mut callee_summaries);
+        let mut closure_targets = std::collections::HashSet::new();
+        collect_summary_closure_pnames(&summary, &mut closure_targets);
+        for closure_pname in closure_targets {
+            let Some(closure_pdesc) = ctx.cfg.get_proc_desc(&closure_pname) else {
+                continue;
+            };
+            // Do not block on `get_or_compute` here while we are already inside
+            // the end-to-end analyzer lock: another worker may be computing the
+            // same summary through `InterChecker::analyze`, which would invert
+            // the lock order and deadlock. A direct recursive analysis keeps
+            // the harness deterministic without relying on store timing.
+            let closure_summary = ctx
+                .summaries
+                .get(&closure_pname)
+                .unwrap_or_else(|| analyze_with_spec_loop(closure_pdesc, ctx, None, depth + 1));
+            callee_summaries
+                .entry(closure_pname)
+                .or_insert(closure_summary);
+        }
         callee_summaries.entry(init_pname).or_insert(summary);
     }
     // When specialization is provided, add summaries for the target procedures
@@ -232,17 +250,14 @@ fn is_pointer_to_function_typ(typ: &sil::typ::Typ) -> bool {
     )
 }
 
-fn collect_summary_closure_refs(
+fn collect_summary_closure_pnames(
     summary: &pulse::summary::PulseSummary,
-    store: &ondemand::summary::SummaryStore<pulse::summary::PulseSummary>,
-    out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
+    out: &mut std::collections::HashSet<sil::procname::Procname>,
 ) {
     for pre_post in &summary.pre_posts {
         for (_addr, attrs) in pre_post.post.post.attrs.iter() {
             if let Some(pname) = attrs.get_closure_proc_name() {
-                if let Some(summary) = store.get(pname) {
-                    out.entry(pname.clone()).or_insert(summary);
-                }
+                out.insert(pname.clone());
             }
         }
     }

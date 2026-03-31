@@ -7,6 +7,29 @@ Keep it current when the active line of investigation changes.
 
 There is no remaining active store-textual count fix to pursue right now.
 
+- The most recent completed correctness item was aliasing contradiction handling
+  in `crates/pulse/src/interproc.rs`.
+  Rust now rejects an unspecialized pre/post when caller aliasing collapses
+  distinct callee heap-backed roots onto one caller representative, matching
+  the OCaml `PulseInterproc.ml` `AliasingWithAllAliases` flow closely enough
+  for the existing alias-specialization machinery.
+- The most recent completed robustness item was the global function-pointer
+  initializer harness fix in `crates/pulse/tests/end_to_end.rs`.
+  The local specialization driver now directly analyzes closure targets
+  discovered from initializer summaries when needed instead of depending on
+  summary-store timing. This removed the order-dependent
+  `test_e2e_global_function_pointer_initializer_is_inlined` flake without
+  blocking on the store under the end-to-end analyzer mutex.
+- Focused validations for that work:
+  - `cargo test -p pulse interproc --lib -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_global_function_pointer_initializer_is_inlined -- --nocapture`
+    repeated 6 times in fresh processes
+  - `make check`
+- Next realistic correctness targets are:
+  - richer `PulseValueHistory` / `PulseTrace` parity
+  - latent issue type / publication timing parity
+  - non-Pulse textual gaps such as `DeclEnv` enhancements
+
 Config-surface follow-up:
 
 - Rust now also supports the OCaml-style generic config-driven model flags

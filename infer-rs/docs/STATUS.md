@@ -2,9 +2,18 @@
 
 ## Summary
 
-**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, specialization loop, FunctionApplication, minimal ValueHistory-based diagnostic provenance, per-instruction tracing, and expanded OCaml-compatible config-driven model flags. funptr.c: 11/11. specialization.c: 5/5. angelism.c: 7/7. cleanup_attribute.c: 0/0.**
+**~30,000 lines of Rust across 11 crates. 350+ tests. Latest authoritative store-textual sweep: 52 of 55 C pulse test files pass the full pipeline. NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Latent issue support, write-through-pointer biabduction, must_be_valid interproc, alias-contradiction rejection for unspecialized summaries, specialization loop, FunctionApplication, minimal ValueHistory-based diagnostic provenance, per-instruction tracing, and expanded OCaml-compatible config-driven model flags. funptr.c: 11/11. specialization.c: 5/5. angelism.c: 7/7. cleanup_attribute.c: 0/0.**
 
 Recent correctness / robustness fixes:
+- Unspecialized summary application now rejects alias-collapsed callee heap roots when two
+  distinct heap-backed callee addresses map to the same caller representative. This is the Rust
+  analogue of the OCaml `PulseInterproc.ml` `AliasingWithAllAliases` rejection path, and it lets
+  the existing alias-specialization machinery handle aliased actuals instead of forcing the
+  unspecialized pre/post through.
+- The end-to-end specialization driver now directly analyzes closure targets discovered from global
+  initializer summaries when the ondemand store does not already contain them. This removes the
+  old order-dependent `test_e2e_global_function_pointer_initializer_is_inlined` flake while also
+  avoiding a store/mutex deadlock in the serialized integration harness.
 - Invalid-access diagnostics now carry minimal value provenance histories (a reduced Rust analogue
   of `PulseValueHistory` / `PulseTrace`), and dedup keys now include history signatures. This
   restores the missing duplicated `realloc_no_check_bad` report in `memory_leak.c`, so
@@ -69,7 +78,9 @@ Pulse features:
 - **Latent issue support**: `is_manifest` classification, LatentAbortProgram propagation through call chains, caller-side re-evaluation
 - **Summary specialization**: HeapPath-based dynamic type specialization for function pointer dispatch, recursive multi-level specialization, `needs_specialization` propagation
 - **Summary normalization**: strip unreachable attrs matching OCaml's `discard_unreachable`
-- **Interprocedural path condition filtering**: translate callee formula atoms/equations to caller, reject inapplicable pre_posts when callee constraints contradict caller state
+- **Interprocedural path condition filtering**: translate callee formula atoms/equations to caller,
+  reject inapplicable pre_posts when callee constraints contradict caller state, and reject
+  unspecialized summaries when caller aliasing collapses callee-disjoint heap roots
 - **Unknown call havoc**: type-aware, havocs memory reachable from pointer-typed args for C extern stubs
 - **Formula solver**: union-find, linear arithmetic, atoms, term equalities, CItv integer intervals, `is_int` reasoning, LessThan implication checks, FunctionApplication tracking
 - **Path-sensitive constant folding**: comparison ops, Mult/DivI/DivF/Mod, Shiftlt/Shiftrt, BAnd/BOr/BXor

@@ -42,8 +42,11 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
 **Notable recent correctness wins:** `cleanup_attribute.c` now matches OCaml again, `angelism.c`
 is back at parity (`7` issues), `memory_leak.c` is back at full parity after the history-aware
 diagnostic fix, `funptr.c` is at parity (`11` issues), `specialization.c` is back to the direct
-OCaml issue set, and `compound_literal.c` / `initlistexpr.c` already match OCaml after fixing the
-sweep expectation helper to use exact basenames.
+OCaml issue set, unspecialized interproc summary application now rejects alias-collapsed callee
+heap roots in the OCaml `AliasingWithAllAliases` cases, the global function-pointer initializer
+end-to-end path is deterministic again after recursively analyzing closure targets from initializer
+summaries, and `compound_literal.c` / `initlistexpr.c` already match OCaml after fixing the sweep
+expectation helper to use exact basenames.
 
 There are no remaining active store-textual count fixes to pursue without either degrading
 precision (`nullptr.c`) or patching over exported-Textual fidelity loss (`sizeof.c`).
@@ -61,10 +64,8 @@ precision (`nullptr.c`) or patching over exported-Textual fidelity loss (`sizeof
 
 ### Pulse gaps
 
-- **Aliasing contradiction detection**: Caller aliasing callee's disjoint formals. Cross-ref: `PulseInterproc.ml` AliasingWithAllAliases.
 - **Full ValueHistory / PulseTrace parity**: Rust now has minimal invalid-access provenance and
   history-sensitive dedup, but richer OCaml-style trace reconstruction is still incomplete.
-- **Global variable handling** in summary application.
 - **`sizeof` type evaluation**: scalar types are handled via `Typ::size_in_bytes()`. Accepted
   store-textual limitation: exported `<int[]>` arrives without array length or `nbytes`.
 - **Latent issues parity / report timing**: latent/base publishing is now routed through summary classification, prune conditions now carry OCaml-style call-depth provenance, callee AbortProgram summaries now propagate again, Rust now has a caller-side latent-invalid-access path, and imported pure-call dependencies now survive summary application/normalization. Remaining: `pre_heap_has_assumptions` parity in `is_manifest`, latent issue type reporting, and OCaml-aligned publication timing for any still-propagated abort over-reports.
