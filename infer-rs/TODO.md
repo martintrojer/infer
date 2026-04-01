@@ -2,7 +2,7 @@
 
 ## OCaml parity gaps (should match OCaml behavior)
 
-### Compliance gaps by impact (authoritative store-textual sweep: 52/55 files analyzed, 3 skipped for fixpoint exhaustion; NPE expected 131 found 132, Leaks expected 20 found 20, UAF expected 7 found 7)
+### Compliance gaps by impact (authoritative store-textual sweep: 52/55 files analyzed, 3 skipped for fixpoint exhaustion; NPE expected 131 found 134, Leaks expected 20 found 20, UAF expected 7 found 7)
 
 Correctness note: keep the semantically correct specialization / latent-invalid-access /
 specialized-summary fixes even when totals move temporarily. The current sweep reflects the real
@@ -18,15 +18,16 @@ remaining count gaps after removing the old basename-matching measurement bug.
 
 **Current active NPE file diffs (correctness work, not workaround targets):**
 
-2. **`latent.c`** (+1): current sweep is `6` vs expected `5`. This is a remaining
+2. **`angelism.c`** (+1): current sweep is `8` vs expected `7`. This regressed after the
+   correctness-first interproc invalid-access fixes and needs localization without undoing the
+   now-correct by-ref / direct-formal behavior.
+
+3. **`latent.c`** (+1): current sweep is `6` vs expected `5`. This is a remaining
    latent-vs-manifest publication mismatch.
 
-3. **`nullptr.c`** (-1): current sweep is `12` vs expected `13`. The earlier
+4. **`nullptr.c`** (-1): current sweep is `12` vs expected `13`. The earlier
    `unknown_from_parameters_latent` false positive is gone, but the file is no longer an accepted
    "+1 real bug" divergence under the current latent/manifest work.
-
-4. **`traces.c`** (-1): current sweep is `4` vs expected `5`. This is another remaining
-   latent/report-publication mismatch.
 
 **Leak differences:** none in the authoritative sweep. `MEMORY_LEAK_C` parity is exact.
 
@@ -46,25 +47,34 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
 
 **Active OCaml-backed correctness focus:**
 
-7. **`manifest_use_after_free`**: Rust still publishes an extra manifest NPE where OCaml keeps
-   only the manifest `AbortProgram(CFree)`.
+7. **Direct-formal / by-ref regression lock-in**: keep the new focused regressions green:
+   `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,
+   `test_e2e_write_through_ptr`, `test_e2e_manifest_use_after_free_reports_only_uaf`, and
+   `test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf`. These are correctness fixes,
+   not optional count-tuning.
 
-8. **`access_use_after_free_bad`**: Rust still misses the manifest
-   `AbortProgram(ConstantDereference on l->next)` that OCaml keeps.
-
-9. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: Rust and OCaml
+8. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: Rust and OCaml
    still diverge on which latent null paths survive call chains and reify as manifest reports.
 
-Recent groundwork that should stay in place even though the current NPE total moved down:
+9. **Current file-level drift after the correctness-first fix set**: `angelism.c`, `latent.c`,
+   and `nullptr.c` now carry the remaining active NPE count gap outside the accepted `sizeof.c`
+   textual limitation.
+
+Recent groundwork that should stay in place even though the current NPE total moved in the wrong direction:
 - interproc formula import now mirrors OCaml `PulseFormula.and_callee_formula` more closely
   (shared substitution across the whole callee formula, remembered `conditions` imported first)
+- summary import now snapshots caller allocation state before `apply_post` and uses that snapshot
+  when importing `EqZero`, instead of relying on the rejected broad formula-before-post reorder
+- caller-side latent invalid-access rechecks now mark translated diagnostic addresses
+  `must_be_valid` and reuse summary classification, which fixes
+  `manifest_use_after_free` without regressing `access_use_after_free_bad`
 - summary normalization now uses `simplify_for_summary(precondition_vocabulary, keep)` and includes
   OCaml-style `pre_heap_has_assumptions`
 - latent invalid-access classification is now narrower than "any caller-visible constant deref":
   pre-existing caller-controlled values can stay latent, true by-ref/outparam slot writes can stay
   latent, and ordinary callee-written field nulls stay manifest again
 - this narrowing restored the direct `.sil` `store_bad` / `use_not_modeled_bad` regressions and
-  brought `angelism.c` and `funptr.c` back to parity in the authoritative sweep
+  keeps `funptr.c` at parity; do not undo it just to recover `angelism.c`'s current extra count
 
 Remaining active store-textual work is concentrated in the latent/manifest invalid-access cluster
 above. Do not try to "fix" `sizeof.c` in Pulse.
@@ -91,7 +101,7 @@ above. Do not try to "fix" `sizeof.c` in Pulse.
   provenance, callee `AbortProgram` summaries now propagate again, Rust now has a caller-side
   `LatentInvalidAccess` path, imported pure-call dependencies now survive summary
   application/normalization, and `pre_heap_has_assumptions` parity is implemented. Remaining:
-  `manifest_use_after_free`, `access_use_after_free_bad`, wrapper/cycle null paths such as
+  `angelism.c`, `latent.c`, `nullptr.c`, wrapper/cycle null paths such as
   `traverse_and_crash_if_equal_to_root`, and richer OCaml-style latent issue typing/traces.
 
 ## Debugging tools

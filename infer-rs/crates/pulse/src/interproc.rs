@@ -15,13 +15,14 @@ use std::collections::{HashMap, HashSet};
 
 use sil::exp::Exp;
 use sil::ident::Ident;
+use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
 use sil::specialization::HeapPath;
 use sil::typ::Typ;
 
-use crate::abductive::AbductiveDomain;
+use crate::abductive::{AbductiveDomain, ImportedFormulaEffect};
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::Attribute;
@@ -29,12 +30,18 @@ use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::summary::PrePost;
-use crate::value_history::ValueHistory;
+use crate::value_history::{HistoryEvent, ValueHistory};
 
 #[derive(Debug, Default)]
 pub(crate) struct ApplySummaryOutcome {
     pub(crate) results: Vec<ExecutionDomain>,
     pub(crate) alias_specialization: Option<Vec<Vec<HeapPath>>>,
+}
+
+enum TranslateFormulaResult {
+    Sat,
+    Unsat,
+    PotentialInvalidAccess(Diagnostic),
 }
 
 /// Apply a callee's summary to the caller's abstract state.
@@ -176,6 +183,14 @@ pub(crate) fn apply_summary_with_aliasing(
         PreMaterializeResult::Ok => None,
     };
 
+    // Snapshot caller-owned allocated roots after pre-materialization but
+    // before the callee post is applied. Cross-ref: OCaml imports callee
+    // arithmetic before `apply_post`, so imported `EqZero` only treats
+    // addresses that already existed in the caller as contradictions or
+    // potential invalid accesses.
+    let (stack_allocated_before_call, heap_allocated_before_call) =
+        caller_state.snapshot_allocated_before_call();
+
     // Step 2: Apply the callee's post heap to the caller.
     //
     // This must handle strong updates, not just writes. If an access exists in
@@ -211,9 +226,8 @@ pub(crate) fn apply_summary_with_aliasing(
         );
     }
 
-    // Step 3: Resolve the return value into the substitution BEFORE
-    // translating the formula, so constraints on the return value (e.g.,
-    // "return value >= 0") are properly mapped to the caller.
+    // Step 3: Resolve the return value into the substitution before importing
+    // the formula, so constraints on the return value map to caller space.
     if let Some(ret_addr) = &pre_post.result {
         let caller_ret = resolve_mut(&mut subst, *ret_addr);
         let ret_history = pre_post
@@ -238,21 +252,54 @@ pub(crate) fn apply_summary_with_aliasing(
         );
     }
 
-    // Step 4: Translate callee's formula constraints to caller.
-    // If the callee's constraints contradict the caller's state
-    // (e.g., callee assumes x < 128 but caller has x = 1000),
-    // this pre_post is inapplicable → skip it (return empty).
-    // Cross-ref: OCaml PulseInterproc.ml apply_post returns Unsat
-    // when the callee's formula contradicts the caller.
+    // Step 4: Translate callee's formula constraints to the caller.
+    // We keep Rust's existing heap-then-formula sequencing, but preserve
+    // OCaml's allocation distinction by checking imported `EqZero` against the
+    // caller's pre-call allocation snapshot rather than the already-updated
+    // post heap.
     log::debug!(
         "[apply_summary] translate_formula for {:?} pre_post",
         pre_post.kind
     );
-    if !translate_formula(&pre_post.post.path_condition, &subst, &mut caller_state) {
-        log::debug!("[apply_summary] → rejected (Unsat)");
-        return ApplySummaryOutcome::default(); // pre_post inapplicable to this caller state
+    match translate_formula(
+        &pre_post.post.path_condition,
+        &pre_post.post,
+        &mut subst,
+        &mut caller_state,
+        stack_allocated_before_call,
+        heap_allocated_before_call,
+        loc,
+    ) {
+        TranslateFormulaResult::Sat => {
+            log::debug!("[apply_summary] → accepted (Sat)");
+        }
+        TranslateFormulaResult::Unsat => {
+            log::debug!("[apply_summary] → rejected (Unsat)");
+            return ApplySummaryOutcome::default();
+        }
+        TranslateFormulaResult::PotentialInvalidAccess(diag) => {
+            mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
+            log::debug!("[apply_summary] → imported potential invalid access: {diag}");
+            return if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
+                let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
+                ApplySummaryOutcome {
+                    results: vec![ExecutionDomain::AbortProgram {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(manifest_diag),
+                    }],
+                    alias_specialization: None,
+                }
+            } else {
+                ApplySummaryOutcome {
+                    results: vec![ExecutionDomain::LatentInvalidAccess {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(diag),
+                    }],
+                    alias_specialization: None,
+                }
+            };
+        }
     }
-    log::debug!("[apply_summary] → accepted (Sat)");
 
     // Step 5: Apply callee's attributes to caller (invalidations + allocations).
     // This MUST happen after formula translation (step 4) because
@@ -347,6 +394,7 @@ pub(crate) fn apply_summary_with_aliasing(
         crate::summary::PrePostKind::LatentInvalidAccess => {
             if let Some(diag) = &pre_post.diagnostic {
                 let diag = translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories);
+                mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
                 if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
                     vec![ExecutionDomain::AbortProgram {
@@ -406,10 +454,12 @@ fn latent_invalid_access_is_manifest(
     caller_state: &AbductiveDomain,
 ) -> bool {
     matches!(
-        diagnostic,
-        Diagnostic::AccessToInvalidAddress { addr, .. }
-            if caller_state.check_valid(*addr).is_err()
-                && crate::summary::abort_is_manifest(caller_pdesc, caller_state)
+        crate::summary::classify_abort_kind(
+            caller_pdesc,
+            caller_state,
+            &reify_invalid_access_diagnostic(diagnostic.clone(), caller_state),
+        ),
+        crate::summary::PrePostKind::AbortProgram
     )
 }
 
@@ -447,6 +497,12 @@ fn reify_invalid_access_diagnostic(
             },
         },
         _ => diagnostic,
+    }
+}
+
+fn mark_diagnostic_addr_must_be_valid(caller_state: &mut AbductiveDomain, diagnostic: &Diagnostic) {
+    if let Diagnostic::AccessToInvalidAddress { addr, .. } = diagnostic {
+        caller_state.mark_must_be_valid(*addr);
     }
 }
 
@@ -888,16 +944,70 @@ fn resolve_mut(
 /// callee's formula space into the caller's abstract value space.
 fn translate_formula(
     callee_formula: &crate::formula::Formula,
-    subst: &HashMap<AbstractValue, AbstractValue>,
+    callee_post: &AbductiveDomain,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
     caller_state: &mut AbductiveDomain,
-) -> bool {
+    mut stack_allocated_before_call: std::collections::HashSet<AbstractValue>,
+    mut heap_allocated_before_call: std::collections::HashSet<AbstractValue>,
+    loc: &Location,
+) -> TranslateFormulaResult {
+    fn imported_potential_invalid_access_diagnostic(
+        addr: AbstractValue,
+        loc: &Location,
+        caller_state: &AbductiveDomain,
+    ) -> Diagnostic {
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        let access_history = caller_state
+            .history_of_value(addr)
+            .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
+        let invalidation_history = access_history.append_event(HistoryEvent::Invalidated {
+            invalidation: invalidation.clone(),
+            location: loc.clone(),
+        });
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            invalidation,
+            access_location: loc.clone(),
+            access_history,
+            invalidation_history,
+        }
+    }
+
+    fn apply_imported_formula_result(
+        caller_state: &mut AbductiveDomain,
+        imported_must_be_valid: &mut std::collections::HashSet<AbstractValue>,
+        stack_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
+        heap_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
+        result: crate::sat_unsat::SatUnsat<Vec<crate::formula::NewEq>>,
+        loc: &Location,
+    ) -> TranslateFormulaResult {
+        match caller_state.apply_formula_result_for_summary_import(
+            result,
+            imported_must_be_valid,
+            stack_allocated_before_call,
+            heap_allocated_before_call,
+        ) {
+            crate::sat_unsat::SatUnsat::Unsat => TranslateFormulaResult::Unsat,
+            crate::sat_unsat::SatUnsat::Sat(ImportedFormulaEffect::Sat) => {
+                TranslateFormulaResult::Sat
+            }
+            crate::sat_unsat::SatUnsat::Sat(ImportedFormulaEffect::PotentialInvalidAccess(
+                addr,
+            )) => TranslateFormulaResult::PotentialInvalidAccess(
+                imported_potential_invalid_access_diagnostic(addr, loc, caller_state),
+            ),
+        }
+    }
+
     let phi = &callee_formula.phi();
-    let mut extended_subst = subst.clone();
     let mut ensure_formula_var = |callee_v: AbstractValue| {
-        extended_subst
+        subst
             .entry(callee_v)
             .or_insert_with(|| callee_v.mk_fresh_same_kind());
     };
+    for &callee_v in &callee_post.must_be_valid {
+        ensure_formula_var(callee_v);
+    }
 
     // Cross-ref: OCaml `PulseFormula.and_callee_formula` uses the same
     // substitution builder for both remembered conditions and the rest of the
@@ -929,48 +1039,122 @@ fn translate_formula(
         }
     }
 
+    let callee_stack_addrs: std::collections::HashSet<_> = callee_post
+        .pre
+        .stack
+        .iter()
+        .chain(callee_post.post.stack.iter())
+        .map(|(_, addr)| callee_post.path_condition.get_var_repr(*addr))
+        .collect();
+
+    let mut imported_must_be_valid: std::collections::HashSet<_> = callee_post
+        .must_be_valid
+        .iter()
+        .copied()
+        .map(|callee_v| callee_post.path_condition.get_var_repr(callee_v))
+        // Callee stack slots (including formal parameter cells) are local
+        // bookkeeping, not caller-space addresses. Propagating their
+        // MustBeValid obligations to actual values turns scalar facts such as
+        // `x == 0` into bogus imported invalid-access reports at call sites.
+        .filter(|callee_v| !callee_stack_addrs.contains(callee_v))
+        .filter_map(|callee_v| subst.get(&callee_v).copied())
+        .map(|caller_v| caller_state.path_condition.get_var_repr(caller_v))
+        .collect();
+
     // Cross-ref: OCaml `PulseFormula.and_callee_formula` conjoins remembered
     // conditions before importing the rest of the callee phi so caller-visible
     // guards do not get trivialized by freshly imported equalities.
     for (atom, depth) in callee_formula.conditions() {
-        let translated = atom.translate(|v| *extended_subst.get(&v).expect("formula subst"));
+        let translated = atom.translate(|v| *subst.get(&v).expect("formula subst"));
         log::debug!("    condition[{depth}]: {atom} → {translated}");
-        let sat = caller_state.and_condition_direct(translated, depth + 1);
-        if sat.is_unsat() {
-            log::debug!("    → UNSAT!");
-            return false;
+        let result = caller_state
+            .path_condition
+            .and_condition_direct(translated, depth + 1);
+        match apply_imported_formula_result(
+            caller_state,
+            &mut imported_must_be_valid,
+            &mut stack_allocated_before_call,
+            &mut heap_allocated_before_call,
+            result,
+            loc,
+        ) {
+            TranslateFormulaResult::Sat => {}
+            TranslateFormulaResult::Unsat => {
+                log::debug!("    → UNSAT!");
+                return TranslateFormulaResult::Unsat;
+            }
+            TranslateFormulaResult::PotentialInvalidAccess(diag) => {
+                return TranslateFormulaResult::PotentialInvalidAccess(diag);
+            }
         }
     }
 
     // Translate linear equations: for each callee_v = lin_expr,
     // translate all variables in the linear expression to caller space
     for (&callee_v, lin) in &phi.linear_eqs {
-        let caller_v = *extended_subst.get(&callee_v).expect("formula subst");
+        let caller_v = *subst.get(&callee_v).expect("formula subst");
         // Check if it's a constant
         if let Some(q) = lin.get_as_const() {
             let c = *q.numer() / *q.denom();
-            if caller_state.and_equal_const(caller_v, c).is_unsat() {
-                return false;
+            let result = caller_state.path_condition.and_equal_const(caller_v, c);
+            match apply_imported_formula_result(
+                caller_state,
+                &mut imported_must_be_valid,
+                &mut stack_allocated_before_call,
+                &mut heap_allocated_before_call,
+                result,
+                loc,
+            ) {
+                TranslateFormulaResult::Sat => {}
+                TranslateFormulaResult::Unsat => return TranslateFormulaResult::Unsat,
+                TranslateFormulaResult::PotentialInvalidAccess(diag) => {
+                    return TranslateFormulaResult::PotentialInvalidAccess(diag);
+                }
             }
             continue;
         }
         // Check if it's a single variable
         if let Some(callee_other) = lin.get_as_var() {
-            let caller_other = *extended_subst.get(&callee_other).expect("formula subst");
-            if caller_state.and_equal(caller_v, caller_other).is_unsat() {
-                return false;
+            let caller_other = *subst.get(&callee_other).expect("formula subst");
+            let result = caller_state
+                .path_condition
+                .and_equal_vars(caller_v, caller_other);
+            match apply_imported_formula_result(
+                caller_state,
+                &mut imported_must_be_valid,
+                &mut stack_allocated_before_call,
+                &mut heap_allocated_before_call,
+                result,
+                loc,
+            ) {
+                TranslateFormulaResult::Sat => {}
+                TranslateFormulaResult::Unsat => return TranslateFormulaResult::Unsat,
+                TranslateFormulaResult::PotentialInvalidAccess(diag) => {
+                    return TranslateFormulaResult::PotentialInvalidAccess(diag);
+                }
             }
             continue;
         }
         // For more complex linear expressions, translate if all vars are in subst
-        let all_vars_mapped = lin.vars.keys().all(|v| extended_subst.contains_key(v));
+        let all_vars_mapped = lin.vars.keys().all(|v| subst.contains_key(v));
         if all_vars_mapped {
-            let translated = lin.translate(|v| *extended_subst.get(&v).expect("formula subst"));
-            if caller_state
-                .and_equal_linear(caller_v, translated)
-                .is_unsat()
-            {
-                return false;
+            let translated = lin.translate(|v| *subst.get(&v).expect("formula subst"));
+            let result = caller_state
+                .path_condition
+                .and_equal_linear(caller_v, translated);
+            match apply_imported_formula_result(
+                caller_state,
+                &mut imported_must_be_valid,
+                &mut stack_allocated_before_call,
+                &mut heap_allocated_before_call,
+                result,
+                loc,
+            ) {
+                TranslateFormulaResult::Sat => {}
+                TranslateFormulaResult::Unsat => return TranslateFormulaResult::Unsat,
+                TranslateFormulaResult::PotentialInvalidAccess(diag) => {
+                    return TranslateFormulaResult::PotentialInvalidAccess(diag);
+                }
             }
         }
     }
@@ -980,22 +1164,32 @@ fn translate_formula(
         phi.atoms.len(),
         callee_formula.conditions().len(),
         subst.len(),
-        extended_subst.len()
+        subst.len()
     );
     for atom in &phi.atoms {
-        let all_mapped = atom
-            .all_vars()
-            .iter()
-            .all(|v| extended_subst.contains_key(v));
+        let all_mapped = atom.all_vars().iter().all(|v| subst.contains_key(v));
         if !all_mapped {
             continue;
         }
-        let translated = atom.translate(|v| extended_subst.get(&v).copied().unwrap_or(v));
+        let translated = atom.translate(|v| subst.get(&v).copied().unwrap_or(v));
         log::debug!("    atom: {atom} → {translated}");
-        let sat = caller_state.and_atom_direct(translated);
-        if sat.is_unsat() {
-            log::debug!("    → UNSAT!");
-            return false;
+        let result = caller_state.path_condition.and_atom_direct(translated);
+        match apply_imported_formula_result(
+            caller_state,
+            &mut imported_must_be_valid,
+            &mut stack_allocated_before_call,
+            &mut heap_allocated_before_call,
+            result,
+            loc,
+        ) {
+            TranslateFormulaResult::Sat => {}
+            TranslateFormulaResult::Unsat => {
+                log::debug!("    → UNSAT!");
+                return TranslateFormulaResult::Unsat;
+            }
+            TranslateFormulaResult::PotentialInvalidAccess(diag) => {
+                return TranslateFormulaResult::PotentialInvalidAccess(diag);
+            }
         }
     }
 
@@ -1004,7 +1198,7 @@ fn translate_formula(
     // Cross-ref: OCaml PulseFormula.and_callee_formula folds substitutions
     // through the whole formula, including function-application terms.
     for (key, ret) in phi.iter_fn_app_eqs() {
-        let Some(&caller_ret) = extended_subst.get(ret) else {
+        let Some(&caller_ret) = subst.get(ret) else {
             continue;
         };
         let mut caller_actuals = Vec::with_capacity(key.actuals.len());
@@ -1014,12 +1208,12 @@ fn translate_formula(
                 crate::formula::phi::FnAppActual::Const(c) => {
                     let fresh = crate::abstract_value::AbstractValue::mk_fresh();
                     if caller_state.and_equal_const(fresh, *c).is_unsat() {
-                        return false;
+                        return TranslateFormulaResult::Unsat;
                     }
                     caller_actuals.push(fresh);
                 }
                 crate::formula::phi::FnAppActual::Var(v) => {
-                    let Some(&caller_actual) = extended_subst.get(v) else {
+                    let Some(&caller_actual) = subst.get(v) else {
                         all_mapped = false;
                         break;
                     };
@@ -1036,10 +1230,10 @@ fn translate_formula(
             .is_unsat()
         {
             log::debug!("    fn_app: {}({:?}) → UNSAT!", key.callee, key.actuals);
-            return false;
+            return TranslateFormulaResult::Unsat;
         }
     }
-    true
+    TranslateFormulaResult::Sat
 }
 
 /// Translate a callee Access to a caller Access (substituting array indices).
@@ -2037,6 +2231,39 @@ mod tests {
         (pre_post, diagnostic, formal_pvar)
     }
 
+    fn mk_latent_null_invalid_access_pre_post() -> (PrePost, Diagnostic) {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        callee_state.mark_must_be_valid(formal_val);
+        callee_state.invalidate(
+            formal_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(formal_val, invalidation);
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::LatentInvalidAccess,
+            diagnostic: Some(diagnostic.clone()),
+        };
+
+        (pre_post, diagnostic)
+    }
+
     #[test]
     fn test_apply_summary_keeps_latent_abort_when_imported_condition_depends_on_caller() {
         let (pre_post, diagnostic) = mk_latent_abort_pre_post();
@@ -2136,6 +2363,84 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_summary_imported_eq_zero_becomes_latent_invalid_access() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let _heap_target = callee_state.read_heap(formal_val, Access::Dereference);
+        callee_state.mark_must_be_valid(formal_val);
+        assert!(callee_state
+            .path_condition
+            .and_equal_const(formal_val, 0)
+            .is_sat());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar.clone())))
+            .unwrap();
+        let caller_formal_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let _caller_heap_target = caller_state.read_heap(caller_formal_val, Access::Dereference);
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_formal_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+        let actuals = vec![(Exp::Var(actual_id), Typ::void())];
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentInvalidAccess { state, diagnostic }]
+                if matches!(
+                    diagnostic.as_ref(),
+                    Diagnostic::AccessToInvalidAddress {
+                        invalidation: crate::invalidation::Invalidation::ConstantDereference(_),
+                        ..
+                    }
+                ) && matches!(
+                    diagnostic.as_ref(),
+                    Diagnostic::AccessToInvalidAddress { addr, .. }
+                        if state.check_valid(*addr).is_ok()
+                )
+        ));
+    }
+
+    #[test]
     fn test_apply_summary_reifies_latent_invalid_access_when_caller_addr_is_invalid() {
         let (pre_post, _diagnostic, _formal_pvar) = mk_latent_invalid_access_pre_post(true);
 
@@ -2161,6 +2466,35 @@ mod tests {
             results.as_slice(),
             [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
                 if found.get_issue_type_id() == diagnostics::issue_type::IssueTypeId::UseAfterFree
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_keeps_direct_formal_null_invalid_access_latent() {
+        let (pre_post, diagnostic) = mk_latent_null_invalid_access_pre_post();
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(
+            Exp::Lvar(Pvar::mk(Mangled::from_string("x"), caller_pname)),
+            Typ::void(),
+        )];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentInvalidAccess { diagnostic: found, .. }]
+                if found.as_ref().get_issue_type_id() == diagnostic.get_issue_type_id()
         ));
     }
 

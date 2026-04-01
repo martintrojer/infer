@@ -157,9 +157,19 @@ pub fn eval_with_history(
                     }
                 }
                 sil::unop::Unop::Neg => {
-                    // -x: if x is a known constant, fold to -x
+                    // Cross-ref: OCaml `PulseArithmetic.eval_unop` keeps
+                    // unary minus connected to its operand in the formula.
+                    // If we drop that symbolic relation here, interproc
+                    // conditions imported through `-x` become disconnected
+                    // from caller-visible inputs and latent arithmetic bugs
+                    // look manifest.
                     if let Some(c) = state.get_const(inner_val.addr) {
                         let _ = state.and_equal_const(result, -c);
+                    } else {
+                        let _ = state.and_equal_linear(
+                            result,
+                            crate::formula::lin_arith::LinArith::of_var(inner_val.addr).neg(),
+                        );
                     }
                 }
                 sil::unop::Unop::BNot => {
@@ -438,6 +448,16 @@ pub fn write_deref_with_history(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
+    let record_write = |addr: AbstractValue, state: &mut AbductiveDomain| {
+        let repr = state.path_condition.get_var_repr(addr);
+        // Cross-ref: OCaml `PulseAbductiveDomain.set_post_cell` records a
+        // `WrittenTo` attribute on each written address. Rust does not thread
+        // PathContext timestamps yet, so keep a stable placeholder timestamp;
+        // current summary classification only relies on the presence of the
+        // write marker, not on its ordering.
+        state.post.attrs.mark_written_to(repr, 0, loc.clone());
+    };
+
     match check_addr_access_with_history(ref_addr.clone(), loc, state) {
         PulseResult::Ok(()) => {}
         PulseResult::FatalError(e, errs) => return PulseResult::FatalError(e, errs),
@@ -447,6 +467,7 @@ pub fn write_deref_with_history(
                 Access::Dereference,
                 ValueWithHistory::new(obj.addr, obj.history.append_assignment(loc.clone())),
             );
+            record_write(ref_addr.addr, state);
             return PulseResult::Recoverable((), errs);
         }
     }
@@ -467,6 +488,7 @@ pub fn write_deref_with_history(
         Access::Dereference,
         ValueWithHistory::new(obj.addr, obj.history.append_assignment(loc.clone())),
     );
+    record_write(ref_addr.addr, state);
     PulseResult::Ok(())
 }
 
@@ -598,4 +620,38 @@ pub fn allocate(
     state: &mut AbductiveDomain,
 ) {
     state.allocate(addr, allocator, loc);
+}
+
+#[cfg(test)]
+mod tests {
+    use sil::procdesc::Procdesc;
+    use sil::procname::Procname;
+    use sil::typ::Typ;
+
+    use super::*;
+
+    #[test]
+    fn test_access_through_zero_records_null_invalidation() {
+        let loc = Location::dummy();
+        let pdesc = Procdesc::new(Procname::c_from_string("test"), Typ::void(), loc.clone());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let p = AbstractValue::mk_fresh();
+        state.and_equal_const(p, 0);
+
+        let result = check_addr_access(p, &loc, &mut state);
+        assert!(matches!(
+            result,
+            PulseResult::FatalError(
+                Diagnostic::AccessToInvalidAddress {
+                    invalidation: Invalidation::ConstantDereference(_),
+                    ..
+                },
+                _
+            )
+        ));
+        assert!(
+            state.check_valid(p).is_err(),
+            "known-zero access should materialize a null invalidation for later reporting"
+        );
+    }
 }

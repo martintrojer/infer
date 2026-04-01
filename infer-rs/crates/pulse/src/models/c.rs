@@ -41,7 +41,6 @@ pub const MODELED_NAMES: &[&str] = &[
     "abort",
     "__assert_fail",
     "__assert_rtn",
-    "__infer_fail",
     "__builtin_expect",
     "random",
     "fopen",
@@ -103,11 +102,17 @@ fn dispatch_with_config(
         return Some(cpp_delete(ret_id, args, loc, state));
     }
 
-    // Non-builtin models: match by name
+    // Non-builtin models: match by name.
+    //
+    // Cross-ref: OCaml `PulseModelsImport.ml` models `abort`/`exit` as
+    // `early_exit`, but does not treat `__infer_fail` as a noreturn Pulse
+    // primitive. Clang lowers assertion-failure control flow through
+    // `__infer_fail`, and OCaml keeps those branches as ordinary summary
+    // paths unless the enclosing proc itself is marked `is_no_return`.
     let name = callee.get_method_name();
     if matches!(
         name,
-        "exit" | "_exit" | "abort" | "__assert_fail" | "__infer_fail" | "__assert_rtn"
+        "exit" | "_exit" | "abort" | "__assert_fail" | "__assert_rtn"
     ) {
         return Some(noreturn(state));
     }
@@ -804,6 +809,18 @@ mod tests {
         let callee = Procname::c_from_string("unknown_func");
         let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_none(), "unknown function should not dispatch");
+    }
+
+    #[test]
+    fn test_dispatch_does_not_model_infer_fail_as_noreturn() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let callee = Procname::c_from_string("__infer_fail");
+        let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
+        assert!(
+            result.is_none(),
+            "__infer_fail should fall back to normal empty-body/unknown-call handling"
+        );
     }
 
     #[test]

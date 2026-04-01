@@ -5,78 +5,67 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-- Active line of investigation is now Pulse latent-versus-manifest invalid
-  access parity, not importer sequencing or store semantics.
-- The importer-sequencing fix is still good and was not the remaining issue:
-  - Rust mirrors OCaml `PulseFormula.and_callee_formula` in
-    `crates/pulse/src/interproc.rs`
-  - remembered `conditions` are imported before the rest of `phi`
-  - one shared substitution is used across the full callee formula
-- Rust summary normalization now also matches the OCaml summary pipeline more
-  closely in `crates/pulse/src/summary.rs`:
-  - `simplify_for_summary(precondition_vocabulary, keep)` is used instead of
-    plain reachability-only simplification
-  - manifestness now includes
-    `PulseAbductiveDomain.Summary.pre_heap_has_assumptions` parity
-- Authoritative OCaml cross-refs for the current mismatch:
+- Active line of investigation is still Pulse latent-versus-manifest
+  invalid-access parity, but the two concrete regressions from the previous
+  pass are now fixed.
+- Imported callee arithmetic in `crates/pulse/src/interproc.rs` no longer uses
+  the rejected broad reorder:
+  - Rust keeps the existing `apply_post`-then-formula sequencing
+  - new `AbductiveDomain::snapshot_allocated_before_call()` captures caller
+    stack/heap allocations after `materialize_pre` and before `apply_post`
+  - `apply_formula_result_for_summary_import()` now uses those snapshots so
+    imported `EqZero` only treats pre-call caller allocations as contradictions
+    or potential invalid accesses
+  - this fixes the reduced guarded-outparam repro and makes
+    `test_e2e_write_through_ptr` pass without reintroducing the broad
+    latent/manifest regression
+- The remaining caller-boundary mismatch is also fixed now:
+  - `latent_use_after_free` still exports
+    `LatentInvalidAccess(NULLPTR_DEREFERENCE)` +
+    `LatentAbortProgram(USE_AFTER_FREE)`, matching the OCaml split
+  - `manifest_use_after_free` no longer upgrades that latent direct-formal
+    null path into a manifest `NULLPTR_DEREFERENCE`
+  - fix in `crates/pulse/src/interproc.rs`:
+    mark the translated invalid-access address as `must_be_valid` in the
+    caller, then reuse `summary::classify_abort_kind()` instead of the old
+    raw `check_valid && abort_is_manifest` test
+  - this keeps direct-formal nulls latent at the next caller boundary while
+    preserving manifest field/null-after-free cases such as
+    `access_use_after_free_bad`
+- OCaml cross-refs that matched this fix direction:
+  - `PulseInterproc.conjoin_callee_arith`
+  - `PulseAbductiveDomain.incorporate_new_eqs`
+  - `PulseCallOperations.apply_callee`
   - `PulseArithmetic.is_manifest`
-  - `PulseAbductiveDomain.Summary.pre_heap_has_assumptions`
-  - `PulseSummary.exec_summary_of_post_common`
-  - `PulseCallOperations.apply_callee` latent-invalid-access handling
-- The broad Rust hypothesis "any caller-visible invalid access should become
-  `LatentInvalidAccess`" was wrong:
-  - it suppressed real manifest UAFs such as
-    `deref_then_free_then_deref_bad` and `access_use_after_free_bad`
-  - OCaml directly contradicts that via summary JSON
-- Current Rust rule in `crates/pulse/src/summary.rs` is narrower and validated:
-  - pre-existing caller-controlled `ConstantDereference` aborts can become
-    `LatentInvalidAccess`
-  - newly written values in true by-ref / outparam slots can still stay latent
-  - ordinary callee-written field nulls stay manifest again
-  - caller-visible non-null invalidations (for example `CFree`) stay
-    `AbortProgram` or `LatentAbortProgram` depending on manifestness
-  - this restored the direct `.sil` `store_bad` / `use_not_modeled_bad`
-    regressions, brought `angelism.c` and `funptr.c` back to parity in the
-    authoritative sweep, and kept UAF parity exact
-- Key OCaml summary evidence collected during this pass:
-  - `deref_then_free_then_deref_bad`
-    -> `LatentInvalidAccess(address=x)` + `AbortProgram(CFree)`
-  - `latent_use_after_free`
-    -> `LatentInvalidAccess` + `LatentAbortProgram(CFree)` + continues
-  - `access_use_after_free_bad`
-    -> `AbortProgram(ConstantDereference on l->next)` +
-       `AbortProgram(CFree on l->next)`
-  - `manifest_use_after_free`
-    -> `ContinueProgram` + `AbortProgram(CFree)` only
-- Current Rust matches the first two OCaml splits above, but not the last two:
-  - `deref_then_free_then_deref_bad` is now correct again
-  - `latent_use_after_free` is now correct again
-  - `manifest_use_after_free` still publishes an extra manifest NPE
-  - `access_use_after_free_bad` still misses the manifest NPE that OCaml keeps
-  - `traverse_and_crash_if_equal_to_root` / the wrapper cycle family still
-    diverge on which latent-vs-manifest null paths survive the call chain
+- New focused coverage from this pass:
+  - `crates/pulse/tests/end_to_end.rs`
+    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`
+  - `crates/pulse/tests/end_to_end.rs`
+    `test_e2e_manifest_use_after_free_reports_only_uaf`
+  - `crates/pulse/src/interproc.rs`
+    `test_apply_summary_keeps_direct_formal_null_invalid_access_latent`
+  - `crates/pulse/tests/end_to_end.rs`
+    `test_e2e_write_through_ptr` is unignored and now passes
 - Latest authoritative validations on the current tree:
-  - `cargo test -p pulse --lib -- --nocapture`
-  - `cargo test -p pulse --test end_to_end -- --nocapture`
-  - `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --nocapture`
-  - `cargo test -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+  - `cargo test -q --manifest-path Cargo.toml -p pulse --lib`
+  - `cargo test -q --manifest-path Cargo.toml -p pulse --test end_to_end`
+  - `cargo test --manifest-path Cargo.toml -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
 - Latest authoritative ignored sweep on the current tree:
-  - `NPE: expected 131, found 132`
+  - `NPE: expected 131, found 134`
   - `LEAK: expected 20, found 20`
   - `UAF: expected 7, found 7`
   - file diffs:
+    - `angelism.c: expected 7, found 8`
     - `latent.c: expected 5, found 6`
     - `nullptr.c: expected 13, found 12`
     - `sizeof.c: expected 0, found 2`
-    - `traces.c: expected 5, found 4`
-- Current best next step:
-  - inspect why OCaml keeps `access_use_after_free_bad`'s
-    `ConstantDereference(l->next)` as a manifest `AbortProgram`, while keeping
-    `deref_then_free_then_deref_bad`'s `ConstantDereference(x)` as
-    `LatentInvalidAccess`
-  - then inspect why Rust still turns the callee latent-null path into a
-    manifest NPE in `manifest_use_after_free`, whereas OCaml drops that path
-    and keeps only the manifest UAF
+- Interpretation of the current sweep:
+  - `sizeof.c` is still the accepted textual-fidelity limitation
+  - `manifest_use_after_free` is fixed, so the current count drift moved
+    elsewhere rather than being the old direct-formal latent/null mismatch
+  - the next realistic work items are to localize the extra NPEs in
+    `angelism.c` and `latent.c`, then inspect which `nullptr.c` report dropped
+    while keeping the correctness-first direct-formal and by-ref fixes intact
 
 Older notes below are historical checkpoints and may no longer describe the
 active investigation.

@@ -132,14 +132,8 @@ pub fn analyze_with_specialization_and_requests(
     // ExitProgram, and AbortProgram. OCaml keeps all paths (including
     // error paths) in the pre_post_list.
     let mut exit_disjuncts = Vec::new();
-    let mut has_any_disjuncts = false;
-    let mut has_continue = false;
     if let Some(exit_state) = inv_map.get(&pdesc.exit_node) {
-        has_any_disjuncts = !exit_state.post.disjuncts.is_empty();
         for d in &exit_state.post.disjuncts {
-            if d.is_continue() {
-                has_continue = true;
-            }
             match d {
                 ExecutionDomain::ContinueProgram(_)
                 | ExecutionDomain::ExitProgram(_)
@@ -153,9 +147,11 @@ pub fn analyze_with_specialization_and_requests(
         }
     }
     // Cross-ref: OCaml consults ProcAttributes.is_no_return at call sites in
-    // Pulse.ml, so preserve that source-level fact even when the exported
-    // Textual body is empty and would otherwise analyze as a normal return.
-    let is_noreturn = pdesc.is_no_return || (has_any_disjuncts && !has_continue);
+    // Pulse.ml. Do not infer noreturn from "no ContinueProgram at exit":
+    // latent/error-only summaries still need normal summary application at
+    // callers, whereas source-level noreturn metadata is the intended fast
+    // path for empty stubs / declarations.
+    let is_noreturn = pdesc.is_no_return;
 
     let summary = PulseSummary::of_proc(pdesc, &exit_disjuncts, diagnostics, is_noreturn);
     let spec_requests = pulse_tf.spec_requests.into_inner();

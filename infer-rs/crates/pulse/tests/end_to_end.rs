@@ -1351,6 +1351,153 @@ fn test_e2e_interproc_path_condition() {
 }
 
 #[test]
+fn test_e2e_negated_actual_keeps_arithmetic_latent_summary() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare random() : int
+        define exit(code: int) : void {
+          #entry:
+            ret null
+        }
+        define assume_non_negative(x: int) : void {
+          #entry:
+            n0:int = load &x
+            jmp then_, else_
+          #then_:
+            prune __sil_lt(n0, 0)
+            _ = exit(1)
+            ret null
+          #else_:
+            prune __sil_lnot(__sil_lt(n0, 0))
+            ret null
+        }
+        define if_negative_then_crash_latent(x: int) : void {
+          local p: *int
+          #entry:
+            n0:int = load &x
+            _ = assume_non_negative(__sil_neg(n0))
+            store &p <- 0:*int
+            n1:*int = load &p
+            store n1 <- 42:int
+            ret null
+        }
+        define caller_bad() : void {
+          #entry:
+            n0 = random()
+            _ = if_negative_then_crash_latent(n0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summaries = store.to_vec();
+
+    let latent_summary = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "if_negative_then_crash_latent")
+        .map(|(_, summary)| summary)
+        .expect("if_negative_then_crash_latent summary missing");
+    assert!(
+        latent_summary.diagnostics.is_empty(),
+        "if_negative_then_crash_latent should stay latent when its imported path condition depends on -x"
+    );
+    assert!(
+        latent_summary
+            .pre_posts
+            .iter()
+            .any(|pp| {
+                matches!(
+                    pp.kind,
+                    pulse::summary::PrePostKind::LatentAbortProgram
+                        | pulse::summary::PrePostKind::LatentInvalidAccess
+                ) && pp
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+            }),
+        "if_negative_then_crash_latent should export a latent NULL_DEREFERENCE pre/post"
+    );
+
+    let caller_summary = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "caller_bad")
+        .map(|(_, summary)| summary)
+        .expect("caller_bad summary missing");
+    assert!(
+        caller_summary
+            .diagnostics
+            .iter()
+            .any(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "caller_bad should report the manifest NULL_DEREFERENCE after applying the latent callee summary"
+    );
+}
+
+#[test]
+fn test_e2e_infer_fail_stub_does_not_force_noreturn_summary() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        declare __infer_fail(int) : void
+
+        define my_assert(x: int) : void {
+          #entry:
+            n0:int = load &x
+            jmp fail, ok
+          #fail:
+            prune __sil_lnot(n0)
+            _ = __infer_fail(0)
+            ret null
+          #ok:
+            prune n0
+            ret null
+        }
+
+        define should_report_assertion_failure(x: int) : void {
+          #entry:
+            store &x <- 0:int
+            n0:int = load &x
+            _ = my_assert(n0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summaries = store.to_vec();
+
+    let assert_summary = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "my_assert")
+        .map(|(_, summary)| summary)
+        .expect("my_assert summary missing");
+    assert_eq!(
+        assert_summary.pre_posts.len(),
+        2,
+        "my_assert should keep both branch summaries when __infer_fail is just a stub"
+    );
+    assert!(
+        assert_summary
+            .pre_posts
+            .iter()
+            .all(|pp| pp.kind == pulse::summary::PrePostKind::ContinueProgram),
+        "my_assert should not synthesize ExitProgram pre/posts from __infer_fail"
+    );
+
+    let caller_summary = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "should_report_assertion_failure")
+        .map(|(_, summary)| summary)
+        .expect("should_report_assertion_failure summary missing");
+    assert!(
+        caller_summary.diagnostics.is_empty(),
+        "should_report_assertion_failure should not report a spurious NULL_DEREFERENCE from my_assert"
+    );
+}
+
+#[test]
 fn test_e2e_empty_body_pure_int_call_preserves_integer_reasoning() {
     let tm = textual_utils::parse_and_convert(
         r#"
@@ -1501,11 +1648,6 @@ fn test_e2e_offsetof_shaped_pure_int_loop_preserves_integer_reasoning() {
 /// attributes, __call_c_function_ptr resolves them, and the callee's summary
 /// is applied. The callee returns null directly (not through pointer
 /// indirection), which our biabduction handles correctly.
-///
-/// Note: write-through-pointer patterns (like assign_NULL which does
-/// `*ptr = NULL`) don't propagate correctly yet because our biabduction
-/// pre-materialization maps formal values to existing heap targets at the
-/// wrong indirection level. This is tracked in TODO.md.
 #[test]
 fn test_e2e_funptr_dispatch() {
     let tm = textual_utils::parse_and_convert(
@@ -1617,11 +1759,135 @@ fn test_e2e_funptr_multilevel() {
     );
 }
 
-/// Test write-through-pointer: callee does *ptr = NULL, caller dereferences ptr.
-/// This isolates the biabduction issue from function pointer dispatch.
-/// Currently fails: biabduction doesn't propagate write-through-formal-pointer.
+/// Regression: if a procedure locally rewrites its own formal slot through a
+/// specialized function-pointer call chain, a later dereference of that formal
+/// must stay manifest.
 #[test]
-#[ignore]
+fn test_e2e_funptr_multilevel_formal_write_stays_manifest() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare __call_c_function_ptr((fun _ -> _), **int) : void
+        define assign_NULL(ptr: **int) : void {
+          #entry:
+            n0:**int = load &ptr
+            store n0 <- 0:*int
+            ret null
+        }
+        define call_funptr(fp: *(fun _ -> _), ptr: **int) : void {
+          #entry:
+            n0:*(fun _ -> _) = load &fp
+            n1:**int = load &ptr
+            _ = __call_c_function_ptr(n0, n1)
+            ret null
+        }
+        define call_call_funptr(fp: *(fun _ -> _), ptr: **int) : void {
+          #entry:
+            n0:*(fun _ -> _) = load &fp
+            n1:**int = load &ptr
+            _ = call_funptr(n0, n1)
+            ret null
+        }
+        define test_bad(ptr: *int) : void {
+          #entry:
+            _ = call_call_funptr(__sil_cfun("assign_NULL"), &ptr)
+            n0:*int = load &ptr
+            store n0 <- 42:int
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let bad = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "test_bad");
+    assert!(
+        bad.is_some_and(|(_, s)| s
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
+        "test_bad should report NULL_DEREFERENCE after assign_NULL rewrites the caller formal through the specialized funptr chain"
+    );
+}
+
+/// Regression: imported scalar guard conditions must stay attached to the
+/// caller's actual scalar, even when the same summary also writes back through
+/// a by-ref out parameter.
+#[test]
+fn test_e2e_guarded_outparam_write_uses_matching_summary_branch() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        define maybe_null(flag: int, out: **int) : void {
+          #entry:
+            n0:int = load &flag
+            jmp zero_branch, nonzero_branch
+          #zero_branch:
+            prune __sil_eq(n0, 0)
+            n1:**int = load &out
+            store n1 <- 0:*int
+            ret null
+          #nonzero_branch:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            ret null
+        }
+        define caller_bad() : int {
+          local flag:int, x:int, p:*int
+          #entry:
+            store &flag <- 0:int
+            store &x <- 1:int
+            store &p <- &x:*int
+            n0:int = load &flag
+            _ = maybe_null(n0, &p)
+            n1:*int = load &p
+            n2:int = load n1
+            ret n2
+        }
+        define caller_ok() : int {
+          local flag:int, x:int, p:*int
+          #entry:
+            store &flag <- 1:int
+            store &x <- 1:int
+            store &p <- &x:*int
+            n0:int = load &flag
+            _ = maybe_null(n0, &p)
+            n1:*int = load &p
+            n2:int = load n1
+            ret n2
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let bad = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "caller_bad");
+    assert!(
+        bad.is_some_and(|(_, s)| s
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
+        "caller_bad should report NULL_DEREFERENCE after the flag == 0 summary branch nulls the out param"
+    );
+
+    let ok = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "caller_ok");
+    assert!(
+        ok.is_some_and(|(_, s)| s.diagnostics.is_empty()),
+        "caller_ok should keep the non-null pointer when the flag != 0 summary branch applies"
+    );
+}
+
+/// Test write-through-pointer: callee does *ptr = NULL, caller dereferences ptr.
+/// This isolates the heap-effect propagation from function-pointer
+/// specialization.
+#[test]
 fn test_e2e_write_through_ptr() {
     let tm = textual_utils::parse_and_convert(
         r#"
@@ -1655,9 +1921,6 @@ fn test_e2e_write_through_ptr() {
             .iter()
             .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)
     });
-    eprintln!("direct_call_bad: has_npe={has_npe}");
-    // This currently fails due to biabduction indirection issue
-    // but documents the expected behavior.
     assert!(
         has_npe,
         "direct_call_bad should detect NULL_DEREFERENCE through write-through-pointer"
@@ -2323,6 +2586,180 @@ fn test_debug_follow_ret() {
 }
 
 #[test]
+fn test_e2e_manifest_use_after_free_reports_only_uaf() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define conditional_free2(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            jmp do_free, skip_free
+          #do_free:
+            prune __sil_eq(n0, 1)
+            _ = free(n1)
+            ret null
+          #skip_free:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define latent_use_after_free(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = conditional_free2(n0, n1)
+            store n1 <- 42:int
+            jmp clean_up, done
+          #clean_up:
+            prune __sil_eq(n0, 0)
+            _ = free(n1)
+            ret null
+          #done:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            ret null
+        }
+
+        define manifest_use_after_free(x: *int) : void {
+          #entry:
+            n0:*int = load &x
+            _ = latent_use_after_free(1, n0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "manifest_use_after_free")
+        .map(|(_, summary)| summary)
+        .expect("manifest_use_after_free summary should exist");
+    let issue_types: Vec<_> = summary
+        .diagnostics
+        .iter()
+        .map(|diag| diag.get_issue_type_id())
+        .collect();
+
+    assert!(
+        issue_types.contains(&IssueTypeId::UseAfterFree),
+        "expected manifest USE_AFTER_FREE, found {issue_types:?}"
+    );
+    assert!(
+        !issue_types.contains(&IssueTypeId::NullptrDereference),
+        "manifest_use_after_free should not publish a manifest NULL_DEREFERENCE, found {issue_types:?}"
+    );
+}
+
+#[test]
+fn test_e2e_latent_error_only_summary_is_not_noreturn() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define conditional_free2(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            jmp do_free, skip_free
+          #do_free:
+            prune __sil_eq(n0, 1)
+            _ = free(n1)
+            ret null
+          #skip_free:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define latent_use_after_free(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = conditional_free2(n0, n1)
+            store n1 <- 42:int
+            jmp clean_up, done
+          #clean_up:
+            prune __sil_eq(n0, 0)
+            _ = free(n1)
+            ret null
+          #done:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "latent_use_after_free")
+        .map(|(_, summary)| summary)
+        .expect("latent_use_after_free summary should exist");
+
+    assert!(
+        !summary.is_noreturn,
+        "latent/error-only summaries still need normal summary application at callers"
+    );
+    assert!(
+        summary
+            .pre_posts
+            .iter()
+            .any(|pp| matches!(pp.kind, pulse::summary::PrePostKind::LatentAbortProgram)),
+        "latent_use_after_free should keep its latent UAF summary path"
+    );
+}
+
+#[test]
+fn test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        type list = { next: *list; data: int }
+
+        define access_use_after_free_bad(l: *list) : void {
+          #entry:
+            n0:*list = load &l
+            n1:*list = load n0.list.next
+            _ = free(n1)
+            n2:*list = load n0.list.next
+            store n2.list.next <- 0:*list
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "access_use_after_free_bad")
+        .map(|(_, summary)| summary)
+        .expect("access_use_after_free_bad summary should exist");
+
+    let issue_types: Vec<_> = summary
+        .diagnostics
+        .iter()
+        .map(|diag| diag.get_issue_type_id())
+        .collect();
+
+    assert!(
+        issue_types.contains(&IssueTypeId::UseAfterFree),
+        "expected manifest USE_AFTER_FREE, found {issue_types:?}"
+    );
+    assert!(
+        issue_types.contains(&IssueTypeId::NullptrDereference),
+        "expected manifest NULL_DEREFERENCE to remain for field access after free, found {issue_types:?}"
+    );
+}
+
+#[test]
 fn test_debug_latent_summary() {
     let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
     if !sil.exists() {
@@ -2336,6 +2773,8 @@ fn test_debug_latent_summary() {
         let name = format!("{pname}");
         if name.contains("latent")
             || name.contains("manifest_use_after_free")
+            || name.contains("conditional_free2")
+            || name.contains("access_use_after_free_bad")
             || name.contains("deref_then_free_then_deref")
             || name.contains("traverse_and_crash")
             || name.contains("crash_after")
@@ -2360,6 +2799,41 @@ fn test_debug_latent_summary() {
                 "  {name}: disjuncts={} kinds={kinds:?} conditions={conditions:?} issues={issues:?}",
                 summary.pre_posts.len(),
             );
+            for (i, pp) in summary.pre_posts.iter().enumerate() {
+                let formals: Vec<_> = pp
+                    .formals
+                    .iter()
+                    .map(|(pvar, addr)| format!("{pvar}->{addr}"))
+                    .collect();
+                let invalid_attrs: Vec<_> = pp
+                    .post
+                    .post
+                    .attrs
+                    .iter()
+                    .filter_map(|(addr, attrs)| {
+                        attrs.get_invalid().map(|(inv, _)| format!("{addr}:{inv}"))
+                    })
+                    .collect();
+                if let Some(diag) = &pp.diagnostic {
+                    let diag_addr = match diag {
+                        pulse::diagnostic::Diagnostic::AccessToInvalidAddress { addr, .. } => {
+                            format!("{addr}")
+                        }
+                        _ => "-".to_string(),
+                    };
+                    eprintln!(
+                        "    pp[{i}] kind={:?} diag={} addr={} formals={formals:?} invalid_attrs={invalid_attrs:?}",
+                        pp.kind,
+                        diag.get_issue_type(),
+                        diag_addr,
+                    );
+                } else if !invalid_attrs.is_empty() {
+                    eprintln!(
+                        "    pp[{i}] kind={:?} diag=- addr=- formals={formals:?} invalid_attrs={invalid_attrs:?}",
+                        pp.kind,
+                    );
+                }
+            }
         }
     }
 }

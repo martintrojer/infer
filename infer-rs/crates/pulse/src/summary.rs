@@ -545,7 +545,7 @@ impl PulseSummary {
                 // reports only after latent-vs-manifest classification.
                 if pp.kind == PrePostKind::AbortProgram {
                     if !proc_is_entry_point(pdesc)
-                        && pre_post_has_caller_visible_constant_deref(pdesc, &mut pp)
+                        && pre_post_has_direct_formal_constant_deref(pdesc, &mut pp)
                     {
                         pp.kind = PrePostKind::LatentInvalidAccess;
                     }
@@ -706,14 +706,41 @@ fn classify_non_exit_abort_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
         return;
     }
 
-    if !proc_is_entry_point(pdesc) && pre_post_has_caller_visible_constant_deref(pdesc, pre_post) {
+    if !proc_is_entry_point(pdesc) && pre_post_has_direct_formal_constant_deref(pdesc, pre_post) {
         pre_post.kind = PrePostKind::LatentInvalidAccess;
     } else if !pre_post_is_manifest(pdesc, pre_post) {
         pre_post.kind = PrePostKind::LatentAbortProgram;
     }
 }
 
-fn pre_post_has_caller_visible_invalid_access(pdesc: &Procdesc, pre_post: &mut PrePost) -> bool {
+fn direct_formal_values(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> std::collections::HashSet<AbstractValue> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    let mut values = std::collections::HashSet::new();
+
+    for (mangled, _typ, _annot) in &pdesc.formals {
+        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        for stack in [&pre_post.pre.stack, &pre_post.post.post.stack] {
+            let Some(stack_addr) = stack.find(&var) else {
+                continue;
+            };
+            let stack_addr = repr_of(stack_addr);
+            values.insert(stack_addr);
+            for heap in [&pre_post.pre.heap, &pre_post.post.post.heap] {
+                if let Some(value) = heap.find_edge(stack_addr, &Access::Dereference) {
+                    values.insert(repr_of(value));
+                }
+            }
+        }
+    }
+
+    values
+}
+
+fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut PrePost) -> bool {
     let Some(diag_addr) = pre_post.diagnostic.as_ref().and_then(|diag| match diag {
         Diagnostic::AccessToInvalidAddress { addr, .. } => {
             Some(pre_post.post.path_condition.get_var_repr(*addr))
@@ -731,35 +758,83 @@ fn pre_post_has_caller_visible_invalid_access(pdesc: &Procdesc, pre_post: &mut P
         return false;
     }
 
-    let canonicalize = |addrs: std::collections::HashSet<AbstractValue>,
-                        pre_post: &PrePost|
-     -> std::collections::HashSet<AbstractValue> {
-        addrs
-            .into_iter()
-            .map(|addr| pre_post.post.path_condition.get_var_repr(addr))
-            .collect()
-    };
+    let direct_formal = direct_formal_values(pdesc, pre_post).contains(&diag_addr);
+    if pre_post_has_post_written_byref_invalid_access(pdesc, pre_post, diag_addr) {
+        return !pre_post_diag_addr_has_non_null_invalidation(pre_post);
+    }
 
-    let caller_visible_in_pre = canonicalize(
-        pre_post.collect_reachable_from_seeds(
-            pre_post.pre.stack.iter().map(|(_, addr)| *addr),
-            true,
-            false,
-        ),
-        pre_post,
-    );
-
-    caller_visible_in_pre.contains(&diag_addr)
-        || pre_post_has_post_written_byref_invalid_access(pdesc, pre_post, diag_addr)
+    direct_formal
+        && !pre_post_has_locally_written_direct_formal(pdesc, pre_post, diag_addr)
+        && !pre_post_diag_addr_has_non_null_invalidation(pre_post)
 }
 
 fn proc_is_entry_point(pdesc: &Procdesc) -> bool {
     pdesc.proc_name.get_method_name() == "main"
 }
 
-/// Cross-ref: OCaml keeps caller-controlled null dereferences as
-/// `LatentInvalidAccess` summaries, while local invalidations like `free(x)`
-/// stay regular aborts and are then classified by manifestness.
+fn post_addr_has_written_to(pre_post: &PrePost, addr: AbstractValue) -> bool {
+    let repr = pre_post.post.path_condition.get_var_repr(addr);
+    pre_post
+        .post
+        .post
+        .attrs
+        .get(&repr)
+        .is_some_and(|attrs| {
+            attrs.iter().any(|attr| {
+                matches!(
+                    attr,
+                    crate::attribute::Attribute::WrittenTo(_, _)
+                )
+            })
+        })
+}
+
+/// Cross-ref: OCaml keeps direct-formal null dereferences latent when they
+/// still reflect untouched caller-owned inputs, but summaries like
+/// `test_syntactic_specialization_bad` and `test_assign_NULL_callback_bad`
+/// remain manifest because the procedure locally wrote its own formal slot
+/// through a by-ref call chain before dereferencing it.
+fn pre_post_has_locally_written_direct_formal(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+    diag_addr: AbstractValue,
+) -> bool {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+
+    for (mangled, _typ, _annot) in &pdesc.formals {
+        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+
+        for stack in [&pre_post.pre.stack, &pre_post.post.post.stack] {
+            let Some(stack_addr) = stack.find(&var) else {
+                continue;
+            };
+            let stack_addr = repr_of(stack_addr);
+            let loaded_value = pre_post
+                .post
+                .post
+                .heap
+                .find_edge(stack_addr, &Access::Dereference)
+                .map(repr_of);
+
+            if stack_addr != diag_addr && loaded_value != Some(diag_addr) {
+                continue;
+            }
+
+            if post_addr_has_written_to(pre_post, stack_addr)
+                || loaded_value.is_some_and(|value| post_addr_has_written_to(pre_post, value))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Cross-ref: OCaml keeps fresh post-written by-ref cells caller-controlled,
+/// while ordinary caller-owned heap contents remain regular aborts and are
+/// classified by manifestness.
 fn formal_is_true_by_ref(typ: &sil::typ::Typ) -> bool {
     typ.strip_ptr().is_some_and(sil::typ::Typ::is_pointer)
 }
@@ -826,17 +901,6 @@ fn pre_post_has_post_written_byref_invalid_access(
     }
 
     false
-}
-
-fn pre_post_has_caller_visible_constant_deref(pdesc: &Procdesc, pre_post: &mut PrePost) -> bool {
-    matches!(
-        pre_post.diagnostic.as_ref(),
-        Some(Diagnostic::AccessToInvalidAddress {
-            invalidation: crate::invalidation::Invalidation::ConstantDereference(_),
-            ..
-        })
-    ) && pre_post_has_caller_visible_invalid_access(pdesc, pre_post)
-        && !pre_post_diag_addr_has_non_null_invalidation(pre_post)
 }
 
 fn pre_post_diag_addr_has_non_null_invalidation(pre_post: &PrePost) -> bool {
@@ -1781,6 +1845,31 @@ mod tests {
         assert!(matches!(
             classify_abort_kind(&pdesc, &astate, &diagnostic),
             PrePostKind::LatentInvalidAccess
+        ));
+    }
+
+    #[test]
+    fn test_classify_abort_kind_reports_locally_written_direct_formal_null_manifest() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        astate.mark_must_be_valid(formal_val);
+        astate.post.attrs.mark_written_to(formal_addr, 1, Location::dummy());
+        astate.invalidate(
+            formal_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(formal_val, invalidation);
+
+        assert!(matches!(
+            classify_abort_kind(&pdesc, &astate, &diagnostic),
+            PrePostKind::AbortProgram
         ));
     }
 

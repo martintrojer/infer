@@ -64,6 +64,17 @@ pub struct AbductiveDomain {
     pub must_be_valid: std::collections::HashSet<AbstractValue>,
 }
 
+/// Outcome of applying callee-imported equalities to an abductive state.
+///
+/// Cross-ref: OCaml `PulseInterproc.conjoin_callee_arith` calls
+/// `PulseAbductiveDomain.incorporate_new_eqs`, which distinguishes a plain
+/// contradiction from a potential invalid access on imported `EqZero`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportedFormulaEffect {
+    Sat,
+    PotentialInvalidAccess(AbstractValue),
+}
+
 impl AbductiveDomain {
     /// Create the initial state for analyzing a procedure.
     ///
@@ -249,6 +260,25 @@ impl AbductiveDomain {
         result.and_then(|new_eqs| self.incorporate_new_eqs(new_eqs))
     }
 
+    /// Apply callee-imported formula equalities using OCaml's interproc
+    /// `EqZero` behavior instead of persisting a synthetic null invalidation.
+    pub fn apply_formula_result_for_summary_import(
+        &mut self,
+        result: SatUnsat<Vec<NewEq>>,
+        imported_must_be_valid: &mut std::collections::HashSet<AbstractValue>,
+        stack_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
+        heap_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
+    ) -> SatUnsat<ImportedFormulaEffect> {
+        result.and_then(|new_eqs| {
+            self.incorporate_new_eqs_for_summary_import(
+                new_eqs,
+                imported_must_be_valid,
+                stack_allocated_before_call,
+                heap_allocated_before_call,
+            )
+        })
+    }
+
     fn incorporate_new_eqs(&mut self, new_eqs: Vec<NewEq>) -> SatUnsat<()> {
         for new_eq in new_eqs {
             match new_eq {
@@ -259,7 +289,7 @@ impl AbductiveDomain {
                     if self.is_stack_allocated(repr) {
                         return SatUnsat::Unsat;
                     }
-                    if self.is_heap_allocated(repr) || self.must_be_valid.contains(&repr) {
+                    if self.is_heap_allocated(repr) {
                         self.post.attrs.invalidate(
                             repr,
                             Invalidation::ConstantDereference(IntLit::zero()),
@@ -273,6 +303,78 @@ impl AbductiveDomain {
             }
         }
         SatUnsat::Sat(())
+    }
+
+    fn incorporate_new_eqs_for_summary_import(
+        &mut self,
+        new_eqs: Vec<NewEq>,
+        imported_must_be_valid: &mut std::collections::HashSet<AbstractValue>,
+        stack_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
+        heap_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
+    ) -> SatUnsat<ImportedFormulaEffect> {
+        for new_eq in new_eqs {
+            match new_eq {
+                NewEq::Equal(old, new) if old == new => {}
+                NewEq::Equal(old, new) => {
+                    self.subst_var(old, new);
+                    let updated = std::mem::take(imported_must_be_valid);
+                    *imported_must_be_valid = self.subst_value_set(updated, old, new);
+                    let updated = std::mem::take(stack_allocated_before_call);
+                    *stack_allocated_before_call = self.subst_value_set(updated, old, new);
+                    let updated = std::mem::take(heap_allocated_before_call);
+                    *heap_allocated_before_call = self.subst_value_set(updated, old, new);
+                }
+                NewEq::EqZero(v) => {
+                    let repr = self.path_condition.get_var_repr(v);
+                    if stack_allocated_before_call.contains(&repr) {
+                        return SatUnsat::Unsat;
+                    }
+                    if heap_allocated_before_call.contains(&repr) {
+                        if imported_must_be_valid.contains(&repr) {
+                            return SatUnsat::Sat(ImportedFormulaEffect::PotentialInvalidAccess(
+                                repr,
+                            ));
+                        }
+                        return SatUnsat::Unsat;
+                    }
+                }
+            }
+        }
+        SatUnsat::Sat(ImportedFormulaEffect::Sat)
+    }
+
+    /// Snapshot caller-owned allocated roots before applying a callee post.
+    ///
+    /// Cross-ref: OCaml imports callee arithmetic before `apply_post`, so
+    /// `EqZero` only treats addresses that were already allocated in the
+    /// caller as contradictions / latent invalid accesses. Rust currently
+    /// imports after heap writes, so preserve the same distinction explicitly.
+    pub fn snapshot_allocated_before_call(
+        &self,
+    ) -> (
+        std::collections::HashSet<AbstractValue>,
+        std::collections::HashSet<AbstractValue>,
+    ) {
+        let stack_allocated = self
+            .post
+            .stack
+            .iter()
+            .filter_map(|(var, &stack_addr)| {
+                matches!(var, Var::ProgramVar(_))
+                    .then_some(self.path_condition.get_var_repr(stack_addr))
+            })
+            .collect();
+
+        let mut heap_allocated = std::collections::HashSet::new();
+        for heap in [&self.pre.heap, &self.post.heap] {
+            for (src, edges) in heap.iter() {
+                if !edges.is_empty() {
+                    heap_allocated.insert(self.path_condition.get_var_repr(*src));
+                }
+            }
+        }
+
+        (stack_allocated, heap_allocated)
     }
 
     fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
@@ -720,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_zero_marks_must_be_valid_value_invalid() {
+    fn test_eq_zero_marks_heap_allocated_value_invalid() {
         let pdesc = make_simple_pdesc();
         let mut state = AbductiveDomain::mk_initial(&pdesc);
         let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
@@ -729,10 +831,46 @@ mod tests {
         )));
         let formal_addr = state.post.stack.find(&formal_var).unwrap();
         let formal_val = state.read_heap(formal_addr, Access::Dereference);
+        let _heap_target = state.read_heap(formal_val, Access::Dereference);
 
         state.mark_must_be_valid(formal_val);
         assert!(state.and_equal_const(formal_val, 0).is_sat());
         assert!(state.check_valid(formal_val).is_err());
+    }
+
+    #[test]
+    fn test_imported_eq_zero_reports_potential_invalid_access_without_invalid_attr() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
+            Mangled::from_string("p"),
+            Procname::c_from_string("test"),
+        )));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+        let formal_val = state.read_heap(formal_addr, Access::Dereference);
+        let _heap_target = state.read_heap(formal_val, Access::Dereference);
+
+        state.mark_must_be_valid(formal_val);
+        let (mut stack_allocated_before_call, mut heap_allocated_before_call) =
+            state.snapshot_allocated_before_call();
+        let result = state.path_condition.and_equal_const(formal_val, 0);
+
+        let mut imported_must_be_valid =
+            std::collections::HashSet::from([state.get_var_repr(formal_val)]);
+        assert!(matches!(
+            state.apply_formula_result_for_summary_import(
+                result,
+                &mut imported_must_be_valid,
+                &mut stack_allocated_before_call,
+                &mut heap_allocated_before_call,
+            ),
+            SatUnsat::Sat(ImportedFormulaEffect::PotentialInvalidAccess(addr))
+                if addr == state.get_var_repr(formal_val)
+        ));
+        assert!(
+            state.check_valid(formal_val).is_ok(),
+            "summary import should report the potential invalid access without persisting a synthetic invalid attr"
+        );
     }
 
     #[test]
