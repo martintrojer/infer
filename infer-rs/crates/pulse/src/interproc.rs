@@ -395,7 +395,8 @@ pub(crate) fn apply_summary_with_aliasing(
         }
         crate::summary::PrePostKind::LatentInvalidAccess => {
             if let Some(diag) = &pre_post.diagnostic {
-                let diag = translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories);
+                let diag =
+                    translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories, loc);
                 mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
                 if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
@@ -426,12 +427,13 @@ fn translate_diagnostic(
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     caller_state: &AbductiveDomain,
     formal_histories: &std::collections::BTreeMap<Pvar, ValueHistory>,
+    loc: &Location,
 ) -> Diagnostic {
     match diagnostic {
         Diagnostic::AccessToInvalidAddress {
             addr,
             invalidation,
-            access_location,
+            access_location: _,
             access_history,
             invalidation_history,
         } => {
@@ -441,7 +443,7 @@ fn translate_diagnostic(
             Diagnostic::AccessToInvalidAddress {
                 addr: caller_addr,
                 invalidation: invalidation.clone(),
-                access_location: access_location.clone(),
+                access_location: loc.clone(),
                 access_history: access_history.map_formals(formal_histories),
                 invalidation_history: invalidation_history.map_formals(formal_histories),
             }

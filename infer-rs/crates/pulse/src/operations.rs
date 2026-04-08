@@ -85,7 +85,7 @@ pub fn eval_with_history(
                 other => return other,
             };
             // Check validity of base before field access (null.field is a null deref)
-            state.mark_must_be_valid(base.addr);
+            state.mark_must_be_valid_at(base.addr, loc);
             materialize_known_zero_invalid(base.addr, &base.history, loc, state);
             if let Err(inv_info) = state.check_valid(base.addr) {
                 let (invalidation, invalidation_history) = *inv_info;
@@ -112,7 +112,7 @@ pub fn eval_with_history(
                 other => return other,
             };
             // Check validity of base before array access (null[i] is a null deref)
-            state.mark_must_be_valid(base.addr);
+            state.mark_must_be_valid_at(base.addr, loc);
             materialize_known_zero_invalid(base.addr, &base.history, loc, state);
             if let Err(inv_info) = state.check_valid(base.addr) {
                 let (invalidation, invalidation_history) = *inv_info;
@@ -373,7 +373,7 @@ pub fn eval_deref_addr_with_history(
 ) -> PulseResult<ValueWithHistory, Diagnostic> {
     // Record that this address must be valid (for interproc pre-condition checks).
     // Cross-ref: OCaml PulseOperations.ml check_addr_access sets MustBeValid.
-    state.mark_must_be_valid(addr.addr);
+    state.mark_must_be_valid_at(addr.addr, loc);
     materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
 
     // THE null-deref / use-after-free check
@@ -411,7 +411,7 @@ pub fn check_addr_access_with_history(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
-    state.mark_must_be_valid(addr.addr);
+    state.mark_must_be_valid_at(addr.addr, loc);
     materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
     if let Err(inv_info) = state.check_valid(addr.addr) {
         let (invalidation, invalidation_history) = *inv_info;

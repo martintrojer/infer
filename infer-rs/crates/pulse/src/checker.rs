@@ -103,6 +103,14 @@ pub fn analyze_with_specialization_and_requests(
     };
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
+    let exit_has_normal_path = inv_map.get(&pdesc.exit_node).is_some_and(|exit_state| {
+        exit_state.post.disjuncts.iter().any(|d| {
+            matches!(
+                d,
+                ExecutionDomain::ContinueProgram(_) | ExecutionDomain::ExitProgram(_)
+            )
+        })
+    });
 
     // Some manifest aborts do not reach the exit node (for example, paths that
     // stop mid-procedure). Keep the non-exit scan for those, but filter each
@@ -110,23 +118,44 @@ pub fn analyze_with_specialization_and_requests(
     // summary creation so we do not publish latent issues too early.
     let mut diagnostics = Vec::new();
     let mut seen_diags = std::collections::HashSet::new();
+    let mut latent_non_exit_disjuncts = Vec::new();
     for (node_id, state) in &inv_map {
         if *node_id == pdesc.exit_node {
             continue;
         }
         for d in &state.post.disjuncts {
-            if let ExecutionDomain::AbortProgram { state, diagnostic } = d {
-                if diagnostic_originates_in_proc(pdesc, diagnostic)
-                    && matches!(
-                        crate::summary::classify_abort_kind(pdesc, state, diagnostic),
-                        crate::summary::PrePostKind::AbortProgram
-                    )
-                {
-                    let key = diagnostic.dedup_key();
-                    if seen_diags.insert(key) {
-                        diagnostics.push(diagnostic.as_ref().clone());
+            match d {
+                ExecutionDomain::AbortProgram { state, diagnostic } => {
+                    if diagnostic_originates_in_proc(pdesc, diagnostic)
+                        && matches!(
+                            crate::summary::classify_abort_kind(pdesc, state, diagnostic),
+                            crate::summary::PrePostKind::AbortProgram
+                        )
+                    {
+                        let key = diagnostic.dedup_key();
+                        if seen_diags.insert(key) {
+                            diagnostics.push(diagnostic.as_ref().clone());
+                        }
                     }
                 }
+                ExecutionDomain::ContinueProgram(astate) if !exit_has_normal_path => {
+                    for latent in
+                        crate::summary::latent_invalid_accesses_from_continue_state(pdesc, astate)
+                    {
+                        let ExecutionDomain::LatentInvalidAccess { diagnostic, .. } = &latent
+                        else {
+                            continue;
+                        };
+                        if diagnostic_originates_in_proc(pdesc, diagnostic)
+                            && !latent_non_exit_disjuncts
+                                .iter()
+                                .any(|existing| existing == &latent)
+                        {
+                            latent_non_exit_disjuncts.push(latent);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -147,6 +176,11 @@ pub fn analyze_with_specialization_and_requests(
                 }
                 _ => {}
             }
+        }
+    }
+    for latent in latent_non_exit_disjuncts {
+        if !exit_disjuncts.iter().any(|existing| existing == &latent) {
+            exit_disjuncts.push(latent);
         }
     }
     // Cross-ref: OCaml consults ProcAttributes.is_no_return at call sites in
@@ -1300,6 +1334,212 @@ mod tests {
         pdesc.set_succs(0, vec![node]);
         pdesc.set_succs(node, vec![1]);
         pdesc
+    }
+
+    fn make_two_hop_field_write_proc() -> Procdesc {
+        let pname = Procname::c_from_string("two_hop_field_write");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let node_struct = sil::typ::TypeName::CStruct(QualifiedCppName::from_string("node"));
+        let next_field = Fieldname::make(node_struct.clone(), "next");
+        let node_ptr_typ = Typ::mk_ptr(Typ::mk_struct(node_struct));
+        pdesc.formals = vec![(
+            Mangled::from_string("q"),
+            node_ptr_typ.clone(),
+            Default::default(),
+        )];
+
+        let formal = Pvar::mk(Mangled::from_string("q"), pname);
+        let n0 = Ident::create_normal(IdentName::from_string("n"), 0);
+        let n1 = Ident::create_normal(IdentName::from_string("n"), 1);
+        let field_write_instrs = vec![
+            Instr::Load {
+                id: n0.clone(),
+                e: Exp::Lvar(formal),
+                typ: node_ptr_typ.clone(),
+                loc: Location::dummy(),
+            },
+            Instr::Load {
+                id: n1.clone(),
+                e: Exp::Lfield(
+                    sil::exp::LfieldObjData {
+                        exp: Box::new(Exp::Var(n0.clone())),
+                        is_implicit: false,
+                    },
+                    next_field.clone(),
+                    Typ::mk_struct(sil::typ::TypeName::CStruct(QualifiedCppName::from_string(
+                        "node",
+                    ))),
+                ),
+                typ: node_ptr_typ.clone(),
+                loc: Location::dummy(),
+            },
+            Instr::Store {
+                e1: Box::new(Exp::Lfield(
+                    sil::exp::LfieldObjData {
+                        exp: Box::new(Exp::Var(n1)),
+                        is_implicit: false,
+                    },
+                    next_field,
+                    Typ::mk_struct(sil::typ::TypeName::CStruct(QualifiedCppName::from_string(
+                        "node",
+                    ))),
+                )),
+                typ: node_ptr_typ,
+                e2: Box::new(Exp::Var(n0)),
+                loc: Location::dummy(),
+            },
+        ];
+        let abort_instrs = vec![Instr::Store {
+            e1: Box::new(Exp::Const(Const::Cint(IntLit::zero()))),
+            typ: Typ::int(sil::typ::IKind::IInt),
+            e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(1)))),
+            loc: Location::dummy(),
+        }];
+        let field_write_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            field_write_instrs,
+            Location::dummy(),
+        );
+        let abort_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            abort_instrs,
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![field_write_node]);
+        pdesc.set_succs(field_write_node, vec![abort_node]);
+        pdesc.set_succs(abort_node, vec![1]);
+        pdesc
+    }
+
+    fn make_two_hop_field_write_same_block_abort_proc() -> Procdesc {
+        let pname = Procname::c_from_string("two_hop_field_write_same_block_abort");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let node_struct = sil::typ::TypeName::CStruct(QualifiedCppName::from_string("node"));
+        let next_field = Fieldname::make(node_struct.clone(), "next");
+        let node_ptr_typ = Typ::mk_ptr(Typ::mk_struct(node_struct));
+        pdesc.formals = vec![(
+            Mangled::from_string("q"),
+            node_ptr_typ.clone(),
+            Default::default(),
+        )];
+
+        let formal = Pvar::mk(Mangled::from_string("q"), pname);
+        let n0 = Ident::create_normal(IdentName::from_string("n"), 0);
+        let n1 = Ident::create_normal(IdentName::from_string("n"), 1);
+        let instrs = vec![
+            Instr::Load {
+                id: n0.clone(),
+                e: Exp::Lvar(formal),
+                typ: node_ptr_typ.clone(),
+                loc: Location::dummy(),
+            },
+            Instr::Load {
+                id: n1.clone(),
+                e: Exp::Lfield(
+                    sil::exp::LfieldObjData {
+                        exp: Box::new(Exp::Var(n0.clone())),
+                        is_implicit: false,
+                    },
+                    next_field.clone(),
+                    Typ::mk_struct(sil::typ::TypeName::CStruct(QualifiedCppName::from_string(
+                        "node",
+                    ))),
+                ),
+                typ: node_ptr_typ.clone(),
+                loc: Location::dummy(),
+            },
+            Instr::Store {
+                e1: Box::new(Exp::Lfield(
+                    sil::exp::LfieldObjData {
+                        exp: Box::new(Exp::Var(n1)),
+                        is_implicit: false,
+                    },
+                    next_field,
+                    Typ::mk_struct(sil::typ::TypeName::CStruct(QualifiedCppName::from_string(
+                        "node",
+                    ))),
+                )),
+                typ: node_ptr_typ,
+                e2: Box::new(Exp::Var(n0)),
+                loc: Location::dummy(),
+            },
+            Instr::Store {
+                e1: Box::new(Exp::Const(Const::Cint(IntLit::zero()))),
+                typ: Typ::int(sil::typ::IKind::IInt),
+                e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(1)))),
+                loc: Location::dummy(),
+            },
+        ];
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            instrs,
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
+
+    #[test]
+    fn test_two_hop_field_write_keeps_local_null_derefs_latent() {
+        let pdesc = make_two_hop_field_write_proc();
+        let summary = analyze(&pdesc);
+
+        let latent_null_derefs = summary
+            .pre_posts
+            .iter()
+            .filter(|pp| {
+                pp.kind == PrePostKind::LatentInvalidAccess
+                    && pp.diagnostic.as_ref().is_some_and(|diag| {
+                        diag.get_issue_type_id()
+                            == diagnostics::issue_type::IssueTypeId::NullptrDereference
+                    })
+            })
+            .count();
+
+        assert_eq!(
+            latent_null_derefs, 2,
+            "expected the non-exit scan to recover both `q == 0` and `q->next == 0` latent dereferences once the field write reaches its own CFG node, summary={summary:?}"
+        );
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .any(|diag| diag.get_issue_type_id()
+                    == diagnostics::issue_type::IssueTypeId::NullptrDereference),
+            "expected the trailing local abort to stay manifest, summary={summary:?}"
+        );
+    }
+
+    #[test]
+    fn test_same_block_local_abort_keeps_earlier_null_derefs_latent() {
+        let pdesc = make_two_hop_field_write_same_block_abort_proc();
+        let summary = analyze(&pdesc);
+
+        let latent_null_derefs = summary
+            .pre_posts
+            .iter()
+            .filter(|pp| {
+                pp.kind == PrePostKind::LatentInvalidAccess
+                    && pp.diagnostic.as_ref().is_some_and(|diag| {
+                        diag.get_issue_type_id()
+                            == diagnostics::issue_type::IssueTypeId::NullptrDereference
+                    })
+            })
+            .count();
+
+        assert_eq!(
+            latent_null_derefs, 2,
+            "expected abort-state summarization to preserve both earlier caller-controlled null dereferences even when the block later aborts locally, summary={summary:?}"
+        );
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .any(|diag| diag.get_issue_type_id()
+                    == diagnostics::issue_type::IssueTypeId::NullptrDereference),
+            "expected the trailing local abort to stay manifest, summary={summary:?}"
+        );
     }
 
     #[test]

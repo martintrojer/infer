@@ -497,6 +497,22 @@ impl AbductiveDomain {
         self.must_be_valid.insert(repr);
     }
 
+    /// Record a must-be-valid access at a concrete program location.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.check_valid` abduces
+    /// `MustBeValid` into the pre-state for addresses already materialized
+    /// there. The summary layer later uses that location to publish latent
+    /// invalid-access obligations on caller-controlled values.
+    pub fn mark_must_be_valid_at(&mut self, addr: AbstractValue, loc: &Location) {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.must_be_valid.insert(repr);
+        if self.pre.heap.get_edges(repr).is_some() {
+            self.pre
+                .attrs
+                .add_one(repr, Attribute::MustBeValid(0, loc.clone(), None));
+        }
+    }
+
     /// Check if an address was marked as must-be-valid.
     pub fn is_must_be_valid(&self, addr: AbstractValue) -> bool {
         let repr = self.path_condition.get_var_repr(addr);

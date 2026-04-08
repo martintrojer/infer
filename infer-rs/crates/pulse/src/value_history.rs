@@ -138,6 +138,15 @@ impl HistoryPath {
         None
     }
 
+    fn contains_formal_origin(&self) -> bool {
+        self.0.iter().any(|event| {
+            matches!(
+                event,
+                HistoryEvent::FormalArgument(_) | HistoryEvent::ActualArgument(_)
+            )
+        })
+    }
+
     fn contains_invalidation_of_same_type(&self, invalidation: &Invalidation) -> bool {
         self.0.iter().any(|event| match event {
             HistoryEvent::Invalidated {
@@ -322,6 +331,10 @@ impl ValueHistory {
         self.0
             .iter()
             .any(|path| path.contains_invalidation_of_same_type(invalidation))
+    }
+
+    pub fn contains_formal_origin(&self) -> bool {
+        self.0.iter().any(HistoryPath::contains_formal_origin)
     }
 
     pub fn last_location(&self) -> Option<&Location> {

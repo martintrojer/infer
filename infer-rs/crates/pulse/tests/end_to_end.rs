@@ -2278,6 +2278,59 @@ fn test_e2e_cyclic_field_write_reifies_latent_abort_in_caller() {
 }
 
 #[test]
+fn test_e2e_two_hop_field_write_keeps_null_derefs_latent() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        type node = {next: *node}
+
+        define crash_after_two_hops_latent(q: *node) : void {
+          #entry:
+            n0:*node = load &q
+            n1:*node = load n0.node.next
+            store n1.node.next <- n0:*node
+            jmp abort
+          #abort:
+            store 0 <- 1:int
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "crash_after_two_hops_latent")
+        .map(|(_, summary)| summary)
+        .expect("summary should exist");
+
+    let latent_null_derefs = summary
+        .pre_posts
+        .iter()
+        .filter(|pp| {
+            pp.kind == pulse::summary::PrePostKind::LatentInvalidAccess
+                && pp
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+        })
+        .count();
+    assert_eq!(
+        latent_null_derefs, 2,
+        "expected one latent null deref for `q` and one for `q->next` once the field write reaches its own CFG node"
+    );
+    assert!(
+        summary
+            .diagnostics
+            .iter()
+            .any(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "expected the trailing local null abort to stay manifest"
+    );
+}
+
+#[test]
 fn test_e2e_latent_chain_stays_latent_until_manifest_callsite() {
     let tm = textual_utils::parse_and_convert(
         r#"
@@ -2950,7 +3003,7 @@ fn test_e2e_latent_error_only_summary_is_not_noreturn() {
 }
 
 #[test]
-fn test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf() {
+fn test_e2e_access_use_after_free_keeps_manifest_uaf_and_latent_npes() {
     let tm = textual_utils::parse_and_convert(
         r#"
         .source_language = "C"
@@ -2989,8 +3042,18 @@ fn test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf() {
         "expected manifest USE_AFTER_FREE, found {issue_types:?}"
     );
     assert!(
-        issue_types.contains(&IssueTypeId::NullptrDereference),
-        "expected manifest NULL_DEREFERENCE to remain for field access after free, found {issue_types:?}"
+        !issue_types.contains(&IssueTypeId::NullptrDereference),
+        "caller-controlled null dereferences should stay latent here, found manifest issues {issue_types:?}"
+    );
+    assert!(
+        summary.pre_posts.iter().any(|pp| {
+            pp.kind == pulse::summary::PrePostKind::LatentInvalidAccess
+                && pp
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+        }),
+        "expected latent NULL_DEREFERENCE pre/posts to remain in the summary"
     );
 }
 
@@ -3050,14 +3113,22 @@ fn test_debug_latent_summary() {
                     })
                     .collect();
                 if let Some(diag) = &pp.diagnostic {
-                    let diag_addr = match diag {
-                        pulse::diagnostic::Diagnostic::AccessToInvalidAddress { addr, .. } => {
-                            format!("{addr}")
-                        }
-                        _ => "-".to_string(),
+                    let (diag_addr, access_history) = match diag {
+                        pulse::diagnostic::Diagnostic::AccessToInvalidAddress {
+                            addr,
+                            access_history,
+                            ..
+                        } => (format!("{addr}"), access_history.signature()),
+                        _ => ("-".to_string(), "-".to_string()),
                     };
+                    let must_be_valid: Vec<_> = pp
+                        .post
+                        .must_be_valid
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
                     eprintln!(
-                        "    pp[{i}] kind={:?} diag={} addr={} formals={formals:?} invalid_attrs={invalid_attrs:?}",
+                        "    pp[{i}] kind={:?} diag={} addr={} must_be_valid={must_be_valid:?} access_history={access_history} formals={formals:?} invalid_attrs={invalid_attrs:?}",
                         pp.kind,
                         diag.get_issue_type(),
                         diag_addr,

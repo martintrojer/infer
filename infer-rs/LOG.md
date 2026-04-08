@@ -5,6 +5,61 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active line of investigation is now the latent-invalid-access recovery work
+  for caller-controlled field writes when a procedure never exports a normal
+  `ContinueProgram`/`ExitProgram` path.
+- Stable checkpoint from the latest pass:
+  - `crates/pulse/src/summary.rs` now recovers caller-controlled latent invalid
+    accesses that survive into a local abort state, including the same-block
+    case that previously dropped them entirely
+  - focused regressions now cover both:
+    - non-exit node-boundary recovery (`test_two_hop_field_write_keeps_local_null_derefs_latent`)
+    - same-block abort-state recovery (`test_same_block_local_abort_keeps_earlier_null_derefs_latent`)
+  - authoritative green validations on the current tree:
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end`
+    - `cargo test -q -p infer-rs --test cli_tests test_pulse_report_issues_for_tests_surfaces_suppressed_reports -- --nocapture`
+  - authoritative ignored sweep on the current tree:
+    - `NPE: expected 131, found 133`
+    - `LEAK: expected 20, found 20`
+    - `UAF: expected 7, found 7`
+    - file diffs:
+      - `nullptr.c: expected 13, found 14`
+      - `sizeof.c: expected 0, found 2`
+      - `traces.c: expected 5, found 4`
+- Important conclusion from the latest experiments:
+  - the remaining `traces.c` miss is not caused by summary construction anymore;
+    exported Textual summaries already contain the needed latent pre_posts for
+    `access_use_after_free_bad`
+  - the gap is in publication/reporting: the current CLI/test reporting path
+    still does not surface the extra suppressed line-62 null report without
+    destabilizing unrelated files
+  - broad attempts to publish latent pre_posts from `to_issue_log()` were
+    explicitly rejected; they fixed `traces.c` but exploded issue counts in
+    `latent.c`, `integers.c`, `interprocedural.c`, `uninit.c`, and others
+- Current tree state from this experiment:
+  - `crates/pulse/src/checker.rs` now does a non-exit scan that synthesizes
+    latent invalid accesses from `ContinueProgram` states only when the exit
+    node has no normal path
+  - `crates/pulse/src/summary.rs` no longer synthesizes latent invalid-access
+    pre/posts directly from summarized `ContinueProgram` exit states
+  - this narrowed sweep regressions in `abduce.c` and `dangling_deref.c`, but it
+    also overcorrected and dropped focused latent summaries that should still be
+    exported, including the local two-hop field-write repro and the latent NPE
+    side of `access_use_after_free_bad`
+- Immediate next step:
+  - restore the correct summary-time latent invalid-access behavior without
+    bringing back duplicate/sweep-side overreporting
+- Important constraint discovered while validating the no-normal-exit path:
+  - the current checker-side non-exit recovery only sees CFG-node boundary
+    states from the fixpoint, not arbitrary intra-block states
+  - a focused repro that creates caller-controlled `must_be_valid` obligations
+    and then aborts in the same block is therefore not a valid test of the
+    current mechanism
+  - the focused unit/e2e repros were updated to split the field write and the
+    local abort into separate basic blocks, which now correctly exercises the
+    non-exit latent recovery path
+
 - Active line of investigation has moved from headline count recovery to exact
   invalid-access publication/report parity.
 - Latest concrete correctness fixes from this pass:
