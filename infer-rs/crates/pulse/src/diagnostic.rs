@@ -141,12 +141,28 @@ impl Diagnostic {
 
     /// Convert to a diagnostics::Issue for reporting.
     pub fn to_issue(&self, procedure: &str) -> diagnostics::issue::Issue {
-        self.to_issue_with_latent(procedure, false)
+        self.to_issue_with_reporting(procedure, false, false)
     }
 
     /// Convert to a diagnostics::Issue for reporting, optionally as latent.
     pub fn to_issue_with_latent(&self, procedure: &str, latent: bool) -> diagnostics::issue::Issue {
+        self.to_issue_with_reporting(procedure, latent, false)
+    }
+
+    /// Convert to a diagnostics::Issue for reporting, optionally marked as
+    /// latent or suppressed.
+    pub fn to_issue_with_reporting(
+        &self,
+        procedure: &str,
+        latent: bool,
+        suppressed: bool,
+    ) -> diagnostics::issue::Issue {
         let loc = self.get_location();
+        let trace = if suppressed {
+            format!("*** SUPPRESSED ***, {self}")
+        } else {
+            format!("{self}")
+        };
         diagnostics::issue::Issue {
             issue_type: self.build_issue_type(latent),
             qualifier: format!("{self}"),
@@ -154,7 +170,25 @@ impl Diagnostic {
             line: loc.line as u32,
             column: loc.col as u32,
             procedure: procedure.to_string(),
-            trace: format!("{self}"),
+            trace,
+        }
+    }
+
+    /// Cross-ref: OCaml `PulseReport.is_constant_deref_without_invalidation`.
+    pub fn is_suppressed(&self) -> bool {
+        match self {
+            Diagnostic::AccessToInvalidAddress {
+                invalidation,
+                access_history,
+                ..
+            } => {
+                matches!(
+                    invalidation,
+                    Invalidation::ConstantDereference(_)
+                        | Invalidation::ComparedToNullInThisProcedure(_)
+                ) && !access_history.contains_invalidation_of_same_type(invalidation)
+            }
+            Diagnostic::MemoryLeak { .. } | Diagnostic::RetainCycle { .. } => false,
         }
     }
 }

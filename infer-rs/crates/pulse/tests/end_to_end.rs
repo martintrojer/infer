@@ -1283,6 +1283,75 @@ fn test_e2e_null_attrs_propagation() {
     );
 }
 
+#[test]
+fn test_e2e_callee_local_abort_is_not_republished_on_caller() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define bake(out: **int) : *int {
+          local zero:*int
+          #entry:
+            store &zero <- 0:*int
+            n0:*int = load &zero
+            store n0 <- 3:int
+            ret null
+        }
+
+        define skip_function_with_no_spec_ok() : *int {
+          local x:*int
+          #entry:
+            store &x <- 0:*int
+            n0 = bake(&x)
+            jmp then_, else_
+          #then_:
+            prune __sil_eq(n0, 0)
+            ret null
+          #else_:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            n1:*int = load &x
+            n2:int = load n1
+            ret n1
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let bake = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "bake");
+    assert!(
+        bake.is_some_and(|(_, s)| s
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)),
+        "bake should report its own manifest NULL_DEREFERENCE"
+    );
+
+    let caller = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "skip_function_with_no_spec_ok");
+    assert!(
+        caller.as_ref().is_some_and(|(_, s)| s.diagnostics.is_empty()),
+        "skip_function_with_no_spec_ok should not republish bake's local manifest NULL_DEREFERENCE: {:?}",
+        caller.map(|(_, s)| {
+            (
+                s.diagnostics
+                    .iter()
+                    .map(|d| (d.get_issue_type_id(), d.get_location().line, format!("{d}")))
+                    .collect::<Vec<_>>(),
+                s.pre_posts
+                    .iter()
+                    .map(|pp| format!("{:?}", pp.kind))
+                    .collect::<Vec<_>>(),
+            )
+        })
+    );
+}
+
 /// Test interprocedural path condition: callee exits if x < 0,
 /// caller should know ret >= 0 on the surviving path.
 #[test]
@@ -1404,19 +1473,16 @@ fn test_e2e_negated_actual_keeps_arithmetic_latent_summary() {
         "if_negative_then_crash_latent should stay latent when its imported path condition depends on -x"
     );
     assert!(
-        latent_summary
-            .pre_posts
-            .iter()
-            .any(|pp| {
-                matches!(
-                    pp.kind,
-                    pulse::summary::PrePostKind::LatentAbortProgram
-                        | pulse::summary::PrePostKind::LatentInvalidAccess
-                ) && pp
-                    .diagnostic
-                    .as_ref()
-                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
-            }),
+        latent_summary.pre_posts.iter().any(|pp| {
+            matches!(
+                pp.kind,
+                pulse::summary::PrePostKind::LatentAbortProgram
+                    | pulse::summary::PrePostKind::LatentInvalidAccess
+            ) && pp
+                .diagnostic
+                .as_ref()
+                .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+        }),
         "if_negative_then_crash_latent should export a latent NULL_DEREFERENCE pre/post"
     );
 
@@ -2655,6 +2721,175 @@ fn test_e2e_manifest_use_after_free_reports_only_uaf() {
 }
 
 #[test]
+fn test_e2e_local_zero_proof_on_formal_keeps_null_deref_manifest() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define create_null_path_ok(p: *int) : void {
+          #entry:
+            n0:*int = load &p
+            jmp is_null, nonnull
+          #is_null:
+            prune __sil_eq(n0, 0)
+            ret null
+          #nonnull:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            store n0 <- 32:int
+            ret null
+        }
+
+        define create_null_path2_bad_FN(p: *int) : void {
+          #entry:
+            n0:*int = load &p
+            jmp is_null, nonnull
+          #is_null:
+            prune __sil_eq(n0, 0)
+            n1:*int = load &p
+            store n1 <- 52:int
+            ret null
+          #nonnull:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            store n0 <- 32:int
+            n2:*int = load &p
+            store n2 <- 52:int
+            ret null
+        }
+
+        define malloc_then_call_create_null_path_then_deref_unconditionally_bad_FN(p: *int) : void {
+          local x:*int
+          #entry:
+            n0 = malloc(4)
+            store &x <- n0
+            n1:*int = load &p
+            jmp is_null, nonnull
+          #is_null:
+            prune __sil_eq(n1, 0)
+            _ = create_null_path_ok(n1)
+            n3:*int = load &p
+            store n3 <- 52:int
+            n4:*int = load &x
+            _ = free(n4)
+            ret null
+          #nonnull:
+            prune __sil_lnot(__sil_eq(n1, 0))
+            store n1 <- 32:int
+            _ = create_null_path_ok(n1)
+            n6:*int = load &p
+            store n6 <- 52:int
+            n7:*int = load &x
+            _ = free(n7)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let summaries = store.to_vec();
+
+    for proc_name in [
+        "create_null_path2_bad_FN",
+        "malloc_then_call_create_null_path_then_deref_unconditionally_bad_FN",
+    ] {
+        let is_manifest_invalid_access = |issue_type: IssueTypeId| {
+            matches!(
+                issue_type,
+                IssueTypeId::NullptrDereference | IssueTypeId::ComparedToNullAndDereferenced
+            )
+        };
+        let summary = summaries
+            .iter()
+            .find(|(pname, _)| format!("{pname}") == proc_name)
+            .map(|(_, summary)| summary)
+            .expect("summary should exist");
+        let issue_types: Vec<_> = summary
+            .diagnostics
+            .iter()
+            .map(|diag| diag.get_issue_type_id())
+            .collect();
+        let kinds: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.kind))
+            .collect();
+        let conditions: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.post.path_condition.conditions()))
+            .collect();
+
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .any(|diag| is_manifest_invalid_access(diag.get_issue_type_id())),
+            "{proc_name} should keep its locally-proven direct-formal null dereference manifest; issue_types={issue_types:?} kinds={kinds:?} conditions={conditions:?}"
+        );
+        assert!(
+            summary
+                .pre_posts
+                .iter()
+                .any(|pp| pp.kind == pulse::summary::PrePostKind::AbortProgram
+                    && pp.diagnostic.as_ref().is_some_and(
+                        |diag| is_manifest_invalid_access(diag.get_issue_type_id())
+                    )),
+            "{proc_name} should export an AbortProgram summary for the null dereference; issue_types={issue_types:?} kinds={kinds:?} conditions={conditions:?}"
+        );
+    }
+}
+
+#[test]
+fn test_e2e_deref_then_free_then_deref_keeps_npe_latent() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define deref_then_free_then_deref_bad(x: *int) : void {
+          #entry:
+            n0:*int = load &x
+            store n0 <- 42:int
+            _ = free(n0)
+            n1:*int = load &x
+            store n1 <- 42:int
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "deref_then_free_then_deref_bad")
+        .map(|(_, summary)| summary)
+        .expect("deref_then_free_then_deref_bad summary should exist");
+    let issue_types: Vec<_> = summary
+        .diagnostics
+        .iter()
+        .map(|diag| diag.get_issue_type_id())
+        .collect();
+
+    assert!(
+        issue_types.contains(&IssueTypeId::UseAfterFree),
+        "expected manifest USE_AFTER_FREE, found {issue_types:?}"
+    );
+    assert!(
+        !issue_types.contains(&IssueTypeId::NullptrDereference),
+        "write-through on the pointee should not make the direct-formal null deref manifest: {issue_types:?}"
+    );
+    assert!(
+        summary.pre_posts.iter().any(|pp| pp.kind
+            == pulse::summary::PrePostKind::LatentInvalidAccess
+            && pp
+                .diagnostic
+                .as_ref()
+                .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)),
+        "expected a latent NULL_DEREFERENCE pre/post to stay in the summary"
+    );
+}
+
+#[test]
 fn test_e2e_latent_error_only_summary_is_not_noreturn() {
     let tm = textual_utils::parse_and_convert(
         r#"
@@ -2968,6 +3203,7 @@ fn test_store_textual_sweep() {
                 Some(&source_file),
                 &source_dir,
                 Some(&infer_results_dir),
+                true,
             );
             let _ = tx.send((proc_count, issues));
         });

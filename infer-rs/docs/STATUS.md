@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, and reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses. The focused `manifest_use_after_free` / `access_use_after_free_bad` mismatches are now fixed and locked by regressions. The current remaining parity work is concentrated in the new file-level NPE deltas (`angelism.c`, `latent.c`, `nullptr.c`) plus wrapper/cycle null-path behavior such as `traverse_and_crash_if_equal_to_root`.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, keep locally-proven direct-formal null dereferences manifest, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` and richer trace/report parity.**
 
 Recent correctness / robustness fixes:
 - Summary import now snapshots caller allocation state after `materialize_pre`
@@ -17,6 +17,20 @@ Recent correctness / robustness fixes:
   direct-formal null dereferences latent at the next caller boundary, fixes
   `manifest_use_after_free`, and preserves the manifest field/null-after-free
   behavior in `access_use_after_free_bad`.
+- Direct-formal constant-deref latentification now refuses to fire when the
+  summary already has a local depth-0 `addr == 0` condition. This matches the
+  OCaml `create_null_path2_bad_FN` / `malloc_then_call_create_null_path_then_deref_unconditionally_bad_FN`
+  shape: the summary stays `AbortProgram`, then reporting decides whether it is
+  suppressed.
+- OCaml-style suppressed-report handling now exists in Rust reporting:
+  default CLI output filters constant / compared-to-null dereferences without a
+  matching invalidation event in the access history, while
+  `--pulse-report-issues-for-tests` surfaces them as distinguished
+  `*** SUPPRESSED ***` reports for `issues.exp`-style sweeps.
+- Non-exit diagnostic collection now avoids republishing callee-local manifest
+  aborts on wrapper callers when the source range clearly belongs to the callee
+  itself. This keeps `bake`-style local NULLPTR reports on the callee instead
+  of leaking them into the caller's manifest scan.
 - Unspecialized summary application now rejects alias-collapsed callee heap roots when two
   distinct heap-backed callee addresses map to the same caller representative. This is the Rust
   analogue of the OCaml `PulseInterproc.ml` `AliasingWithAllAliases` rejection path, and it lets
@@ -45,8 +59,8 @@ Recent correctness / robustness fixes:
 - Imported pure-call conditions now translate their remembered function-application dependencies
   through summary application, and summary normalization keeps those pure-call results reachable
   from caller-visible actuals. This removed the old `unknown_from_parameters_latent` manifest
-  false positive. `nullptr.c` is currently back on the diff list for a different
-  latent/manifest null-path reason; the pure-call dependency fix remains correct groundwork.
+  false positive; the pure-call dependency fix remains correct groundwork under the newer
+  local-zero/suppression parity work.
 - Capture metadata recovery now also restores `has_cleanup_attribute` on locals
   from `infer debug --procedures --procedures-attributes`, and Rust now mirrors
   OCaml `cleanup_attribute_store` by marking values stored into cleanup locals
@@ -55,8 +69,7 @@ Recent correctness / robustness fixes:
 - Unknown by-ref call havoc now refreshes lvalue-root slots instead of weakening summary
   application. This keeps the by-ref unknown-call semantics aligned with OCaml without losing the
   real `call_by_ref_actual_already_in_footprint_bad` report. This remains
-  correct groundwork even though `angelism.c` is back on the active diff list
-  for a newer precision issue.
+  correct groundwork for the current exact-issue parity work.
 - Added a Rust analogue of OCaml's latent-invalid-access flow and caller-side reification, which restores the missing aliased UAF behavior in `specialization.c` without turning callee-only paths into manifest base reports.
 - Specialized summaries are now published back into the owning ondemand summary store. That
   remains necessary groundwork for function-pointer parity, and `funptr.c` is back at parity in
@@ -360,9 +373,7 @@ The repo also keeps a separate `capture --dump-textual` sweep as a secondary reg
 **NULLPTR_DEREFERENCE comparison vs OCaml `issues.exp`: expected 131, found 134.**
 
 Per-file differences:
-- `angelism.c`: expected `7`, found `8`
-- `latent.c`: expected `5`, found `6`
-- `nullptr.c`: expected `13`, found `12`
+- `nullptr.c`: expected `13`, found `14`
 - `sizeof.c`: expected `0`, found `2` (accepted exported-Textual fidelity limitation)
 
 Current interpretation of these deltas:
@@ -375,22 +386,21 @@ Current interpretation of these deltas:
 - narrowing latent-invalid-access classification so ordinary callee-written
   field nulls stay manifest restored the direct `store_bad` /
   `use_not_modeled_bad` regressions and keeps `funptr.c` at parity
-- `angelism.c` is back on the active diff list after the newer interproc
-  caller-boundary fixes; treat that as a fresh investigation target, not as
-  evidence that the earlier by-ref corrections were wrong
-- `nullptr.c` no longer has the old imported-pure-call false positive. Its current `12/13` gap is
-  part of the active latent/manifest null-path investigation, not evidence that the pure-call fix
-  was wrong.
+- the two OCaml-style suppressed `nullptr.c` reports are now counted again in the ignored sweep
+  via `--pulse-report-issues-for-tests`, but they stay out of default CLI output by design
+- the remaining `nullptr.c` delta is the accepted real `FN_nullptr_deref_old_bad` report. Keep
+  the Rust report; do not add imprecision to match the OCaml false negative.
 - `integers.c`, `nullptr_more.c`, and `offsetof_expr.c` are no longer on the sweep diff list.
 - `compound_literal.c` and `initlistexpr.c` already match OCaml; their earlier sweep diffs were
   measurement bugs caused by basename suffix matching in the expectation helper.
 - `assert.c` and `ternary.c` remain fixed by OCaml-style prune-condition depth tracking.
+- count parity is no longer blocked on `angelism.c` or `latent.c`, though focused debug output can
+  still show wrapper/cycle issue-set drift that count-only sweeps do not expose.
 - `sizeof.c` is no longer considered an active Pulse parity task: the exported Textual path drops
   `Sizeof.nbytes` / array extents and emits `<int[]>`, so Rust receives too little information to
   fold those branches without adding a workaround. See `docs/STORE_TEXTUAL.md`.
-- The remaining active work is concentrated in latent-vs-manifest invalid-access parity:
-  `angelism.c`, `latent.c`, `nullptr.c`, and wrapper/cycle null paths such as
-  `traverse_and_crash_if_equal_to_root`.
+- The remaining active work is concentrated in exact issue-set / reporting parity for wrapper/cycle
+  null paths such as `traverse_and_crash_if_equal_to_root`, plus richer trace reconstruction.
 
 **MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
 
@@ -429,9 +439,9 @@ using any exact disjunct/null-attr mismatch counts.
      callee formula import mirrors OCaml `PulseFormula.and_callee_formula` more closely.
    - Latent invalid access now exists for caller-derived invalid addresses, imported pure-call
      dependencies survive summary application, and `pre_heap_has_assumptions` is included in
-     manifestness. The remaining active mismatch is narrower: latent-vs-manifest invalid-access
-     typing/publication parity (`angelism.c`, `latent.c`, `nullptr.c`, and
-     wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`).
+     manifestness. The remaining active mismatch is narrower: exact publication/reporting parity
+     on wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`, plus richer
+     suppression / trace presentation detail.
    - Minimal `ValueHistory` threading now exists for invalid-access provenance and dedup, but full
      OCaml `PulseValueHistory` / `PulseTrace` parity is still missing
    - No global variable handling in summary application
@@ -444,13 +454,12 @@ using any exact disjunct/null-attr mismatch counts.
 
 ## What's Next (ranked by impact and tractability)
 
-### 1. Finish latent-vs-manifest invalid-access parity
-The active correctness work is now tightly scoped. Match OCaml on:
+### 1. Finish exact invalid-access publication parity
+The remaining correctness work is now mostly issue-set, not headline-count, work. Match OCaml on:
 
-- `angelism.c` (current authoritative sweep: `8` vs expected `7`)
-- `latent.c` (current authoritative sweep: `6` vs expected `5`)
-- `nullptr.c` (current authoritative sweep: `12` vs expected `13`)
 - wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`
+- latent-vs-manifest publication details that count-only sweeps can hide
+- report/tracing presentation details around suppressed issues and caller reification
 
 Use OCaml summary dumps and per-instruction traces first; do not tune counts directly.
 
@@ -459,9 +468,12 @@ The new minimal provenance layer is enough to restore the duplicated `memory_lea
 `realloc_no_check_bad` reports and improve dedup correctness, but it is still reduced compared with
 OCaml's full `PulseValueHistory` / `PulseTrace` stack.
 
-### 3. Keep `sizeof.c` as an accepted exported-Textual limitation
-Do not add Pulse-side workarounds for this. The current mismatch comes from the capture/export
-boundary losing `Sizeof.nbytes` / array extents before Rust sees the textual SIL.
+### 3. Keep the accepted remaining count deltas documented
+Do not add Pulse-side workarounds for these:
+
+- `nullptr.c` `+1`: real `FN_nullptr_deref_old_bad` report that OCaml misses
+- `sizeof.c` `+2`: exported-Textual fidelity limit (`Sizeof.nbytes` / array extents lost before
+  Rust sees the SIL)
 
 ### Other latent/reporting follow-up
 The current Rust implementation now has condition-depth tracking, latent invalid-access support,
@@ -471,7 +483,7 @@ specialized-summary filtering, imported pure-call dependency translation, and
 - precise latent-vs-manifest execution-kind selection for caller-visible invalid accesses
 - wrapper/cycle null-path survival and reification through call chains
 - latent issue type reporting / traces
-- any residual propagated-abort publication mismatches behind the remaining NPE over-counts
+- suppressed-report presentation / trace detail
 
 ### Other gaps
 

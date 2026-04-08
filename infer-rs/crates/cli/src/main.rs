@@ -55,6 +55,10 @@ struct Cli {
     #[arg(long)]
     liveness_only: bool,
 
+    /// Report suppressed issues as distinguished test-only reports.
+    #[arg(long = "pulse-report-issues-for-tests")]
+    pulse_report_issues_for_tests: bool,
+
     /// Regex of methods to model as wrappers to `free(3)`.
     #[arg(long = "pulse-model-free-pattern")]
     pulse_model_free_pattern: Option<String>,
@@ -159,6 +163,9 @@ impl Cli {
         }
         if self.liveness_only {
             c.liveness_only = true;
+        }
+        if self.pulse_report_issues_for_tests {
+            c.pulse_report_issues_for_tests = true;
         }
         if let Some(v) = &self.pulse_model_free_pattern {
             c.pulse_model_free_pattern = Some(v.clone());

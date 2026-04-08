@@ -118,6 +118,7 @@ pub fn run_infer_rs_on_textual(
     source_override: Option<&str>,
     cwd: &Path,
     results_dir: Option<&Path>,
+    report_issues_for_tests: bool,
 ) -> Result<Vec<String>, String> {
     let infer_rs_bin =
         find_infer_rs_binary().ok_or_else(|| "could not locate infer-rs binary".to_string())?;
@@ -138,6 +139,9 @@ pub fn run_infer_rs_on_textual(
             .arg("--quiet")
             .arg("-o")
             .arg(&out_dir);
+        if report_issues_for_tests {
+            cmd.arg("--pulse-report-issues-for-tests");
+        }
         if let Some(results_dir) = results_dir {
             cmd.arg("--results-dir").arg(results_dir);
         }

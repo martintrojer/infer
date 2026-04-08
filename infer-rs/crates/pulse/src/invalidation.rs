@@ -135,6 +135,11 @@ impl Invalidation {
     pub fn is_null_deref(&self) -> bool {
         matches!(self, Invalidation::ConstantDereference(i) if i.is_zero())
     }
+
+    /// Cross-ref: OCaml `PulseInvalidation.is_same_type`.
+    pub fn is_same_type(&self, other: &Self) -> bool {
+        self.disc_index() == other.disc_index()
+    }
 }
 
 impl fmt::Display for Invalidation {

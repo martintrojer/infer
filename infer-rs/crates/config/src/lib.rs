@@ -92,6 +92,11 @@ pub struct InferConfig {
     #[serde(rename = "liveness-only")]
     pub liveness_only: bool,
 
+    /// Report suppressed issues as distinguished test-only reports.
+    /// OCaml: `--pulse-report-issues-for-tests` (default false)
+    #[serde(rename = "pulse-report-issues-for-tests")]
+    pub pulse_report_issues_for_tests: bool,
+
     /// Regex of methods that should be modelled as wrappers to `free(3)`.
     /// OCaml: `--pulse-model-free-pattern` (default none)
     #[serde(rename = "pulse-model-free-pattern")]
@@ -184,6 +189,7 @@ impl Default for InferConfig {
             pulse_intraprocedural_only: false,
             pulse_only: false,
             liveness_only: false,
+            pulse_report_issues_for_tests: false,
             pulse_model_free_pattern: None,
             pulse_model_malloc_pattern: None,
             pulse_model_realloc_pattern: None,
@@ -279,6 +285,7 @@ mod tests {
         assert!(!config.pulse_intraprocedural_only);
         assert!(!config.pulse_only);
         assert!(!config.liveness_only);
+        assert!(!config.pulse_report_issues_for_tests);
         assert!(config.pulse_model_free_pattern.is_none());
         assert!(config.pulse_model_malloc_pattern.is_none());
         assert!(config.pulse_model_realloc_pattern.is_none());
@@ -311,6 +318,7 @@ mod tests {
             "pulse-model-realloc-pattern": "my_realloc",
             "pulse-model-abort": ["ns1::ns2::fun_abort"],
             "pulse-model-unreachable": ["handle_failure"],
+            "pulse-report-issues-for-tests": true,
             "pulse-model-return-nonnull": "Handle::get",
             "pulse-model-return-this": "ModelClass.initWith:",
             "pulse-model-return-first-arg": "release\\|.*release:",
@@ -357,6 +365,7 @@ mod tests {
             config.pulse_model_unknown_pure,
             vec!["get_value_pure", "read_only_helper"]
         );
+        assert!(config.pulse_report_issues_for_tests);
     }
 
     #[test]

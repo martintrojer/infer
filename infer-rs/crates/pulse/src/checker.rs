@@ -31,6 +31,7 @@ use sil::procname::Procname;
 use sil::specialization::PulseSpecialization;
 
 use crate::abductive::AbductiveDomain;
+use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::summary::PulseSummary;
 use crate::transfer;
@@ -115,10 +116,12 @@ pub fn analyze_with_specialization_and_requests(
         }
         for d in &state.post.disjuncts {
             if let ExecutionDomain::AbortProgram { state, diagnostic } = d {
-                if matches!(
-                    crate::summary::classify_abort_kind(pdesc, state, diagnostic),
-                    crate::summary::PrePostKind::AbortProgram
-                ) {
+                if diagnostic_originates_in_proc(pdesc, diagnostic)
+                    && matches!(
+                        crate::summary::classify_abort_kind(pdesc, state, diagnostic),
+                        crate::summary::PrePostKind::AbortProgram
+                    )
+                {
                     let key = diagnostic.dedup_key();
                     if seen_diags.insert(key) {
                         diagnostics.push(diagnostic.as_ref().clone());
@@ -156,6 +159,40 @@ pub fn analyze_with_specialization_and_requests(
     let summary = PulseSummary::of_proc(pdesc, &exit_disjuncts, diagnostics, is_noreturn);
     let spec_requests = pulse_tf.spec_requests.into_inner();
     (summary, spec_requests)
+}
+
+fn diagnostic_originates_in_proc(pdesc: &Procdesc, diagnostic: &Diagnostic) -> bool {
+    let loc = diagnostic.get_location();
+
+    // Keep reporting when we do not have reliable source ranges. The filter is
+    // only meant to suppress callee-local manifest aborts that are already
+    // published on the callee itself and leak into the caller's non-exit scan.
+    if loc.is_dummy() {
+        return true;
+    }
+
+    let mut proc_file = None;
+    let mut proc_start = i32::MAX;
+    let mut proc_end = i32::MIN;
+    for node in &pdesc.nodes {
+        if node.loc.is_dummy() {
+            continue;
+        }
+        if proc_file.is_none() {
+            proc_file = Some(node.loc.file.clone());
+        }
+        if proc_file.as_ref() != Some(&node.loc.file) {
+            continue;
+        }
+        proc_start = proc_start.min(node.loc.line);
+        proc_end = proc_end.max(node.loc.line);
+    }
+
+    let Some(proc_file) = proc_file else {
+        return true;
+    };
+
+    loc.file == proc_file && proc_start <= loc.line && loc.line <= proc_end
 }
 
 /// Pulse transfer functions for the disjunctive abstract interpreter.
@@ -871,8 +908,13 @@ fn exec_call_c_function_ptr(
 /// Convert Pulse diagnostics to an IssueLog for reporting.
 pub fn to_issue_log(summary: &PulseSummary, proc_name: &str) -> IssueLog {
     let mut log = IssueLog::new();
+    let report_suppressed = config::get().pulse_report_issues_for_tests;
     for diag in &summary.diagnostics {
-        log.report(diag.to_issue(proc_name));
+        let suppressed = diag.is_suppressed();
+        if suppressed && !report_suppressed {
+            continue;
+        }
+        log.report(diag.to_issue_with_reporting(proc_name, false, suppressed));
     }
     log.sort();
     log
@@ -884,6 +926,7 @@ mod tests {
     use crate::abstract_value::AbstractValue;
     use crate::access::Access;
     use crate::summary::{PrePost, PrePostKind};
+    use crate::value_history::ValueHistory;
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
     use sil::exp::Exp;
@@ -1079,6 +1122,26 @@ mod tests {
         assert!(log
             .to_issues_exp()
             .contains(diagnostics::issue_type::IssueTypeId::NullptrDereference.id()));
+    }
+
+    #[test]
+    fn test_to_issue_log_filters_suppressed_null_deref_by_default() {
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            access_history: ValueHistory::epoch(),
+            invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
+        };
+        let summary = PulseSummary::intra_only(vec![diagnostic]);
+
+        let log = to_issue_log(&summary, "suppressed_null_deref");
+
+        assert!(
+            log.is_empty(),
+            "suppressed constant-dereference diagnostics should stay out of default reporting"
+        );
     }
 
     /// Diamond CFG: start → a → {b, c} → d → exit

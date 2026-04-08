@@ -337,6 +337,88 @@ fn test_pulse_detects_null_deref() {
 }
 
 #[test]
+fn test_pulse_report_issues_for_tests_surfaces_suppressed_reports() {
+    let inputs = TempDir::new();
+    let fixture = inputs.join("suppressed_null.sil");
+    std::fs::write(
+        &fixture,
+        r#".source_language = "C"
+
+define create_null_path2_bad_FN(p: *int) : void {
+  #entry:
+    n0:*int = load &p
+    jmp is_null, nonnull
+  #is_null:
+    prune __sil_eq(n0, 0)
+    n1:*int = load &p
+    store n1 <- 52:int
+    ret null
+  #nonnull:
+    prune __sil_lnot(__sil_eq(n0, 0))
+    store n0 <- 32:int
+    n2:*int = load &p
+    store n2 <- 52:int
+    ret null
+}
+"#,
+    )
+    .unwrap();
+
+    let default_out = TempDir::new();
+    let (default_code, _default_stdout, default_stderr) = run_infer_rs(&[
+        "--pulse-only",
+        "-q",
+        "-o",
+        default_out.to_str().unwrap(),
+        fixture.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        default_code, 0,
+        "suppressed issues should stay out of default reporting. stderr: {default_stderr}"
+    );
+    let default_report = std::fs::read_to_string(default_out.join("report.json")).unwrap();
+    let default_issues: serde_json::Value = serde_json::from_str(&default_report).unwrap();
+    assert_eq!(
+        default_issues.as_array().map(Vec::len),
+        Some(0),
+        "default reporting should omit suppressed issues: {default_report}"
+    );
+
+    let test_out = TempDir::new();
+    let (test_code, _test_stdout, test_stderr) = run_infer_rs(&[
+        "--pulse-only",
+        "--pulse-report-issues-for-tests",
+        "-q",
+        "-o",
+        test_out.to_str().unwrap(),
+        fixture.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        test_code, 2,
+        "test-reporting mode should surface suppressed issues. stderr: {test_stderr}"
+    );
+    let test_report = std::fs::read_to_string(test_out.join("report.json")).unwrap();
+    let test_issues: serde_json::Value = serde_json::from_str(&test_report).unwrap();
+    let issues = test_issues
+        .as_array()
+        .expect("report.json should be a JSON array");
+    assert!(
+        issues.iter().any(|issue| {
+            matches!(
+                issue["issue_type"]["id"].as_str(),
+                Some(id)
+                    if id == IssueTypeId::NullptrDereference.id()
+                        || id == IssueTypeId::ComparedToNullAndDereferenced.id()
+            )
+                && issue["trace"]
+                    .as_str()
+                    .is_some_and(|trace| trace.starts_with("*** SUPPRESSED ***"))
+        }),
+        "test-reporting mode should include suppressed null-dereference-family issues: {test_report}"
+    );
+}
+
+#[test]
 fn test_source_override_sets_reported_file() {
     let fixture = test_data_dir().join("pulse/null_deref.sil");
     let tmp_dir = TempDir::new();

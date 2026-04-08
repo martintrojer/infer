@@ -41,7 +41,7 @@ pub(crate) struct ApplySummaryOutcome {
 enum TranslateFormulaResult {
     Sat,
     Unsat,
-    PotentialInvalidAccess(Diagnostic),
+    PotentialInvalidAccess(Box<Diagnostic>),
 }
 
 /// Apply a callee's summary to the caller's abstract state.
@@ -281,7 +281,7 @@ pub(crate) fn apply_summary_with_aliasing(
             mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
             log::debug!("[apply_summary] → imported potential invalid access: {diag}");
             return if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
-                let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
+                let manifest_diag = reify_invalid_access_diagnostic(*diag, &caller_state);
                 ApplySummaryOutcome {
                     results: vec![ExecutionDomain::AbortProgram {
                         state: Box::new(caller_state),
@@ -293,7 +293,7 @@ pub(crate) fn apply_summary_with_aliasing(
                 ApplySummaryOutcome {
                     results: vec![ExecutionDomain::LatentInvalidAccess {
                         state: Box::new(caller_state),
-                        diagnostic: Box::new(diag),
+                        diagnostic: diag,
                     }],
                     alias_specialization: None,
                 }
@@ -358,18 +358,20 @@ pub(crate) fn apply_summary_with_aliasing(
             vec![ExecutionDomain::ContinueProgram(caller_state)]
         }
         crate::summary::PrePostKind::AbortProgram => {
-            // Cross-ref: OCaml PulseCallOperations.ml apply_callee preserves
-            // AbortProgram when applying a callee summary instead of dropping
-            // it. This is particularly important for on-demand specialized
-            // summaries: their diagnostics are not published elsewhere.
-            if let Some(diag) = &pre_post.diagnostic {
-                vec![ExecutionDomain::AbortProgram {
-                    state: Box::new(caller_state),
-                    diagnostic: Box::new(diag.clone()),
-                }]
-            } else {
-                vec![]
-            }
+            // A manifest AbortProgram in the callee is already published on
+            // the callee's own summary. Applying that same abort as a caller
+            // AbortProgram republishes the local callee issue on every caller
+            // (`angelism.c: skip_function_with_no_spec_ok` style duplication).
+            //
+            // Specialized summaries are handled separately:
+            // `PulseSummary::add_specialized_summary` merges their diagnostics
+            // onto the owning summary and strips manifest abort diagnostics
+            // from the cached specialized pre/posts before they can reach
+            // callers.
+            //
+            // So for ordinary callee-local manifest aborts, stop this caller
+            // path without producing a caller-side execution state.
+            vec![]
         }
         crate::summary::PrePostKind::LatentAbortProgram => {
             // Cross-ref: OCaml PulseCallOperations.ml re-checks a latent issue
@@ -993,9 +995,9 @@ fn translate_formula(
             }
             crate::sat_unsat::SatUnsat::Sat(ImportedFormulaEffect::PotentialInvalidAccess(
                 addr,
-            )) => TranslateFormulaResult::PotentialInvalidAccess(
+            )) => TranslateFormulaResult::PotentialInvalidAccess(Box::new(
                 imported_potential_invalid_access_diagnostic(addr, loc, caller_state),
-            ),
+            )),
         }
     }
 
@@ -2101,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_summary_propagates_abort_program_diagnostic() {
+    fn test_apply_summary_drops_plain_abort_program_at_callers() {
         let callee_pname = Procname::c_from_string("callee");
         let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
         callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
@@ -2150,11 +2152,10 @@ mod tests {
             caller_state,
         );
 
-        assert!(matches!(
-            results.as_slice(),
-            [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
-                if found.as_ref() == &diagnostic
-        ));
+        assert!(
+            results.is_empty(),
+            "plain callee-local AbortProgram paths should stop the caller path without republishing the callee diagnostic"
+        );
     }
 
     fn mk_latent_abort_pre_post() -> (PrePost, crate::diagnostic::Diagnostic) {

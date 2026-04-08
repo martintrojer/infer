@@ -5,67 +5,59 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-- Active line of investigation is still Pulse latent-versus-manifest
-  invalid-access parity, but the two concrete regressions from the previous
-  pass are now fixed.
-- Imported callee arithmetic in `crates/pulse/src/interproc.rs` no longer uses
-  the rejected broad reorder:
-  - Rust keeps the existing `apply_post`-then-formula sequencing
-  - new `AbductiveDomain::snapshot_allocated_before_call()` captures caller
-    stack/heap allocations after `materialize_pre` and before `apply_post`
-  - `apply_formula_result_for_summary_import()` now uses those snapshots so
-    imported `EqZero` only treats pre-call caller allocations as contradictions
-    or potential invalid accesses
-  - this fixes the reduced guarded-outparam repro and makes
-    `test_e2e_write_through_ptr` pass without reintroducing the broad
-    latent/manifest regression
-- The remaining caller-boundary mismatch is also fixed now:
-  - `latent_use_after_free` still exports
-    `LatentInvalidAccess(NULLPTR_DEREFERENCE)` +
-    `LatentAbortProgram(USE_AFTER_FREE)`, matching the OCaml split
-  - `manifest_use_after_free` no longer upgrades that latent direct-formal
-    null path into a manifest `NULLPTR_DEREFERENCE`
-  - fix in `crates/pulse/src/interproc.rs`:
-    mark the translated invalid-access address as `must_be_valid` in the
-    caller, then reuse `summary::classify_abort_kind()` instead of the old
-    raw `check_valid && abort_is_manifest` test
-  - this keeps direct-formal nulls latent at the next caller boundary while
-    preserving manifest field/null-after-free cases such as
-    `access_use_after_free_bad`
-- OCaml cross-refs that matched this fix direction:
-  - `PulseInterproc.conjoin_callee_arith`
-  - `PulseAbductiveDomain.incorporate_new_eqs`
-  - `PulseCallOperations.apply_callee`
-  - `PulseArithmetic.is_manifest`
-- New focused coverage from this pass:
-  - `crates/pulse/tests/end_to_end.rs`
-    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`
-  - `crates/pulse/tests/end_to_end.rs`
-    `test_e2e_manifest_use_after_free_reports_only_uaf`
-  - `crates/pulse/src/interproc.rs`
-    `test_apply_summary_keeps_direct_formal_null_invalid_access_latent`
-  - `crates/pulse/tests/end_to_end.rs`
-    `test_e2e_write_through_ptr` is unignored and now passes
+- Active line of investigation has moved from headline count recovery to exact
+  invalid-access publication/report parity.
+- Latest concrete correctness fixes from this pass:
+  - `crates/pulse/src/summary.rs`:
+    `pre_post_has_direct_formal_constant_deref()` now refuses to latentify a
+    direct-formal null dereference when the summary already contains a local
+    depth-0 `addr == 0` proof
+  - `crates/pulse/src/diagnostic.rs`,
+    `crates/pulse/src/value_history.rs`,
+    `crates/pulse/src/invalidation.rs`,
+    `crates/pulse/src/checker.rs`:
+    OCaml-style suppressed-report detection now exists; default reporting drops
+    those issues, and `--pulse-report-issues-for-tests` surfaces them as
+    `*** SUPPRESSED ***`
+  - `crates/pulse/src/checker.rs` also filters out callee-local manifest aborts
+    from the caller's non-exit scan when the diagnostic source range clearly
+    belongs to the callee
+- OCaml cross-refs used for this pass:
+  - `PulseSummary.exec_summary_of_post_common`
+  - `PulseLatentIssue.should_report`
+  - `PulseReport.is_constant_deref_without_invalidation`
+  - `PulseInvalidation.is_same_type`
+- Focused coverage added this pass:
+  - `summary::tests::test_classify_abort_kind_reports_direct_formal_null_manifest_when_locally_proven_zero`
+  - `summary::tests::test_classify_abort_kind_keeps_write_through_pointee_null_deref_latent`
+  - `checker::tests::test_to_issue_log_filters_suppressed_null_deref_by_default`
+  - `end_to_end::test_e2e_local_zero_proof_on_formal_keeps_null_deref_manifest`
+  - `end_to_end::test_e2e_deref_then_free_then_deref_keeps_npe_latent`
+  - `end_to_end::test_e2e_callee_local_abort_is_not_republished_on_caller`
+  - `cli_tests::test_pulse_report_issues_for_tests_surfaces_suppressed_reports`
 - Latest authoritative validations on the current tree:
+  - `cargo fmt --all`
+  - `cargo test -q --manifest-path Cargo.toml -p config --lib`
   - `cargo test -q --manifest-path Cargo.toml -p pulse --lib`
   - `cargo test -q --manifest-path Cargo.toml -p pulse --test end_to_end`
+  - `cargo test -q --manifest-path Cargo.toml -p infer-rs --test cli_tests`
   - `cargo test --manifest-path Cargo.toml -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
 - Latest authoritative ignored sweep on the current tree:
   - `NPE: expected 131, found 134`
   - `LEAK: expected 20, found 20`
   - `UAF: expected 7, found 7`
   - file diffs:
-    - `angelism.c: expected 7, found 8`
-    - `latent.c: expected 5, found 6`
-    - `nullptr.c: expected 13, found 12`
+    - `nullptr.c: expected 13, found 14`
     - `sizeof.c: expected 0, found 2`
 - Interpretation of the current sweep:
-  - `sizeof.c` is still the accepted textual-fidelity limitation
-  - `manifest_use_after_free` is fixed, so the current count drift moved
-    elsewhere rather than being the old direct-formal latent/null mismatch
-  - the next realistic work items are to localize the extra NPEs in
-    `angelism.c` and `latent.c`, then inspect which `nullptr.c` report dropped
-    while keeping the correctness-first direct-formal and by-ref fixes intact
+  - `nullptr.c +1` is now the accepted real `FN_nullptr_deref_old_bad`
+    divergence; the two OCaml-style `*** SUPPRESSED ***` reports are counted
+    again in the ignored sweep but remain hidden in default CLI output
+  - `sizeof.c +2` is still the accepted exported-Textual fidelity limitation
+  - count parity is no longer blocked on `angelism.c` or `latent.c`
+  - remaining meaningful parity work is exact issue-set publication on
+    wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`,
+    plus richer `ValueHistory` / `PulseTrace` parity
 
 Older notes below are historical checkpoints and may no longer describe the
 active investigation.

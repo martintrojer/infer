@@ -763,9 +763,44 @@ fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut Pr
         return !pre_post_diag_addr_has_non_null_invalidation(pre_post);
     }
 
+    if pre_post_has_local_zero_condition(pre_post, diag_addr) {
+        return false;
+    }
+
     direct_formal
         && !pre_post_has_locally_written_direct_formal(pdesc, pre_post, diag_addr)
         && !pre_post_diag_addr_has_non_null_invalidation(pre_post)
+}
+
+/// OCaml still keeps locally-proven direct-formal null dereferences manifest.
+/// `create_null_path2_bad_FN` and
+/// `malloc_then_call_create_null_path_then_deref_unconditionally_bad_FN`
+/// both export `AbortProgram` summaries because the callee itself established
+/// the `p == 0` path with a depth-0 branch condition before dereferencing `p`.
+///
+/// The direct-formal latent rule should only approximate true
+/// `PotentialInvalidAccessSummary`-style caller obligations, not ordinary
+/// callee-local proofs.
+fn pre_post_has_local_zero_condition(pre_post: &PrePost, diag_addr: AbstractValue) -> bool {
+    let repr = pre_post.post.path_condition.get_var_repr(diag_addr);
+    pre_post
+        .post
+        .path_condition
+        .conditions()
+        .iter()
+        .any(|(atom, depth)| {
+            *depth == 0
+                && matches!(
+                    atom,
+                    crate::formula::atom::Atom::Equal(
+                        crate::formula::term::Term::Var(v),
+                        crate::formula::term::Term::Const(0)
+                    ) | crate::formula::atom::Atom::Equal(
+                        crate::formula::term::Term::Const(0),
+                        crate::formula::term::Term::Var(v)
+                    ) if *v == repr
+                )
+        })
 }
 
 fn proc_is_entry_point(pdesc: &Procdesc) -> bool {
@@ -774,19 +809,11 @@ fn proc_is_entry_point(pdesc: &Procdesc) -> bool {
 
 fn post_addr_has_written_to(pre_post: &PrePost, addr: AbstractValue) -> bool {
     let repr = pre_post.post.path_condition.get_var_repr(addr);
-    pre_post
-        .post
-        .post
-        .attrs
-        .get(&repr)
-        .is_some_and(|attrs| {
-            attrs.iter().any(|attr| {
-                matches!(
-                    attr,
-                    crate::attribute::Attribute::WrittenTo(_, _)
-                )
-            })
-        })
+    pre_post.post.post.attrs.get(&repr).is_some_and(|attrs| {
+        attrs
+            .iter()
+            .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _)))
+    })
 }
 
 /// Cross-ref: OCaml keeps direct-formal null dereferences latent when they
@@ -794,6 +821,11 @@ fn post_addr_has_written_to(pre_post: &PrePost, addr: AbstractValue) -> bool {
 /// `test_syntactic_specialization_bad` and `test_assign_NULL_callback_bad`
 /// remain manifest because the procedure locally wrote its own formal slot
 /// through a by-ref call chain before dereferencing it.
+///
+/// Writing through the pointee behind the formal (`*x = ...`) is different:
+/// that mutates caller-owned memory, but it does not rewrite the formal slot
+/// `x` itself. OCaml still keeps `latent.c:deref_then_free_then_deref_bad`
+/// latent on the null-deref side.
 fn pre_post_has_locally_written_direct_formal(
     pdesc: &Procdesc,
     pre_post: &PrePost,
@@ -821,9 +853,7 @@ fn pre_post_has_locally_written_direct_formal(
                 continue;
             }
 
-            if post_addr_has_written_to(pre_post, stack_addr)
-                || loaded_value.is_some_and(|value| post_addr_has_written_to(pre_post, value))
-            {
+            if post_addr_has_written_to(pre_post, stack_addr) {
                 return true;
             }
         }
@@ -1849,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_abort_kind_reports_locally_written_direct_formal_null_manifest() {
+    fn test_classify_abort_kind_reports_direct_formal_null_manifest_when_locally_proven_zero() {
         let pdesc = make_pdesc_with_formals(&["x"]);
         let mut astate = AbductiveDomain::mk_initial(&pdesc);
         let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
@@ -1858,7 +1888,14 @@ mod tests {
         let formal_val = astate.read_heap(formal_addr, Access::Dereference);
         let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
         astate.mark_must_be_valid(formal_val);
-        astate.post.attrs.mark_written_to(formal_addr, 1, Location::dummy());
+        let condition = crate::formula::atom::Atom::Equal(
+            crate::formula::term::Term::Var(formal_val),
+            crate::formula::term::Term::Const(0),
+        );
+        assert!(astate
+            .path_condition
+            .and_condition_direct(condition, 0)
+            .is_sat());
         astate.invalidate(
             formal_val,
             invalidation.clone(),
@@ -1870,6 +1907,62 @@ mod tests {
         assert!(matches!(
             classify_abort_kind(&pdesc, &astate, &diagnostic),
             PrePostKind::AbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_classify_abort_kind_reports_locally_written_direct_formal_null_manifest() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        astate.mark_must_be_valid(formal_val);
+        astate
+            .post
+            .attrs
+            .mark_written_to(formal_addr, 1, Location::dummy());
+        astate.invalidate(
+            formal_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(formal_val, invalidation);
+
+        assert!(matches!(
+            classify_abort_kind(&pdesc, &astate, &diagnostic),
+            PrePostKind::AbortProgram
+        ));
+    }
+
+    #[test]
+    fn test_classify_abort_kind_keeps_write_through_pointee_null_deref_latent() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        astate.mark_must_be_valid(formal_val);
+        astate
+            .post
+            .attrs
+            .mark_written_to(formal_val, 1, Location::dummy());
+        astate.invalidate(
+            formal_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(formal_val, invalidation);
+
+        assert!(matches!(
+            classify_abort_kind(&pdesc, &astate, &diagnostic),
+            PrePostKind::LatentInvalidAccess
         ));
     }
 
