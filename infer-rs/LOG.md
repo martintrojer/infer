@@ -5,6 +5,46 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active line of investigation is still `specialization.c` main-summary
+  parity, but the latest pass narrowed two more exporter/model gaps without
+  changing the headline `Matching: 5` / `Differences: 16`.
+- Latest stable checkpoint:
+  - `crates/pulse/src/summary.rs`
+    - summary normalization now strips post-summary `Initialized` attrs from
+      hidden formal/local stack roots after `restore_formals_for_summary`,
+      while keeping caller-visible pointee/return attrs
+    - focused unit coverage:
+      - `summary::tests::test_normalize_drops_initialized_on_formal_stack_root`
+  - `crates/pulse/src/checker.rs`
+    - unresolved `__call_c_function_ptr` now:
+      - forces the OCaml-style dereference of the function-pointer value in the
+        unspecialized path
+      - records `UnknownEffect` on actual values
+      - marks fresh integer returns with `is_int`
+    - focused unit coverage:
+      - `checker::tests::test_exec_call_c_function_ptr_unknown_derefs_funptr_and_marks_unknown_effect`
+  - validations on the current tree:
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+- Current `specialization.c` comparator result is still:
+  - `Matching: 5`
+  - `Differences: 16`
+- Important conclusions from this pass:
+  - the old formal-root `Initialized` export noise was real and is now gone
+    from simple summaries such as `add_one`, `add_two`, `id`, and from the
+    alias-call wrappers
+  - unresolved funptr summaries now expose more of the OCaml unspecialized
+    surface (`UnknownEffect`, extra dereference / `MustBe*`, integer return
+    typing), which changed the shape of `invoke` / `invoke_itself_bad` in the
+    right direction even though the comparator count did not move
+  - the next fault line is now concentrated in:
+    - representative / formula normalization (`add_one`, `add_two`, `id`,
+      `add_more_bad`, parts of `invoke_itself_bad`, `two_pointers_recursion_bad`)
+    - alias-shape / latent-vs-continue main-summary mismatches
+      (`test_alias`, `test_unalias`, `call_test_alias_bad`,
+      `call_test_unalias_bad`, `may_double_free_if_alias`)
+
 - Active line of investigation is back on `specialization.c` main-summary
   parity after restoring two correctness regressions that the previous
   parity pass introduced.

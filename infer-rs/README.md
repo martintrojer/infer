@@ -17,6 +17,13 @@ actuals. This fixes the lost latent precondition regressions and removes the old
 `invoke(id)` / `add_one` / `add_two` `v -*-> v` self-edge without papering over the remaining
 semantic mismatches.
 
+The latest specialization/summarization cleanup tightened two more OCaml-backed surfaces:
+summary normalization now strips post-summary `Initialized` attrs from hidden formal/local stack
+roots after `restore_formals_for_summary`, and unresolved `__call_c_function_ptr` now
+dereferences the function-pointer value, records `UnknownEffect` on actuals, and preserves
+`is_int` on fresh integer returns. This moves `invoke`-style summaries closer to OCaml even
+though the comparator checkpoint itself is still unchanged.
+
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
 
@@ -35,9 +42,10 @@ alpha-renamed abstract values), and the ignored
 file. The latest OCaml-backed access-mode and interproc fixes align Rust's local read/write
 bookkeeping with `PulseOperations.check_addr_access`, restore leaf `MustBeValid` handling, and
 stop replaying formal-stack bookkeeping onto by-value actuals. The current comparator checkpoint
-is still `Matching: 5`, `Differences: 16`, but the old self-edge bug is gone; the remaining
-semantic diffs are now concentrated in return/result representative choice, formula normalization,
-extra exported `Initialized` attrs on caller/formal roots, and broader alias-shape parity.
+is still `Matching: 5`, `Differences: 16`, but the old self-edge bug and formal-root
+`Initialized` export noise are gone; the remaining semantic diffs are now concentrated in
+return/result representative choice, formula normalization, alias-shape parity, and
+latent-vs-continue summary shape in the specialization wrappers.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

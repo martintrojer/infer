@@ -812,7 +812,6 @@ fn materialize_pre(
         }
 
         if let Some(edges) = callee_pre.heap.get_edges(callee_addr) {
-
             if callee_pre_attrs
                 .and_then(|attrs| attrs.get_must_be_initialized())
                 .is_some()
@@ -1792,7 +1791,10 @@ mod tests {
             .unwrap();
         let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
         let result_addr = AbstractValue::mk_fresh();
-        callee_state.post.heap.add_edge(result_addr, Access::Dereference, formal_val);
+        callee_state
+            .post
+            .heap
+            .add_edge(result_addr, Access::Dereference, formal_val);
         callee_state.initialize(result_addr);
         callee_state
             .post

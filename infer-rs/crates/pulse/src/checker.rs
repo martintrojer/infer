@@ -33,6 +33,7 @@ use sil::specialization::PulseSpecialization;
 use crate::abductive::AbductiveDomain;
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
+use crate::pulse_result::PulseResult;
 use crate::summary::PulseSummary;
 use crate::transfer;
 
@@ -930,12 +931,35 @@ fn exec_call_c_function_ptr(
     // Unresolved function pointer: record the need for dynamic type
     // specialization so the caller can re-analyze us with the known type.
     // Cross-ref: OCaml PulseModelsC.ml call_c_function_ptr None branch.
+    match crate::operations::eval_deref_with_history(funptr_exp, loc, &mut state) {
+        PulseResult::Ok(_) => {}
+        PulseResult::Recoverable(_, errors) => {
+            let mut results = Vec::new();
+            for diag in errors {
+                results.push(ExecutionDomain::AbortProgram {
+                    state: Box::new(state.clone()),
+                    diagnostic: Box::new(diag),
+                });
+            }
+            return results;
+        }
+        PulseResult::FatalError(diag, _) => {
+            return vec![ExecutionDomain::AbortProgram {
+                state: Box::new(state),
+                diagnostic: Box::new(diag),
+            }];
+        }
+    }
     state.add_need_dynamic_type_specialization(funptr_val);
     let ret_val = crate::abstract_value::AbstractValue::mk_fresh();
     crate::operations::write_id(ret_id, ret_val, &mut state);
+    if ret_typ.is_int() {
+        state.path_condition.and_is_int(ret_val);
+    }
     // Havoc actual args (not the funptr itself) for unresolved calls
     for (arg_exp, _arg_typ) in actual_args {
         let arg_val = crate::operations::eval_or_fresh(arg_exp, loc, &mut state);
+        state.add_attr(arg_val, crate::attribute::Attribute::UnknownEffect);
         state.apply_unknown_effect(arg_val);
         crate::operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
     }
@@ -979,6 +1003,7 @@ mod tests {
     use sil::qualified_cpp_name::QualifiedCppName;
     use sil::specialization::{HeapPath, PulseSpecialization};
     use sil::typ::Typ;
+    use sil::var::Var;
 
     fn formal_value_heap_path(formal_pvar: &Pvar) -> HeapPath {
         HeapPath::Dereference(Box::new(HeapPath::Pvar(formal_pvar.clone())))
@@ -1178,6 +1203,129 @@ mod tests {
         assert!(
             log.is_empty(),
             "suppressed constant-dereference diagnostics should stay out of default reporting"
+        );
+    }
+
+    #[test]
+    fn test_exec_call_c_function_ptr_unknown_derefs_funptr_and_marks_unknown_effect() {
+        let caller_pname = Procname::c_from_string("invoke");
+        let mut pdesc = Procdesc::new(
+            caller_pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        pdesc.formals = vec![
+            (
+                Mangled::from_string("f"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("i"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+        ];
+
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let f_pvar = Pvar::mk(Mangled::from_string("f"), caller_pname.clone());
+        let f_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(f_pvar)))
+            .unwrap();
+        let funptr_val = state.read_heap(f_addr, Access::Dereference);
+
+        let i_pvar = Pvar::mk(Mangled::from_string("i"), caller_pname);
+        let i_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(i_pvar)))
+            .unwrap();
+        let arg_val = state.read_heap(i_addr, Access::Dereference);
+
+        let fp_id = Ident::create_normal(IdentName::from_string("fp"), 0);
+        crate::operations::write_id(&fp_id, funptr_val, &mut state);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 1);
+        crate::operations::write_id(&arg_id, arg_val, &mut state);
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 2);
+
+        let args = vec![
+            (Exp::Var(fp_id.clone()), Typ::mk_ptr(Typ::void())),
+            (Exp::Var(arg_id), Typ::int(sil::typ::IKind::IInt)),
+        ];
+        let requests = RefCell::new(Vec::new());
+
+        let results = exec_call_c_function_ptr(
+            CallSite {
+                pdesc: &pdesc,
+                ret_id: &ret_id,
+                ret_typ: &Typ::int(sil::typ::IKind::IInt),
+                args: &args,
+                loc: &Location::dummy(),
+                spec_requests: Some(&requests),
+            },
+            state,
+            &HashMap::new(),
+        );
+
+        let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
+            panic!("expected unresolved funptr call to keep one continue state, got {results:?}");
+        };
+
+        assert!(
+            state.need_dynamic_type_specialization.contains(&funptr_val),
+            "unresolved call should request specialization from the function pointer value"
+        );
+        assert!(
+            state
+                .pre
+                .heap
+                .find_edge(funptr_val, &Access::Dereference)
+                .is_some(),
+            "unresolved call should read through the function pointer in the pre-state"
+        );
+        assert!(
+            state
+                .post
+                .heap
+                .find_edge(funptr_val, &Access::Dereference)
+                .is_some(),
+            "unresolved call should keep the function-pointer dereference in the post-state"
+        );
+        assert!(
+            state
+                .pre
+                .attrs
+                .get(&funptr_val)
+                .is_some_and(|attrs| attrs.get_must_be_valid().is_some()),
+            "dereferencing the function pointer should abduce MustBeValid on that value"
+        );
+        assert!(
+            state
+                .pre
+                .attrs
+                .get(&funptr_val)
+                .is_some_and(|attrs| attrs.get_must_be_initialized().is_some()),
+            "dereferencing the function pointer should abduce MustBeInitialized on that value"
+        );
+        assert!(
+            state
+                .post
+                .attrs
+                .get(&arg_val)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::UnknownEffect)),
+            "unresolved call should keep UnknownEffect on actual values"
+        );
+
+        let ret_val = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return id should be written");
+        assert!(
+            state.path_condition.phi().is_marked_int(ret_val),
+            "integer return type should keep the is_int fact on the fresh unknown result"
         );
     }
 

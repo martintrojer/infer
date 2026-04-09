@@ -38,6 +38,11 @@ impl BaseAddressAttributes {
         self.map.get(addr)
     }
 
+    /// Get mutable access to the attributes for an address.
+    pub fn get_mut(&mut self, addr: &AbstractValue) -> Option<&mut Attributes> {
+        self.map.get_mut(addr)
+    }
+
     /// Check if an address is valid (not invalid).
     ///
     /// Returns `Ok(())` if valid, or `Err(Box<(invalidation, history)>)` if invalid.
@@ -123,6 +128,11 @@ impl BaseAddressAttributes {
     /// Iterate over all addresses and their attributes.
     pub fn iter(&self) -> impl Iterator<Item = (&AbstractValue, &Attributes)> {
         self.map.iter()
+    }
+
+    /// Remove all attributes for an address.
+    pub fn remove_addr(&mut self, addr: &AbstractValue) {
+        self.map.remove(addr);
     }
 
     /// Remove attributes on addresses not in the reachable set.

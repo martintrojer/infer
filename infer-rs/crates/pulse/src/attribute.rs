@@ -93,6 +93,8 @@ pub enum Attribute {
     StdMoved,
     /// std::vector::reserve was called.
     StdVectorReserve,
+    /// May be modified by an unknown/external call.
+    UnknownEffect,
     /// Uninitialized value.
     Uninitialized,
     /// Unreachable at this program point.

@@ -782,7 +782,10 @@ mod tests {
             "writes should not synthesize a pre edge for the overwritten pointee"
         );
         assert_eq!(
-            state.post.heap.find_edge(formal_value, &Access::Dereference),
+            state
+                .post
+                .heap
+                .find_edge(formal_value, &Access::Dereference),
             Some(written),
             "the post-state should record the new pointee value"
         );
@@ -832,7 +835,12 @@ mod tests {
         };
 
         assert!(
-            state.post.attrs.get(&value).and_then(|attrs| attrs.get_invalid()).is_none(),
+            state
+                .post
+                .attrs
+                .get(&value)
+                .and_then(|attrs| attrs.get_invalid())
+                .is_none(),
             "prune-specific constant evaluation should stay non-invalidating"
         );
     }

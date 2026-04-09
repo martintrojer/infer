@@ -56,11 +56,16 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    Current checkpoint is still `Matching: 5`, `Differences: 16`. The local
    access-mode fix removed the simple missing-`MustBeInitialized` gap, and the
    latest correctness pass restored leaf `MustBeValid` precondition handling
-   plus skipping formal-stack replay for value-style actuals. That fixed the
-   lost latent regressions and removed the old `invoke(id)` / `add_one` /
-   `add_two` self-edge bug. The next real blockers are return/result
-   representative choice, formula normalization, extra exported `Initialized`
-   attrs on caller/formal roots, and broader alias-shape parity. Important
+   plus skipping formal-stack replay for value-style actuals. The latest
+   exporter/model cleanup also strips hidden formal/local stack-root
+   `Initialized` attrs from normalized summaries and makes unresolved
+   `__call_c_function_ptr` mirror OCaml's unspecialized path more closely
+   (funptr dereference, `UnknownEffect` on actuals, integer-return `is_int`).
+   That fixed the lost latent regressions, removed the old `invoke(id)` /
+   `add_one` / `add_two` self-edge bug, and eliminated the old formal-root
+   `Initialized` summary noise. The next real blockers are return/result
+   representative choice, formula normalization, and broader alias-shape /
+   latent-vs-continue parity. Important
    OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
    the dereferenced formal value, so do not try to "fix" this by blindly
    propagating formal-stack `MustBe*` attrs through the current Rust
@@ -86,6 +91,12 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    is still incomplete.
 
 Recent groundwork that should stay in place even though the current NPE total moved in the wrong direction:
+- summary normalization now strips hidden formal/local stack-root `Initialized`
+  attrs after `restore_formals_for_summary`, matching the OCaml exported
+  summary surface while keeping caller-visible pointee/return attrs
+- unresolved `__call_c_function_ptr` now dereferences the function-pointer
+  value in the unspecialized path, records `UnknownEffect` on actual values,
+  and preserves `is_int` on fresh integer returns
 - interproc formula import now mirrors OCaml `PulseFormula.and_callee_formula` more closely
   (shared substitution across the whole callee formula, remembered `conditions` imported first)
 - summary import now snapshots caller allocation state before `apply_post` and uses that snapshot

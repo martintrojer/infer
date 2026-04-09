@@ -317,6 +317,32 @@ impl PrePost {
 
         self.restore_formals_for_summary();
 
+        // Cross-ref: OCaml exported summaries for scalar/value formals keep the
+        // formal stack cells and their dereference edges, but they do not keep
+        // read-side `Initialized` markers on those local stack roots
+        // themselves. Callers care about the pointee/return-visible effects,
+        // not that the callee read its own local formal slot.
+        let hidden_stack_roots: HashSet<_> = self
+            .post
+            .post
+            .stack
+            .iter()
+            .filter(|(var, _)| !var.is_global() && !var.is_return())
+            .map(|(_, addr)| *addr)
+            .collect();
+        let mut empty_attr_roots = Vec::new();
+        for addr in &hidden_stack_roots {
+            if let Some(attrs) = self.post.post.attrs.get_mut(addr) {
+                attrs.remove(&crate::attribute::Attribute::Initialized);
+                if attrs.is_empty() {
+                    empty_attr_roots.push(*addr);
+                }
+            }
+        }
+        for addr in empty_attr_roots {
+            self.post.post.attrs.remove_addr(&addr);
+        }
+
         // The caller-visible summary surface is rooted in the visible stack:
         // restored pre bindings, globals, and the return slot. After
         // restore_formals_for_summary() there are no arbitrary post locals
@@ -371,7 +397,10 @@ impl PrePost {
         self.pre.heap.retain_reachable(&pre_heap_reachable);
         self.pre.attrs.retain_reachable(&pre_canonical_reachable);
         self.post.post.heap.retain_reachable(&post_heap_reachable);
-        self.post.post.attrs.retain_reachable(&post_canonical_reachable);
+        self.post
+            .post
+            .attrs
+            .retain_reachable(&post_canonical_reachable);
         self.post
             .must_be_valid
             .retain(|addr| post_canonical_reachable.contains(addr));
@@ -1946,6 +1975,43 @@ mod tests {
         assert!(
             pp.pre.attrs.get(&post_only).is_none(),
             "post-only values should not survive in the exported precondition"
+        );
+    }
+
+    #[test]
+    fn test_normalize_drops_initialized_on_formal_stack_root() {
+        let pdesc = make_pdesc_with_formals(&["p"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("p"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+
+        astate.initialize(formal_addr);
+        astate.initialize(formal_val);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert!(
+            pp.post.post.attrs.get(&formal_addr).is_none(),
+            "formal stack roots should not keep exported Initialized attrs"
+        );
+        assert!(
+            pp.post
+                .post
+                .attrs
+                .get(&formal_val)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
+            "the caller-visible pointee value should keep Initialized"
         );
     }
 
