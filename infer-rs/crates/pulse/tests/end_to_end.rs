@@ -3469,6 +3469,15 @@ fn test_debug_specialization_summary() {
             eprintln!(
                 "  {name}: issues={issues:?} kinds={kinds:?} conditions={conditions:?} specialized={specs:?}"
             );
+            if name == "test_alias"
+                || name == "test_unalias"
+                || name == "call_test_alias_bad"
+                || name == "call_test_unalias_bad"
+            {
+                for (i, pp) in summary.pre_posts.iter().enumerate() {
+                    eprintln!("    raw_main[{i}]={:#?}", rust_pre_post_to_raw(pp));
+                }
+            }
         }
     }
 }

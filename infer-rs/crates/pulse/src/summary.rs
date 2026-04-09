@@ -337,38 +337,47 @@ impl PrePost {
         );
         reachable.extend(always_reachable);
 
-        let canonical_reachable: HashSet<_> = reachable
+        let post_canonical_reachable: HashSet<_> = reachable
             .iter()
             .map(|addr| self.post.path_condition.get_var_repr(*addr))
             .collect();
-        let mut heap_reachable = reachable.clone();
-        heap_reachable.extend(canonical_reachable.iter().copied());
-        let mut formula_seeds = canonical_reachable.clone();
-        formula_seeds.extend(self.collect_reachable_array_indices(&heap_reachable));
-        let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
-        let precondition_seed_reachable = self.collect_reachable_from_seeds(
+        let mut post_heap_reachable = reachable.clone();
+        post_heap_reachable.extend(post_canonical_reachable.iter().copied());
+        let pre_reachable = self.collect_reachable_from_seeds(
             self.pre.stack.iter().map(|(_, addr)| *addr),
             true,
             false,
         );
-        let mut precondition_vocabulary = precondition_seed_reachable.clone();
+        let pre_canonical_reachable: HashSet<_> = pre_reachable
+            .iter()
+            .map(|addr| self.post.path_condition.get_var_repr(*addr))
+            .collect();
+        let mut pre_heap_reachable = pre_reachable.clone();
+        pre_heap_reachable.extend(pre_canonical_reachable.iter().copied());
+        let mut formula_seeds = post_canonical_reachable.clone();
+        formula_seeds.extend(self.collect_reachable_array_indices(&post_heap_reachable));
+        let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
+        let mut precondition_vocabulary = pre_reachable.clone();
         precondition_vocabulary.extend(expand_formula_reachable(
             &self.post.path_condition,
-            &precondition_seed_reachable,
+            &pre_reachable,
         ));
 
         let leaks = self.check_memory_leaks(&formula_reachable, &locally_reachable);
 
-        self.pre.heap.retain_reachable(&heap_reachable);
-        self.pre.attrs.retain_reachable(&canonical_reachable);
-        self.post.post.heap.retain_reachable(&heap_reachable);
-        self.post.post.attrs.retain_reachable(&canonical_reachable);
+        // Cross-ref: OCaml `discard_unreachable_ ~for_summary:true` keeps the
+        // exported precondition stricter than the summarized post. Post-only
+        // values can stay in the post, but they must not leak into `pre`.
+        self.pre.heap.retain_reachable(&pre_heap_reachable);
+        self.pre.attrs.retain_reachable(&pre_canonical_reachable);
+        self.post.post.heap.retain_reachable(&post_heap_reachable);
+        self.post.post.attrs.retain_reachable(&post_canonical_reachable);
         self.post
             .must_be_valid
-            .retain(|addr| canonical_reachable.contains(addr));
+            .retain(|addr| post_canonical_reachable.contains(addr));
         self.post
             .need_dynamic_type_specialization
-            .retain(|addr| canonical_reachable.contains(addr));
+            .retain(|addr| post_canonical_reachable.contains(addr));
 
         // Cross-ref: OCaml `PulseAbductiveDomain.filter_for_summary` calls
         // `PulseFormula.simplify ~precondition_vocabulary ~keep`. The key
@@ -1901,6 +1910,42 @@ mod tests {
                 .iter()
                 .all(|diag| !matches!(diag, Diagnostic::MemoryLeak { .. })),
             "AlwaysReachable addresses should be excluded from leak reporting"
+        );
+    }
+
+    #[test]
+    fn test_normalize_drops_pre_attrs_for_post_only_values() {
+        let pdesc = make_pdesc_with_formals(&["p"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("p"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let post_only = AbstractValue::mk_fresh();
+
+        astate.write_heap(formal_val, Access::Dereference, post_only);
+        astate.pre.attrs.add_one(
+            post_only,
+            crate::attribute::Attribute::UsedAsBranchCond(
+                pdesc.proc_name.clone(),
+                Location::dummy(),
+            ),
+        );
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert!(
+            pp.pre.attrs.get(&post_only).is_none(),
+            "post-only values should not survive in the exported precondition"
         );
     }
 

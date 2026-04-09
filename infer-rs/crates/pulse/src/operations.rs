@@ -278,29 +278,21 @@ fn eval_const(
             if let Some(n) = i.to_i64() {
                 state.and_equal_const(v, n);
             }
-            // Mark as invalid only for values that look like pointers.
-            // Cross-ref OCaml: PulseOperations.ml eval_const marks Cint
-            // with ConstantDereference. In practice, only 0 (null) and
-            // small constants cause real null derefs. Non-zero constants
-            // used as integer values (e.g., set_ptr(buf, 1)) shouldn't
-            // be marked invalid — they're not pointer dereferences.
-            if i.is_zero() {
-                let inv = Invalidation::ConstantDereference(i.clone());
-                state.invalidate(
-                    v,
-                    inv.clone(),
-                    ValueHistory::invalidated(inv.clone(), loc.clone()),
-                );
-                PulseResult::Ok(ValueWithHistory::new(
-                    v,
-                    ValueHistory::invalidated(inv, loc.clone()),
-                ))
-            } else {
-                PulseResult::Ok(ValueWithHistory::new(
-                    v,
-                    ValueHistory::assignment(loc.clone()),
-                ))
-            }
+            // Cross-ref: OCaml `PulseOperations.eval_const` invalidates every
+            // integer literal under `ConstantDereference`, while prune uses a
+            // separate non-invalidating path. Keeping normal eval aligned with
+            // OCaml is important for summary parity on stored constants such as
+            // `1` and `2`, not just `0`.
+            let inv = Invalidation::ConstantDereference(i.clone());
+            state.invalidate(
+                v,
+                inv.clone(),
+                ValueHistory::invalidated(inv.clone(), loc.clone()),
+            );
+            PulseResult::Ok(ValueWithHistory::new(
+                v,
+                ValueHistory::invalidated(inv, loc.clone()),
+            ))
         }
         Const::Cfun(pname) => {
             // Record the procedure name as a Closure attribute so that
@@ -501,18 +493,10 @@ pub fn write_deref_with_history(
             );
         }
     }
-    // Abduce: record that the callee accesses this address for writing.
-    // The pre-edge records what WAS at this address before the write
-    // (a fresh "before" value), while the post-edge records the new value.
-    // This distinction is critical for interproc: materialize_pre maps
-    // the "before" value to the caller's existing value, and Step 2
-    // overwrites it with the callee's new value.
-    // Cross-ref: OCaml PulseOperations.ml write_deref calls write_access
-    // which does biabduction (abduce on pre with old value).
-    let pre_target = state.read_heap_with_history(ref_addr.clone(), Access::Dereference);
-    // read_heap already added the pre-edge with the "before" value.
-    // The pre_target is whatever was there (or a fresh value if nothing).
-    let _ = pre_target; // used by read_heap to create pre-edge
+    // Cross-ref: OCaml `PulseOperations.write_deref` delegates to
+    // `write_access`, which updates the post edge directly after the write
+    // access check. It does not synthesize a pre-state dereference edge for
+    // the "old" value being overwritten.
     state.write_heap_with_history(
         ref_addr.addr,
         Access::Dereference,
@@ -768,6 +752,88 @@ mod tests {
                 .iter()
                 .any(|attr| matches!(attr, Attribute::WrittenTo(_, _))),
             "writes should keep the WrittenTo summary marker"
+        );
+    }
+
+    #[test]
+    fn test_write_deref_does_not_abduce_old_pointee_into_pre() {
+        let loc = Location::dummy();
+        let (pdesc, pvar) = make_pdesc_with_formal("p");
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar)))
+            .expect("formal should be bound");
+
+        let formal_value = state.read_heap(formal_addr, Access::Dereference);
+        let written = AbstractValue::mk_fresh();
+
+        let result = write_deref(formal_value, written, &loc, &mut state);
+        assert!(matches!(result, PulseResult::Ok(())));
+        assert_eq!(
+            state.pre.heap.find_edge(formal_addr, &Access::Dereference),
+            Some(formal_value),
+            "loading the formal should keep the formal-slot pre edge"
+        );
+        assert_eq!(
+            state.pre.heap.find_edge(formal_value, &Access::Dereference),
+            None,
+            "writes should not synthesize a pre edge for the overwritten pointee"
+        );
+        assert_eq!(
+            state.post.heap.find_edge(formal_value, &Access::Dereference),
+            Some(written),
+            "the post-state should record the new pointee value"
+        );
+    }
+
+    #[test]
+    fn test_normal_eval_marks_nonzero_constants_invalid() {
+        let loc = Location::dummy();
+        let pdesc = Procdesc::new(Procname::c_from_string("test"), Typ::void(), loc.clone());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        let value = match eval_with_history(
+            &Exp::Const(Const::Cint(IntLit::of_int(1))),
+            &loc,
+            &mut state,
+        ) {
+            PulseResult::Ok(value) => value,
+            other => panic!("expected constant eval to succeed, got {other:?}"),
+        };
+
+        let invalid = state
+            .post
+            .attrs
+            .get(&value.addr)
+            .and_then(|attrs| attrs.get_invalid())
+            .map(|(inv, _)| inv.clone());
+        assert_eq!(
+            invalid,
+            Some(Invalidation::ConstantDereference(IntLit::of_int(1))),
+            "normal constant evaluation should keep OCaml's invalidation marker for non-zero ints"
+        );
+    }
+
+    #[test]
+    fn test_prune_eval_keeps_nonzero_constants_non_invalidating() {
+        let loc = Location::dummy();
+        let pdesc = Procdesc::new(Procname::c_from_string("test"), Typ::void(), loc.clone());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        let value = match eval_for_prune(
+            &Exp::Const(Const::Cint(IntLit::of_int(1))),
+            &loc,
+            &mut state,
+        ) {
+            PulseResult::Ok(value) => value,
+            other => panic!("expected prune eval to succeed, got {other:?}"),
+        };
+
+        assert!(
+            state.post.attrs.get(&value).and_then(|attrs| attrs.get_invalid()).is_none(),
+            "prune-specific constant evaluation should stay non-invalidating"
         );
     }
 }

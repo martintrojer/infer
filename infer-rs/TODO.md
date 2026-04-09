@@ -54,9 +54,13 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
    diagnostic, alpha-renamed) and is now the authoritative fine-grained driver.
    Current checkpoint is still `Matching: 5`, `Differences: 16`. The local
-   access-mode fix removed the simple missing-`MustBeInitialized` gap, so the
-   next real blockers are heap/root-shape parity, formula representative
-   parity, and latent-invalid-access duplication/classification. Important
+   access-mode fix removed the simple missing-`MustBeInitialized` gap, and the
+   latest correctness pass restored leaf `MustBeValid` precondition handling
+   plus skipping formal-stack replay for value-style actuals. That fixed the
+   lost latent regressions and removed the old `invoke(id)` / `add_one` /
+   `add_two` self-edge bug. The next real blockers are return/result
+   representative choice, formula normalization, extra exported `Initialized`
+   attrs on caller/formal roots, and broader alias-shape parity. Important
    OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
    the dereferenced formal value, so do not try to "fix" this by blindly
    propagating formal-stack `MustBe*` attrs through the current Rust
@@ -67,6 +71,8 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `test_e2e_write_through_ptr`, `test_e2e_manifest_use_after_free_reports_only_uaf`,
    `test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf`,
    `test_e2e_local_zero_proof_on_formal_keeps_null_deref_manifest`,
+   `test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent`,
+   `test_e2e_latent_chain_stays_latent_until_manifest_callsite`,
    `test_e2e_callee_local_abort_is_not_republished_on_caller`, and
    `test_to_issue_log_filters_suppressed_null_deref_by_default`. These are correctness fixes, not
    optional count-tuning.

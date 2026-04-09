@@ -5,6 +5,47 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active line of investigation is back on `specialization.c` main-summary
+  parity after restoring two correctness regressions that the previous
+  parity pass introduced.
+- Latest stable checkpoint:
+  - `crates/pulse/src/interproc.rs`
+    - `materialize_pre` now checks `MustBeValid` obligations for leaf pre
+      values too, not only for pre cells with outgoing edges
+    - post-cell replay now skips callee formal-stack cells only for
+      value-style actuals (`Var`, constants, computed expressions), while
+      preserving replay for true lvalue-style actuals (`Lvar` / `Lfield` /
+      `Lindex`)
+  - focused new unit coverage:
+    - `interproc::tests::test_apply_summary_keeps_leaf_precondition_violation_latent_when_flag_depends_on_caller`
+    - `interproc::tests::test_apply_summary_does_not_replay_formal_stack_cell_onto_value_actual`
+  - correctness regressions fixed:
+    - `test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent`
+    - `test_e2e_latent_chain_stays_latent_until_manifest_callsite`
+  - authoritative validations on the current tree:
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+- Current `specialization.c` comparator result is still:
+  - `Matching: 5`
+  - `Differences: 16`
+- Important new conclusion from this pass:
+  - the old `invoke(id)` / `add_one` self-edge bug (`v -*-> v`) was real and is
+    now fixed
+  - the remaining `add_one` / `add_two` / `add_more_bad` diffs are no longer
+    about bogus self-dereference cells
+  - the next fault line is narrower:
+    return/result representative choice and formula normalization still differ
+    from OCaml, and Rust still leaves extra `Initialized` attrs on caller/formal
+    roots that OCaml does not export
+- Most useful OCaml cross-refs for the next pass:
+  - `infer/src/pulse/PulseInterproc.ml`
+    - `materialize_pre_from_actual`
+    - `apply_post`
+  - `infer/src/pulse/PulseAbductiveDomain.ml`
+    - `restore_formals_for_summary`
+    - `filter_for_summary`
+
 - Active step on the main-summary comparator path was the OCaml-style
   read/write access bookkeeping fix.
 - Stable checkpoint from this pass:

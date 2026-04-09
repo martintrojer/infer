@@ -74,6 +74,7 @@ pub(crate) fn apply_summary_with_aliasing(
     // Step 1: Build the callee→caller substitution from formals→actuals
     let mut subst: HashMap<AbstractValue, AbstractValue> = HashMap::new();
     let mut callee_heap_paths: HashMap<AbstractValue, Option<HeapPath>> = HashMap::new();
+    let mut value_actual_formal_stack_addrs = std::collections::HashSet::new();
     let mut formal_histories: std::collections::BTreeMap<Pvar, ValueHistory> =
         std::collections::BTreeMap::new();
 
@@ -82,6 +83,9 @@ pub(crate) fn apply_summary_with_aliasing(
             let actual_val =
                 operations::eval_or_fresh_with_history(actual_exp, loc, &mut caller_state);
             subst.insert(*formal_addr, actual_val.addr);
+            if !matches!(actual_exp, Exp::Lvar(_) | Exp::Lfield(..) | Exp::Lindex(..)) {
+                value_actual_formal_stack_addrs.insert(*formal_addr);
+            }
             formal_histories.insert(formal_pvar.clone(), actual_val.history);
             callee_heap_paths.entry(*formal_addr).or_insert(None);
         }
@@ -183,6 +187,13 @@ pub(crate) fn apply_summary_with_aliasing(
         PreMaterializeResult::Ok => None,
     };
 
+    import_callee_pre_attributes(
+        &pre_post.pre,
+        &formal_stack_addrs,
+        &mut subst,
+        &mut caller_state,
+    );
+
     // Snapshot caller-owned allocated roots after pre-materialization but
     // before the callee post is applied. Cross-ref: OCaml imports callee
     // arithmetic before `apply_post`, so imported `EqZero` only treats
@@ -199,6 +210,13 @@ pub(crate) fn apply_summary_with_aliasing(
     // `delete_edges_in_callee_pre_from_caller` + `record_post_cell`.
     let mut processed_pre_cells = HashSet::new();
     for (callee_addr, pre_edges) in pre_post.pre.heap.iter() {
+        // Cross-ref: OCaml materializes actuals from the dereferenced formal
+        // value, not by replaying the callee formal stack cell onto the
+        // caller. Re-applying that bookkeeping cell after Step 1a would turn
+        // by-value actuals into bogus self-edges such as `v -*-> v`.
+        if value_actual_formal_stack_addrs.contains(callee_addr) {
+            continue;
+        }
         let Some(&caller_addr) = subst.get(callee_addr) else {
             continue;
         };
@@ -213,6 +231,9 @@ pub(crate) fn apply_summary_with_aliasing(
     }
 
     for (callee_addr, post_edges) in pre_post.post.post.heap.iter() {
+        if value_actual_formal_stack_addrs.contains(callee_addr) {
+            continue;
+        }
         if processed_pre_cells.contains(callee_addr) {
             continue;
         }
@@ -753,46 +774,44 @@ fn materialize_pre(
             };
         }
 
-        if let Some(edges) = callee_pre.heap.get_edges(callee_addr) {
-            let callee_pre_attrs = callee_pre.attrs.get(&callee_addr);
-            // Only check validity for addresses the callee actually
-            // dereferences (marked must_be_valid). Just having pre-edges
-            // (from loading the formal) doesn't mean the address must be valid.
-            // Cross-ref: OCaml PulseInterproc.ml `check_all_valid` reads the
-            // requirement from the callee pre attrs and, on success, abduces
-            // the same fact into the caller precondition. OCaml materializes
-            // parameter PRE from the dereferenced formal value
-            // (`materialize_pre_from_actual`), not the formal stack cell
-            // itself, so keep the Rust propagation restricted to derived
-            // addresses until our substitution model matches that shape.
-            let is_formal_stack = formal_stack_addrs.contains(&callee_addr);
-            let needs_must_be_valid = callee_pre_attrs
-                .and_then(|attrs| attrs.get_must_be_valid())
-                .is_some()
-                || callee_post.is_must_be_valid(callee_addr);
-            if !edges.is_empty() && !is_formal_stack && needs_must_be_valid {
-                if let Err(inv_info) = caller_state.check_valid(caller_addr) {
-                    log::debug!("    [materialize_pre] PRE-VIOLATION: callee={callee_addr} caller={caller_addr}");
-                    if first_error.is_none() {
-                        let access_history = caller_state
-                            .history_of_value(caller_addr)
-                            .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
-                        first_error = Some(Box::new(
-                            crate::diagnostic::Diagnostic::AccessToInvalidAddress {
-                                addr: caller_addr,
-                                invalidation: inv_info.0,
-                                access_location: loc.clone(),
-                                access_history,
-                                invalidation_history: inv_info.1,
-                            },
-                        ));
-                    }
-                    // Skip exploring edges from this invalid address
-                    // (OCaml line 621-623)
-                    continue;
+        let callee_pre_attrs = callee_pre.attrs.get(&callee_addr);
+        // Cross-ref: OCaml `PulseInterproc.materialize_pre` must honor
+        // `MustBeValid` obligations on leaf pre values as well as values with
+        // outgoing pre-edges. The old Rust behavior only checked values with
+        // non-empty pre cells, which a synthetic write-time read happened to
+        // mask before we removed that incorrect edge creation.
+        let is_formal_stack = formal_stack_addrs.contains(&callee_addr);
+        let needs_must_be_valid = callee_pre_attrs
+            .and_then(|attrs| attrs.get_must_be_valid())
+            .is_some()
+            || callee_post.is_must_be_valid(callee_addr);
+        if !is_formal_stack && needs_must_be_valid {
+            if let Err(inv_info) = caller_state.check_valid(caller_addr) {
+                log::debug!(
+                    "    [materialize_pre] PRE-VIOLATION: callee={callee_addr} caller={caller_addr}"
+                );
+                if first_error.is_none() {
+                    let access_history = caller_state
+                        .history_of_value(caller_addr)
+                        .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
+                    first_error = Some(Box::new(
+                        crate::diagnostic::Diagnostic::AccessToInvalidAddress {
+                            addr: caller_addr,
+                            invalidation: inv_info.0,
+                            access_location: loc.clone(),
+                            access_history,
+                            invalidation_history: inv_info.1,
+                        },
+                    ));
                 }
-                caller_state.mark_must_be_valid_at(caller_addr, loc);
+                // Skip exploring edges from this invalid address
+                // (OCaml line 621-623)
+                continue;
             }
+            caller_state.mark_must_be_valid_at(caller_addr, loc);
+        }
+
+        if let Some(edges) = callee_pre.heap.get_edges(callee_addr) {
 
             if callee_pre_attrs
                 .and_then(|attrs| attrs.get_must_be_initialized())
@@ -908,6 +927,37 @@ fn extend_subst_with_callee_array_indices(
 
     map_indices(&pre_post.pre.heap);
     map_indices(&pre_post.post.post.heap);
+}
+
+fn import_callee_pre_attributes(
+    callee_pre: &crate::base_domain::BaseDomain,
+    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) {
+    for (callee_addr, attrs) in callee_pre.attrs.iter() {
+        if formal_stack_addrs.contains(callee_addr) {
+            continue;
+        }
+
+        let Some(caller_addr) = subst.get(callee_addr).copied() else {
+            continue;
+        };
+        let caller_addr = caller_state.get_var_repr(caller_addr);
+
+        // Cross-ref: OCaml `AddressAttributes.abduce_one` only keeps imported
+        // pre attrs on addresses that already belong to the caller pre-state.
+        if caller_state.pre.heap.get_edges(caller_addr).is_none() {
+            continue;
+        }
+
+        for attr in attrs.iter() {
+            caller_state
+                .pre
+                .attrs
+                .add_one(caller_addr, translate_attribute(subst, attr));
+        }
+    }
 }
 
 fn apply_post_cell(
@@ -1728,6 +1778,91 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_summary_does_not_replay_formal_stack_cell_onto_value_actual() {
+        let callee_pname = Procname::c_from_string("id");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("i"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let formal_pvar = Pvar::mk(Mangled::from_string("i"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let result_addr = AbstractValue::mk_fresh();
+        callee_state.post.heap.add_edge(result_addr, Access::Dereference, formal_val);
+        callee_state.initialize(result_addr);
+        callee_state
+            .post
+            .attrs
+            .mark_written_to(result_addr, 0, Location::dummy());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: Some(result_addr),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar)))
+            .unwrap();
+        let caller_formal_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_formal_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let ExecutionDomain::ContinueProgram(state) = &results[0] else {
+            panic!("expected continue result, got {results:?}");
+        };
+        assert!(
+            state
+                .post
+                .heap
+                .find_edge(caller_formal_val, &Access::Dereference)
+                .is_none(),
+            "callee formal bookkeeping should not become a caller self-edge"
+        );
+        let ret_addr = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return id should be written");
+        assert_eq!(
+            state.post.heap.find_edge(ret_addr, &Access::Dereference),
+            Some(caller_formal_val),
+            "return cell should point to the caller actual value"
+        );
+    }
+
+    #[test]
     fn test_apply_summary_propagates_global_stack_effects() {
         let callee_pname = Procname::c_from_string("__infer_globals_initializer_fp");
         let callee_pdesc = Procdesc::new(callee_pname, Typ::void(), Location::dummy());
@@ -2223,7 +2358,11 @@ mod tests {
             .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
             .unwrap();
         let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
-        callee_state.mark_must_be_valid(formal_val);
+        callee_state.mark_must_be_valid_at(formal_val, &Location::dummy());
+        assert!(
+            callee_state.pre.attrs.get(&formal_val).is_some(),
+            "callee pre attrs should include the pointee validity requirement"
+        );
         if invalidate_formal {
             callee_state.invalidate(
                 formal_val,
@@ -2459,6 +2598,80 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_summary_imports_pre_attrs_without_pre_edges() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        callee_state.mark_must_be_valid_at(formal_val, &Location::dummy());
+        assert!(
+            callee_state.pre.attrs.get(&formal_val).is_some(),
+            "callee pre attrs should include the pointee validity requirement"
+        );
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar)))
+            .unwrap();
+        let caller_formal_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_formal_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let ExecutionDomain::ContinueProgram(state) = &results[0] else {
+            panic!("expected continue result, got {results:?}");
+        };
+        let imported_attrs = state
+            .pre
+            .attrs
+            .get(&caller_formal_val)
+            .expect("caller pointee should keep imported pre attrs");
+        assert!(
+            imported_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _))),
+            "callee pre attrs without outgoing pre edges should still import into caller pre"
+        );
+    }
+
+    #[test]
     fn test_apply_summary_reifies_latent_invalid_access_when_caller_addr_is_invalid() {
         let (pre_post, _diagnostic, _formal_pvar) = mk_latent_invalid_access_pre_post(true);
 
@@ -2615,6 +2828,59 @@ mod tests {
         }
     }
 
+    fn mk_leaf_latent_precondition_pre_post() -> PrePost {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![
+            (
+                Mangled::from_string("flag"),
+                Typ::void(),
+                Default::default(),
+            ),
+            (Mangled::from_string("p"), Typ::void(), Default::default()),
+        ];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let flag_pvar = Pvar::mk(Mangled::from_string("flag"), callee_pname.clone());
+        let flag_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(flag_pvar.clone())))
+            .unwrap();
+        let flag_val = callee_state.read_heap(flag_addr, Access::Dereference);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        callee_state.mark_must_be_valid_at(p_val, &Location::dummy());
+        assert!(
+            callee_state
+                .pre
+                .attrs
+                .get(&p_val)
+                .is_some_and(|attrs| attrs.get_must_be_valid().is_some()),
+            "leaf pre values should carry MustBeValid without needing outgoing pre edges"
+        );
+        let _ = callee_state.path_condition.and_condition_direct(
+            crate::formula::atom::Atom::Equal(
+                crate::formula::term::Term::Var(flag_val),
+                crate::formula::term::Term::Const(4),
+            ),
+            1,
+        );
+
+        PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(flag_pvar, flag_addr), (p_pvar, p_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        }
+    }
+
     #[test]
     fn test_apply_summary_keeps_latent_precondition_violation_when_flag_depends_on_caller() {
         let pre_post = mk_latent_precondition_pre_post();
@@ -2649,6 +2915,43 @@ mod tests {
                 [ExecutionDomain::LatentAbortProgram { .. }]
             ),
             "expected caller-dependent precondition violation to stay latent, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_keeps_leaf_precondition_violation_latent_when_flag_depends_on_caller() {
+        let pre_post = mk_leaf_latent_precondition_pre_post();
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![
+            (
+                Exp::Lvar(Pvar::mk(Mangled::from_string("x"), caller_pname)),
+                Typ::void(),
+            ),
+            (
+                Exp::Const(sil::const_val::Const::Cint(IntLit::zero())),
+                Typ::void(),
+            ),
+        ];
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(
+            matches!(
+                results.as_slice(),
+                [ExecutionDomain::LatentAbortProgram { .. }]
+            ),
+            "expected caller-dependent leaf precondition violation to stay latent, got {results:?}"
         );
     }
 

@@ -9,6 +9,14 @@ null provenance from both real `Prune` instructions and model-generated
 `free(NULL)` / `free(non-null)` splits, so locally branch-proven direct-formal null dereferences
 stay manifest/suppressed while caller-controlled ones stay latent.
 
+The latest interproc correctness pass restored two OCaml-backed behaviors that the previous
+summary-parity work had regressed: leaf `MustBeValid` preconditions are now checked/imported even
+when the callee pre value has no outgoing pre-heap edges, and summary replay now skips callee
+formal-stack bookkeeping cells for value-style actuals while still replaying true lvalue/by-ref
+actuals. This fixes the lost latent precondition regressions and removes the old bogus
+`invoke(id)` / `add_one` / `add_two` `v -*-> v` self-edge without papering over the remaining
+semantic mismatches.
+
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
 
@@ -24,10 +32,12 @@ Exact summary-equality work now uses a semantic driver instead of raw JSON diffs
 `main.pre_post_list` state (stack / heap / attrs / conditions / phi / diagnostic with
 alpha-renamed abstract values), and the ignored
 `test_summary_comparison_specialization_main` test uses `specialization.c` as the current gold
-file. The latest OCaml-backed access-mode fix aligns Rust's local read/write bookkeeping with
-`PulseOperations.check_addr_access`, which removed the missing `MustBeInitialized` gap on simple
-summaries. The remaining semantic diffs are now mostly heap/root-shape, formula normalization, and
-latent-invalid-access parity.
+file. The latest OCaml-backed access-mode and interproc fixes align Rust's local read/write
+bookkeeping with `PulseOperations.check_addr_access`, restore leaf `MustBeValid` handling, and
+stop replaying formal-stack bookkeeping onto by-value actuals. The current comparator checkpoint
+is still `Matching: 5`, `Differences: 16`, but the old self-edge bug is gone; the remaining
+semantic diffs are now concentrated in return/result representative choice, formula normalization,
+extra exported `Initialized` attrs on caller/formal roots, and broader alias-shape parity.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.
