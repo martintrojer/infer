@@ -53,25 +53,27 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `test_summary_comparison_specialization_main`. Step 1 compares canonical
    `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
    diagnostic, alpha-renamed) and is now the authoritative fine-grained driver.
-   Current checkpoint is now `Matching: 11`, `Differences: 10`. The local
+   Current checkpoint is now `Matching: 13`, `Differences: 8`. The local
    access-mode fix removed the simple missing-`MustBeInitialized` gap, and the
    latest correctness pass restored leaf `MustBeValid` precondition handling
    plus skipping formal-stack replay for value-style actuals. The latest
    exporter/model cleanup also strips hidden formal/local stack-root
    `Initialized` attrs from normalized summaries and makes unresolved
    `__call_c_function_ptr` mirror OCaml's unspecialized path more closely
-   (funptr dereference, `UnknownEffect` on actuals, integer-return `is_int`).
+   (funptr dereference, conservative initialization of funptr/actual
+   reachable values, `UnknownEffect` on actuals, integer-return `is_int`).
    That fixed the lost latent regressions, removed the old `invoke(id)` /
-   `add_one` / `add_two` self-edge bug, and eliminated the old formal-root
-   `Initialized` summary noise. The latest pass also stops wrapper abort
-   recovery from republishing imported callee `MustBeValid` obligations and
-   fixes the OCaml heap-target value-id parser used on `all_summaries.json`.
-   That removes `call_test_alias_bad` and `call_test_unalias_bad` from the
-   diff set and deletes a chunk of bogus graph-shape noise. The next real
-   blockers are the remaining ten diffs: `add_more_bad`, `add_one`,
-   `add_two`, `alias_recursion`, `call_may_double_free_if_alias_bad`,
-   `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`,
-   `test_unalias`, and `two_pointers_recursion_bad`. Important
+   `add_one` / `add_two` self-edge bug, eliminated the old formal-root
+   `Initialized` summary noise, and brings `add_one` / `invoke` to parity.
+   The latest pass also stops wrapper abort recovery from republishing
+   imported callee `MustBeValid` obligations and fixes the OCaml heap-target
+   value-id parser used on `all_summaries.json`. That removes
+   `call_test_alias_bad` and `call_test_unalias_bad` from the diff set and
+   deletes a chunk of bogus graph-shape noise. The next real blockers are the
+   remaining eight diffs: `add_more_bad`, `add_two`, `alias_recursion`,
+   `call_may_double_free_if_alias_bad`, `invoke_itself_bad`,
+   `may_double_free_if_alias`, `test_unalias`, and
+   `two_pointers_recursion_bad`. Important
    OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
    the dereferenced formal value, so do not try to "fix" this by blindly
    propagating formal-stack `MustBe*` attrs through the current Rust

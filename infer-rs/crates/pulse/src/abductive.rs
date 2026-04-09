@@ -694,6 +694,24 @@ impl AbductiveDomain {
         }
     }
 
+    /// Conservatively initialize call arguments before model / unknown-call handling.
+    ///
+    /// Cross-ref: OCaml `PulseOperations.conservatively_initialize_args`
+    /// initializes every value reachable from the actual argument roots before
+    /// entering model-specific logic.
+    pub fn conservatively_initialize_args(
+        &mut self,
+        roots: impl IntoIterator<Item = AbstractValue>,
+    ) {
+        let mut reachable = std::collections::HashSet::new();
+        for root in roots {
+            reachable.extend(self.reachable_from(root));
+        }
+        for addr in reachable {
+            self.initialize(addr);
+        }
+    }
+
     /// For unknown calls on `&slot`, ensure future loads from the slot see a
     /// fresh post-state value even if the slot had not been materialized yet.
     pub fn ensure_deref_edge_if_missing(&mut self, addr: AbstractValue) {

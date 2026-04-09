@@ -884,6 +884,17 @@ fn exec_call_c_function_ptr(
 
     // Evaluate the function pointer expression to get its abstract value
     let funptr_val = crate::operations::eval_or_fresh(funptr_exp, loc, &mut state);
+    let actual_arg_values: Vec<_> = actual_args
+        .iter()
+        .map(|(arg_exp, _arg_typ)| crate::operations::eval_or_fresh(arg_exp, loc, &mut state))
+        .collect();
+
+    // Cross-ref: OCaml Pulse.ml conservatively initializes model arguments
+    // before entering `PulseModelsC.call_c_function_ptr`, so exported summaries
+    // keep `Initialized` on the function pointer and actual argument values.
+    state.conservatively_initialize_args(
+        std::iter::once(funptr_val).chain(actual_arg_values.iter().copied()),
+    );
 
     // Look up the Closure attribute to find the target procname
     log::debug!(
@@ -957,8 +968,8 @@ fn exec_call_c_function_ptr(
         state.path_condition.and_is_int(ret_val);
     }
     // Havoc actual args (not the funptr itself) for unresolved calls
-    for (arg_exp, _arg_typ) in actual_args {
-        let arg_val = crate::operations::eval_or_fresh(arg_exp, loc, &mut state);
+    for ((arg_exp, _arg_typ), arg_val) in actual_args.iter().zip(actual_arg_values.iter().copied())
+    {
         state.add_attr(arg_val, crate::attribute::Attribute::UnknownEffect);
         state.apply_unknown_effect(arg_val);
         crate::operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
@@ -1313,9 +1324,16 @@ mod tests {
             state
                 .post
                 .attrs
-                .get(&arg_val)
-                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::UnknownEffect)),
-            "unresolved call should keep UnknownEffect on actual values"
+                .get(&funptr_val)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
+            "model dispatch should conservatively initialize the function pointer value"
+        );
+        assert!(
+            state.post.attrs.get(&arg_val).is_some_and(|attrs| {
+                attrs.contains(&crate::attribute::Attribute::Initialized)
+                    && attrs.contains(&crate::attribute::Attribute::UnknownEffect)
+            }),
+            "unresolved call should conservatively initialize actual values and keep UnknownEffect"
         );
 
         let ret_val = state

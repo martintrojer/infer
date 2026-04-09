@@ -20,9 +20,11 @@ semantic mismatches.
 The latest specialization/summarization cleanup tightened two more OCaml-backed surfaces:
 summary normalization now strips post-summary `Initialized` attrs from hidden formal/local stack
 roots after `restore_formals_for_summary`, and unresolved `__call_c_function_ptr` now
-dereferences the function-pointer value, records `UnknownEffect` on actuals, and preserves
-`is_int` on fresh integer returns. This moves `invoke`-style summaries closer to OCaml even
-though the comparator checkpoint itself is still unchanged.
+conservatively initializes values reachable from the function pointer and actual roots before
+model / unknown-call handling, while still dereferencing the function-pointer value, recording
+`UnknownEffect` on actuals, and preserving `is_int` on fresh integer returns. This mirrors OCaml
+`PulseOperations.conservatively_initialize_args` more closely and removes the old unresolved-call
+`Initialized` gap from `invoke`-style summaries.
 
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
@@ -39,15 +41,18 @@ Exact summary-equality work now uses a semantic driver instead of raw JSON diffs
 `main.pre_post_list` state (stack / heap / attrs / conditions / phi / diagnostic with
 alpha-renamed abstract values), and the ignored
 `test_summary_comparison_specialization_main` test uses `specialization.c` as the current gold
-file. The latest OCaml-backed access-mode and interproc fixes align Rust's local read/write
-bookkeeping with `PulseOperations.check_addr_access`, restore leaf `MustBeValid` handling, and
-stop replaying formal-stack bookkeeping onto by-value actuals. The current comparator checkpoint
-is now `Matching: 11`, `Differences: 10`: the old self-edge bug and formal-root `Initialized`
-export noise are gone, wrapper latent-invalid-access recovery no longer republishes imported
-callee `MustBeValid` obligations, and the comparator now parses both stack-style and heap-target
-OCaml value-id shapes from `all_summaries.json`. The remaining semantic diffs are concentrated in
-double-free / alias-recursion cases, invoke / attr-export parity, and a smaller formula /
-return-shape cluster.
+file. The latest OCaml-backed access-mode, interproc, exporter, and unresolved-call fixes align
+Rust's local read/write bookkeeping with `PulseOperations.check_addr_access`, restore leaf
+`MustBeValid` handling, stop replaying formal-stack bookkeeping onto by-value actuals, and
+initialize unresolved call arguments the same way OCaml does. The current comparator checkpoint is
+now `Matching: 13`, `Differences: 8`: the old self-edge bug and formal-root `Initialized` export
+noise are gone, `add_one` and `invoke` are now matching, wrapper latent-invalid-access recovery no
+longer republishes imported callee `MustBeValid` obligations, and the comparator now parses both
+stack-style and heap-target OCaml value-id shapes from `all_summaries.json`. The remaining
+semantic diffs are concentrated in alias / double-free recursion
+(`alias_recursion`, `call_may_double_free_if_alias_bad`, `may_double_free_if_alias`, `test_unalias`)
+plus a smaller arithmetic / attr-export cluster (`add_more_bad`, `add_two`,
+`invoke_itself_bad`, `two_pointers_recursion_bad`).
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

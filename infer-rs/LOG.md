@@ -6,6 +6,46 @@ Keep it current when the active line of investigation changes.
 ## Current Focus
 
 - Latest stable checkpoint:
+  - `crates/pulse/src/abductive.rs`
+    - added `conservatively_initialize_args(...)`
+    - cross-ref: OCaml `PulseOperations.conservatively_initialize_args`
+  - `crates/pulse/src/checker.rs`
+    - `exec_call_c_function_ptr(...)` now:
+      - evaluates actual args once up front
+      - conservatively initializes values reachable from the funptr and actual
+        roots before model / unknown-call handling
+      - reuses those evaluated actuals on the unresolved-call path
+    - focused regression:
+      - `checker::tests::test_exec_call_c_function_ptr_unknown_derefs_funptr_and_marks_unknown_effect`
+        now also asserts `Initialized` on both the funptr value and actual arg
+        value, while keeping `UnknownEffect`
+  - validations on the current tree:
+    - `make check`
+    - `cargo test -q -p pulse --lib test_exec_call_c_function_ptr_unknown_derefs_funptr_and_marks_unknown_effect`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+  - current `specialization.c` comparator result:
+    - `Matching: 13`
+    - `Differences: 8`
+  - remaining diff set:
+    - `add_more_bad`
+    - `add_two`
+    - `alias_recursion`
+    - `call_may_double_free_if_alias_bad`
+    - `invoke_itself_bad`
+    - `may_double_free_if_alias`
+    - `test_unalias`
+    - `two_pointers_recursion_bad`
+  - important conclusions:
+    - `add_one` and `invoke` now match; the unresolved-funptr `Initialized`
+      gap was real
+    - do not retry the broad checker-side non-exit latent-invalid-access
+      recovery; it explodes wrapper/alias diffs
+    - the next likely real fault line is in `crates/pulse/src/summary.rs`
+      latent/export behavior for the alias / double-free cluster, plus smaller
+      comparator-side arithmetic normalization for `add_more_bad` / `add_two`
+      / parts of `invoke_itself_bad`
+
+- Latest stable checkpoint:
   - `crates/pulse/src/summary.rs`
     - abort-state latent-invalid-access recovery now skips imported callee
       `MustBeValid` obligations whose access location does not belong to a

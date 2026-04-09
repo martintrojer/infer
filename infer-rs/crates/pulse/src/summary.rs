@@ -884,9 +884,9 @@ fn latent_invalid_access_is_imported_from_call(
         .get(&repr)
         .and_then(|attrs| attrs.get_must_be_valid())
         .is_some_and(|(_timestamp, location, _reason)| {
-            !proc_has_local_access_at_location(pdesc, &location)
-                || proc_has_call_at_location(pdesc, &location)
-                || access_history.has_call_at_location_before_invalidation(&location)
+            !proc_has_local_access_at_location(pdesc, location)
+                || proc_has_call_at_location(pdesc, location)
+                || access_history.has_call_at_location_before_invalidation(location)
         })
 }
 
