@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely (funptr dereference, `UnknownEffect` on actuals, integer-return `is_int`), and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the `specialization.c` main-summary semantic cluster (`Matching: 5`, `Differences: 16`) around representative choice / formula normalization / alias-shape / latent-vs-continue details.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely (funptr dereference, `UnknownEffect` on actuals, integer-return `is_int`), and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 11`, `Differences: 10`) after fixing wrapper latent-invalid-access over-recovery and OCaml heap-target value-id parsing; the remaining diffs are centered on alias/double-free recursion, invoke/attr-export parity, and a smaller formula / return-shape set.**
 
 Recent correctness / robustness fixes:
 - Exact summary-equality work now has a semantic driver instead of raw JSON diffs:
@@ -23,15 +23,15 @@ Recent correctness / robustness fixes:
   function-pointer value even on the unspecialized path, records
   `UnknownEffect` on actual values, and preserves `is_int` on fresh integer
   returns. This moves `invoke` / `invoke_itself_bad` in the right direction
-  even though the overall comparator count is still unchanged.
+  and remains part of the current smaller comparator gap.
 - Local read/write access bookkeeping now mirrors OCaml
   `PulseOperations.check_addr_access` more closely: successful reads abduce
   `MustBeInitialized` and mark the accessed address `Initialized`, and
   successful writes mark the written address `Initialized` before the existing
   `WrittenTo` summary marker. This removed the old missing
   `MustBeInitialized` gap from simple summaries such as `add_one`, `add_two`,
-  and `id`, even though the current `specialization.c` comparator checkpoint
-  is still `Matching: 5`, `Differences: 16`.
+  and `id`, and it stays foundational to the current `Matching: 11`,
+  `Differences: 10` checkpoint.
 - Summary import now honors leaf `MustBeValid` obligations even when the
   callee pre value has no outgoing pre-heap edges. This restores the lost
   caller-dependent latent precondition behavior that regressed after Rust
@@ -41,12 +41,24 @@ Recent correctness / robustness fixes:
   replaying them for true lvalue / by-ref actuals. This removes the old bogus
   `v -*-> v` self-edge on flows such as `invoke(id, n0)` without weakening
   by-ref materialization.
+- Abort-state latent-invalid-access recovery now refuses to republish imported
+  callee `MustBeValid` obligations unless the recorded access location belongs
+  to a real local access in the current procedure. This removes the old
+  wrapper-latent noise from `call_test_alias_bad` and
+  `call_test_unalias_bad` without hiding true local aborts.
+- The summary comparator now parses both OCaml value-id encodings from
+  `all_summaries.json` (`["Unknown","v1","_"]` and heap-target `["v3","_"]`)
+  and normalizes `is_int(...)` through equality bindings. That eliminates a
+  chunk of bogus graph-shape differences that were not real semantic
+  mismatches.
 - After those correctness repairs, the remaining
-  `test_summary_comparison_specialization_main` semantic mismatches are now
-  narrower: return/result representative choice, formula normalization,
-  broader alias-shape parity, and latent-vs-continue summary-shape
-  differences. The comparator count itself is unchanged at `Matching: 5`,
-  `Differences: 16`.
+  `test_summary_comparison_specialization_main` semantic mismatches are down to
+  `Matching: 11`, `Differences: 10`: `add_more_bad`, `add_one`, `add_two`,
+  `alias_recursion`, `call_may_double_free_if_alias_bad`, `invoke`,
+  `invoke_itself_bad`, `may_double_free_if_alias`, `test_unalias`, and
+  `two_pointers_recursion_bad`. The remaining themes are representative /
+  formula normalization detail, invoke attr/export parity, and harder alias /
+  double-free / recursion shape mismatches.
 - Summary import now snapshots caller allocation state after `materialize_pre`
   but before `apply_post`, and imported `EqZero` handling consults those
   pre-call snapshots instead of the rejected broad formula-before-post reorder.

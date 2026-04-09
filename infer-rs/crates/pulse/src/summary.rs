@@ -155,6 +155,21 @@ pub(crate) fn classify_abort_kind(
 }
 
 impl PrePost {
+    /// Canonicalize the exported state to the current formula representatives
+    /// before summary filtering.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.filter_for_summary` first calls
+    /// `canonicalize`, then restores formals and discards unreachable state.
+    fn canonicalize_for_summary(&mut self) {
+        self.post.canonicalize_with_current_path_condition();
+        for (_formal, addr) in &mut self.formals {
+            *addr = self.post.path_condition.get_var_repr(*addr);
+        }
+        if let Some(result) = &mut self.result {
+            *result = self.post.path_condition.get_var_repr(*result);
+        }
+    }
+
     /// Restore formal/global/return variable views in the post-state before
     /// summary filtering.
     ///
@@ -306,6 +321,8 @@ impl PrePost {
     /// simplifies the path condition to live values only.
     fn normalize(&mut self) -> Vec<Diagnostic> {
         use std::collections::HashSet;
+
+        self.canonicalize_for_summary();
 
         // OCaml checks leaks from the pre-filter state, before restoring and
         // trimming the post stack for summary creation.
@@ -854,6 +871,50 @@ fn diagnostic_addr_repr(pre_post: &PrePost) -> Option<AbstractValue> {
     })
 }
 
+fn latent_invalid_access_is_imported_from_call(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+    addr: AbstractValue,
+    access_history: &crate::value_history::ValueHistory,
+) -> bool {
+    let repr = pre_post.post.path_condition.get_var_repr(addr);
+    pre_post
+        .pre
+        .attrs
+        .get(&repr)
+        .and_then(|attrs| attrs.get_must_be_valid())
+        .is_some_and(|(_timestamp, location, _reason)| {
+            !proc_has_local_access_at_location(pdesc, &location)
+                || proc_has_call_at_location(pdesc, &location)
+                || access_history.has_call_at_location_before_invalidation(&location)
+        })
+}
+
+fn proc_has_call_at_location(pdesc: &Procdesc, location: &sil::location::Location) -> bool {
+    pdesc.nodes.iter().any(|node| {
+        node.instrs.iter().any(|instr| {
+            matches!(
+                instr,
+                sil::instr::Instr::Call { loc, .. } if loc == location
+            )
+        })
+    })
+}
+
+fn proc_has_local_access_at_location(pdesc: &Procdesc, location: &sil::location::Location) -> bool {
+    pdesc.nodes.iter().any(|node| {
+        node.instrs.iter().any(|instr| {
+            matches!(
+                instr,
+                sil::instr::Instr::Load { loc, .. }
+                    | sil::instr::Instr::Store { loc, .. }
+                    | sil::instr::Instr::Prune { loc, .. }
+                    if loc == location
+            )
+        })
+    })
+}
+
 /// Check if an error is manifest (not dependent on caller-provided values).
 ///
 /// An error is manifest if every recorded prune condition is either:
@@ -960,6 +1021,9 @@ fn latent_invalid_access_diagnostics_from_normalized_pre_post(
             continue;
         }
         let access_history = pre_post.post.history_of_value(repr).unwrap_or_default();
+        if latent_invalid_access_is_imported_from_call(pdesc, pre_post, repr, &access_history) {
+            continue;
+        }
         if !caller_controlled.contains(&repr) && !access_history.contains_formal_origin() {
             continue;
         }
@@ -2016,6 +2080,71 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_canonicalizes_return_root_to_formula_repr() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let stale_result = AbstractValue::of_raw(10);
+        let canonical_result = AbstractValue::of_raw(2);
+
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, stale_result);
+        astate.post.attrs.initialize(stale_result);
+
+        let result = astate.path_condition.and_equal(
+            &crate::formula::Operand::AbstractValue(stale_result),
+            &crate::formula::Operand::AbstractValue(canonical_result),
+        );
+        assert!(result.is_sat());
+        assert_eq!(
+            astate.post.heap.find_edge(return_addr, &Access::Dereference),
+            Some(stale_result),
+            "this fixture should keep the stale heap root until summary normalization canonicalizes it"
+        );
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(stale_result),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert_eq!(
+            pp.post.post.heap.find_edge(return_addr, &Access::Dereference),
+            Some(canonical_result),
+            "summary normalization should rewrite return-visible heap roots to the formula representative"
+        );
+        assert_eq!(
+            pp.result,
+            Some(canonical_result),
+            "summary metadata should stay aligned with the canonicalized state"
+        );
+        assert!(
+            pp.post
+                .post
+                .attrs
+                .get(&canonical_result)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
+            "caller-visible attrs should follow the canonicalized return value"
+        );
+        assert!(
+            pp.post.post.attrs.get(&stale_result).is_none(),
+            "stale pre-canonicalization roots should not survive summary export"
+        );
+    }
+
+    #[test]
     fn test_is_manifest_ignores_local_prune_on_formal_value() {
         let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
         let _ = pre_post
@@ -2644,6 +2773,80 @@ mod tests {
             summary.pre_posts[0].kind,
             PrePostKind::AbortProgram
         ));
+    }
+
+    #[test]
+    fn test_of_proc_does_not_recover_imported_call_must_be_valid_from_local_abort() {
+        let mut pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let call_loc = Location {
+            line: 7,
+            col: 3,
+            ..Location::dummy()
+        };
+        let callee = Procname::c_from_string("callee");
+        let call_node = pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
+            vec![sil::instr::Instr::Call {
+                ret: (Ident::create_none(), Typ::void()),
+                fun_exp: sil::exp::Exp::Const(sil::const_val::Const::Cfun(callee.clone())),
+                args: vec![],
+                loc: call_loc.clone(),
+                flags: sil::call_flags::CallFlags::default(),
+            }],
+            call_loc.clone(),
+        );
+        pdesc.set_succs(0, vec![call_node]);
+        pdesc.set_succs(call_node, vec![1]);
+
+        astate.mark_must_be_valid(formal_val);
+        astate.pre.attrs.add_one(
+            formal_val,
+            crate::attribute::Attribute::MustBeValid(0, call_loc.clone(), None),
+        );
+        astate.write_heap_with_history(
+            formal_addr,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(
+                formal_val,
+                ValueHistory::formal_argument(pvar.clone()).wrap_call(&callee, &call_loc),
+            ),
+        );
+
+        let local_null = AbstractValue::mk_fresh();
+        let diagnostic = dummy_invalid_access_diagnostic(
+            local_null,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic.clone()),
+            }],
+            vec![],
+            false,
+        );
+
+        assert_eq!(
+            summary.pre_posts.len(),
+            1,
+            "imported callee preconditions should not synthesize extra latent summaries"
+        );
+        assert!(matches!(
+            summary.pre_posts[0].kind,
+            PrePostKind::AbortProgram
+        ));
+        assert_eq!(
+            summary.diagnostics,
+            vec![diagnostic],
+            "the local abort should stay the only published issue"
+        );
     }
 
     #[test]

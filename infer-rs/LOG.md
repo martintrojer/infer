@@ -5,6 +5,115 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Latest stable checkpoint:
+  - `crates/pulse/src/summary.rs`
+    - abort-state latent-invalid-access recovery now skips imported callee
+      `MustBeValid` obligations whose access location does not belong to a
+      real local access in the current proc
+    - focused regression:
+      - `summary::tests::test_of_proc_does_not_recover_imported_call_must_be_valid_from_local_abort`
+    - important observed effect:
+      - `call_test_alias_bad` / `call_test_unalias_bad` no longer export the
+        extra Rust-only `LatentInvalidAccess` wrapper summary; debug output is
+        back to a single `AbortProgram`, matching OCaml at the coarse level
+  - `crates/test-harness/src/summary_compare.rs`
+    - fixed `parse_ocaml_value_id()` to handle both OCaml JSON shapes:
+      - stack-style `["Unknown","v1","_"]`
+      - heap-target style `["v3","_"]`
+    - phi canonicalization now resolves `is_int(...)` through explicit `eq:`
+      bindings and drops trivial `is_int(constant)` noise
+    - added focused parser/canonicalization regressions:
+      - `summary_compare::tests::test_parse_ocaml_abort_wrapper_shape`
+      - `summary_compare::tests::test_canonicalization_matches_alias_wrapper_abort_shape`
+      - `summary_compare::tests::test_phi_normalization_resolves_is_int_through_equalities`
+    - this parser bug explained a large chunk of the earlier bogus graph
+      diffs in alias-wrapper / specialization summaries
+- Validations on the current tree:
+  - `cargo fmt --all`
+  - `cargo test -q -p test-harness --lib`
+  - `cargo test -q -p pulse --lib`
+  - `cargo test -q -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
+  - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+- Current `specialization.c` comparator result:
+  - before this pass:
+    - `Matching: 5`
+    - `Differences: 16`
+  - after this pass:
+    - `Matching: 11`
+    - `Differences: 10`
+- Remaining highest-value clusters after the parser/exporter cleanup:
+  - real latent-summary/export behavior still looks open in
+    `may_double_free_if_alias` / `call_may_double_free_if_alias_bad`
+  - comparator/formula normalization is still underpowered for:
+    - `add_one`
+    - `add_two`
+    - `add_more_bad`
+    - parts of `invoke`, `invoke_itself_bad`, and `two_pointers_recursion_bad`
+  - `alias_recursion` still looks like a genuine summary-set divergence
+
+- Active line of investigation is still `specialization.c` main-summary
+  parity, but the latest OCaml-backed state-canonicalization pass confirmed
+  that the remaining `Matching: 5` / `Differences: 16` are not caused by
+  stale equalities left unreplayed in the exported Rust state.
+- Latest stable checkpoint:
+  - `crates/pulse/src/abductive.rs`
+    - added `canonicalize_with_current_path_condition()`
+    - cross-ref: OCaml `PulseAbductiveDomain.canonicalize` before
+      `filter_for_summary`
+  - `crates/pulse/src/summary.rs`
+    - `PrePost::normalize()` now canonicalizes the abductive state before
+      `restore_formals_for_summary()`
+    - focused unit coverage:
+      - `summary::tests::test_normalize_canonicalizes_return_root_to_formula_repr`
+- Validations on the current tree:
+  - `make check`
+  - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+- Important conclusion from this pass:
+  - the new canonicalization step is correct and should stay, but the
+    `specialization.c` comparator output is unchanged:
+    - `Matching: 5`
+    - `Differences: 16`
+  - this narrows the next fault line further:
+    - comparator-side semantic normalization is likely underpowered for the
+      arithmetic/representative cluster (`add_one`, `add_two`, `add_more_bad`,
+      `id`)
+    - alias/main-summary shape differences are still real candidates in
+      `test_alias`, `test_unalias`, `call_test_alias_bad`,
+      `call_test_unalias_bad`, and `may_double_free_if_alias`
+  - fresh raw-summary evidence from OCaml:
+    - `add_one` exports `pre: v1 -*-> v2`, `post: return(v14) -*-> v13`, and
+      phi `v2 = v13 - 1`
+    - `add_two` exports `pre: v1 -*-> v3`, `post: return(v30) -*-> v29`, and
+      phi `v3 = v29 - 2`
+    - `add_more_bad` exports `pre` branch conditions and term-eqs in the same
+      style (`v2 = a1 + 1`, function-app result tied to return minus one)
+  - implication:
+    the next pass should inspect raw Rust summaries for the same procs and
+    decide whether to improve the semantic comparator or the exported summary
+    shape; canonicalizing the state itself was not enough
+- Follow-up comparator work on the same tree:
+  - `crates/test-harness/src/summary_compare.rs` now prefers stable
+    stack-root path labels (`i`, `i.*`, `return`, `return.*`, `x.*.*`, ...)
+    over arbitrary `vN` ids for values reachable from the summary stack/heap
+  - focused unit coverage:
+    - `summary_compare::tests::test_canonicalization_prefers_stack_paths_for_reachable_values`
+  - the headline count is still unchanged:
+    - `Matching: 5`
+    - `Differences: 16`
+  - but the remaining diffs are now more interpretable:
+    - arithmetic/representative cluster now reads in stack-root terms
+      (`add_one`: OCaml still effectively ties `return` to the input path
+      differently from Rust; `id`: pure `is_int(i.*)`-style mismatch)
+    - alias-wrapper cluster now clearly shows the extra Rust latent
+      `x.* = 0` / `y.* = 0` summaries on top of the manifest/local wrapper
+      behavior
+  - implication:
+    the next likely high-value fix is in abort-state latent-invalid-access
+    recovery for wrapper callers (`call_test_alias_bad`,
+    `call_test_unalias_bad`, `may_double_free_if_alias`), while the
+    arithmetic cluster may still need comparator-side formula normalization
+    rather than analysis edits
+
 - Active line of investigation is still `specialization.c` main-summary
   parity, but the latest pass narrowed two more exporter/model gaps without
   changing the headline `Matching: 5` / `Differences: 16`.

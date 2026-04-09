@@ -14,7 +14,7 @@
 //! Step 1 compares `main.pre_post_list`. Specialized summaries are the next
 //! layer to add on top of the same canonical model.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 
 /// Raw pre/post state before abstract values are alpha-renamed.
@@ -160,7 +160,7 @@ impl RawPrePost {
             .iter()
             .map(|item| id_canonicalizer.replace_ids(item))
             .collect();
-        phi.sort();
+        phi = canonicalize_phi_items(&phi);
 
         CanonicalPrePost {
             kind: self.kind.clone(),
@@ -204,9 +204,95 @@ fn canonicalize_attrs(
     result
 }
 
+fn canonicalize_phi_items(phi: &[String]) -> Vec<String> {
+    let eqs: HashMap<_, _> = phi
+        .iter()
+        .filter_map(|item| {
+            let rest = item.strip_prefix("eq:")?;
+            let (lhs, rhs) = rest.split_once('=')?;
+            Some((lhs.to_string(), rhs.to_string()))
+        })
+        .collect();
+
+    let mut normalized = BTreeSet::new();
+    for item in phi {
+        if let Some(term) = parse_is_int_item(item) {
+            for normalized_term in normalize_is_int_terms(term, &eqs) {
+                normalized.insert(format!("is_int({normalized_term})"));
+            }
+        } else {
+            normalized.insert(item.clone());
+        }
+    }
+
+    normalized.into_iter().collect()
+}
+
+fn parse_is_int_item(item: &str) -> Option<&str> {
+    item.strip_prefix("is_int(")?.strip_suffix(')')
+}
+
+fn normalize_is_int_terms(term: &str, eqs: &HashMap<String, String>) -> BTreeSet<String> {
+    let mut normalized = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    normalize_is_int_term(term, eqs, &mut visiting, &mut normalized);
+    normalized
+}
+
+fn normalize_is_int_term(
+    term: &str,
+    eqs: &HashMap<String, String>,
+    visiting: &mut BTreeSet<String>,
+    normalized: &mut BTreeSet<String>,
+) {
+    if is_integer_constant(term) || !visiting.insert(term.to_string()) {
+        return;
+    }
+
+    if let Some(rhs) = eqs.get(term) {
+        normalize_is_int_term(rhs, eqs, visiting, normalized);
+        visiting.remove(term);
+        return;
+    }
+
+    if let Some(vars) = parse_linear_term_vars(term) {
+        normalized.insert(term.to_string());
+        if vars.len() == 1 && matches!(vars[0].1, -1 | 1) {
+            normalize_is_int_term(&vars[0].0, eqs, visiting, normalized);
+        }
+        visiting.remove(term);
+        return;
+    }
+
+    normalized.insert(term.to_string());
+    visiting.remove(term);
+}
+
+fn parse_linear_term_vars(term: &str) -> Option<Vec<(String, i32)>> {
+    let inner = term.strip_prefix("lin(")?.strip_suffix(')')?;
+    let mut vars = Vec::new();
+    for part in inner.split(',') {
+        if part.is_empty() || part.starts_with("const=") {
+            continue;
+        }
+        let (coeff, var) = part.split_once('*')?;
+        let coeff = coeff.parse().ok()?;
+        vars.push((var.to_string(), coeff));
+    }
+    Some(vars)
+}
+
+fn is_integer_constant(term: &str) -> bool {
+    !term.is_empty()
+        && term
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'/'))
+}
+
 struct IdCanonicalizer {
     mapping: HashMap<String, String>,
     adjacency: HashMap<String, Vec<(String, String)>>,
+    preferred_paths: HashMap<String, String>,
     next_unrestricted: usize,
     next_restricted: usize,
 }
@@ -223,9 +309,11 @@ impl IdCanonicalizer {
         for edges in adjacency.values_mut() {
             edges.sort();
         }
+        let preferred_paths = build_preferred_paths(pre_post, &adjacency);
         Self {
             mapping: HashMap::new(),
             adjacency,
+            preferred_paths,
             next_unrestricted: 1,
             next_restricted: 1,
         }
@@ -249,7 +337,9 @@ impl IdCanonicalizer {
             return;
         }
 
-        let canonical = if raw.starts_with('a') {
+        let canonical = if let Some(path) = self.preferred_paths.get(raw) {
+            path.clone()
+        } else if raw.starts_with('a') {
             let next = self.next_restricted;
             self.next_restricted += 1;
             format!("a{next}")
@@ -270,6 +360,84 @@ impl IdCanonicalizer {
 
     fn replace_ids(&self, text: &str) -> String {
         replace_abstract_ids(text, &self.mapping)
+    }
+}
+
+fn build_preferred_paths(
+    pre_post: &RawPrePost,
+    adjacency: &HashMap<String, Vec<(String, String)>>,
+) -> HashMap<String, String> {
+    let mut paths = HashMap::new();
+    let mut queue = VecDeque::new();
+
+    let mut roots: Vec<_> = pre_post
+        .pre_stack
+        .iter()
+        .chain(pre_post.post_stack.iter())
+        .map(|(var, addr)| (var.clone(), addr.clone()))
+        .collect();
+    roots.sort();
+
+    for (var, addr) in roots {
+        if consider_preferred_path(&mut paths, &addr, &var) {
+            queue.push_back((addr, var));
+        }
+    }
+
+    while let Some((raw, path)) = queue.pop_front() {
+        if paths.get(&raw) != Some(&path) {
+            continue;
+        }
+        let Some(edges) = adjacency.get(&raw) else {
+            continue;
+        };
+        for (access, dst) in edges {
+            let Some(next_path) = extend_path(&path, access) else {
+                continue;
+            };
+            if consider_preferred_path(&mut paths, dst, &next_path) {
+                queue.push_back((dst.clone(), next_path));
+            }
+        }
+    }
+
+    paths
+}
+
+fn consider_preferred_path(
+    paths: &mut HashMap<String, String>,
+    raw: &str,
+    candidate: &str,
+) -> bool {
+    match paths.get(raw) {
+        Some(existing) if !path_is_better(candidate, existing) => false,
+        _ => {
+            paths.insert(raw.to_string(), candidate.to_string());
+            true
+        }
+    }
+}
+
+fn path_is_better(candidate: &str, existing: &str) -> bool {
+    let candidate_key = path_sort_key(candidate);
+    let existing_key = path_sort_key(existing);
+    candidate_key < existing_key
+}
+
+fn path_sort_key(path: &str) -> (usize, usize, &str) {
+    let depth = path
+        .as_bytes()
+        .iter()
+        .filter(|byte| matches!(**byte, b'*' | b'.' | b'['))
+        .count();
+    (depth, path.len(), path)
+}
+
+fn extend_path(path: &str, access: &str) -> Option<String> {
+    match access {
+        "*" => Some(format!("{path}.*")),
+        _ if access.starts_with('.') => Some(format!("{path}{access}")),
+        _ => None,
     }
 }
 
@@ -563,10 +731,20 @@ fn parse_ocaml_value_id(value: &serde_json::Value) -> Option<String> {
         return Some(id.to_string());
     }
     let arr = value.as_array()?;
-    if arr.len() < 2 {
-        return None;
+    if let Some(id) = arr.first().and_then(serde_json::Value::as_str) {
+        if looks_like_abstract_id(id) {
+            return Some(id.to_string());
+        }
     }
-    arr[1].as_str().map(ToOwned::to_owned)
+    arr.iter()
+        .skip(1)
+        .filter_map(serde_json::Value::as_str)
+        .find(|candidate| looks_like_abstract_id(candidate))
+        .map(ToOwned::to_owned)
+}
+
+fn looks_like_abstract_id(value: &str) -> bool {
+    value.starts_with('v') || value.starts_with('a')
 }
 
 fn parse_ocaml_access(value: &serde_json::Value) -> String {
@@ -1320,5 +1498,294 @@ mod tests {
         assert!(!summaries.is_empty());
         assert!(summaries.contains_key("return_null"));
         assert!(!summaries["return_null"].main.is_empty());
+    }
+
+    #[test]
+    fn test_canonicalization_prefers_stack_paths_for_reachable_values() {
+        let raw = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v1".to_string())],
+                post_stack: vec![
+                    ("i".to_string(), "v1".to_string()),
+                    ("return".to_string(), "v14".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v2".to_string(),
+                    },
+                    RawEdge {
+                        src: "v14".to_string(),
+                        access: "*".to_string(),
+                        dst: "v13".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec!["eq:v2=lin(1*v13,const=-1)".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+
+        assert_eq!(pre_post.pre_stack, vec!["i=i"]);
+        assert_eq!(pre_post.post_stack, vec!["i=i", "return=return"]);
+        assert_eq!(pre_post.pre_heap, vec!["i -*-> i.*"]);
+        assert_eq!(
+            pre_post.post_heap,
+            vec!["i -*-> i.*", "return -*-> return.*"]
+        );
+        assert_eq!(pre_post.phi, vec!["eq:i.*=lin(1*return.*,const=-1)"]);
+    }
+
+    #[test]
+    fn test_canonicalization_matches_alias_wrapper_abort_shape() {
+        let ocaml = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "AbortProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v1".to_string())],
+                post_stack: vec![("x".to_string(), "v1".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v3".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                    RawEdge {
+                        src: "v3".to_string(),
+                        access: "*".to_string(),
+                        dst: "v10".to_string(),
+                    },
+                ],
+                pre_attrs: vec![
+                    (
+                        "v1".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                    ("v3".to_string(), vec!["MustBeValid".to_string()]),
+                ],
+                post_attrs: vec![
+                    (
+                        "v3".to_string(),
+                        vec!["Initialized".to_string(), "WrittenTo".to_string()],
+                    ),
+                    (
+                        "v10".to_string(),
+                        vec!["Invalid(ConstantDereference(1))".to_string()],
+                    ),
+                ],
+                conditions: vec![],
+                phi: vec!["eq:v10=1".to_string()],
+                diagnostic: Some("AccessToInvalidAddress(ConstantDereference(0))".to_string()),
+            }],
+        };
+
+        let rust = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "AbortProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v1".to_string())],
+                post_stack: vec![("x".to_string(), "v1".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v2".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                ],
+                pre_attrs: vec![
+                    (
+                        "v1".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                    ("v2".to_string(), vec!["MustBeValid".to_string()]),
+                ],
+                post_attrs: vec![
+                    (
+                        "v2".to_string(),
+                        vec!["Initialized".to_string(), "WrittenTo".to_string()],
+                    ),
+                    (
+                        "v3".to_string(),
+                        vec!["Invalid(ConstantDereference(1))".to_string()],
+                    ),
+                ],
+                conditions: vec![],
+                phi: vec!["eq:v3=1".to_string()],
+                diagnostic: Some("AccessToInvalidAddress(ConstantDereference(0))".to_string()),
+            }],
+        };
+
+        assert_eq!(ocaml.canonicalize(), rust.canonicalize());
+    }
+
+    #[test]
+    fn test_parse_ocaml_abort_wrapper_shape() {
+        let value: serde_json::Value = serde_json::json!([
+            "Stopped",
+            [
+                "AbortProgram",
+                {
+                    "astate": {
+                        "post": {
+                            "heap": [
+                                ["v1", [[["Dereference"], ["v3", "_"]]]],
+                                ["v3", [[["Dereference"], ["v10", "_"]]]]
+                            ],
+                            "stack": [
+                                [["ProgramVar", {"plain": "x", "mangled": "x{0}"}], ["Unknown", "v1", "_"]]
+                            ],
+                            "attrs": [
+                                ["v3", [["Initialized"], ["WrittenTo", 3, ["Immediate", {"location": {"file": ["Absolute", "/tmp/specialization.c"], "line": 97, "col": 3, "macro_file_opt": null, "macro_line": -1}, "history": "_"}]]]],
+                                ["v10", [["Invalid", ["ConstantDereference", "1"], ["Immediate", {"location": {"file": ["Absolute", "/tmp/specialization.c"], "line": 97, "col": 3, "macro_file_opt": null, "macro_line": -1}, "history": "_"}]]]]
+                            ]
+                        },
+                        "pre": {
+                            "heap": [
+                                ["v1", [[["Dereference"], ["v3", "_"]]]]
+                            ],
+                            "stack": [
+                                [["ProgramVar", {"plain": "x", "mangled": "x{0}"}], ["Unknown", "v1", "_"]]
+                            ],
+                            "attrs": [
+                                ["v1", [["MustBeInitialized", 0, ["Immediate", {"location": {"file": ["Absolute", "/tmp/specialization.c"], "line": 101, "col": 1, "macro_file_opt": null, "macro_line": -1}, "history": "_"}]], ["MustBeValid", 0, ["Immediate", {"location": {"file": ["Absolute", "/tmp/specialization.c"], "line": 101, "col": 1, "macro_file_opt": null, "macro_line": -1}, "history": "_"}], null]]],
+                                ["v3", [["MustBeValid", 3, ["ViaCall", {"f": ["Call", ["C", {"c_name": ["test_alias"], "c_mangled": null, "c_template_args": ["NoTemplate"]}]], "location": {"file": ["Absolute", "/tmp/specialization.c"], "line": 102, "col": 7, "macro_file_opt": null, "macro_line": -1}, "history": "_", "in_call": ["Immediate", {"location": {"file": ["Absolute", "/tmp/specialization.c"], "line": 96, "col": 3, "macro_file_opt": null, "macro_line": -1}, "history": "_"}]}], null]]]
+                            ]
+                        },
+                        "path_condition": {
+                            "conditions": [],
+                            "phi": {
+                                "term_eqs": [
+                                    [["Const", {"num": "1", "den": "1"}], "v10"]
+                                ],
+                                "atoms": []
+                            }
+                        }
+                    },
+                    "diagnostic": [
+                        "AccessToInvalidAddress",
+                        {
+                            "invalidation": ["ConstantDereference", "0"]
+                        }
+                    ]
+                }
+            ]
+        ]);
+
+        let parsed = parse_ocaml_pre_post(&value).expect("abort wrapper should parse");
+        let expected = RawPrePost {
+            kind: "AbortProgram".to_string(),
+            pre_stack: vec![("x".to_string(), "v1".to_string())],
+            post_stack: vec![("x".to_string(), "v1".to_string())],
+            pre_heap: vec![RawEdge {
+                src: "v1".to_string(),
+                access: "*".to_string(),
+                dst: "v3".to_string(),
+            }],
+            post_heap: vec![
+                RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v3".to_string(),
+                },
+                RawEdge {
+                    src: "v3".to_string(),
+                    access: "*".to_string(),
+                    dst: "v10".to_string(),
+                },
+            ],
+            pre_attrs: vec![
+                (
+                    "v1".to_string(),
+                    vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                ),
+                ("v3".to_string(), vec!["MustBeValid".to_string()]),
+            ],
+            post_attrs: vec![
+                (
+                    "v3".to_string(),
+                    vec!["Initialized".to_string(), "WrittenTo".to_string()],
+                ),
+                (
+                    "v10".to_string(),
+                    vec!["Invalid(ConstantDereference(1))".to_string()],
+                ),
+            ],
+            conditions: vec![],
+            phi: vec!["eq:v10=1".to_string()],
+            diagnostic: Some("AccessToInvalidAddress(ConstantDereference(0))".to_string()),
+        };
+
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn test_phi_normalization_resolves_is_int_through_equalities() {
+        let left = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v1".to_string())],
+                post_stack: vec![("i".to_string(), "v1".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v1=lin(1*v2,const=-1)".to_string(),
+                    "is_int(v1)".to_string(),
+                    "eq:v3=1".to_string(),
+                    "is_int(v3)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v10".to_string())],
+                post_stack: vec![("i".to_string(), "v10".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v10=lin(1*v11,const=-1)".to_string(),
+                    "is_int(v11)".to_string(),
+                    "is_int(lin(1*v11,const=-1))".to_string(),
+                    "eq:v12=1".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
     }
 }

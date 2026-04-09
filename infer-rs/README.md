@@ -42,10 +42,12 @@ alpha-renamed abstract values), and the ignored
 file. The latest OCaml-backed access-mode and interproc fixes align Rust's local read/write
 bookkeeping with `PulseOperations.check_addr_access`, restore leaf `MustBeValid` handling, and
 stop replaying formal-stack bookkeeping onto by-value actuals. The current comparator checkpoint
-is still `Matching: 5`, `Differences: 16`, but the old self-edge bug and formal-root
-`Initialized` export noise are gone; the remaining semantic diffs are now concentrated in
-return/result representative choice, formula normalization, alias-shape parity, and
-latent-vs-continue summary shape in the specialization wrappers.
+is now `Matching: 11`, `Differences: 10`: the old self-edge bug and formal-root `Initialized`
+export noise are gone, wrapper latent-invalid-access recovery no longer republishes imported
+callee `MustBeValid` obligations, and the comparator now parses both stack-style and heap-target
+OCaml value-id shapes from `all_summaries.json`. The remaining semantic diffs are concentrated in
+double-free / alias-recursion cases, invoke / attr-export parity, and a smaller formula /
+return-shape cluster.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

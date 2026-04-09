@@ -617,6 +617,58 @@ impl AbductiveDomain {
         self.path_condition.get_var_repr(v)
     }
 
+    /// Rewrite the current state to the formula's canonical representatives.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.canonicalize` runs before
+    /// `filter_for_summary`, so summary export does not keep stale heap roots
+    /// or stack bindings after equalities have been learned only in the path
+    /// condition.
+    pub(crate) fn canonicalize_with_current_path_condition(&mut self) {
+        let mut rewrites = std::collections::BTreeSet::new();
+        let mut collect = |v: AbstractValue| {
+            let repr = self.path_condition.get_var_repr(v);
+            if repr != v {
+                rewrites.insert((v, repr));
+            }
+        };
+
+        for (_var, value) in self.pre.stack.iter_with_history() {
+            collect(value.addr);
+        }
+        for (_var, value) in self.post.stack.iter_with_history() {
+            collect(value.addr);
+        }
+        for heap in [&self.pre.heap, &self.post.heap] {
+            for (src, edges) in heap.iter() {
+                collect(*src);
+                for (access, value) in edges.iter_with_history() {
+                    if let Access::ArrayAccess(_, idx) = access {
+                        collect(*idx);
+                    }
+                    collect(value.addr);
+                }
+            }
+        }
+        for attrs in [&self.pre.attrs, &self.post.attrs] {
+            for (addr, _attrs) in attrs.iter() {
+                collect(*addr);
+            }
+        }
+        for &addr in &self.must_be_valid {
+            collect(addr);
+        }
+        for &addr in &self.need_dynamic_type_specialization {
+            collect(addr);
+        }
+        for &value in self.const_cache.values() {
+            collect(value);
+        }
+
+        for (old, new) in rewrites {
+            self.subst_var(old, new);
+        }
+    }
+
     /// Apply the effect of an unknown/external call on a value: havoc all
     /// memory reachable from `addr` by replacing edge targets with fresh values.
     ///

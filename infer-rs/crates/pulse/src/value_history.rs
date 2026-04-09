@@ -112,6 +112,11 @@ impl HistoryPath {
         None
     }
 
+    fn has_call_at_location_before_invalidation(&self, location: &Location) -> bool {
+        self.first_call_before_invalidation()
+            .is_some_and(|(_proc, call_loc)| call_loc == location)
+    }
+
     fn first_invalidation(&self) -> Option<(&Invalidation, &Location)> {
         self.0.iter().find_map(|event| match event {
             HistoryEvent::Invalidated {
@@ -321,6 +326,12 @@ impl ValueHistory {
         self.0
             .iter()
             .find_map(HistoryPath::first_call_before_invalidation)
+    }
+
+    pub fn has_call_at_location_before_invalidation(&self, location: &Location) -> bool {
+        self.0
+            .iter()
+            .any(|path| path.has_call_at_location_before_invalidation(location))
     }
 
     pub fn first_invalidation(&self) -> Option<(&Invalidation, &Location)> {
