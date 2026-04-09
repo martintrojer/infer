@@ -552,7 +552,7 @@ impl PulseSummary {
             // recover any surviving caller-controlled `must_be_valid`
             // obligations here before the final abort classification hides
             // them behind the manifest error.
-            let abort_latent_invalid_accesses = latent_invalid_access_pre_posts_from_abort_state(
+            let recovered_invalid_accesses = recovered_invalid_access_pre_posts_from_abort_state(
                 pdesc,
                 &pp,
                 &existing_latent_invalid_access_keys,
@@ -580,7 +580,14 @@ impl PulseSummary {
             }
 
             pre_posts.push(pp);
-            pre_posts.extend(abort_latent_invalid_accesses);
+            for recovered in &recovered_invalid_accesses {
+                if recovered.kind == PrePostKind::AbortProgram {
+                    if let Some(diag) = &recovered.diagnostic {
+                        diagnostics.push(diag.clone());
+                    }
+                }
+            }
+            pre_posts.extend(recovered_invalid_accesses);
         }
 
         // Non-exit latent synthesis can recover summary paths that never make
@@ -678,7 +685,7 @@ impl PulseSummary {
     }
 }
 
-pub(crate) fn latent_invalid_accesses_from_continue_state(
+pub(crate) fn recovered_invalid_accesses_from_continue_state(
     pdesc: &Procdesc,
     astate: &AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
@@ -687,14 +694,41 @@ pub(crate) fn latent_invalid_accesses_from_continue_state(
         return Vec::new();
     }
 
+    let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, &pp);
+    let direct_formal_values = direct_formal_value_addrs(pdesc, &pp);
     latent_invalid_access_diagnostics_from_normalized_pre_post(pdesc, &pp, None)
         .into_iter()
         .filter_map(|(addr, diagnostic)| {
-            let mut latent_state = pp.post.clone();
-            if latent_state.and_equal_const(addr, 0).is_sat() {
-                Some(ExecutionDomain::LatentInvalidAccess {
-                    state: Box::new(latent_state),
-                    diagnostic: Box::new(diagnostic),
+            let mut recovered_state = pp.post.clone();
+            if recovered_state.and_equal_const(addr, 0).is_sat() {
+                let mut recovered = PrePost {
+                    pre: pp.pre.clone(),
+                    post: recovered_state,
+                    formals: pp.formals.clone(),
+                    result: pp.result,
+                    kind: if direct_formal_values.contains(&addr) {
+                        PrePostKind::LatentInvalidAccess
+                    } else {
+                        PrePostKind::AbortProgram
+                    },
+                    diagnostic: Some(diagnostic),
+                };
+                if recovered.kind != PrePostKind::LatentInvalidAccess
+                    || !caller_controlled.contains(&addr)
+                {
+                    classify_recovered_invalid_access_pre_post(pdesc, &mut recovered);
+                }
+                let diagnostic = Box::new(recovered.diagnostic.take()?);
+                Some(match recovered.kind {
+                    PrePostKind::AbortProgram => ExecutionDomain::AbortProgram {
+                        state: Box::new(recovered.post),
+                        diagnostic,
+                    },
+                    PrePostKind::LatentInvalidAccess => ExecutionDomain::LatentInvalidAccess {
+                        state: Box::new(recovered.post),
+                        diagnostic,
+                    },
+                    _ => return None,
                 })
             } else {
                 None
@@ -703,7 +737,7 @@ pub(crate) fn latent_invalid_accesses_from_continue_state(
         .collect()
 }
 
-fn latent_invalid_access_pre_posts_from_abort_state(
+fn recovered_invalid_access_pre_posts_from_abort_state(
     pdesc: &Procdesc,
     pre_post: &PrePost,
     existing_latent_invalid_access_keys: &std::collections::HashSet<String>,
@@ -745,19 +779,32 @@ fn latent_invalid_access_pre_posts_from_abort_state(
             };
             let mut latent_state = pre_post.post.clone();
             if latent_state.and_equal_const(addr, 0).is_sat() {
-                Some(PrePost {
+                let mut recovered = PrePost {
                     pre: pre_post.pre.clone(),
                     post: latent_state,
                     formals: pre_post.formals.clone(),
                     result: pre_post.result,
-                    kind: PrePostKind::LatentInvalidAccess,
+                    kind: PrePostKind::AbortProgram,
                     diagnostic: Some(diagnostic),
-                })
+                };
+                classify_recovered_invalid_access_pre_post(pdesc, &mut recovered);
+                Some(recovered)
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn classify_recovered_invalid_access_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
+    let stays_latent = (!proc_is_entry_point(pdesc)
+        && pre_post_has_direct_formal_constant_deref(pdesc, pre_post))
+        || !pre_post_is_manifest(pdesc, pre_post);
+    pre_post.kind = if stays_latent {
+        PrePostKind::LatentInvalidAccess
+    } else {
+        PrePostKind::AbortProgram
+    };
 }
 
 fn diagnostic_addr_repr(pre_post: &PrePost) -> Option<AbstractValue> {
@@ -965,6 +1012,26 @@ fn formal_stack_addrs(
         .collect()
 }
 
+fn direct_formal_value_addrs(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> std::collections::HashSet<AbstractValue> {
+    pdesc
+        .formals
+        .iter()
+        .filter_map(|(mangled, _typ, _annot)| {
+            let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+            let var = Var::ProgramVar(Box::new(pvar));
+            pre_post
+                .pre
+                .stack
+                .find(&var)
+                .and_then(|addr| pre_post.pre.heap.find_edge(addr, &Access::Dereference))
+                .map(|value| pre_post.post.path_condition.get_var_repr(value))
+        })
+        .collect()
+}
+
 fn pre_heap_deref_value_targets(pre_post: &PrePost) -> std::collections::HashSet<AbstractValue> {
     pre_post
         .pre
@@ -1020,16 +1087,17 @@ fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut Pr
     }
 
     let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
-    let direct_formal = caller_controlled.contains(&diag_addr) || access_history_has_formal_origin;
+    let direct_formal = direct_formal_value_addrs(pdesc, pre_post).contains(&diag_addr);
+    let caller_owned = caller_controlled.contains(&diag_addr) || access_history_has_formal_origin;
     if pre_post_has_post_written_byref_invalid_access(pdesc, pre_post, diag_addr) {
         return !pre_post_diag_addr_has_non_null_invalidation(pre_post);
     }
 
     if pre_post_has_local_zero_condition(pre_post, diag_addr) {
-        return false;
+        return direct_formal && !addr_was_used_as_branch_cond(pre_post, diag_addr);
     }
 
-    direct_formal
+    caller_owned
         && !pre_post_has_locally_written_direct_formal(pdesc, pre_post, diag_addr)
         && !pre_post_diag_addr_has_non_null_invalidation(pre_post)
 }
@@ -1042,7 +1110,11 @@ fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut Pr
 ///
 /// The direct-formal latent rule should only approximate true
 /// `PotentialInvalidAccessSummary`-style caller obligations, not ordinary
-/// callee-local proofs.
+/// callee-local proofs. A plain local `p == 0` formula equality is not enough:
+/// `latent.c:deref_then_free_then_deref_bad` reaches `x == 0` through the
+/// `free(NULL)` split and still stays latent in OCaml. The surviving parity
+/// signal for the manifest cases is that the value was recorded as
+/// `UsedAsBranchCond` by a real prune in the current procedure.
 fn pre_post_has_local_zero_condition(pre_post: &PrePost, diag_addr: AbstractValue) -> bool {
     let repr = pre_post.post.path_condition.get_var_repr(diag_addr);
     pre_post
@@ -1062,6 +1134,18 @@ fn pre_post_has_local_zero_condition(pre_post: &PrePost, diag_addr: AbstractValu
                         crate::formula::term::Term::Var(v)
                     ) if *v == repr
                 )
+        })
+}
+
+fn addr_was_used_as_branch_cond(pre_post: &PrePost, addr: AbstractValue) -> bool {
+    let repr = pre_post.post.path_condition.get_var_repr(addr);
+    [&pre_post.pre.attrs, &pre_post.post.post.attrs]
+        .into_iter()
+        .filter_map(|attrs| attrs.get(&repr))
+        .any(|attrs| {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::UsedAsBranchCond(_, _)))
         })
 }
 
@@ -2158,6 +2242,21 @@ mod tests {
             .path_condition
             .and_condition_direct(condition, 0)
             .is_sat());
+        astate.pre.attrs.add_one(
+            formal_val,
+            crate::attribute::Attribute::UsedAsBranchCond(
+                pdesc.proc_name.clone(),
+                Location::dummy(),
+            ),
+        );
+        astate.invalidate(
+            formal_val,
+            crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
+                Location::dummy(),
+            ),
+        );
         astate.invalidate(
             formal_val,
             invalidation.clone(),

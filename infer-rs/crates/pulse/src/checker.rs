@@ -118,7 +118,7 @@ pub fn analyze_with_specialization_and_requests(
     // summary creation so we do not publish latent issues too early.
     let mut diagnostics = Vec::new();
     let mut seen_diags = std::collections::HashSet::new();
-    let mut latent_non_exit_disjuncts = Vec::new();
+    let mut recovered_non_exit_disjuncts = Vec::new();
     for (node_id, state) in &inv_map {
         if *node_id == pdesc.exit_node {
             continue;
@@ -139,19 +139,22 @@ pub fn analyze_with_specialization_and_requests(
                     }
                 }
                 ExecutionDomain::ContinueProgram(astate) if !exit_has_normal_path => {
-                    for latent in
-                        crate::summary::latent_invalid_accesses_from_continue_state(pdesc, astate)
-                    {
-                        let ExecutionDomain::LatentInvalidAccess { diagnostic, .. } = &latent
-                        else {
-                            continue;
+                    for recovered in crate::summary::recovered_invalid_accesses_from_continue_state(
+                        pdesc, astate,
+                    ) {
+                        let diagnostic = match &recovered {
+                            ExecutionDomain::AbortProgram { diagnostic, .. }
+                            | ExecutionDomain::LatentInvalidAccess { diagnostic, .. } => {
+                                diagnostic.as_ref()
+                            }
+                            _ => continue,
                         };
                         if diagnostic_originates_in_proc(pdesc, diagnostic)
-                            && !latent_non_exit_disjuncts
+                            && !recovered_non_exit_disjuncts
                                 .iter()
-                                .any(|existing| existing == &latent)
+                                .any(|existing| existing == &recovered)
                         {
-                            latent_non_exit_disjuncts.push(latent);
+                            recovered_non_exit_disjuncts.push(recovered);
                         }
                     }
                 }
@@ -178,9 +181,9 @@ pub fn analyze_with_specialization_and_requests(
             }
         }
     }
-    for latent in latent_non_exit_disjuncts {
-        if !exit_disjuncts.iter().any(|existing| existing == &latent) {
-            exit_disjuncts.push(latent);
+    for recovered in recovered_non_exit_disjuncts {
+        if !exit_disjuncts.iter().any(|existing| existing == &recovered) {
+            exit_disjuncts.push(recovered);
         }
     }
     // Cross-ref: OCaml consults ProcAttributes.is_no_return at call sites in

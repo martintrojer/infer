@@ -5,6 +5,52 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active line of investigation has now moved from the `traces.c` gap back to
+  general parity / documentation cleanup.
+- Current tree status:
+  - Pulse branch-condition parity fix is implemented and documented
+  - `make check` is green
+  - ready to commit once the tracked files are staged
+- Stable checkpoint from the latest pass:
+  - `traces.c` is fixed in the ignored store-textual sweep
+  - current authoritative ignored sweep is:
+    - `NPE: expected 131, found 134`
+    - `LEAK: expected 20, found 20`
+    - `UAF: expected 7, found 7`
+    - file diffs:
+      - `nullptr.c: expected 13, found 14`
+      - `sizeof.c: expected 0, found 2`
+  - interpretation remains:
+    - `nullptr.c +1` is the accepted real `FN_nullptr_deref_old_bad`
+      divergence
+    - `sizeof.c +2` is the accepted exported-Textual fidelity limitation
+- Root cause and fix for the old `traces.c` miss:
+  - OCaml exports two summary disjuncts for `access_use_after_free_bad`:
+    a suppressed `ConstantDereference` on the `v4 == 0` branch and a manifest
+    `CFree` / UAF branch
+  - Rust was missing the suppressed null report because two OCaml parity
+    signals were absent or underused:
+    - the `free(NULL)` / `free(non-null)` split in `models/c.rs` was not
+      recording depth-0 prune conditions, only formula equalities
+    - prune handling in `transfer.rs` was not recording
+      `UsedAsBranchCond`, which OCaml uses to distinguish real local branch
+      proofs from other caller-controlled direct-formal null paths
+  - the stable fix set is:
+    - `crates/pulse/src/models/c.rs`: record the `ptr == 0` / `0 < ptr`
+      branch conditions in the free model
+    - `crates/pulse/src/transfer.rs`: record `UsedAsBranchCond` on values used
+      in prune expressions
+    - `crates/pulse/src/summary.rs`: use `UsedAsBranchCond` plus the recorded
+      local zero condition to keep branch-proven direct-formal null derefs
+      manifest, while preserving `free(NULL)` direct-formal cases such as
+      `latent.c:deref_then_free_then_deref_bad` as latent
+- Latest focused validations on the current tree:
+  - `make check`
+  - `cargo test -q -p pulse --lib`
+  - `cargo test -q -p pulse --test end_to_end`
+  - `cargo test -q -p infer-rs --test cli_tests test_pulse_report_issues_for_tests_surfaces_suppressed_reports -- --nocapture`
+  - `cargo test -q -p pulse --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
+
 - Active line of investigation is now the latent-invalid-access recovery work
   for caller-controlled field writes when a procedure never exports a normal
   `ContinueProgram`/`ExitProgram` path.

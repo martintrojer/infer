@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, keep locally-proven direct-formal null dereferences manifest, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` and richer trace/report parity.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` and richer trace/report parity.**
 
 Recent correctness / robustness fixes:
 - Summary import now snapshots caller allocation state after `materialize_pre`
@@ -22,6 +22,12 @@ Recent correctness / robustness fixes:
   OCaml `create_null_path2_bad_FN` / `malloc_then_call_create_null_path_then_deref_unconditionally_bad_FN`
   shape: the summary stays `AbortProgram`, then reporting decides whether it is
   suppressed.
+- `free()` now records its `ptr == 0` and `0 < ptr` split as depth-0 branch
+  conditions, and prune now records `UsedAsBranchCond` on values used in branch
+  tests. Recovered-invalid-access classification uses those signals to separate
+  locally branch-proven direct-formal null dereferences from caller-controlled
+  `free(NULL)`-style cases. This restores the missing suppressed null report in
+  `traces.c` without reviving the earlier broad latent-prepost publication bug.
 - OCaml-style suppressed-report handling now exists in Rust reporting:
   default CLI output filters constant / compared-to-null dereferences without a
   matching invalidation event in the access history, while
@@ -121,7 +127,8 @@ Pulse features:
   LatentAbortProgram / LatentInvalidAccess)
 - **Biabduction**: pre-state tracking, pre-materialization with formal-value mapping, pre-condition violation detection
 - **Latent issue support**: `is_manifest` classification, `LatentAbortProgram` propagation through
-  call chains, and caller-side `LatentInvalidAccess` re-evaluation
+  call chains, caller-side `LatentInvalidAccess` re-evaluation, and
+  branch-condition provenance via `UsedAsBranchCond`
 - **Summary specialization**: HeapPath-based dynamic type specialization for function pointer dispatch, recursive multi-level specialization, `needs_specialization` propagation
 - **Summary normalization**: `simplify_for_summary(precondition_vocabulary, keep)` with
   reachability filtering matching OCaml `PulseSummary` more closely

@@ -42,7 +42,7 @@ pub fn exec_instr_with_pdesc(
     match instr {
         Instr::Load { id, e, loc, typ } => exec_load(id, e, typ, loc, state),
         Instr::Store { e1, e2, loc, .. } => exec_store(pdesc, e1, e2, loc, state),
-        Instr::Prune { exp, loc, .. } => exec_prune(exp, loc, state),
+        Instr::Prune { exp, loc, .. } => exec_prune(pdesc, exp, loc, state),
         Instr::Call {
             ret: (ret_id, ret_typ),
             fun_exp,
@@ -199,8 +199,13 @@ fn local_has_cleanup_attribute(pdesc: Option<&Procdesc>, lhs_exp: &Exp) -> bool 
 /// For `if (p != NULL)`, the true branch gets `p ≠ 0` and the false branch gets `p = 0`.
 /// If the constraint is unsatisfiable (e.g., pruning `2 < 3` on the false branch),
 /// the path is killed (no ContinueProgram returned).
-fn exec_prune(exp: &Exp, loc: &Location, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
-    if prune_expr(exp, loc, &mut state) {
+fn exec_prune(
+    pdesc: Option<&Procdesc>,
+    exp: &Exp,
+    loc: &Location,
+    mut state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    if prune_expr(pdesc, exp, loc, &mut state) {
         log::trace!("  [prune] SAT: {exp}");
         vec![ExecutionDomain::ContinueProgram(state)]
     } else {
@@ -215,24 +220,37 @@ fn exec_prune(exp: &Exp, loc: &Location, mut state: AbductiveDomain) -> Vec<Exec
 /// Cross-ref: OCaml's `PulseOperations.prune` dispatches `prune_binop` for
 /// all BinOp operators, not just Eq/Ne. Handles comparison ops (Lt/Le/Gt/Ge)
 /// directly to add atoms without going through eval+term_eq indirection.
-fn prune_expr(exp: &Exp, loc: &Location, state: &mut AbductiveDomain) -> bool {
-    prune_binop(exp, loc, state, false)
+fn prune_expr(
+    pdesc: Option<&Procdesc>,
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> bool {
+    prune_binop(pdesc, exp, loc, state, false)
 }
 
 /// Core prune handler for all binary/unary operators.
 /// When `negated` is true, we're in the negated context (prune(!e)).
 ///
 /// Cross-ref: OCaml's Pulse.ml `prune_binop` handles all comparison operators.
-fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: bool) -> bool {
+fn prune_binop(
+    pdesc: Option<&Procdesc>,
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+    negated: bool,
+) -> bool {
     use sil::binop::Binop;
     match exp {
         // Equality and disequality
-        Exp::BinOp(Binop::Eq, lhs, rhs) => prune_eq_operands(lhs, rhs, loc, state, negated),
-        Exp::BinOp(Binop::Ne, lhs, rhs) => prune_eq_operands(lhs, rhs, loc, state, !negated),
+        Exp::BinOp(Binop::Eq, lhs, rhs) => prune_eq_operands(pdesc, lhs, rhs, loc, state, negated),
+        Exp::BinOp(Binop::Ne, lhs, rhs) => prune_eq_operands(pdesc, lhs, rhs, loc, state, !negated),
         // Comparison operators: add atoms directly
         Exp::BinOp(Binop::Lt, lhs, rhs) => {
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x < y) → y ≤ x
                 state.prune_less_equal(&op_rhs, &op_lhs).is_sat()
@@ -243,6 +261,8 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
         Exp::BinOp(Binop::Le, lhs, rhs) => {
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x ≤ y) → y < x
                 state.prune_less_than(&op_rhs, &op_lhs).is_sat()
@@ -254,6 +274,8 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             // x > y ↔ y < x
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x > y) → x ≤ y
                 state.prune_less_equal(&op_lhs, &op_rhs).is_sat()
@@ -265,6 +287,8 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             // x ≥ y ↔ y ≤ x
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
+            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x ≥ y) → y < x  → wait, !(x ≥ y) = y > x = x < y
                 state.prune_less_than(&op_lhs, &op_rhs).is_sat()
@@ -273,10 +297,13 @@ fn prune_binop(exp: &Exp, loc: &Location, state: &mut AbductiveDomain, negated: 
             }
         }
         // Logical negation
-        Exp::UnOp(sil::unop::Unop::LNot, inner, _) => prune_binop(inner, loc, state, !negated),
+        Exp::UnOp(sil::unop::Unop::LNot, inner, _) => {
+            prune_binop(pdesc, inner, loc, state, !negated)
+        }
         // Default: variable/expression — truthy (≠ 0) or falsy (= 0)
         _ => {
             let val = operations::eval_or_fresh_for_prune(exp, loc, state);
+            record_used_as_branch_cond(pdesc, val, loc, state);
             state.prune_eq_const(val, 0, !negated).is_sat()
         }
     }
@@ -303,7 +330,35 @@ fn eval_operand_for_prune(
     }
 }
 
+fn record_used_as_branch_cond(
+    pdesc: Option<&Procdesc>,
+    value: AbstractValue,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) {
+    let Some(pdesc) = pdesc else {
+        return;
+    };
+    let value = state.path_condition.get_var_repr(value);
+    state.pre.attrs.add_one(
+        value,
+        crate::attribute::Attribute::UsedAsBranchCond(pdesc.proc_name.clone(), loc.clone()),
+    );
+}
+
+fn record_operand_used_as_branch_cond(
+    pdesc: Option<&Procdesc>,
+    operand: &crate::formula::Operand,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) {
+    if let crate::formula::Operand::AbstractValue(value) = operand {
+        record_used_as_branch_cond(pdesc, *value, loc, state);
+    }
+}
+
 fn prune_eq_operands(
+    pdesc: Option<&Procdesc>,
     lhs: &Exp,
     rhs: &Exp,
     loc: &Location,
@@ -312,6 +367,8 @@ fn prune_eq_operands(
 ) -> bool {
     let lhs = eval_operand_for_prune(lhs, loc, state);
     let rhs = eval_operand_for_prune(rhs, loc, state);
+    record_operand_used_as_branch_cond(pdesc, &lhs, loc, state);
+    record_operand_used_as_branch_cond(pdesc, &rhs, loc, state);
     match (lhs, rhs) {
         (
             crate::formula::Operand::AbstractValue(v1),
@@ -690,6 +747,46 @@ mod tests {
             assert!(
                 s.is_known_zero(p),
                 "after prune(p == 0), p should be known zero"
+            );
+        } else {
+            panic!("expected ContinueProgram");
+        }
+    }
+
+    #[test]
+    fn test_prune_eq_zero_records_used_as_branch_cond() {
+        let pname = Procname::c_from_string("branch_cond");
+        let pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let p = AbstractValue::mk_fresh();
+        let id = Ident::create_normal(IdentName::from_string("p"), 0);
+        state.post.stack.add(Var::LogicalVar(id.clone()), p);
+
+        let instr = Instr::Prune {
+            exp: Exp::BinOp(
+                sil::binop::Binop::Eq,
+                Box::new(Exp::Var(id)),
+                Box::new(Exp::Const(Const::Cint(IntLit::zero()))),
+            ),
+            loc: Location::dummy(),
+            is_then_branch: true,
+            if_kind: sil::instr::IfKind::If,
+        };
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+
+        assert_eq!(results.len(), 1);
+        if let ExecutionDomain::ContinueProgram(state) = &results[0] {
+            assert!(
+                state
+                    .pre
+                    .attrs
+                    .get(&p)
+                    .is_some_and(|attrs| attrs.iter().any(|attr| matches!(
+                        attr,
+                        crate::attribute::Attribute::UsedAsBranchCond(proc, _)
+                            if proc == &pname
+                    ))),
+                "pruning on a value should record it as a branch condition"
             );
         } else {
             panic!("expected ContinueProgram");

@@ -386,8 +386,9 @@ fn invalidate_first_arg(
 /// Model: `free(ptr)` — invalidate with CFree.
 ///
 /// In C, `free(NULL)` is a valid no-op. Mirror OCaml's
-/// `Basic.free_or_delete`: try both `ptr == 0` and `ptr > 0`, but
-/// keep only the satisfiable branches.
+/// `Basic.free_or_delete`: try both `ptr == 0` and `ptr > 0`, keep only the
+/// satisfiable branches, and retain those branch conditions in the formula so
+/// summary classification can distinguish the null and non-null paths later.
 fn free(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -400,7 +401,16 @@ fn free(
         let mut results = Vec::new();
 
         let mut null_state = state.clone();
-        if null_state.and_equal_const(addr.addr, 0).is_sat() {
+        if null_state
+            .and_condition_direct(
+                crate::formula::atom::Atom::Equal(
+                    crate::formula::term::Term::Var(addr.addr),
+                    crate::formula::term::Term::Const(0),
+                ),
+                0,
+            )
+            .is_sat()
+        {
             let ret_val = AbstractValue::mk_fresh();
             operations::write_id_with_history(
                 ret_id,
@@ -413,7 +423,16 @@ fn free(
             results.push(ExecutionDomain::ContinueProgram(null_state));
         }
 
-        if state.and_positive(addr.addr).is_sat() {
+        if state
+            .and_condition_direct(
+                crate::formula::atom::Atom::LessThan(
+                    crate::formula::term::Term::Const(0),
+                    crate::formula::term::Term::Var(addr.addr),
+                ),
+                0,
+            )
+            .is_sat()
+        {
             results.extend(invalidate_first_arg(
                 ret_id,
                 args,
@@ -782,6 +801,48 @@ mod tests {
             "free should discard the impossible NULL branch on a known non-null path"
         );
         assert!(results.iter().all(|r| r.is_continue()));
+    }
+
+    #[test]
+    fn test_free_records_branch_conditions_for_null_and_nonnull_paths() {
+        let mut state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let ptr_id = Ident::create_normal(IdentName::from_string("p"), 0);
+        let ptr = AbstractValue::mk_fresh();
+        state.post.stack.add(Var::LogicalVar(ptr_id.clone()), ptr);
+
+        let results = free(
+            &ret_id,
+            &[(Exp::Var(ptr_id), Typ::void())],
+            &Location::dummy(),
+            state,
+        );
+
+        let null_atom = crate::formula::atom::Atom::Equal(
+            crate::formula::term::Term::Var(ptr),
+            crate::formula::term::Term::Const(0),
+        );
+        let positive_atom = crate::formula::atom::Atom::LessThan(
+            crate::formula::term::Term::Const(0),
+            crate::formula::term::Term::Var(ptr),
+        );
+
+        assert!(
+            results.iter().any(|result| matches!(
+                result,
+                ExecutionDomain::ContinueProgram(state)
+                    if state.path_condition.conditions().get(&null_atom) == Some(&0)
+            )),
+            "free(NULL) branch should retain a local ptr == 0 prune condition"
+        );
+        assert!(
+            results.iter().any(|result| matches!(
+                result,
+                ExecutionDomain::ContinueProgram(state)
+                    if state.path_condition.conditions().get(&positive_atom) == Some(&0)
+            )),
+            "free(non-null) branch should retain a local 0 < ptr prune condition"
+        );
     }
 
     #[test]

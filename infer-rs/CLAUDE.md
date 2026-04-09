@@ -21,6 +21,19 @@ Key OCaml files to cross-reference:
 - Do not add workarounds, special cases, or heuristic hacks whose main purpose is to make the sweep numbers look better without fixing the underlying behavior.
 - When a correct fix regresses totals, keep the correct fix and investigate the newly exposed gaps separately.
 
+## Direct-formal null parity gotcha
+
+When debugging direct-formal null dereferences, separate real local branch proofs from generic
+solver equalities.
+
+- Preserve local branch conditions at depth 0. Model-side splits such as
+  `free(NULL)` / `free(non-null)` should use `and_condition_direct(...)`, not just
+  `and_equal_const(...)`, so summary classification can see the branch provenance.
+- Record `Attribute::UsedAsBranchCond` on abstract values seen in `Prune`. Manifest-vs-latent
+  classification depends on that signal together with the local zero condition.
+- Do not treat "the formula contains `addr == 0`" as sufficient evidence that a direct-formal null
+  dereference should be manifest. `latent.c:deref_then_free_then_deref_bad` is the counterexample.
+
 ## Compliance debugging recipe
 
 When investigating why a C test file produces different results from OCaml:

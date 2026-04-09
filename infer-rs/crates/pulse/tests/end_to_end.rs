@@ -3003,7 +3003,7 @@ fn test_e2e_latent_error_only_summary_is_not_noreturn() {
 }
 
 #[test]
-fn test_e2e_access_use_after_free_keeps_manifest_uaf_and_latent_npes() {
+fn test_e2e_access_use_after_free_keeps_manifest_uaf_and_suppressed_npes() {
     let tm = textual_utils::parse_and_convert(
         r#"
         .source_language = "C"
@@ -3042,18 +3042,26 @@ fn test_e2e_access_use_after_free_keeps_manifest_uaf_and_latent_npes() {
         "expected manifest USE_AFTER_FREE, found {issue_types:?}"
     );
     assert!(
-        !issue_types.contains(&IssueTypeId::NullptrDereference),
-        "caller-controlled null dereferences should stay latent here, found manifest issues {issue_types:?}"
+        issue_types.contains(&IssueTypeId::NullptrDereference),
+        "expected the locally-proven null branch to stay manifest and suppressed, found {issue_types:?}"
     );
     assert!(
         summary.pre_posts.iter().any(|pp| {
-            pp.kind == pulse::summary::PrePostKind::LatentInvalidAccess
+            pp.kind == pulse::summary::PrePostKind::AbortProgram
                 && pp
                     .diagnostic
                     .as_ref()
                     .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
         }),
-        "expected latent NULL_DEREFERENCE pre/posts to remain in the summary"
+        "expected an AbortProgram NULL_DEREFERENCE pre/post to remain in the summary"
+    );
+    assert!(
+        summary
+            .diagnostics
+            .iter()
+            .find(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+            .is_some_and(pulse::diagnostic::Diagnostic::is_suppressed),
+        "expected the manifest NULL_DEREFERENCE to stay suppressed in summary diagnostics"
     );
 }
 

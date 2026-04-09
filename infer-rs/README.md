@@ -4,7 +4,12 @@ Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory sa
 
 Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 134. Leaks: expected 20, found 20. UAF: expected 7, found 7.
 
-`memory_leak.c` is now back at parity after history-aware invalid-access provenance/dedup. The
+Recent OCaml-backed parity work also restored `traces.c`: Rust now preserves branch-conditioned
+null provenance from both real `Prune` instructions and model-generated
+`free(NULL)` / `free(non-null)` splits, so locally branch-proven direct-formal null dereferences
+stay manifest/suppressed while caller-controlled ones stay latent.
+
+`memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
 
 - `nullptr.c` (+1): accepted correctness-positive divergence. Rust reports the real
@@ -63,6 +68,7 @@ to in-memory summaries.
 |------|-------------|
 | `--pulse-only` | Run only the Pulse checker |
 | `--liveness-only` | Run only the liveness/dead store checker |
+| `--pulse-report-issues-for-tests` | Emit suppressed Pulse issues as distinguished `*** SUPPRESSED ***` test reports |
 | `-j N` / `--jobs N` | Number of parallel worker threads (default: all CPUs) |
 | `-o` / `--output DIR` | Output directory for report.json (default: `infer-rs-out`) |
 | `--results-dir DIR` | Infer results directory containing capture.db (default: `infer-out`) |
@@ -153,12 +159,14 @@ infer-rs/
 3. `infer-rs` parses textual SIL files in parallel, transforms them, and converts each module to SIL
 4. The per-file `Cfg`/`Tenv` results are merged into one in-memory program
 5. Pulse analysis runs: WTO fixpoint with disjunctive domain, biabduction, interprocedural summary application
+   and OCaml-backed latent/manifest invalid-access classification
 6. Reports NULLPTR_DEREFERENCE, USE_AFTER_FREE, MEMORY_LEAK_C issues with original source file paths
 
 ## Key Design Decisions
 
 - **Textual as bridge**: human-readable SIL serialization is the interop boundary between OCaml and Rust
 - **Cross-reference OCaml**: analysis logic follows OCaml's approach, cross-referenced against source in `infer/src/pulse/`
+- **Correctness over counts**: keep semantically correct OCaml-backed behavior even when sweep totals move temporarily; accepted divergences are documented instead of hidden
 - **Test through comparison**: compare against OCaml's `issues.exp` for compliance
 - **Per-instruction tracing**: `--debug-level-analysis` + `scripts/compare_traces.py` for debugging divergences
 

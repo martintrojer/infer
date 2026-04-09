@@ -51,7 +51,8 @@ crates/pulse/
     models/c.rs           Layer 8: C models (malloc/free/realloc, new/delete, fopen, random, etc.)
     specialization.rs     Layer 8: function pointer dispatch specialization
     interproc.rs          Layer 8: summary application, biabduction, callee→caller mapping
-    transfer.rs           Layer 9: SIL instruction → state transition (prune extracts constraints)
+    summary.rs            Layer 8: summary creation, latent/manifest invalid-access classification
+    transfer.rs           Layer 9: SIL instruction → state transition (prune extracts constraints and branch-condition provenance)
     diagnostic.rs         Layer 8: error classification and reporting
     execution_domain.rs   Layer 9: ContinueProgram | AbortProgram | ...
     checker.rs            Entry point: analyze + to_issue_log
@@ -105,6 +106,7 @@ void uaf() {
 | Models | ~10K lines across languages | C models: malloc/free/realloc, new/delete, exit/abort, fopen/getcwd, random, 18 stdio |
 | Model dispatch | `ProcnameDispatcher` DSL | `builtin_decl::match_builtin` identity matching |
 | Specialization | HeapPath-based dynamic types | Same: specialization loop in CLI + checker |
+| Null-path provenance | Branch-conditioned summary/report logic | `UsedAsBranchCond` attrs + depth-0 recorded model/prune conditions |
 
 ## Excluded
 
