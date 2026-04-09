@@ -22,7 +22,7 @@ use sil::var::Var;
 
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
-use crate::attribute::{Allocator, Attribute};
+use crate::attribute::{Allocator, Attribute, InitializationError};
 use crate::base_domain::BaseDomain;
 use crate::formula::atom::Atom;
 use crate::formula::lin_arith::LinArith;
@@ -226,6 +226,14 @@ impl AbductiveDomain {
         self.post.attrs.check_valid(repr)
     }
 
+    /// Check if an address is initialized.
+    ///
+    /// Cross-ref: OCaml `PulseBaseAddressAttributes.check_initialized`.
+    pub fn check_initialized(&self, addr: AbstractValue) -> Result<(), InitializationError> {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.post.attrs.check_initialized(repr)
+    }
+
     /// Mark an address as invalid (freed, null, etc.).
     pub fn invalidate(&mut self, addr: AbstractValue, inv: Invalidation, history: ValueHistory) {
         let repr = self.path_condition.get_var_repr(addr);
@@ -242,6 +250,53 @@ impl AbductiveDomain {
     pub fn initialize(&mut self, addr: AbstractValue) {
         let repr = self.path_condition.get_var_repr(addr);
         self.post.attrs.initialize(repr);
+    }
+
+    /// Record a must-be-initialized read at a concrete program location.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.check_initialized` abduces
+    /// `MustBeInitialized` into the pre-state for addresses already
+    /// materialized there, unless the address has already been written in the
+    /// current procedure.
+    pub fn mark_must_be_initialized_at(&mut self, addr: AbstractValue, loc: &Location) {
+        let repr = self.path_condition.get_var_repr(addr);
+        let is_written_to = self
+            .post
+            .attrs
+            .get(&repr)
+            .and_then(|attrs| attrs.get_written_to())
+            .is_some();
+        if !is_written_to && self.pre.heap.get_edges(repr).is_some() {
+            self.pre
+                .attrs
+                .add_one(repr, Attribute::MustBeInitialized(0, loc.clone()));
+        }
+    }
+
+    /// Record a successful read access.
+    ///
+    /// This keeps the inferred read precondition and mirrors OCaml's
+    /// `check_addr_access Read` post-update by marking the address
+    /// `Initialized` so repeated reads do not keep re-reporting it.
+    ///
+    /// Returns `false` if the address is currently marked `Uninitialized`.
+    /// Rust does not surface `ReadUninitialized` diagnostics yet, so callers
+    /// leave the state unchanged and continue.
+    pub fn record_read_access_at(&mut self, addr: AbstractValue, loc: &Location) -> bool {
+        if self.check_initialized(addr).is_err() {
+            return false;
+        }
+        self.mark_must_be_initialized_at(addr, loc);
+        self.initialize(addr);
+        true
+    }
+
+    /// Record a successful write access.
+    ///
+    /// Cross-ref: OCaml `check_addr_access Write` initializes the written
+    /// address immediately.
+    pub fn record_write_access_at(&mut self, addr: AbstractValue) {
+        self.initialize(addr);
     }
 
     /// Keep an address reachable across summary normalization.

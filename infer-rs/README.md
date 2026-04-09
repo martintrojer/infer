@@ -19,6 +19,16 @@ remaining published NPE delta is:
   Textual lowers array `sizeof(...)` expressions to `<int[]>` without `nbytes` or array length, so
   the Rust roundtrip cannot constant-fold those branches.
 
+Exact summary-equality work now uses a semantic driver instead of raw JSON diffs:
+`crates/test-harness/src/summary_compare.rs` canonicalizes OCaml and Rust
+`main.pre_post_list` state (stack / heap / attrs / conditions / phi / diagnostic with
+alpha-renamed abstract values), and the ignored
+`test_summary_comparison_specialization_main` test uses `specialization.c` as the current gold
+file. The latest OCaml-backed access-mode fix aligns Rust's local read/write bookkeeping with
+`PulseOperations.check_addr_access`, which removed the missing `MustBeInitialized` gap on simple
+summaries. The remaining semantic diffs are now mostly heap/root-shape, formula normalization, and
+latent-invalid-access parity.
+
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.
 
@@ -144,7 +154,7 @@ infer-rs/
     pulse/           Pulse engine (null deref, UAF, models, interproc)
     diagnostics/     Issue types and reporting
     ondemand/        Parallel analysis runner
-    test-harness/    Test infra: OCaml runner, summary comparison
+    test-harness/    Test infra: OCaml runner, semantic summary comparison
     config/          Configuration (.inferconfig, CLI flags)
     cli/             CLI binary (infer-rs)
   docs/              STATUS, PULSE, architecture docs

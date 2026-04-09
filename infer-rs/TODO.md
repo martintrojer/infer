@@ -48,7 +48,21 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
 
 **Active OCaml-backed correctness focus:**
 
-3. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
+3. **Main-summary semantic parity (`specialization.c`)**: keep driving parity through
+   `crates/test-harness/src/summary_compare.rs` and
+   `test_summary_comparison_specialization_main`. Step 1 compares canonical
+   `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
+   diagnostic, alpha-renamed) and is now the authoritative fine-grained driver.
+   Current checkpoint is still `Matching: 5`, `Differences: 16`. The local
+   access-mode fix removed the simple missing-`MustBeInitialized` gap, so the
+   next real blockers are heap/root-shape parity, formula representative
+   parity, and latent-invalid-access duplication/classification. Important
+   OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
+   the dereferenced formal value, so do not try to "fix" this by blindly
+   propagating formal-stack `MustBe*` attrs through the current Rust
+   substitution map.
+
+4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,
    `test_e2e_write_through_ptr`, `test_e2e_manifest_use_after_free_reports_only_uaf`,
    `test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf`,
@@ -57,11 +71,11 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `test_to_issue_log_filters_suppressed_null_deref_by_default`. These are correctness fixes, not
    optional count-tuning.
 
-4. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: the headline file
+5. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: the headline file
    counts are now at the expected baseline, but Rust and OCaml can still diverge on which latent
    null paths survive call chains and reify as manifest reports.
 
-5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
+6. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
    dedup and `issues.exp`-style counting, but richer OCaml-style `PulseTrace` / publication detail
    is still incomplete.
 

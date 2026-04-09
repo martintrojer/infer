@@ -754,17 +754,23 @@ fn materialize_pre(
         }
 
         if let Some(edges) = callee_pre.heap.get_edges(callee_addr) {
+            let callee_pre_attrs = callee_pre.attrs.get(&callee_addr);
             // Only check validity for addresses the callee actually
             // dereferences (marked must_be_valid). Just having pre-edges
             // (from loading the formal) doesn't mean the address must be valid.
-            // Cross-ref: OCaml PulseInterproc.ml check_all_valid only checks
-            // addresses with MustBeValid attribute (line 1218).
-            // Skip must_be_valid check for formal stack addresses — they
-            // map to actual VALUES in the subst, not stack addresses, so
-            // check_valid would incorrectly test the value instead of the
-            // (always-valid) stack slot. Only check derived addresses.
+            // Cross-ref: OCaml PulseInterproc.ml `check_all_valid` reads the
+            // requirement from the callee pre attrs and, on success, abduces
+            // the same fact into the caller precondition. OCaml materializes
+            // parameter PRE from the dereferenced formal value
+            // (`materialize_pre_from_actual`), not the formal stack cell
+            // itself, so keep the Rust propagation restricted to derived
+            // addresses until our substitution model matches that shape.
             let is_formal_stack = formal_stack_addrs.contains(&callee_addr);
-            if !edges.is_empty() && !is_formal_stack && callee_post.is_must_be_valid(callee_addr) {
+            let needs_must_be_valid = callee_pre_attrs
+                .and_then(|attrs| attrs.get_must_be_valid())
+                .is_some()
+                || callee_post.is_must_be_valid(callee_addr);
+            if !edges.is_empty() && !is_formal_stack && needs_must_be_valid {
                 if let Err(inv_info) = caller_state.check_valid(caller_addr) {
                     log::debug!("    [materialize_pre] PRE-VIOLATION: callee={callee_addr} caller={caller_addr}");
                     if first_error.is_none() {
@@ -785,6 +791,15 @@ fn materialize_pre(
                     // (OCaml line 621-623)
                     continue;
                 }
+                caller_state.mark_must_be_valid_at(caller_addr, loc);
+            }
+
+            if callee_pre_attrs
+                .and_then(|attrs| attrs.get_must_be_initialized())
+                .is_some()
+                && !is_formal_stack
+            {
+                let _ = caller_state.record_read_access_at(caller_addr, loc);
             }
 
             for (access, callee_target) in edges.iter() {

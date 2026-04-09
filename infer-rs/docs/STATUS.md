@@ -5,6 +5,22 @@
 **~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` and richer trace/report parity.**
 
 Recent correctness / robustness fixes:
+- Exact summary-equality work now has a semantic driver instead of raw JSON diffs:
+  `crates/test-harness/src/summary_compare.rs` canonicalizes OCaml and Rust
+  `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
+  diagnostic, with alpha-renamed abstract values), and the ignored
+  `test_summary_comparison_specialization_main` test uses `specialization.c`
+  as the current gold file. This step intentionally compares `main` summaries
+  first; `specialized` remains the next layer after the main-summary mismatches
+  are reduced.
+- Local read/write access bookkeeping now mirrors OCaml
+  `PulseOperations.check_addr_access` more closely: successful reads abduce
+  `MustBeInitialized` and mark the accessed address `Initialized`, and
+  successful writes mark the written address `Initialized` before the existing
+  `WrittenTo` summary marker. This removed the old missing
+  `MustBeInitialized` gap from simple summaries such as `add_one`, `add_two`,
+  and `id`, even though the current `specialization.c` comparator checkpoint
+  is still `Matching: 5`, `Differences: 16`.
 - Summary import now snapshots caller allocation state after `materialize_pre`
   but before `apply_post`, and imported `EqZero` handling consults those
   pre-call snapshots instead of the rejected broad formula-before-post reorder.
@@ -126,6 +142,10 @@ Pulse features:
 - **Multi-disjunct summaries** with PrePostKind (ContinueProgram / ExitProgram / AbortProgram /
   LatentAbortProgram / LatentInvalidAccess)
 - **Biabduction**: pre-state tracking, pre-materialization with formal-value mapping, pre-condition violation detection
+- **Access-mode parity**: successful reads now carry OCaml-style
+  `MustBeInitialized` / `Initialized` side effects locally, while interproc
+  still avoids naively propagating formal-stack `MustBe*` attrs until the Rust
+  substitution model matches OCaml's dereferenced-formal materialization shape
 - **Latent issue support**: `is_manifest` classification, `LatentAbortProgram` propagation through
   call chains, caller-side `LatentInvalidAccess` re-evaluation, and
   branch-condition provenance via `UsedAsBranchCond`

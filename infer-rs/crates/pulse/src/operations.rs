@@ -49,6 +49,35 @@ fn materialize_known_zero_invalid(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessMode {
+    Read,
+    Write,
+}
+
+fn check_validity_and_record_access(
+    addr: &ValueWithHistory,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+    mode: AccessMode,
+) -> Result<(), Box<(Invalidation, ValueHistory)>> {
+    // Cross-ref: OCaml `PulseOperations.check_addr_access` first abduces
+    // `MustBeValid`, then checks invalidation, then applies the
+    // read/write-specific initialization side effect.
+    state.mark_must_be_valid_at(addr.addr, loc);
+    materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
+    let valid = state.check_valid(addr.addr);
+    if valid.is_ok() {
+        match mode {
+            AccessMode::Read => {
+                let _ = state.record_read_access_at(addr.addr, loc);
+            }
+            AccessMode::Write => state.record_write_access_at(addr.addr),
+        }
+    }
+    valid
+}
+
 /// Evaluate a SIL expression to an abstract value.
 ///
 /// Mirrors OCaml's `PulseOperations.eval` (simplified).
@@ -84,10 +113,12 @@ pub fn eval_with_history(
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
-            // Check validity of base before field access (null.field is a null deref)
-            state.mark_must_be_valid_at(base.addr, loc);
-            materialize_known_zero_invalid(base.addr, &base.history, loc, state);
-            if let Err(inv_info) = state.check_valid(base.addr) {
+            // Check validity and initialization of the base before field
+            // access (`null.field` is a null deref, reading the field also
+            // requires the base cell to be initialized).
+            if let Err(inv_info) =
+                check_validity_and_record_access(&base, loc, state, AccessMode::Read)
+            {
                 let (invalidation, invalidation_history) = *inv_info;
                 return PulseResult::Recoverable(
                     ValueWithHistory::new(
@@ -111,10 +142,12 @@ pub fn eval_with_history(
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
-            // Check validity of base before array access (null[i] is a null deref)
-            state.mark_must_be_valid_at(base.addr, loc);
-            materialize_known_zero_invalid(base.addr, &base.history, loc, state);
-            if let Err(inv_info) = state.check_valid(base.addr) {
+            // Check validity and initialization of the base before array
+            // access (`null[i]` is a null deref, reading the slot requires the
+            // base cell to be initialized).
+            if let Err(inv_info) =
+                check_validity_and_record_access(&base, loc, state, AccessMode::Read)
+            {
                 let (invalidation, invalidation_history) = *inv_info;
                 return PulseResult::Recoverable(
                     ValueWithHistory::new(
@@ -371,13 +404,9 @@ pub fn eval_deref_addr_with_history(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<ValueWithHistory, Diagnostic> {
-    // Record that this address must be valid (for interproc pre-condition checks).
-    // Cross-ref: OCaml PulseOperations.ml check_addr_access sets MustBeValid.
-    state.mark_must_be_valid_at(addr.addr, loc);
-    materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
-
-    // THE null-deref / use-after-free check
-    if let Err(inv_info) = state.check_valid(addr.addr) {
+    // Record the access preconditions and check the address before following
+    // the dereference edge.
+    if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::Read) {
         let (invalidation, invalidation_history) = *inv_info;
         return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
             addr: addr.addr,
@@ -411,9 +440,7 @@ pub fn check_addr_access_with_history(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
-    state.mark_must_be_valid_at(addr.addr, loc);
-    materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
-    if let Err(inv_info) = state.check_valid(addr.addr) {
+    if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::Read) {
         let (invalidation, invalidation_history) = *inv_info;
         return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
             addr: addr.addr,
@@ -458,17 +485,20 @@ pub fn write_deref_with_history(
         state.post.attrs.mark_written_to(repr, 0, loc.clone());
     };
 
-    match check_addr_access_with_history(ref_addr.clone(), loc, state) {
-        PulseResult::Ok(()) => {}
-        PulseResult::FatalError(e, errs) => return PulseResult::FatalError(e, errs),
-        PulseResult::Recoverable((), errs) => {
-            state.write_heap_with_history(
-                ref_addr.addr,
-                Access::Dereference,
-                ValueWithHistory::new(obj.addr, obj.history.append_assignment(loc.clone())),
+    match check_validity_and_record_access(&ref_addr, loc, state, AccessMode::Write) {
+        Ok(()) => {}
+        Err(inv_info) => {
+            let (invalidation, invalidation_history) = *inv_info;
+            return PulseResult::FatalError(
+                Diagnostic::AccessToInvalidAddress {
+                    addr: ref_addr.addr,
+                    invalidation,
+                    access_location: loc.clone(),
+                    access_history: ref_addr.history.clone(),
+                    invalidation_history,
+                },
+                vec![],
             );
-            record_write(ref_addr.addr, state);
-            return PulseResult::Recoverable((), errs);
         }
     }
     // Abduce: record that the callee accesses this address for writing.
@@ -624,11 +654,23 @@ pub fn allocate(
 
 #[cfg(test)]
 mod tests {
+    use sil::mangled::Mangled;
     use sil::procdesc::Procdesc;
     use sil::procname::Procname;
+    use sil::pvar::Pvar;
     use sil::typ::Typ;
+    use sil::var::Var;
 
     use super::*;
+    use crate::attribute::Attribute;
+
+    fn make_pdesc_with_formal(name: &str) -> (Procdesc, Pvar) {
+        let pname = Procname::c_from_string("test");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(Mangled::from_string(name), Typ::void(), Default::default())];
+        let pvar = Pvar::mk(Mangled::from_string(name), pname);
+        (pdesc, pvar)
+    }
 
     #[test]
     fn test_access_through_zero_records_null_invalidation() {
@@ -652,6 +694,80 @@ mod tests {
         assert!(
             state.check_valid(p).is_err(),
             "known-zero access should materialize a null invalidation for later reporting"
+        );
+    }
+
+    #[test]
+    fn test_read_access_abduces_must_be_initialized_and_marks_initialized() {
+        let loc = Location::dummy();
+        let (pdesc, pvar) = make_pdesc_with_formal("p");
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar)))
+            .expect("formal should be bound");
+
+        let result = eval_deref_addr(formal_addr, &loc, &mut state);
+        assert!(matches!(result, PulseResult::Ok(_)));
+
+        let pre_attrs = state
+            .pre
+            .attrs
+            .get(&formal_addr)
+            .expect("formal read should abduce pre attrs");
+        assert!(
+            pre_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _))),
+            "read access should keep MustBeValid in the precondition"
+        );
+        assert!(
+            pre_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeInitialized(_, _))),
+            "read access should keep MustBeInitialized in the precondition"
+        );
+
+        let post_attrs = state
+            .post
+            .attrs
+            .get(&formal_addr)
+            .expect("read access should leave post attrs");
+        assert!(
+            post_attrs.contains(&Attribute::Initialized),
+            "successful reads should mark the accessed address initialized"
+        );
+    }
+
+    #[test]
+    fn test_write_access_marks_written_address_initialized() {
+        let loc = Location::dummy();
+        let (pdesc, pvar) = make_pdesc_with_formal("p");
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar)))
+            .expect("formal should be bound");
+
+        let result = write_deref(formal_addr, AbstractValue::mk_fresh(), &loc, &mut state);
+        assert!(matches!(result, PulseResult::Ok(())));
+
+        let post_attrs = state
+            .post
+            .attrs
+            .get(&formal_addr)
+            .expect("write access should leave post attrs");
+        assert!(
+            post_attrs.contains(&Attribute::Initialized),
+            "writes should mark the written address initialized"
+        );
+        assert!(
+            post_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::WrittenTo(_, _))),
+            "writes should keep the WrittenTo summary marker"
         );
     }
 }

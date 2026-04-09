@@ -5,6 +5,87 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active step on the main-summary comparator path was the OCaml-style
+  read/write access bookkeeping fix.
+- Stable checkpoint from this pass:
+  - `crates/pulse/src/operations.rs` and `crates/pulse/src/abductive.rs`
+    now mirror the `PulseOperations.check_addr_access` split more closely:
+    - successful reads abduce `MustBeInitialized` and mark the accessed
+      address `Initialized`
+    - successful writes mark the written address `Initialized` before the
+      existing `WrittenTo` summary marker
+  - focused unit coverage added:
+    - `operations::tests::test_read_access_abduces_must_be_initialized_and_marks_initialized`
+    - `operations::tests::test_write_access_marks_written_address_initialized`
+  - important OCaml cross-ref from this pass:
+    - `PulseInterproc.materialize_pre_from_actual` starts PRE
+      materialization from the dereferenced formal value, not the formal stack
+      cell itself
+    - consequence for Rust:
+      do **not** naively propagate formal-stack `MustBeValid` /
+      `MustBeInitialized` through the current substitution map
+    - current Rust interproc hook keeps the new pre-attr propagation limited
+      to non-formal derived addresses, and still accepts the older
+      `must_be_valid` post-set used by some Rust unit fixtures
+- Current `specialization.c` main-summary comparison result after this pass:
+  - `Matching: 5`
+  - `Differences: 16`
+  - the targeted attr gap improved locally:
+    simple summaries such as `add_one`, `add_two`, and `id` no longer miss
+    `MustBeInitialized` on the formal root in `pre_attrs`
+  - the dominant remaining clusters are now:
+    - heap/root shape mismatches
+    - formula representative/normalization mismatches
+    - latent invalid-access duplication / classification mismatches
+    - extra `Initialized` attrs that are likely downstream of the remaining
+      shape mismatch rather than a standalone access-mode bug
+- Validations completed on the current tree:
+  - `cargo test -q -p pulse operations::tests::test_read_access_abduces_must_be_initialized_and_marks_initialized --lib`
+  - `cargo test -q -p pulse operations::tests::test_write_access_marks_written_address_initialized --lib`
+  - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+  - `make check`
+
+- Active line of investigation has moved from count-level parity back to
+  fine-grained summary equivalence.
+- New summary-comparison checkpoint:
+  - `crates/test-harness/src/summary_compare.rs` now has a canonical
+    main-summary comparator that:
+    - parses OCaml `all_summaries.json`
+    - builds a fine-grained `PrePost` model (stack / heap / attrs /
+      conditions / phi / diagnostic)
+    - alpha-renames abstract values
+    - compares canonicalized main summaries per procedure
+  - `crates/pulse/tests/end_to_end.rs` now has the first gold-file harness
+    `test_summary_comparison_specialization_main`
+  - current scope is intentionally step 1 only:
+    - compare `main.pre_post_list`
+    - ignore specialized summaries for now
+    - ignore OCaml-only `type_constraints`
+    - ignore interval-only noise and filter builtin-only Rust summaries
+    - dedup simplified attrs so location/timestamp multiplicity does not
+      overwhelm the semantic diff
+- Focused validation:
+  - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+  - `make check`
+- Current `specialization.c` main-summary comparison result:
+  - `Matching: 5`
+  - `Differences: 16`
+  - no `ocaml_only` / `rust_only` procedures after builtin filtering
+- The remaining diff clusters now look actionable:
+  - **Precondition attr parity**: OCaml often exports
+    `MustBeInitialized + MustBeValid` on formal roots while Rust often exports
+    only `MustBeValid`
+  - **Heap/root shape parity**: several procedures still disagree on whether a
+    formal/root introduces an extra dereference layer (`v3 -*-> v2` vs
+    `v2 -*-> v3`-style mismatches)
+  - **Formula parity**: Rust still exports more normalized atom/linear forms in
+    places where OCaml exports `term_eqs` / `is_int`-shaped facts
+  - **Execution-kind parity**: `may_double_free_if_alias` still has
+    `LatentInvalidAccess` vs `ContinueProgram` differences
+- Realistic next step from this checkpoint:
+  - use the new `specialization.c` diff as the driver for main-summary parity
+    fixes before extending the comparator to `specialized`
+
 - Active line of investigation has now moved from the `traces.c` gap back to
   general parity / documentation cleanup.
 - Current tree status:

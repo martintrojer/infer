@@ -45,8 +45,8 @@ crates/pulse/
     base_memory.rs        Layer 5: AbstractValue → Edges heap graph
     base_attrs.rs         Layer 5: AbstractValue → Attributes map
     base_domain.rs        Layer 5: {stack, heap, attrs} composite
-    abductive.rs          Layer 7: pre/post state + formula, must_be_valid, check_valid
-    operations.rs         Layer 8: eval, read, write, invalidate, allocate, eval_or_fresh
+    abductive.rs          Layer 7: pre/post state + formula, must_be_valid, check_valid, initialized-read bookkeeping
+    operations.rs         Layer 8: eval, read, write, invalidate, allocate, eval_or_fresh, OCaml-style access-mode side effects
     models/mod.rs         Layer 8: model dispatch via builtin_decl::match_builtin
     models/c.rs           Layer 8: C models (malloc/free/realloc, new/delete, fopen, random, etc.)
     specialization.rs     Layer 8: function pointer dispatch specialization
@@ -101,7 +101,7 @@ void uaf() {
 | Formula | Inlined solver (was sledge) | Port: union-find, linear arith, atoms, CItv, FunctionApplication |
 | Result monad | Custom `PulseResult` with `let*` | `enum PulseResult<T>` with combinators |
 | Memory edges | `RecencyMap` (bounded) | `BTreeMap` (deterministic iteration) |
-| Biabduction | MustBeValid attrs, write_access | must_be_valid set, write_deref pre-edges |
+| Biabduction | MustBeValid + MustBeInitialized attrs, write_access | must_be_valid set plus local OCaml-style access-mode side effects; full interproc MustBeInitialized parity is still in progress |
 | Parallelism | Per-procedure via ondemand | Same, via `ondemand` crate with rayon |
 | Models | ~10K lines across languages | C models: malloc/free/realloc, new/delete, exit/abort, fopen/getcwd, random, 18 stdio |
 | Model dispatch | `ProcnameDispatcher` DSL | `builtin_decl::match_builtin` identity matching |

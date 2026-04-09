@@ -13,7 +13,7 @@ use std::fmt;
 use sil::location::Location;
 
 use crate::abstract_value::AbstractValue;
-use crate::attribute::{Attribute, Attributes};
+use crate::attribute::{Attribute, Attributes, InitializationError};
 use crate::invalidation::Invalidation;
 use crate::value_history::ValueHistory;
 
@@ -50,6 +50,20 @@ impl BaseAddressAttributes {
             if let Some((inv, history)) = attrs.get_invalid() {
                 return Err(Box::new((inv.clone(), history.clone())));
             }
+        }
+        Ok(())
+    }
+
+    /// Check if an address is initialized.
+    ///
+    /// Cross-ref: OCaml `PulseBaseAddressAttributes.check_initialized`.
+    pub fn check_initialized(&self, addr: AbstractValue) -> Result<(), InitializationError> {
+        if self
+            .map
+            .get(&addr)
+            .is_some_and(Attributes::is_uninitialized)
+        {
+            return Err(InitializationError::Uninitialized);
         }
         Ok(())
     }

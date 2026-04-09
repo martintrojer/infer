@@ -27,6 +27,13 @@ use crate::value_history::ValueHistory;
 /// Timestamp for ordering events in the analysis.
 pub type Timestamp = u64;
 
+/// Error returned when a read requires initialized memory but the address is
+/// still marked `Uninitialized`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitializationError {
+    Uninitialized,
+}
+
 /// How an address was allocated.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Allocator {
@@ -159,6 +166,22 @@ impl Attributes {
         })
     }
 
+    /// Find the `MustBeInitialized` attribute, if any.
+    pub fn get_must_be_initialized(&self) -> Option<(Timestamp, &Location)> {
+        self.0.iter().find_map(|a| match a {
+            Attribute::MustBeInitialized(ts, loc) => Some((*ts, loc)),
+            _ => None,
+        })
+    }
+
+    /// Find the `WrittenTo` attribute, if any.
+    pub fn get_written_to(&self) -> Option<(Timestamp, &Location)> {
+        self.0.iter().find_map(|a| match a {
+            Attribute::WrittenTo(ts, loc) => Some((*ts, loc)),
+            _ => None,
+        })
+    }
+
     /// Check if this address is allocated.
     pub fn is_allocated(&self) -> bool {
         self.0
@@ -182,6 +205,14 @@ impl Attributes {
     /// Check if this address is initialized.
     pub fn is_initialized(&self) -> bool {
         self.0.iter().any(|a| matches!(a, Attribute::Initialized))
+    }
+
+    /// Check if this address is still considered uninitialized.
+    ///
+    /// Cross-ref: OCaml `Attributes.get_uninitialized` ignores the marker once
+    /// `Initialized` is present.
+    pub fn is_uninitialized(&self) -> bool {
+        !self.is_initialized() && self.0.iter().any(|a| matches!(a, Attribute::Uninitialized))
     }
 
     /// Check if this address should be kept reachable across summary creation.

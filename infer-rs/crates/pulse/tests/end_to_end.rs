@@ -1108,12 +1108,18 @@ fn test_e2e_fopen_null_deref() {
     );
 }
 
-/// Summary comparison: run OCaml and Rust on same C files, compare summaries.
-/// Heavy test — spawns infer for each file.
-///   cargo test --test end_to_end test_summary_comparison -- --ignored --nocapture
+/// Summary comparison: run OCaml and Rust on the same C file and compare
+/// canonicalized main summaries.
+///
+/// Step 1 focuses on a single gold file and `main.pre_post_list`.
+/// Specialized-summary comparison is the next layer to add on top of the same
+/// canonical model.
+///
+/// Heavy test — spawns infer.
+///   cargo test --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture
 #[test]
 #[ignore]
-fn test_summary_comparison() {
+fn test_summary_comparison_specialization_main() {
     use test_harness::infer_runner::InferRunner;
     use test_harness::summary_compare;
 
@@ -1122,101 +1128,370 @@ fn test_summary_comparison() {
         return;
     };
 
-    let c_dir = test_harness::fixtures::ocaml_c_test_dir().join("pulse");
-    if !c_dir.exists() {
-        eprintln!("skipping: OCaml C test dir not found");
+    let c_path = test_harness::fixtures::ocaml_c_test_dir()
+        .join("pulse")
+        .join("specialization.c");
+    if !c_path.exists() {
+        eprintln!("skipping: specialization.c not found");
         return;
     }
 
-    // All files with NPE or leak differences plus key files
-    let test_files = [
-        "nullptr.c",
-        "interprocedural.c",
-        "exit_example.c",
-        "assert.c",
-        "angelism.c",
-        "nullptr_more.c",
-        "traces.c",
-        "memory_leak.c",
-        "latent.c",
-        "funptr.c",
-        "initlistexpr.c",
-        "compound_literal.c",
-        "abduce.c",
-        "specialization.c",
-        "fopen.c",
-    ];
+    let ocaml_summaries_path = runner
+        .analyze_pulse_c(&c_path)
+        .expect("OCaml analysis should succeed for specialization.c");
+    let ocaml_summaries = summary_compare::parse_ocaml_summaries(&ocaml_summaries_path);
 
-    for filename in test_files {
-        let c_path = c_dir.join(filename);
-        if !c_path.exists() {
+    let sil_path = runner
+        .dump_textual_for_c(&c_path)
+        .expect("dump-textual should succeed for specialization.c");
+    let tm = textual_utils::parse_file_and_convert(&sil_path);
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let mut rust_summaries = std::collections::HashMap::new();
+    for (pname, summary) in store.to_vec() {
+        if sil::builtin_decl::is_declared(&pname) {
             continue;
         }
-
-        eprintln!("\n--- {filename} ---");
-
-        // 1. Run OCaml pulse and get summaries
-        let ocaml_summaries_path = match runner.analyze_pulse_c(&c_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("  OCaml analysis failed: {e}");
-                continue;
-            }
-        };
-        let ocaml_facts = summary_compare::parse_ocaml_summaries(&ocaml_summaries_path);
-
-        // 2. Run dump-textual and get the .sil, then run Rust pipeline
-        let sil_path = match runner.dump_textual_for_c(&c_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("  dump-textual failed: {e}");
-                continue;
-            }
-        };
-        let tm = textual_utils::parse_file_and_convert(&sil_path);
-        let checker = PulseInterChecker;
-        let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
-
-        // 3. Extract Rust summary facts
-        let mut rust_facts = std::collections::HashMap::new();
-        for (pname, summary) in store.to_vec() {
-            let name = format!("{pname}");
-            // Strip any qualifiers to match OCaml's simple name
-            let simple_name = name.split('.').last().unwrap_or(&name).to_string();
-
-            let exec_states = if summary.is_noreturn {
-                vec!["ExitProgram".to_string()]
-            } else if summary.diagnostics.is_empty() {
-                vec!["ContinueProgram".to_string()]
-            } else {
-                vec!["AbortProgram".to_string()]
-            };
-
-            // Check if any value in any disjunct's post-state has Invalid attrs
-            let has_null_attrs = summary.pre_posts.iter().any(|pp| {
-                pp.post
-                    .post
-                    .attrs
-                    .iter()
-                    .any(|(_, attrs)| attrs.get_invalid().is_some())
-            });
-
-            rust_facts.insert(
-                simple_name,
-                summary_compare::SummaryFacts::new(
-                    summary.pre_posts.len().max(1), // at least 1 disjunct
-                    exec_states,
-                    has_null_attrs,
-                    vec![],
-                    summary.is_noreturn,
-                ),
-            );
-        }
-
-        // 4. Compare
-        let report = summary_compare::compare_summaries(&ocaml_facts, &rust_facts);
-        eprintln!("{report}");
+        rust_summaries.insert(
+            pname.get_method_name().to_string(),
+            rust_summary_to_canonical(&summary),
+        );
     }
+
+    let report = summary_compare::compare_summaries(&ocaml_summaries, &rust_summaries);
+    eprintln!("{report}");
+    assert!(
+        report.ocaml_only.is_empty() && report.rust_only.is_empty(),
+        "specialization.c summary harness should compare the same procedure set\n{report}"
+    );
+    assert!(
+        report.matching + report.differences.len() > 0,
+        "specialization.c summary harness should compare at least one procedure"
+    );
+}
+
+fn rust_summary_to_canonical(
+    summary: &pulse::summary::PulseSummary,
+) -> test_harness::summary_compare::CanonicalProcedureSummary {
+    let raw = test_harness::summary_compare::RawProcedureSummary {
+        main: summary.pre_posts.iter().map(rust_pre_post_to_raw).collect(),
+    };
+    raw.canonicalize()
+}
+
+fn rust_pre_post_to_raw(
+    pre_post: &pulse::summary::PrePost,
+) -> test_harness::summary_compare::RawPrePost {
+    test_harness::summary_compare::RawPrePost {
+        kind: format!("{:?}", pre_post.kind),
+        pre_stack: rust_stack_entries(&pre_post.pre.stack),
+        post_stack: rust_stack_entries(&pre_post.post.post.stack),
+        pre_heap: rust_heap_edges(&pre_post.pre.heap),
+        post_heap: rust_heap_edges(&pre_post.post.post.heap),
+        pre_attrs: rust_attrs(&pre_post.pre.attrs),
+        post_attrs: rust_attrs(&pre_post.post.post.attrs),
+        conditions: rust_conditions(&pre_post.post.path_condition),
+        phi: rust_phi_items(&pre_post.post.path_condition),
+        diagnostic: pre_post.diagnostic.as_ref().map(format_rust_diagnostic),
+    }
+}
+
+fn rust_stack_entries(stack: &pulse::base_stack::BaseStack) -> Vec<(String, String)> {
+    let mut entries: Vec<_> = stack
+        .iter()
+        .map(|(var, addr)| (rust_var_name(var), format!("{addr}")))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn rust_heap_edges(
+    heap: &pulse::base_memory::BaseMemory,
+) -> Vec<test_harness::summary_compare::RawEdge> {
+    let mut edges = Vec::new();
+    for (src, outgoing) in heap.iter() {
+        for (access, dst) in outgoing.iter() {
+            edges.push(test_harness::summary_compare::RawEdge {
+                src: format!("{src}"),
+                access: format_rust_access(access),
+                dst: format!("{dst}"),
+            });
+        }
+    }
+    edges.sort();
+    edges
+}
+
+fn rust_attrs(attrs: &pulse::base_attrs::BaseAddressAttributes) -> Vec<(String, Vec<String>)> {
+    let mut entries: Vec<_> = attrs
+        .iter()
+        .map(|(addr, attr_set)| {
+            let mut attr_strings: Vec<_> = attr_set.iter().map(format_rust_attr).collect();
+            attr_strings.sort();
+            attr_strings.dedup();
+            (format!("{addr}"), attr_strings)
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn rust_conditions(formula: &pulse::formula::Formula) -> Vec<String> {
+    let mut conditions: Vec<_> = formula
+        .conditions()
+        .keys()
+        .map(|atom| format!("cond:{}", format_rust_atom(atom)))
+        .collect();
+    conditions.sort();
+    conditions
+}
+
+fn rust_phi_items(formula: &pulse::formula::Formula) -> Vec<String> {
+    let phi = formula.phi();
+    let mut items = Vec::new();
+
+    for (var, lin) in &phi.linear_eqs {
+        items.push(format!("eq:{var}={}", format_rust_linear(lin)));
+    }
+
+    for (var, term_eq) in &phi.term_eqs {
+        items.push(format!("eq:{var}={}", format_rust_term_eq(term_eq)));
+    }
+
+    for (fn_app, ret) in phi.iter_fn_app_eqs() {
+        items.push(format!("eq:{ret}={}", format_rust_fn_app(fn_app)));
+    }
+
+    for var in &phi.is_int_vars {
+        items.push(format!("is_int({var})"));
+    }
+
+    for atom in &phi.atoms {
+        items.push(format!("atom:{}", format_rust_atom(atom)));
+    }
+
+    items.sort();
+    items
+}
+
+fn rust_var_name(var: &sil::var::Var) -> String {
+    match var {
+        sil::var::Var::ProgramVar(pvar) => {
+            if pvar.is_return() {
+                "return".to_string()
+            } else {
+                pvar.name.plain.clone()
+            }
+        }
+        sil::var::Var::LogicalVar(id) => id.name.as_str().to_string(),
+    }
+}
+
+fn format_rust_access(access: &pulse::access::Access) -> String {
+    match access {
+        pulse::access::Access::Dereference => "*".to_string(),
+        pulse::access::Access::FieldAccess(field) => format!(".{}", field.field_name),
+        pulse::access::Access::ArrayAccess(_, index) => format!("[{index}]"),
+    }
+}
+
+fn format_rust_attr(attr: &pulse::attribute::Attribute) -> String {
+    match attr {
+        pulse::attribute::Attribute::Initialized => "Initialized".to_string(),
+        pulse::attribute::Attribute::WrittenTo(_, _) => "WrittenTo".to_string(),
+        pulse::attribute::Attribute::MustBeValid(_, _, Some(reason)) => {
+            format!("MustBeValid({})", format_rust_reason(reason))
+        }
+        pulse::attribute::Attribute::MustBeValid(_, _, None) => "MustBeValid".to_string(),
+        pulse::attribute::Attribute::MustBeInitialized(_, _) => "MustBeInitialized".to_string(),
+        pulse::attribute::Attribute::Invalid(invalidation, _) => {
+            format!("Invalid({})", format_rust_invalidation(invalidation))
+        }
+        pulse::attribute::Attribute::Allocated(allocator, _) => {
+            format!("Allocated({})", format_rust_allocator(allocator))
+        }
+        pulse::attribute::Attribute::Closure(proc) => {
+            format!("Closure({})", proc.get_method_name())
+        }
+        pulse::attribute::Attribute::ReturnedFromUnknown(values) => {
+            let values = values.iter().map(ToString::to_string).collect::<Vec<_>>();
+            format!("ReturnedFromUnknown({})", values.join(","))
+        }
+        pulse::attribute::Attribute::StaticType(typ) => format!("StaticType({typ:?})"),
+        pulse::attribute::Attribute::UsedAsBranchCond(proc, _) => {
+            format!("UsedAsBranchCond({})", proc.get_method_name())
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+fn format_rust_reason(reason: &pulse::invalidation::MustBeValidReason) -> String {
+    match reason {
+        pulse::invalidation::MustBeValidReason::BlockCall => "BlockCall".to_string(),
+        pulse::invalidation::MustBeValidReason::InsertionIntoCollectionKey => {
+            "InsertionIntoCollectionKey".to_string()
+        }
+        pulse::invalidation::MustBeValidReason::InsertionIntoCollectionValue => {
+            "InsertionIntoCollectionValue".to_string()
+        }
+        pulse::invalidation::MustBeValidReason::SelfOfNonPODReturnMethod(typ) => {
+            format!("SelfOfNonPODReturnMethod({typ:?})")
+        }
+        pulse::invalidation::MustBeValidReason::NullArgumentWhereNonNullExpected => {
+            "NullArgumentWhereNonNullExpected".to_string()
+        }
+    }
+}
+
+fn format_rust_invalidation(invalidation: &pulse::invalidation::Invalidation) -> String {
+    match invalidation {
+        pulse::invalidation::Invalidation::CFree => "CFree".to_string(),
+        pulse::invalidation::Invalidation::ComparedToNullInThisProcedure(_) => {
+            "ComparedToNullInThisProcedure".to_string()
+        }
+        pulse::invalidation::Invalidation::ConstantDereference(value) => {
+            format!("ConstantDereference({value})")
+        }
+        pulse::invalidation::Invalidation::CppDelete => "CppDelete".to_string(),
+        pulse::invalidation::Invalidation::CppDeleteArray => "CppDeleteArray".to_string(),
+        pulse::invalidation::Invalidation::EndIterator => "EndIterator".to_string(),
+        pulse::invalidation::Invalidation::FClose => "FClose".to_string(),
+        pulse::invalidation::Invalidation::GoneOutOfScope(_, _) => "GoneOutOfScope".to_string(),
+        pulse::invalidation::Invalidation::OptionalEmpty => "OptionalEmpty".to_string(),
+        pulse::invalidation::Invalidation::StdVector(function) => {
+            format!("StdVector({function:?})")
+        }
+    }
+}
+
+fn format_rust_allocator(allocator: &pulse::attribute::Allocator) -> String {
+    match allocator {
+        pulse::attribute::Allocator::CMalloc => "CMalloc".to_string(),
+        pulse::attribute::Allocator::CRealloc => "CRealloc".to_string(),
+        pulse::attribute::Allocator::CppNew => "CppNew".to_string(),
+        pulse::attribute::Allocator::CppNewArray => "CppNewArray".to_string(),
+        pulse::attribute::Allocator::HackAsync => "HackAsync".to_string(),
+        pulse::attribute::Allocator::JavaResource(proc) => {
+            format!("JavaResource({})", proc.get_method_name())
+        }
+        pulse::attribute::Allocator::CSharpResource(proc) => {
+            format!("CSharpResource({})", proc.get_method_name())
+        }
+        pulse::attribute::Allocator::CustomMalloc(proc) => {
+            format!("CustomMalloc({})", proc.get_method_name())
+        }
+        pulse::attribute::Allocator::CustomRealloc(proc) => {
+            format!("CustomRealloc({})", proc.get_method_name())
+        }
+        pulse::attribute::Allocator::CustomFree(proc) => {
+            format!("CustomFree({})", proc.get_method_name())
+        }
+    }
+}
+
+fn format_rust_diagnostic(diagnostic: &pulse::diagnostic::Diagnostic) -> String {
+    match diagnostic {
+        pulse::diagnostic::Diagnostic::AccessToInvalidAddress { invalidation, .. } => {
+            format!(
+                "AccessToInvalidAddress({})",
+                format_rust_invalidation(invalidation)
+            )
+        }
+        pulse::diagnostic::Diagnostic::MemoryLeak { .. } => "MemoryLeak".to_string(),
+        pulse::diagnostic::Diagnostic::RetainCycle { .. } => "RetainCycle".to_string(),
+    }
+}
+
+fn format_rust_atom(atom: &pulse::formula::atom::Atom) -> String {
+    match atom {
+        pulse::formula::atom::Atom::Equal(lhs, rhs) => {
+            format!("{} = {}", format_rust_term(lhs), format_rust_term(rhs))
+        }
+        pulse::formula::atom::Atom::NotEqual(lhs, rhs) => {
+            format!("{} != {}", format_rust_term(lhs), format_rust_term(rhs))
+        }
+        pulse::formula::atom::Atom::LessEqual(lhs, rhs) => {
+            format!("{} <= {}", format_rust_term(lhs), format_rust_term(rhs))
+        }
+        pulse::formula::atom::Atom::LessThan(lhs, rhs) => {
+            format!("{} < {}", format_rust_term(lhs), format_rust_term(rhs))
+        }
+    }
+}
+
+fn format_rust_term(term: &pulse::formula::term::Term) -> String {
+    match term {
+        pulse::formula::term::Term::Var(var) => format!("{var}"),
+        pulse::formula::term::Term::Const(constant) => constant.to_string(),
+        pulse::formula::term::Term::Add(lhs, rhs) => {
+            format!("add({}, {})", format_rust_term(lhs), format_rust_term(rhs))
+        }
+        pulse::formula::term::Term::Sub(lhs, rhs) => {
+            format!("sub({}, {})", format_rust_term(lhs), format_rust_term(rhs))
+        }
+        pulse::formula::term::Term::Mult(lhs, rhs) => {
+            format!("mult({}, {})", format_rust_term(lhs), format_rust_term(rhs))
+        }
+        pulse::formula::term::Term::Neg(inner) => format!("neg({})", format_rust_term(inner)),
+        pulse::formula::term::Term::Not(inner) => format!("not({})", format_rust_term(inner)),
+        pulse::formula::term::Term::IsZero(inner) => {
+            format!("is_zero({})", format_rust_term(inner))
+        }
+    }
+}
+
+fn format_rust_linear(lin: &pulse::formula::lin_arith::LinArith) -> String {
+    let mut terms: Vec<_> = lin
+        .vars
+        .iter()
+        .map(|(var, coeff)| (format!("{var}"), coeff.to_string()))
+        .collect();
+    terms.sort();
+    format_linear_for_compare(terms, lin.constant.to_string())
+}
+
+fn format_rust_term_eq(term_eq: &pulse::formula::phi::TermEq) -> String {
+    format!(
+        "binop::{:?}({}, {})",
+        term_eq.op,
+        format_rust_operand(&term_eq.lhs),
+        format_rust_operand(&term_eq.rhs)
+    )
+}
+
+fn format_rust_operand(operand: &pulse::formula::Operand) -> String {
+    match operand {
+        pulse::formula::Operand::AbstractValue(value) => format!("{value}"),
+        pulse::formula::Operand::ConstOperand(value) => value.to_string(),
+    }
+}
+
+fn format_rust_fn_app(fn_app: &pulse::formula::phi::FnAppKey) -> String {
+    let actuals = fn_app
+        .actuals
+        .iter()
+        .map(|actual| match actual {
+            pulse::formula::phi::FnAppActual::Const(value) => value.to_string(),
+            pulse::formula::phi::FnAppActual::Var(value) => format!("{value}"),
+        })
+        .collect::<Vec<_>>();
+    format!("{}({})", fn_app.callee, actuals.join(","))
+}
+
+fn format_linear_for_compare(mut terms: Vec<(String, String)>, constant: String) -> String {
+    terms.sort();
+    if terms.is_empty() {
+        return constant;
+    }
+    let mut pieces: Vec<_> = terms
+        .into_iter()
+        .map(|(var, coeff)| format!("{coeff}*{var}"))
+        .collect();
+    if constant != "0" {
+        pieces.push(format!("const={constant}"));
+    }
+    format!("lin({})", pieces.join(","))
 }
 
 /// Test that null attributes propagate through summaries.
