@@ -194,7 +194,16 @@ pub fn analyze_with_specialization_and_requests(
     // path for empty stubs / declarations.
     let is_noreturn = pdesc.is_no_return;
 
-    let summary = PulseSummary::of_proc(pdesc, &exit_disjuncts, diagnostics, is_noreturn);
+    let has_dropped_disjuncts = inv_map
+        .values()
+        .any(|domain| domain.post.had_dropped_disjuncts);
+    let summary = PulseSummary::of_proc_with_metadata(
+        pdesc,
+        &exit_disjuncts,
+        diagnostics,
+        is_noreturn,
+        has_dropped_disjuncts,
+    );
     let spec_requests = pulse_tf.spec_requests.into_inner();
     (summary, spec_requests)
 }
@@ -298,7 +307,12 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             disjuncts: new_disjuncts,
             max_disjuncts: state.max_disjuncts,
             max_widen_iters: state.max_widen_iters,
+            // Cross-ref: OCaml carries dropped-disjunct metadata in the
+            // non-disjunctive state, so once a path has been under-approximated
+            // the bit remains set for the rest of the procedure.
+            had_dropped_disjuncts: state.had_dropped_disjuncts,
         };
+        result.dedup();
         result.bound();
 
         let rc = result.disjuncts.iter().filter(|d| d.is_continue()).count();
@@ -332,6 +346,7 @@ fn exec_instr_with_summaries(
         fun_exp: Exp::Const(Const::Cfun(callee_pname)),
         args,
         loc,
+        flags,
         ..
     } = instr
     {
@@ -341,6 +356,7 @@ fn exec_instr_with_summaries(
             ret_typ,
             args,
             loc,
+            call_flags: flags,
             spec_requests,
         };
 
@@ -368,6 +384,14 @@ fn exec_instr_with_summaries(
                 },
                 state,
             );
+        }
+
+        if *callee_pname == pdesc.proc_name {
+            // Cross-ref: OCaml PulseCallOperations.on_recursive_call returns
+            // the current state for direct self-recursion instead of routing
+            // the call through generic unknown-call havoc.
+            log::debug!("  [call] cut direct self recursion: {callee_pname}");
+            return vec![ExecutionDomain::ContinueProgram(state)];
         }
     }
 
@@ -437,6 +461,7 @@ struct CallSite<'a> {
     ret_typ: &'a sil::typ::Typ,
     args: &'a [(Exp, sil::typ::Typ)],
     loc: &'a sil::location::Location,
+    call_flags: &'a sil::call_flags::CallFlags,
     spec_requests: Option<&'a RefCell<Vec<(Procname, PulseSpecialization)>>>,
 }
 
@@ -445,6 +470,19 @@ struct KnownCalleeCall<'a> {
     callee_pname: &'a Procname,
     callee_summary: &'a PulseSummary,
     callsite: CallSite<'a>,
+}
+
+#[derive(Clone)]
+struct SelectedSummary<'a> {
+    pre_posts: &'a [crate::summary::PrePost],
+    specialization: PulseSpecialization,
+    has_dropped_disjuncts: bool,
+}
+
+struct KnownCalleeResults {
+    results: Vec<ExecutionDomain>,
+    used_summary_has_dropped_disjuncts: bool,
+    used_summary_was_empty: bool,
 }
 
 fn merge_return_history_from_equal_actuals(
@@ -683,22 +721,29 @@ fn extract_root_pvar(path: &sil::specialization::HeapPath) -> Option<&sil::pvar:
 fn select_pre_posts_and_specialization<'a>(
     callee_summary: &'a PulseSummary,
     caller_spec: Option<&PulseSpecialization>,
-) -> (&'a [crate::summary::PrePost], PulseSpecialization) {
+) -> SelectedSummary<'a> {
     if let Some(spec) = caller_spec {
-        if let Some(specialized) = callee_summary.get_specialized(spec) {
-            return (specialized, spec.clone());
+        if let Some(specialized) = callee_summary.get_specialized_data(spec) {
+            return SelectedSummary {
+                pre_posts: &specialized.pre_posts,
+                specialization: spec.clone(),
+                has_dropped_disjuncts: specialized.has_dropped_disjuncts,
+            };
         }
     }
 
-    (&callee_summary.pre_posts, PulseSpecialization::bottom())
+    SelectedSummary {
+        pre_posts: &callee_summary.pre_posts,
+        specialization: PulseSpecialization::bottom(),
+        has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
+    }
 }
 
 fn apply_pre_posts_with_specialization_loop(
     known_callee: KnownCalleeCall<'_>,
     caller_state: &crate::abductive::AbductiveDomain,
-    initial_pre_posts: &[crate::summary::PrePost],
-    initial_spec: PulseSpecialization,
-) -> Vec<ExecutionDomain> {
+    initial_summary: SelectedSummary<'_>,
+) -> KnownCalleeResults {
     // Cross-ref: OCaml `PulseCallOperations.iter_call` first tries the
     // currently available summary, then turns alias contradictions from
     // `PulseInterproc.apply_summary` into alias specialization requests or an
@@ -713,13 +758,18 @@ fn apply_pre_posts_with_specialization_loop(
     } = known_callee.callsite;
     let callee_pname = known_callee.callee_pname;
     let callee_summary = known_callee.callee_summary;
-    let mut current_pre_posts = initial_pre_posts;
-    let mut current_spec = initial_spec;
+    let mut current_pre_posts = initial_summary.pre_posts;
+    let mut current_spec = initial_summary.specialization;
+    let mut current_has_dropped_disjuncts = initial_summary.has_dropped_disjuncts;
     let mut tried_specs: Vec<PulseSpecialization> = Vec::new();
 
     loop {
         if current_pre_posts.is_empty() {
-            return vec![];
+            return KnownCalleeResults {
+                results: vec![],
+                used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
+                used_summary_was_empty: true,
+            };
         }
 
         log::debug!(
@@ -746,25 +796,38 @@ fn apply_pre_posts_with_specialization_loop(
         }
 
         if !results.is_empty() || alias_groups.is_empty() {
-            return results;
+            return KnownCalleeResults {
+                results,
+                used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
+                used_summary_was_empty: false,
+            };
         }
 
         let next_spec = specialization_with_aliases(&current_spec, alias_groups);
         if next_spec == current_spec || tried_specs.iter().any(|spec| spec == &next_spec) {
-            return vec![];
+            return KnownCalleeResults {
+                results: vec![],
+                used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
+                used_summary_was_empty: false,
+            };
         }
         tried_specs.push(next_spec.clone());
 
-        if let Some(specialized) = callee_summary.get_specialized(&next_spec) {
+        if let Some(specialized) = callee_summary.get_specialized_data(&next_spec) {
             log::debug!("  [call] retrying {callee_pname} with alias specialization {next_spec}");
             current_spec = next_spec;
-            current_pre_posts = specialized;
+            current_pre_posts = &specialized.pre_posts;
+            current_has_dropped_disjuncts = specialized.has_dropped_disjuncts;
             continue;
         }
 
         log::debug!("  [call] requesting alias specialization {next_spec}");
         queue_specialization_request(spec_requests, callee_pname, callee_summary, next_spec);
-        return vec![];
+        return KnownCalleeResults {
+            results: vec![],
+            used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
+            used_summary_was_empty: false,
+        };
     }
 }
 
@@ -778,6 +841,7 @@ fn exec_known_callee_summary(
         ret_typ,
         args,
         loc,
+        call_flags: _,
         spec_requests,
     } = known_callee.callsite;
     let callee_pname = known_callee.callee_pname;
@@ -838,16 +902,79 @@ fn exec_known_callee_summary(
         propagate_specialization_need(callee_summary, args, loc, &mut state);
     }
 
-    let (pre_posts, active_spec) =
+    let selected_summary =
         select_pre_posts_and_specialization(callee_summary, caller_spec.as_ref());
-    if pre_posts.is_empty() {
+    if selected_summary.pre_posts.is_empty() {
         log::debug!("  [call] no applicable pre/posts for {callee_pname}");
-        return vec![];
+        let results = maybe_force_continue_after_known_call(
+            known_callee.callsite,
+            state.clone(),
+            callee_pname,
+            vec![],
+            true,
+        );
+        return merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state);
     }
 
-    let results =
-        apply_pre_posts_with_specialization_loop(known_callee, &state, pre_posts, active_spec);
+    let applied = apply_pre_posts_with_specialization_loop(known_callee, &state, selected_summary);
+    let results = maybe_force_continue_after_known_call(
+        known_callee.callsite,
+        state.clone(),
+        callee_pname,
+        applied.results,
+        applied.used_summary_was_empty || applied.used_summary_has_dropped_disjuncts,
+    );
     merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state)
+}
+
+fn has_continue_program(results: &[ExecutionDomain]) -> bool {
+    results
+        .iter()
+        .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_)))
+}
+
+fn exec_known_call_as_unknown(
+    callsite: CallSite<'_>,
+    callee_pname: &Procname,
+    state: crate::abductive::AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    let CallSite {
+        pdesc,
+        ret_id,
+        ret_typ,
+        args,
+        loc,
+        call_flags,
+        ..
+    } = callsite;
+    let call_instr = Instr::Call {
+        ret: (ret_id.clone(), ret_typ.clone()),
+        fun_exp: Exp::Const(Const::Cfun(callee_pname.clone())),
+        args: args.to_vec(),
+        loc: loc.clone(),
+        flags: call_flags.clone(),
+    };
+    transfer::exec_instr_with_pdesc(Some(pdesc), &call_instr, state)
+}
+
+fn maybe_force_continue_after_known_call(
+    callsite: CallSite<'_>,
+    state: crate::abductive::AbductiveDomain,
+    callee_pname: &Procname,
+    mut results: Vec<ExecutionDomain>,
+    should_force_continue: bool,
+) -> Vec<ExecutionDomain> {
+    if !config::get().pulse_force_continue
+        || has_continue_program(&results)
+        || !should_force_continue
+    {
+        return results;
+    }
+
+    log::debug!("  [call] forcing continue for {callee_pname}: treating known callee as unknown");
+    let mut unknown_results = exec_known_call_as_unknown(callsite, callee_pname, state);
+    unknown_results.append(&mut results);
+    unknown_results
 }
 
 /// Handle `__call_c_function_ptr(funptr, args...)`.
@@ -869,6 +996,7 @@ fn exec_call_c_function_ptr(
         ret_typ,
         args,
         loc,
+        call_flags,
         spec_requests,
     } = callsite;
     // First arg is the function pointer, rest are the actual arguments
@@ -910,7 +1038,7 @@ fn exec_call_c_function_ptr(
                 fun_exp: Exp::Const(Const::Cfun(target_pname)),
                 args: actual_args.to_vec(),
                 loc: loc.clone(),
-                flags: sil::call_flags::CallFlags::default(),
+                flags: call_flags.clone(),
             };
             return transfer::exec_instr_with_pdesc(Some(pdesc), &call_instr, state);
         }
@@ -931,6 +1059,7 @@ fn exec_call_c_function_ptr(
                         ret_typ,
                         args: actual_args,
                         loc,
+                        call_flags,
                         spec_requests,
                     },
                 },
@@ -1080,14 +1209,17 @@ mod tests {
             specialized_state.write_heap(specialized_formal_val, Access::Dereference, written);
             vec![(
                 alias_spec.clone(),
-                vec![PrePost {
-                    pre: specialized_state.pre.clone(),
-                    post: specialized_state,
-                    formals: vec![(formal_pvar.clone(), specialized_formal_addr)],
-                    result: None,
-                    kind: PrePostKind::ContinueProgram,
-                    diagnostic: None,
-                }],
+                crate::summary::SpecializedSummary {
+                    pre_posts: vec![PrePost {
+                        pre: specialized_state.pre.clone(),
+                        post: specialized_state,
+                        formals: vec![(formal_pvar.clone(), specialized_formal_addr)],
+                        result: None,
+                        kind: PrePostKind::ContinueProgram,
+                        diagnostic: None,
+                    }],
+                    has_dropped_disjuncts: false,
+                },
             )]
         } else {
             Vec::new()
@@ -1097,6 +1229,7 @@ mod tests {
             callee_pname,
             PulseSummary {
                 pre_posts: vec![unspecialized_pre_post],
+                has_dropped_disjuncts: false,
                 specialized,
                 diagnostics: vec![],
                 is_noreturn: false,
@@ -1107,6 +1240,91 @@ mod tests {
             alias_spec,
             next_field,
         )
+    }
+
+    fn make_abort_only_summary(has_dropped_disjuncts: bool) -> (Procname, PulseSummary) {
+        let callee_pname = Procname::c_from_string("abort_only");
+        let callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        let state = crate::abductive::AbductiveDomain::mk_initial(&callee_pdesc);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            access_history: ValueHistory::epoch(),
+            invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
+        };
+        (
+            callee_pname,
+            PulseSummary {
+                pre_posts: vec![PrePost {
+                    pre: state.pre.clone(),
+                    post: state,
+                    formals: vec![],
+                    result: None,
+                    kind: PrePostKind::AbortProgram,
+                    diagnostic: Some(diagnostic.clone()),
+                }],
+                has_dropped_disjuncts,
+                specialized: vec![],
+                diagnostics: vec![diagnostic],
+                is_noreturn: false,
+                needs_specialization: HashMap::new(),
+                is_empty_body: false,
+                formal_types: vec![],
+            },
+        )
+    }
+
+    fn make_empty_known_summary() -> (Procname, PulseSummary) {
+        let callee_pname = Procname::c_from_string("empty_known");
+        (
+            callee_pname,
+            PulseSummary {
+                pre_posts: vec![],
+                has_dropped_disjuncts: false,
+                specialized: vec![],
+                diagnostics: vec![],
+                is_noreturn: false,
+                needs_specialization: HashMap::new(),
+                is_empty_body: false,
+                formal_types: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn test_exec_instr_preserves_dropped_disjuncts_metadata() {
+        let pname = Procname::c_from_string("preserve_drop_flag");
+        let pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let callee_summaries = HashMap::new();
+        let tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            proc_name: format!("{pname}"),
+            spec_requests: RefCell::new(vec![]),
+        };
+        let state = DisjunctiveDomain {
+            disjuncts: vec![ExecutionDomain::ContinueProgram(
+                crate::abductive::AbductiveDomain::mk_initial(&pdesc),
+            )],
+            max_disjuncts: 20,
+            max_widen_iters: 3,
+            had_dropped_disjuncts: true,
+        };
+        let instr = Instr::Load {
+            id: Ident::create_normal(IdentName::from_string("n"), 0),
+            e: Exp::Const(Const::Cint(IntLit::zero())),
+            typ: Typ::void(),
+            loc: Location::dummy(),
+        };
+
+        let result = tf.exec_instr(&state, &(), pdesc.start_node, 0, &instr);
+
+        assert!(
+            result.had_dropped_disjuncts,
+            "instruction execution should preserve earlier dropped-disjunct metadata"
+        );
     }
 
     /// Build: void f() { int *p = NULL; *p = 42; }
@@ -1266,6 +1484,7 @@ mod tests {
             (Exp::Var(arg_id), Typ::int(sil::typ::IKind::IInt)),
         ];
         let requests = RefCell::new(Vec::new());
+        let call_flags = sil::call_flags::CallFlags::default();
 
         let results = exec_call_c_function_ptr(
             CallSite {
@@ -1274,6 +1493,7 @@ mod tests {
                 ret_typ: &Typ::int(sil::typ::IKind::IInt),
                 args: &args,
                 loc: &Location::dummy(),
+                call_flags: &call_flags,
                 spec_requests: Some(&requests),
             },
             state,
@@ -1344,6 +1564,41 @@ mod tests {
         assert!(
             state.path_condition.phi().is_marked_int(ret_val),
             "integer return type should keep the is_int fact on the fresh unknown result"
+        );
+    }
+
+    #[test]
+    fn test_exec_instr_cuts_direct_self_recursion_before_unknown_call_havoc() {
+        let pname = Procname::c_from_string("self_rec");
+        let pdesc = Procdesc::new(
+            pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        let instr = Instr::Call {
+            ret: (ret_id.clone(), Typ::int(sil::typ::IKind::IInt)),
+            fun_exp: Exp::Const(Const::Cfun(pname)),
+            args: vec![],
+            loc: Location::dummy(),
+            flags: sil::call_flags::CallFlags::default(),
+        };
+
+        let results = exec_instr_with_summaries(
+            &pdesc,
+            &instr,
+            crate::abductive::AbductiveDomain::mk_initial(&pdesc),
+            &HashMap::new(),
+            None,
+        );
+
+        let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
+            panic!("expected direct self recursion to keep one continue state, got {results:?}");
+        };
+
+        assert!(
+            state.post.stack.find(&Var::LogicalVar(ret_id)).is_none(),
+            "direct self recursion should return the current state, not write an unknown return"
         );
     }
 
@@ -1860,6 +2115,7 @@ mod tests {
         let ret_typ = Typ::void();
         let args = [(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))];
         let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
 
         let results = exec_known_callee_summary(
             KnownCalleeCall {
@@ -1871,6 +2127,7 @@ mod tests {
                     ret_typ: &ret_typ,
                     args: &args,
                     loc: &loc,
+                    call_flags: &call_flags,
                     spec_requests: Some(&requests),
                 },
             },
@@ -1910,6 +2167,7 @@ mod tests {
         let ret_typ = Typ::void();
         let args = [(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))];
         let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
 
         let results = exec_known_callee_summary(
             KnownCalleeCall {
@@ -1921,6 +2179,7 @@ mod tests {
                     ret_typ: &ret_typ,
                     args: &args,
                     loc: &loc,
+                    call_flags: &call_flags,
                     spec_requests: Some(&requests),
                 },
             },
@@ -1945,6 +2204,132 @@ mod tests {
         assert!(
             requests.into_inner().is_empty(),
             "cached specialization should avoid re-enqueueing the same alias request"
+        );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_force_continue_for_empty_summary() {
+        let (callee_pname, callee_summary) = make_empty_known_summary();
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let ret_id = Ident::create_none();
+        let ret_typ = Typ::void();
+        let args: [(Exp, Typ); 0] = [];
+        let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
+        let state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let results = exec_known_callee_summary(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    call_flags: &call_flags,
+                    spec_requests: None,
+                },
+            },
+            state,
+        );
+
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
+            "empty known summaries should fall back to unknown-call continue, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_force_continue_appends_unknown_continue_for_dropped_summary()
+    {
+        let (callee_pname, callee_summary) = make_abort_only_summary(true);
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let ret_id = Ident::create_none();
+        let ret_typ = Typ::void();
+        let args: [(Exp, Typ); 0] = [];
+        let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
+        let state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let results = exec_known_callee_summary(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    call_flags: &call_flags,
+                    spec_requests: None,
+                },
+            },
+            state,
+        );
+
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
+            "dropped-summary known calls should gain an unknown-call continue, got {results:?}"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "manifest callee-local aborts should still stay unpublished on callers; force-continue only restores the missing continue path"
+        );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_does_not_force_continue_for_precise_abort_only_summary() {
+        let (callee_pname, callee_summary) = make_abort_only_summary(false);
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let ret_id = Ident::create_none();
+        let ret_typ = Typ::void();
+        let args: [(Exp, Typ); 0] = [];
+        let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
+        let state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let results = exec_known_callee_summary(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    call_flags: &call_flags,
+                    spec_requests: None,
+                },
+            },
+            state,
+        );
+
+        assert!(
+            !results
+                .iter()
+                .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
+            "precise abort-only summaries should not be widened into unknown-call continues"
         );
     }
 

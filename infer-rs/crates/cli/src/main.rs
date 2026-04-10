@@ -59,6 +59,11 @@ struct Cli {
     #[arg(long = "pulse-report-issues-for-tests")]
     pulse_report_issues_for_tests: bool,
 
+    /// Force known calls with no continuing summary path to fall back to
+    /// unknown-call semantics when the summary was incomplete.
+    #[arg(long = "pulse-force-continue")]
+    pulse_force_continue: Option<bool>,
+
     /// Regex of methods to model as wrappers to `free(3)`.
     #[arg(long = "pulse-model-free-pattern")]
     pulse_model_free_pattern: Option<String>,
@@ -166,6 +171,9 @@ impl Cli {
         }
         if self.pulse_report_issues_for_tests {
             c.pulse_report_issues_for_tests = true;
+        }
+        if let Some(v) = self.pulse_force_continue {
+            c.pulse_force_continue = v;
         }
         if let Some(v) = &self.pulse_model_free_pattern {
             c.pulse_model_free_pattern = Some(v.clone());

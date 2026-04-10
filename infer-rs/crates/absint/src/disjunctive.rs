@@ -25,6 +25,7 @@ pub struct DisjunctiveDomain<D: Comparable> {
     pub disjuncts: Vec<D>,
     pub max_disjuncts: usize,
     pub max_widen_iters: usize,
+    pub had_dropped_disjuncts: bool,
 }
 
 impl<D: Comparable> DisjunctiveDomain<D> {
@@ -34,6 +35,7 @@ impl<D: Comparable> DisjunctiveDomain<D> {
             disjuncts: vec![d],
             max_disjuncts,
             max_widen_iters,
+            had_dropped_disjuncts: false,
         }
     }
 
@@ -43,6 +45,7 @@ impl<D: Comparable> DisjunctiveDomain<D> {
             disjuncts: Vec::new(),
             max_disjuncts,
             max_widen_iters,
+            had_dropped_disjuncts: false,
         }
     }
 
@@ -51,13 +54,30 @@ impl<D: Comparable> DisjunctiveDomain<D> {
         if self.disjuncts.len() > self.max_disjuncts {
             let excess = self.disjuncts.len() - self.max_disjuncts;
             self.disjuncts.drain(..excess);
+            self.had_dropped_disjuncts = true;
         }
+    }
+
+    /// Remove duplicate/subsumed disjuncts while preserving the first
+    /// occurrence, mirroring OCaml's "favor the left-hand disjuncts" join
+    /// strategy.
+    pub fn dedup(&mut self) {
+        let mut kept = Vec::with_capacity(self.disjuncts.len());
+        for disjunct in self.disjuncts.drain(..) {
+            if kept.iter().any(|existing| disjunct.leq(existing)) {
+                self.had_dropped_disjuncts = true;
+            } else {
+                kept.push(disjunct);
+            }
+        }
+        self.disjuncts = kept;
     }
 }
 
 impl<D: Comparable> PartialEq for DisjunctiveDomain<D> {
     fn eq(&self, other: &Self) -> bool {
         self.disjuncts == other.disjuncts
+            && self.had_dropped_disjuncts == other.had_dropped_disjuncts
     }
 }
 
@@ -68,6 +88,7 @@ impl<D: Comparable> Comparable for DisjunctiveDomain<D> {
         self.disjuncts
             .iter()
             .all(|d| rhs.disjuncts.iter().any(|r| d.leq(r)))
+            && (!self.had_dropped_disjuncts || rhs.had_dropped_disjuncts)
     }
 }
 
@@ -75,11 +96,14 @@ impl<D: Comparable> AbstractDomain for DisjunctiveDomain<D> {
     /// Join = union of disjuncts, bounded by max_disjuncts.
     fn join(&self, other: &Self) -> Self {
         let mut result = self.clone();
+        result.had_dropped_disjuncts |= other.had_dropped_disjuncts;
         for d in &other.disjuncts {
             // Favor keeping existing disjuncts, but drop semantically
             // equivalent ones modulo the inner domain ordering.
             if !result.disjuncts.iter().any(|existing| d.leq(existing)) {
                 result.disjuncts.push(d.clone());
+            } else {
+                result.had_dropped_disjuncts = true;
             }
         }
         result.bound();
@@ -91,7 +115,11 @@ impl<D: Comparable> AbstractDomain for DisjunctiveDomain<D> {
     fn widen(&self, next: &Self, num_iters: usize) -> Self {
         if num_iters > self.max_widen_iters {
             // Stop exploring new paths — keep previous state
-            return self.clone();
+            let mut result = self.clone();
+            if !next.leq(self) {
+                result.had_dropped_disjuncts = true;
+            }
+            return result;
         }
         self.join(next)
     }
@@ -112,5 +140,73 @@ impl<D: Comparable> WithBottom for DisjunctiveDomain<D> {
 impl<D: Comparable> fmt::Display for DisjunctiveDomain<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} disjuncts", self.disjuncts.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TestDisjunct(u8);
+
+    impl Comparable for TestDisjunct {
+        fn leq(&self, rhs: &Self) -> bool {
+            self == rhs
+        }
+    }
+
+    impl AbstractDomain for TestDisjunct {
+        fn join(&self, other: &Self) -> Self {
+            if self == other {
+                self.clone()
+            } else {
+                other.clone()
+            }
+        }
+
+        fn widen(&self, next: &Self, _num_iters: usize) -> Self {
+            self.join(next)
+        }
+    }
+
+    #[test]
+    fn test_join_marks_duplicate_disjuncts_as_dropped() {
+        let lhs = DisjunctiveDomain::singleton(TestDisjunct(1), 20, 3);
+        let rhs = DisjunctiveDomain::singleton(TestDisjunct(1), 20, 3);
+
+        let joined = lhs.join(&rhs);
+
+        assert_eq!(joined.disjuncts, vec![TestDisjunct(1)]);
+        assert!(
+            joined.had_dropped_disjuncts,
+            "deduplicated join should preserve OCaml-style dropped-disjunct metadata"
+        );
+    }
+
+    #[test]
+    fn test_join_keeps_drop_flag_clear_when_nothing_is_discarded() {
+        let lhs = DisjunctiveDomain::singleton(TestDisjunct(1), 20, 3);
+        let rhs = DisjunctiveDomain::singleton(TestDisjunct(2), 20, 3);
+
+        let joined = lhs.join(&rhs);
+
+        assert_eq!(joined.disjuncts, vec![TestDisjunct(1), TestDisjunct(2)]);
+        assert!(!joined.had_dropped_disjuncts);
+    }
+
+    #[test]
+    fn test_dedup_marks_duplicate_disjuncts_as_dropped() {
+        let mut domain = DisjunctiveDomain {
+            disjuncts: vec![TestDisjunct(1), TestDisjunct(1), TestDisjunct(2)],
+            max_disjuncts: 20,
+            max_widen_iters: 3,
+            had_dropped_disjuncts: false,
+        };
+
+        domain.dedup();
+
+        assert_eq!(domain.disjuncts, vec![TestDisjunct(1), TestDisjunct(2)]);
+        assert!(domain.had_dropped_disjuncts);
     }
 }

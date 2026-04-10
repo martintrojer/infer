@@ -368,6 +368,12 @@ where
 
         // Not converged: execute instructions and update
         let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &new_pre);
+        // Cross-ref: OCaml `AbstractInterpreter.exec_node_instrs` keeps the
+        // existing node post and joins newly produced disjuncts into it.
+        // Replacing the post outright loses duplicate/drop information that was
+        // discovered on earlier visits, which in turn hides under-approximation
+        // metadata from summary export.
+        let post = old_state.post.join(&post);
         let visit_count = old_state.visit_count + 1;
         inv_map.insert(
             node_id,

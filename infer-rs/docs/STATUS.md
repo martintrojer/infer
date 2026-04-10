@@ -2,9 +2,32 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely by conservatively initializing reachable funptr/actual values before model handling, stop recoverable transfer/model invalid accesses once they have been classified, mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`, and now preserve direct-formal latent ordering with real per-state `MustBeValid` timestamps instead of hardcoded `0`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 13`, `Differences: 8`). A broader checker-side attempt to recover non-exit latent invalid accesses when another path reaches exit was reverted after OCaml summary cross-checks showed that it over-published latent summaries in alias/wrapper/recursion cases; the remaining diffs are still centered on alias/double-free recursion and a smaller arithmetic / attr-export set, but `may_double_free_if_alias` itself is now narrowed to latent payload / attr / phi parity rather than the old extra-disjunct bug, so the next focused fault line is `call_may_double_free_if_alias_bad` plus the residual specialization payload cluster.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely by conservatively initializing reachable funptr/actual values before model handling, stop recoverable transfer/model invalid accesses once they have been classified, mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`, preserve direct-formal latent ordering with real per-state `MustBeValid` timestamps instead of hardcoded `0`, support OCaml's `pulse-force-continue` flag together with persisted dropped-disjunct summary metadata, fix cycle-wave scheduling for self-recursive callees, and now cut direct self recursion before it falls through to generic unknown-call havoc. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 14`, `Differences: 7`). The self-loop scheduler fix was a real parity mover and removed `alias_recursion` from the diff set; the new direct self-recursion cut is correctness-aligned with OCaml `on_recursive_call` but has not moved the headline comparator yet. The new force-continue support also remains correct and tested, but it still does not explain `call_may_double_free_if_alias_bad`, so that wrapper gap is deeper than the missing config surface alone. A broader checker-side attempt to recover non-exit latent invalid accesses when another path reaches exit was reverted after OCaml summary cross-checks showed that it over-published latent summaries in alias/wrapper/recursion cases; the remaining diffs are still centered on alias/double-free recursion and a smaller arithmetic / attr-export set, but `may_double_free_if_alias` itself is now narrowed to latent payload / attr / phi parity rather than the old extra-disjunct bug, so the next focused fault lines are the residual recursive-call bookkeeping gap and `call_may_double_free_if_alias_bad` plus the remaining specialization payload cluster.**
 
 Recent correctness / robustness fixes:
+- Callgraph scheduling now treats a single-node SCC with a self-edge as a real
+  recursive cycle, so callers such as `alias_recursion` no longer get analyzed
+  ahead of self-recursive callees such as `two_pointers_recursion_bad`. The
+  focused regression `test_schedule_self_recursive_callee_before_caller`
+  documents the bug, and the ignored `specialization.c` comparator moves from
+  `Matching: 13`, `Differences: 8` to `Matching: 14`, `Differences: 7`.
+- Direct self-recursive calls with no currently available summary now keep the
+  current state instead of falling through to generic unknown-call havoc. This
+  matches OCaml `PulseCallOperations.on_recursive_call` for the direct
+  self-call case and is locked down by
+  `test_exec_instr_cuts_direct_self_recursion_before_unknown_call_havoc`. This
+  is a correctness fix that stays in place even though it does not move the
+  headline `specialization.c` comparator beyond `14 / 7`.
+- Rust now supports OCaml's `pulse-force-continue` config/CLI flag and keeps
+  `has_dropped_disjuncts` metadata on both main and specialized summaries.
+  Known-callee calls now fall back to transfer-side unknown-call semantics only
+  when the selected summary is empty or marked incomplete for that reason.
+  Focused checker tests lock down both sides of that contract: empty/incomplete
+  summaries regain a continue path, while precise abort-only summaries still do
+  not get widened into unknown-call continues. The `specialization.c`
+  comparator remains stuck beyond the scheduler fix, so this stays as
+  correct groundwork rather than the final explanation for
+  `call_may_double_free_if_alias_bad`.
 - Direct-formal latent summary shaping now uses real per-state summary-event
   order instead of fake location order. Rust previously stamped
   `MustBeValid` / `MustBeInitialized` attrs with timestamp `0`, so
@@ -89,16 +112,19 @@ Recent correctness / robustness fixes:
   mismatches.
 - After those correctness repairs, the remaining
   `test_summary_comparison_specialization_main` semantic mismatches are down to
-  `Matching: 13`, `Differences: 8`: `add_more_bad`, `add_two`,
-  `alias_recursion`, `call_may_double_free_if_alias_bad`,
-  `invoke_itself_bad`, `may_double_free_if_alias`, `test_unalias`, and
-  `two_pointers_recursion_bad`. `add_one` and `invoke` now match after the
-  unresolved-call conservative-initialization fix. The remaining themes are
-  representative / formula normalization detail plus harder alias /
+  `Matching: 14`, `Differences: 7`: `add_more_bad`, `add_two`,
+  `call_may_double_free_if_alias_bad`, `invoke_itself_bad`,
+  `may_double_free_if_alias`, `test_unalias`, and
+  `two_pointers_recursion_bad`. `alias_recursion` now matches after the
+  self-loop scheduler fix, while `add_one` and `invoke` already matched after
+  the unresolved-call conservative-initialization fix. The remaining themes
+  are representative / formula normalization detail plus harder alias /
   double-free / recursion / attr-export mismatches. `may_double_free_if_alias`
   no longer has the old extra latent-disjunct bug; what remains there is
   diagnostic payload / attr / phi detail, while `call_may_double_free_if_alias_bad`
-  is the next sharper wrapper/caller target.
+  is the next sharper wrapper/caller target and the recursion cluster still
+  needs richer recursive-call bookkeeping than "missing summary means unknown
+  call".
 - Summary import now snapshots caller allocation state after `materialize_pre`
   but before `apply_post`, and imported `EqZero` handling consults those
   pre-call snapshots instead of the rejected broad formula-before-post reorder.

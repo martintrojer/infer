@@ -97,6 +97,13 @@ pub struct InferConfig {
     #[serde(rename = "pulse-report-issues-for-tests")]
     pub pulse_report_issues_for_tests: bool,
 
+    /// Force analysis to continue past known calls that produced no
+    /// ContinueProgram summary, treating the callee as an unknown call when
+    /// OCaml would do the same.
+    /// OCaml: `--pulse-force-continue` (default true)
+    #[serde(rename = "pulse-force-continue")]
+    pub pulse_force_continue: bool,
+
     /// Regex of methods that should be modelled as wrappers to `free(3)`.
     /// OCaml: `--pulse-model-free-pattern` (default none)
     #[serde(rename = "pulse-model-free-pattern")]
@@ -190,6 +197,7 @@ impl Default for InferConfig {
             pulse_only: false,
             liveness_only: false,
             pulse_report_issues_for_tests: false,
+            pulse_force_continue: true,
             pulse_model_free_pattern: None,
             pulse_model_malloc_pattern: None,
             pulse_model_realloc_pattern: None,
@@ -286,6 +294,7 @@ mod tests {
         assert!(!config.pulse_only);
         assert!(!config.liveness_only);
         assert!(!config.pulse_report_issues_for_tests);
+        assert!(config.pulse_force_continue);
         assert!(config.pulse_model_free_pattern.is_none());
         assert!(config.pulse_model_malloc_pattern.is_none());
         assert!(config.pulse_model_realloc_pattern.is_none());
@@ -302,10 +311,11 @@ mod tests {
 
     #[test]
     fn test_from_json_known_fields() {
-        let json = r#"{"pulse-max-disjuncts": 50, "quiet": true}"#;
+        let json = r#"{"pulse-max-disjuncts": 50, "quiet": true, "pulse-force-continue": false}"#;
         let config = InferConfig::from_json(json);
         assert_eq!(config.pulse_max_disjuncts, 50);
         assert!(config.quiet);
+        assert!(!config.pulse_force_continue);
         // Other fields should be defaults
         assert_eq!(config.max_widens, 10_000);
     }
@@ -319,6 +329,7 @@ mod tests {
             "pulse-model-abort": ["ns1::ns2::fun_abort"],
             "pulse-model-unreachable": ["handle_failure"],
             "pulse-report-issues-for-tests": true,
+            "pulse-force-continue": false,
             "pulse-model-return-nonnull": "Handle::get",
             "pulse-model-return-this": "ModelClass.initWith:",
             "pulse-model-return-first-arg": "release\\|.*release:",
@@ -366,6 +377,7 @@ mod tests {
             vec!["get_value_pure", "read_only_helper"]
         );
         assert!(config.pulse_report_issues_for_tests);
+        assert!(!config.pulse_force_continue);
     }
 
     #[test]

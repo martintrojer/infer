@@ -6,6 +6,106 @@ Keep it current when the active line of investigation changes.
 ## Current Focus
 
 - Latest stable checkpoint:
+  - `crates/ondemand/src/callgraph.rs`
+    - fixed cycle-wave scheduling to treat a single-node SCC with a self-edge
+      as a real recursive cycle
+    - cross-ref: this was the missing case behind
+      `alias_recursion -> two_pointers_recursion_bad`; the old scheduler could
+      deadlock-break on `alias_recursion` first and analyze it before its
+      self-recursive callee
+    - focused regression:
+      - `test_schedule_self_recursive_callee_before_caller`
+  - `crates/pulse/src/checker.rs`
+    - direct self-recursive calls with no available summary now cut recursion
+      and keep the current state instead of falling through to generic
+      unknown-call havoc
+    - cross-ref: OCaml `PulseCallOperations.on_recursive_call`
+    - focused regression:
+      - `test_exec_instr_cuts_direct_self_recursion_before_unknown_call_havoc`
+  - validations on the current tree:
+    - `cargo test -q -p ondemand --lib`
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
+  - important observed effect:
+    - scheduler fix was a real parity mover:
+      - before: `Matching: 13`, `Differences: 8`
+      - after self-loop scheduling fix: `Matching: 14`, `Differences: 7`
+      - `alias_recursion` disappears from the diff set
+    - the direct self-recursion cut is still a keep because it matches OCaml,
+      but it does not move the headline counts yet:
+      - current: `Matching: 14`, `Differences: 7`
+    - recursion-heavy deltas now split more cleanly:
+      - `two_pointers_recursion_bad` / `invoke_itself_bad`
+        still need richer recursive-call handling than "summary missing means
+        unknown call"
+      - `may_double_free_if_alias` /
+        `call_may_double_free_if_alias_bad` remain the highest-confidence
+        non-recursion semantic gap
+    - raw Rust debug still shows:
+      - `may_double_free_if_alias` main summary kinds are
+        `LatentInvalidAccess`, `LatentInvalidAccess`, `ContinueProgram`
+      - the alias-specialized summary is still
+        `disjuncts=2 dropped=false`
+      - latent pre/posts still carry concrete invalid-access diagnostics on the
+        Rust side, whereas OCaml exported summaries appear not to
+    - implication:
+      - next work should stay correctness-first and split in this order:
+        1. recursive-call bookkeeping / cycle semantics for direct recursion
+           beyond the new self-call cut
+        2. `may_double_free_if_alias` specialized-summary incompleteness and
+           latent-summary export parity
+
+- Latest stable checkpoint:
+  - `crates/absint/src/disjunctive.rs`
+    - `DisjunctiveDomain` now tracks `had_dropped_disjuncts`
+    - set when bounding disjuncts and when widening refuses a strictly larger
+      state
+  - `crates/pulse/src/summary.rs`
+    - `PulseSummary` now keeps OCaml-style
+      `has_dropped_disjuncts`
+    - specialized summaries now keep the same metadata instead of storing only
+      raw `pre_posts`
+  - `crates/config/src/lib.rs`
+    - added OCaml-compatible `pulse-force-continue` flag
+    - default is `true` to match `infer/src/base/Config.ml`
+  - `crates/cli/src/main.rs`
+    - wired `--pulse-force-continue` override into `InferConfig`
+  - `crates/pulse/src/checker.rs`
+    - known-callee calls now fall back to transfer-side unknown-call semantics
+      only when the selected summary is empty or marked as having dropped
+      disjuncts
+    - this is intentionally narrow; precise abort-only summaries still do not
+      get widened into unknown-call continues
+    - focused regressions:
+      - `test_exec_known_callee_summary_force_continue_for_empty_summary`
+      - `test_exec_known_callee_summary_force_continue_appends_unknown_continue_for_dropped_summary`
+      - `test_exec_known_callee_summary_does_not_force_continue_for_precise_abort_only_summary`
+  - validations on the current tree:
+    - `cargo test -q -p config --lib`
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
+  - important observed effect:
+    - the new `pulse_force_continue` support is correct groundwork, but it does
+      not move the current `specialization.c` comparator:
+      - `Matching: 13`
+      - `Differences: 8`
+    - `call_may_double_free_if_alias_bad` still exports only
+      `AbortProgram + ContinueProgram` on Rust, while OCaml still has the extra
+      empty continue branch
+    - debug output now makes this sharper:
+      - `may_double_free_if_alias` main summary is still
+        `LatentInvalidAccess`, `LatentInvalidAccess`, `ContinueProgram`
+      - `call_may_double_free_if_alias_bad` is still only
+        `AbortProgram`, `ContinueProgram`
+      - no specialized summary is involved at that wrapper
+    - implication:
+      the missing wrapper continue branch is not explained by the previously
+      missing config surface alone; the next fault line is deeper in summary
+      application / latent-invalid-access reification for that caller context
+
+- Latest stable checkpoint:
   - `crates/pulse/src/abductive.rs`
     - added `conservatively_initialize_args(...)`
     - cross-ref: OCaml `PulseOperations.conservatively_initialize_args`

@@ -95,7 +95,8 @@ impl CallGraph {
                 remaining_sorted.sort_by(|a, b| format!("{a}").cmp(&format!("{b}")));
                 for start in &remaining_sorted {
                     let scc = find_one_cycle_from(start, &remaining, &successors);
-                    if scc.len() > 1 {
+                    let has_self_edge = self.callees(start).any(|callee| callee == start);
+                    if scc.len() > 1 || has_self_edge {
                         cycle = Some(scc);
                         break;
                     }
@@ -424,6 +425,21 @@ mod tests {
             main_wave >= a_wave,
             "main should be in same or later wave than the cycle"
         );
+    }
+
+    #[test]
+    fn test_schedule_self_recursive_callee_before_caller() {
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(mk_proc_with_calls("self_rec", &["self_rec"]));
+        cfg.add_proc_desc(mk_proc_with_calls("caller", &["self_rec"]));
+
+        let cg = CallGraph::from_cfg(&cfg);
+        let defined: HashSet<_> = cfg.proc_descs.keys().cloned().collect();
+        let waves = cg.bottom_up_schedule(&defined);
+
+        assert_eq!(waves.len(), 2);
+        assert_eq!(waves[0], vec![Procname::c_from_string("self_rec")]);
+        assert_eq!(waves[1], vec![Procname::c_from_string("caller")]);
     }
 
     #[test]

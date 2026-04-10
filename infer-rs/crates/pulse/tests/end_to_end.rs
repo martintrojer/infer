@@ -3454,7 +3454,18 @@ fn test_debug_specialization_summary() {
             let specs: Vec<_> = summary
                 .specialized
                 .iter()
-                .map(|(spec, pps)| format!("{spec} disjuncts={}", pps.len()))
+                .map(|(spec, data)| {
+                    let kinds: Vec<_> = data
+                        .pre_posts
+                        .iter()
+                        .map(|pp| format!("{:?}", pp.kind))
+                        .collect();
+                    format!(
+                        "{spec} disjuncts={} dropped={} kinds={kinds:?}",
+                        data.pre_posts.len(),
+                        data.has_dropped_disjuncts
+                    )
+                })
                 .collect();
             let kinds: Vec<_> = summary
                 .pre_posts

@@ -37,9 +37,13 @@ pub struct PulseSummary {
     /// The main (non-specialized) post-states at procedure exit.
     /// Matches OCaml's `PulseSummary.main.pre_post_list`.
     pub pre_posts: Vec<PrePost>,
+    /// True when analysis had to drop some disjuncts while computing this
+    /// summary (for example because of the disjunct bound or widening limit).
+    /// Cross-ref: OCaml `PulseNonDisjunctiveDomain.Summary.has_dropped_disjuncts`.
+    pub has_dropped_disjuncts: bool,
     /// Specialized summaries, each paired with the specialization used.
     /// Matches OCaml's `PulseSummary.specialized`.
-    pub specialized: Vec<(PulseSpecialization, Vec<PrePost>)>,
+    pub specialized: Vec<(PulseSpecialization, SpecializedSummary)>,
     /// Diagnostics found during analysis.
     pub diagnostics: Vec<Diagnostic>,
     /// True if the procedure never returns (all paths end in ExitProgram).
@@ -56,6 +60,12 @@ pub struct PulseSummary {
     /// Types of formal parameters. Used to determine which arguments to
     /// havoc for unknown/empty-body calls (only pointer types get havoced).
     pub formal_types: Vec<sil::typ::Typ>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpecializedSummary {
+    pub pre_posts: Vec<PrePost>,
+    pub has_dropped_disjuncts: bool,
 }
 
 /// A single pre/post pair from the analysis.
@@ -530,6 +540,7 @@ impl PulseSummary {
     pub fn intra_only(diagnostics: Vec<Diagnostic>) -> Self {
         Self {
             pre_posts: Vec::new(),
+            has_dropped_disjuncts: false,
             specialized: Vec::new(),
             diagnostics,
             is_noreturn: false,
@@ -548,6 +559,16 @@ impl PulseSummary {
         exec_states: &[ExecutionDomain],
         diagnostics: Vec<Diagnostic>,
         is_noreturn: bool,
+    ) -> Self {
+        Self::of_proc_with_metadata(pdesc, exec_states, diagnostics, is_noreturn, false)
+    }
+
+    pub fn of_proc_with_metadata(
+        pdesc: &Procdesc,
+        exec_states: &[ExecutionDomain],
+        diagnostics: Vec<Diagnostic>,
+        is_noreturn: bool,
+        has_dropped_disjuncts: bool,
     ) -> Self {
         // Build a PrePost for each execution path (ContinueProgram, ExitProgram,
         // AbortProgram). Matches OCaml's `pre_post_list` which keeps ALL paths
@@ -696,6 +717,7 @@ impl PulseSummary {
 
         Self {
             pre_posts,
+            has_dropped_disjuncts,
             specialized: Vec::new(),
             diagnostics,
             is_noreturn,
@@ -740,15 +762,25 @@ impl PulseSummary {
                 pre_post.diagnostic = None;
             }
         }
-        self.specialized.push((spec, summary.pre_posts));
+        self.specialized.push((
+            spec,
+            SpecializedSummary {
+                pre_posts: summary.pre_posts,
+                has_dropped_disjuncts: summary.has_dropped_disjuncts,
+            },
+        ));
     }
 
     /// Look up a specialized summary.
     pub fn get_specialized(&self, spec: &PulseSpecialization) -> Option<&Vec<PrePost>> {
+        self.get_specialized_data(spec).map(|data| &data.pre_posts)
+    }
+
+    pub fn get_specialized_data(&self, spec: &PulseSpecialization) -> Option<&SpecializedSummary> {
         self.specialized
             .iter()
             .find(|(s, _)| s == spec)
-            .map(|(_, pp)| pp)
+            .map(|(_, data)| data)
     }
 
     /// Check if the specialization limit has been reached.
@@ -2115,6 +2147,7 @@ mod tests {
                 kind: PrePostKind::AbortProgram,
                 diagnostic: Some(diagnostic.clone()),
             }],
+            has_dropped_disjuncts: false,
             specialized: vec![],
             diagnostics: vec![diagnostic.clone()],
             is_noreturn: false,
@@ -3405,6 +3438,7 @@ mod tests {
                 kind: PrePostKind::LatentInvalidAccess,
                 diagnostic: Some(diagnostic.clone()),
             }],
+            has_dropped_disjuncts: false,
             specialized: vec![],
             diagnostics: vec![diagnostic],
             is_noreturn: false,

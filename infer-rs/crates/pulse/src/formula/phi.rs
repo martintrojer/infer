@@ -452,18 +452,32 @@ impl Phi {
     /// Simplify: remove constraints mentioning unreachable variables.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
         let var_eqs = &self.var_eqs;
+        let is_reachable = |v: AbstractValue| reachable.contains(&var_eqs.find_immut(v));
+        let operand_is_reachable = |operand: &super::Operand| match operand {
+            super::Operand::AbstractValue(v) => is_reachable(*v),
+            super::Operand::ConstOperand(_) => true,
+        };
+
         self.atoms.retain(|atom| {
             let vars = atom.all_vars();
-            vars.iter()
-                .all(|v| reachable.contains(&var_eqs.find_immut(*v)))
+            vars.iter().all(|v| is_reachable(*v))
         });
-        let keep: HashSet<AbstractValue> = self
-            .linear_eqs
-            .keys()
-            .filter(|v| reachable.contains(&var_eqs.find_immut(**v)))
-            .copied()
-            .collect();
-        self.linear_eqs.retain(|v, _| keep.contains(v));
+        self.linear_eqs
+            .retain(|v, lin| is_reachable(*v) && lin.get_variables().all(is_reachable));
+        self.term_eqs.retain(|v, term_eq| {
+            is_reachable(*v)
+                && operand_is_reachable(&term_eq.lhs)
+                && operand_is_reachable(&term_eq.rhs)
+        });
+        self.intervals.retain(|v, _| is_reachable(*v));
+        self.is_int_vars.retain(|v| is_reachable(*v));
+        self.fn_app_eqs.retain(|key, ret| {
+            is_reachable(*ret)
+                && key.actuals.iter().all(|actual| match actual {
+                    FnAppActual::Const(_) => true,
+                    FnAppActual::Var(v) => is_reachable(*v),
+                })
+        });
     }
 
     /// Forget pure constraints mentioning the given canonical values while
@@ -921,5 +935,103 @@ mod tests {
             .and_atom(Atom::LessThan(t1.clone(), t2.clone()))
             .is_sat());
         assert!(phi.and_atom(Atom::Equal(t1.clone(), t2.clone())).is_unsat());
+    }
+
+    #[test]
+    fn test_simplify_drops_unreachable_term_fn_app_interval_and_is_int_facts() {
+        let mut phi = Phi::ttrue();
+        let keep = AbstractValue::of_raw(1);
+        let dead_term = AbstractValue::of_raw(2);
+        let dead_actual = AbstractValue::of_raw(3);
+        let dead_fn_ret = AbstractValue::of_raw(4);
+        let dead_interval = AbstractValue::of_raw(5);
+        let dead_is_int = AbstractValue::of_raw(6);
+
+        assert!(phi.and_const_eq(keep, 7).is_sat());
+        assert!(phi.and_const_eq(dead_actual, 0).is_sat());
+        phi.term_eqs.insert(
+            dead_term,
+            TermEq {
+                op: sil::binop::Binop::PlusA(None),
+                lhs: super::super::Operand::ConstOperand(1),
+                rhs: super::super::Operand::ConstOperand(2),
+            },
+        );
+        assert!(phi
+            .and_fn_app(dead_fn_ret, "__infer_skip", &[dead_actual])
+            .is_sat());
+        assert!(phi
+            .add_interval(dead_interval, super::super::citv::CItv::equal_to(42))
+            .is_sat());
+        phi.mark_is_int(dead_is_int);
+
+        phi.simplify(&HashSet::from([keep]));
+
+        assert!(
+            phi.term_eqs.is_empty(),
+            "dead term equalities should be dropped during simplification"
+        );
+        assert!(
+            phi.iter_fn_app_eqs().next().is_none(),
+            "dead function-application facts should be dropped during simplification"
+        );
+        assert!(
+            !phi.intervals.contains_key(&dead_interval),
+            "dead intervals should be dropped during simplification"
+        );
+        assert!(
+            !phi.is_int_vars.contains(&dead_is_int),
+            "dead is_int facts should be dropped during simplification"
+        );
+        assert_eq!(
+            phi.get_known_const(keep),
+            Some(Q::from_integer(7)),
+            "reachable constraints should survive simplification"
+        );
+    }
+
+    #[test]
+    fn test_simplify_keeps_reachable_term_fn_app_interval_and_is_int_facts() {
+        let mut phi = Phi::ttrue();
+        let term_ret = AbstractValue::of_raw(1);
+        let fn_actual = AbstractValue::of_raw(2);
+        let fn_ret = AbstractValue::of_raw(3);
+
+        phi.term_eqs.insert(
+            term_ret,
+            TermEq {
+                op: sil::binop::Binop::PlusA(None),
+                lhs: super::super::Operand::AbstractValue(fn_actual),
+                rhs: super::super::Operand::ConstOperand(1),
+            },
+        );
+        assert!(phi.and_const_eq(fn_actual, 0).is_sat());
+        assert!(phi
+            .and_fn_app(fn_ret, "__infer_skip", &[fn_actual])
+            .is_sat());
+        assert!(phi
+            .add_interval(fn_actual, super::super::citv::CItv::equal_to(0))
+            .is_sat());
+        phi.mark_is_int(fn_actual);
+
+        phi.simplify(&HashSet::from([term_ret, fn_actual, fn_ret]));
+
+        assert!(
+            phi.term_eqs.contains_key(&term_ret),
+            "reachable term equalities should survive simplification"
+        );
+        assert_eq!(
+            phi.iter_fn_app_eqs().count(),
+            1,
+            "reachable function-application facts should survive simplification"
+        );
+        assert!(
+            phi.intervals.contains_key(&fn_actual),
+            "reachable intervals should survive simplification"
+        );
+        assert!(
+            phi.is_int_vars.contains(&fn_actual),
+            "reachable is_int facts should survive simplification"
+        );
     }
 }

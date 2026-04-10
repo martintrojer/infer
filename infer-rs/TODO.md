@@ -53,7 +53,7 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `test_summary_comparison_specialization_main`. Step 1 compares canonical
    `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
    diagnostic, alpha-renamed) and is now the authoritative fine-grained driver.
-   Current checkpoint is now `Matching: 13`, `Differences: 8`. The local
+   Current checkpoint is now `Matching: 14`, `Differences: 7`. The local
    access-mode fix removed the simple missing-`MustBeInitialized` gap, and the
    latest correctness pass restored leaf `MustBeValid` precondition handling
    plus skipping formal-stack replay for value-style actuals. The latest
@@ -69,8 +69,10 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    imported callee `MustBeValid` obligations and fixes the OCaml heap-target
    value-id parser used on `all_summaries.json`. That removes
    `call_test_alias_bad` and `call_test_unalias_bad` from the diff set and
-   deletes a chunk of bogus graph-shape noise. The next real blockers are the
-   remaining eight diffs: `add_more_bad`, `add_two`, `alias_recursion`,
+   deletes a chunk of bogus graph-shape noise. The latest callgraph fix now
+   also treats self-loops as real recursive cycles, which removes
+   `alias_recursion` from the diff set and moves the comparator to `14 / 7`.
+   The remaining seven diffs are now `add_more_bad`, `add_two`,
    `call_may_double_free_if_alias_bad`, `invoke_itself_bad`,
    `may_double_free_if_alias`, `test_unalias`, and
    `two_pointers_recursion_bad`. Important
@@ -93,7 +95,20 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    targets are narrower:
    `call_may_double_free_if_alias_bad`, the remaining latent payload / attr /
    phi parity inside `may_double_free_if_alias`, and then the existing
-   recursion / arithmetic / attr-export cluster.
+   recursion / arithmetic / attr-export cluster. A direct self-recursion cut
+   now also matches OCaml `PulseCallOperations.on_recursive_call` for the
+   simple self-call case and should stay even though it does not move the
+   current `14 / 7` comparator; the remaining recursion-heavy diffs still need
+   richer recursive-call bookkeeping than generic unknown-call fallback.
+   OCaml-compatible
+   `pulse-force-continue` support is now wired through config/CLI and the
+   known-callee checker path, with dropped-disjunct summary metadata preserved
+   on both main and specialized summaries. That groundwork is correct and stays,
+   but the comparator remains stuck beyond the scheduler fix, and
+   `call_may_double_free_if_alias_bad` still exports only
+   `AbortProgram + ContinueProgram` on Rust. The remaining wrapper gap is
+   therefore deeper than the missing flag surface and likely lives in summary
+   application / latent-invalid-access reification rather than config.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

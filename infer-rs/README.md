@@ -26,6 +26,15 @@ model / unknown-call handling, while still dereferencing the function-pointer va
 `PulseOperations.conservatively_initialize_args` more closely and removes the old unresolved-call
 `Initialized` gap from `invoke`-style summaries.
 
+The config surface now also supports OCaml's `pulse-force-continue` flag through both
+`.inferconfig` and CLI override. Rust summaries now retain OCaml-style
+`has_dropped_disjuncts` metadata, and known-callee calls only fall back to unknown-call semantics
+when the selected summary is empty or marked incomplete for the same reason. That narrow
+force-continue path is correct and tested, but it does not move the current
+`specialization.c` comparator: `Matching: 13`, `Differences: 8` still holds, and
+`call_may_double_free_if_alias_bad` remains the clearest proof that the remaining wrapper gap is
+deeper than the previously missing flag surface.
+
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
 
@@ -124,6 +133,7 @@ to in-memory summaries.
 | `--pulse-only` | Run only the Pulse checker |
 | `--liveness-only` | Run only the liveness/dead store checker |
 | `--pulse-report-issues-for-tests` | Emit suppressed Pulse issues as distinguished `*** SUPPRESSED ***` test reports |
+| `--pulse-force-continue BOOL` | Override OCaml-compatible force-continue fallback for incomplete known callees |
 | `-j N` / `--jobs N` | Number of parallel worker threads (default: all CPUs) |
 | `-o` / `--output DIR` | Output directory for report.json (default: `infer-rs-out`) |
 | `--results-dir DIR` | Infer results directory containing capture.db (default: `infer-out`) |
@@ -150,6 +160,8 @@ to in-memory summaries.
 `pulse-model-return-{nonnull,this,first-arg,nullable}`, `pulse-model-skip-pattern`, and
 `pulse-model-unknown-pure` are compatible with OCaml Infer's shared `.inferconfig` files,
 including the `Str.regexp` syntax used in test suites such as `\\(my\\|a\\)_malloc`.
+`pulse-force-continue` is also compatible with shared `.inferconfig`; the Rust default remains
+`true` to match OCaml.
 `pulse-model-{abort,unreachable}` follow OCaml's exact-procname list semantics.
 `pulse-model-returns-copy-pattern` is still intentionally unsupported because Rust does not yet
 implement OCaml's non-disjunctive unnecessary-copy tracking.
