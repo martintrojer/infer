@@ -77,7 +77,16 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
    the dereferenced formal value, so do not try to "fix" this by blindly
    propagating formal-stack `MustBe*` attrs through the current Rust
-   substitution map.
+   substitution map. The latest recoverable-stop cleanup also stays in place:
+   recoverable transfer/model invalid accesses now stop instead of exporting
+   `ContinueProgram + AbortProgram`, but this does not change the `13 / 8`
+   comparator checkpoint. A broader checker-side attempt to recover
+   non-exit latent invalid accesses when another path reaches exit was
+   reverted after OCaml summary cross-checks showed it spuriously adds latent
+   summaries to `test_alias`, `test_unalias`, and wrapper / recursion cases.
+   The next real question is narrower: where do the `may_double_free_if_alias`
+   null-read stop paths get folded back into `ContinueProgram` before summary
+   export?
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,
@@ -87,8 +96,12 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent`,
    `test_e2e_latent_chain_stays_latent_until_manifest_callsite`,
    `test_e2e_callee_local_abort_is_not_republished_on_caller`, and
-   `test_to_issue_log_filters_suppressed_null_deref_by_default`. These are correctness fixes, not
-   optional count-tuning.
+   `test_to_issue_log_filters_suppressed_null_deref_by_default`. Also keep
+   the ignored documentation repro
+   `checker::tests::test_normal_exit_keeps_non_exit_latent_abort`: it marks a
+   still-missing OCaml behavior, but the obvious broad checker-side fix was
+   proven wrong and must not be resurrected as a count-tuning workaround.
+   These are correctness fixes, not optional count-tuning.
 
 5. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: the headline file
    counts are now at the expected baseline, but Rust and OCaml can still diverge on which latent

@@ -54,6 +54,17 @@ semantic diffs are concentrated in alias / double-free recursion
 plus a smaller arithmetic / attr-export cluster (`add_more_bad`, `add_two`,
 `invoke_itself_bad`, `two_pointers_recursion_bad`).
 
+The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
+error has already been classified: transfer-side load/store recoverable errors and C-model
+recoverable errors now stop instead of exporting `ContinueProgram + AbortProgram`, with focused
+regressions for null-formal stores and double-free. That cleanup is correct and stays, but it does
+not move the current `specialization.c` comparator. A broader checker-side attempt to recover
+non-exit latent invalid accesses when another path reaches exit was cross-checked against OCaml and
+reverted because it over-published latent summaries in `test_alias`, `test_unalias`, and wrapper /
+recursion cases. The ignored `test_normal_exit_keeps_non_exit_latent_abort` now exists only to
+document that still-missing direct-formal-read case. The next semantic target is tracing where the
+`may_double_free_if_alias` null-read stop paths turn into `ContinueProgram` before summary export.
+
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.
 

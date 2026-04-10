@@ -17,6 +17,7 @@ use sil::typ::Typ;
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::attribute::Allocator;
+use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::invalidation::Invalidation;
 use crate::models::matching::matches_procname_pattern;
@@ -315,6 +316,23 @@ fn custom_malloc(
 
 /// Shared: invalidate first argument with given invalidation kind.
 /// Used by free, delete, delete[].
+///
+/// Cross-ref: OCaml `PulseReport.report_exec_results` stops recoverable model
+/// errors once reporting succeeds instead of keeping a normal continue path.
+fn stopped_results_from_recoverable_errors(
+    state: AbductiveDomain,
+    errors: Vec<Diagnostic>,
+) -> Vec<ExecutionDomain> {
+    let Some(diagnostic) = errors.into_iter().next() else {
+        return vec![ExecutionDomain::ContinueProgram(state)];
+    };
+
+    vec![ExecutionDomain::AbortProgram {
+        state: Box::new(state),
+        diagnostic: Box::new(diagnostic),
+    }]
+}
+
 fn invalidate_first_arg(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -351,14 +369,7 @@ fn invalidate_first_arg(
                     ),
                     &mut state,
                 );
-                let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-                for diag in errors {
-                    results.push(ExecutionDomain::AbortProgram {
-                        state: Box::new(state.clone()),
-                        diagnostic: Box::new(diag),
-                    });
-                }
-                return results;
+                return stopped_results_from_recoverable_errors(state, errors);
             }
             PulseResult::Ok(()) => {
                 state.invalidate(
@@ -523,14 +534,7 @@ fn check_file_arg(
             PulseResult::Recoverable((), errors) => {
                 let ret_val = AbstractValue::mk_fresh();
                 operations::write_id(ret_id, ret_val, &mut state);
-                let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-                for diag in errors {
-                    results.push(ExecutionDomain::AbortProgram {
-                        state: Box::new(state.clone()),
-                        diagnostic: Box::new(diag),
-                    });
-                }
-                return results;
+                return stopped_results_from_recoverable_errors(state, errors);
             }
             PulseResult::Ok(()) => {}
         }
@@ -643,14 +647,7 @@ fn memcpy(
             }
             PulseResult::Recoverable((), errors) => {
                 operations::write_id(ret_id, dest_addr, &mut state);
-                let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-                for diag in errors {
-                    results.push(ExecutionDomain::AbortProgram {
-                        state: Box::new(state.clone()),
-                        diagnostic: Box::new(diag),
-                    });
-                }
-                return results;
+                return stopped_results_from_recoverable_errors(state, errors);
             }
             PulseResult::Ok(()) => {
                 // dest is valid, continue to check src
@@ -670,14 +667,7 @@ fn memcpy(
                 }];
             }
             PulseResult::Recoverable((), errors) => {
-                let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-                for diag in errors {
-                    results.push(ExecutionDomain::AbortProgram {
-                        state: Box::new(state.clone()),
-                        diagnostic: Box::new(diag),
-                    });
-                }
-                return results;
+                return stopped_results_from_recoverable_errors(state, errors);
             }
             PulseResult::Ok(()) => {}
         }
@@ -842,6 +832,46 @@ mod tests {
                     if state.path_condition.conditions().get(&positive_atom) == Some(&0)
             )),
             "free(non-null) branch should retain a local 0 < ptr prune condition"
+        );
+    }
+
+    #[test]
+    fn test_double_free_stops_without_continue() {
+        let mut state = mk_state();
+        let ret0 = Ident::create_normal(IdentName::from_string("n"), 0);
+        let ret1 = Ident::create_normal(IdentName::from_string("n"), 1);
+        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
+        let ptr = AbstractValue::mk_fresh();
+
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(pvar.clone())), ptr);
+        state.allocate(ptr, Allocator::CMalloc, Location::dummy());
+        let _ = state.and_not_equal(&Operand::AbstractValue(ptr), &Operand::ConstOperand(0));
+
+        let args = vec![(Exp::Lvar(pvar.clone()), Typ::void())];
+        let first_results = free(&ret0, &args, &Location::dummy(), state);
+        let freed_state = first_results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("first free should keep the valid non-null path");
+
+        let second_results = free(&ret1, &args, &Location::dummy(), freed_state);
+        assert!(
+            !second_results.iter().any(ExecutionDomain::is_continue),
+            "double free should stop instead of exporting a normal continue path"
+        );
+        assert!(
+            matches!(
+                second_results.as_slice(),
+                [ExecutionDomain::AbortProgram { diagnostic, .. }]
+                    if matches!(diagnostic.as_ref(), Diagnostic::AccessToInvalidAddress { .. })
+            ),
+            "expected a single invalid-access abort on double free, got {second_results:?}"
         );
     }
 

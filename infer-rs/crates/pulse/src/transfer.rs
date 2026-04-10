@@ -7,9 +7,7 @@
 //!
 //! Mirrors OCaml's `Pulse.ml` exec_instr (simplified).
 //!
-//! Maps each SIL instruction to a list of possible resulting states
-//! (the list has >1 element when an error is found — one AbortProgram
-//! and one ContinueProgram for the "maybe it's ok" case).
+//! Maps each SIL instruction to a list of possible resulting states.
 
 use sil::const_val::Const;
 use sil::exp::Exp;
@@ -19,6 +17,7 @@ use sil::procdesc::Procdesc;
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
+use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::pulse_result::PulseResult;
@@ -40,7 +39,7 @@ pub fn exec_instr_with_pdesc(
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
     match instr {
-        Instr::Load { id, e, loc, typ } => exec_load(id, e, typ, loc, state),
+        Instr::Load { id, e, loc, typ } => exec_load(pdesc, id, e, typ, loc, state),
         Instr::Store { e1, e2, loc, .. } => exec_store(pdesc, e1, e2, loc, state),
         Instr::Prune { exp, loc, .. } => exec_prune(pdesc, exp, loc, state),
         Instr::Call {
@@ -67,6 +66,7 @@ pub fn exec_instr_with_pdesc(
 /// BinOp results (comparisons) lose their formula constraints through the
 /// unnecessary dereference edge, breaking path-sensitive pruning.
 fn exec_load(
+    pdesc: Option<&Procdesc>,
     id: &sil::ident::Ident,
     rhs_exp: &Exp,
     typ: &sil::typ::Typ,
@@ -99,15 +99,11 @@ fn exec_load(
             vec![ExecutionDomain::ContinueProgram(state)]
         }
         PulseResult::Recoverable(value, errors) => {
-            operations::write_id_with_history(id, value, &mut state);
-            let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-            for diag in errors {
-                results.push(ExecutionDomain::AbortProgram {
-                    state: Box::new(state.clone()),
-                    diagnostic: Box::new(diag),
-                });
+            operations::write_id_with_history(id, value.clone(), &mut state);
+            if typ.is_int() {
+                state.path_condition.and_is_int(value.addr);
             }
-            results
+            stopped_results_from_recoverable_errors(pdesc, state, errors)
         }
         PulseResult::FatalError(diag, _) => {
             vec![ExecutionDomain::AbortProgram {
@@ -149,14 +145,7 @@ fn exec_store(
     };
     // Report errors from evaluating the LHS (e.g., null.field access)
     if !lhs_errors.is_empty() {
-        let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-        for diag in lhs_errors {
-            results.push(ExecutionDomain::AbortProgram {
-                state: Box::new(state.clone()),
-                diagnostic: Box::new(diag),
-            });
-        }
-        return results;
+        return stopped_results_from_recoverable_errors(pdesc, state, lhs_errors);
     }
 
     if local_has_cleanup_attribute(pdesc, lhs_exp) {
@@ -170,16 +159,47 @@ fn exec_store(
             diagnostic: Box::new(d),
         }],
         PulseResult::Recoverable((), errors) => {
-            let mut results = vec![ExecutionDomain::ContinueProgram(state.clone())];
-            for diag in errors {
-                results.push(ExecutionDomain::AbortProgram {
-                    state: Box::new(state.clone()),
-                    diagnostic: Box::new(diag),
-                });
-            }
-            results
+            stopped_results_from_recoverable_errors(pdesc, state, errors)
         }
     }
+}
+
+fn stopped_results_from_recoverable_errors(
+    pdesc: Option<&Procdesc>,
+    state: AbductiveDomain,
+    errors: Vec<Diagnostic>,
+) -> Vec<ExecutionDomain> {
+    let Some(diagnostic) = errors.into_iter().next() else {
+        return vec![ExecutionDomain::ContinueProgram(state)];
+    };
+
+    let exec = if let Some(pdesc) = pdesc {
+        match crate::summary::classify_abort_kind(pdesc, &state, &diagnostic) {
+            crate::summary::PrePostKind::LatentInvalidAccess => {
+                ExecutionDomain::LatentInvalidAccess {
+                    state: Box::new(state),
+                    diagnostic: Box::new(diagnostic),
+                }
+            }
+            crate::summary::PrePostKind::LatentAbortProgram => {
+                ExecutionDomain::LatentAbortProgram {
+                    state: Box::new(state),
+                    diagnostic: Box::new(diagnostic),
+                }
+            }
+            _ => ExecutionDomain::AbortProgram {
+                state: Box::new(state),
+                diagnostic: Box::new(diagnostic),
+            },
+        }
+    } else {
+        ExecutionDomain::AbortProgram {
+            state: Box::new(state),
+            diagnostic: Box::new(diagnostic),
+        }
+    };
+
+    vec![exec]
 }
 
 fn local_has_cleanup_attribute(pdesc: Option<&Procdesc>, lhs_exp: &Exp) -> bool {
@@ -611,6 +631,59 @@ mod tests {
             _ => false,
         });
         assert!(has_abort, "storing to null should produce AbortProgram");
+    }
+
+    #[test]
+    fn test_store_through_null_formal_stops_as_latent_without_continue() {
+        let pname = Procname::c_from_string("formal_store");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal = Pvar::mk(Mangled::from_string("x"), pname);
+        let formal_var = Var::ProgramVar(Box::new(formal.clone()));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+        let formal_val = state.read_heap(formal_addr, Access::Dereference);
+        let loaded = Ident::create_normal(IdentName::from_string("n"), 0);
+        state
+            .post
+            .stack
+            .add(Var::LogicalVar(loaded.clone()), formal_val);
+        state.invalidate(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
+        );
+
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Var(loaded)),
+            typ: Typ::void(),
+            e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(42)))),
+            loc: Location::dummy(),
+        };
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+
+        assert!(
+            !results.iter().any(|r| r.is_continue()),
+            "recoverable formal null stores should stop the path instead of continuing"
+        );
+        assert!(
+            matches!(
+                results.as_slice(),
+                [ExecutionDomain::AbortProgram { diagnostic, .. }]
+                    | [ExecutionDomain::LatentInvalidAccess { diagnostic, .. }]
+                    | [ExecutionDomain::LatentAbortProgram { diagnostic, .. }]
+                    if matches!(diagnostic.as_ref(), Diagnostic::AccessToInvalidAddress { .. })
+            ),
+            "expected a single stopped invalid-access state, got {results:?}"
+        );
     }
 
     #[test]

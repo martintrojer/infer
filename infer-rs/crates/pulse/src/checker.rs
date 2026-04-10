@@ -1649,6 +1649,43 @@ mod tests {
         pdesc
     }
 
+    fn make_formal_load_then_exit_proc() -> Procdesc {
+        let pname = Procname::c_from_string("formal_load_then_exit");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let int_typ = Typ::int(sil::typ::IKind::IInt);
+        let int_ptr_typ = Typ::mk_ptr(int_typ.clone());
+        pdesc.formals = vec![(
+            Mangled::from_string("q"),
+            int_ptr_typ.clone(),
+            Default::default(),
+        )];
+
+        let formal = Pvar::mk(Mangled::from_string("q"), pname);
+        let n0 = Ident::create_normal(IdentName::from_string("n"), 0);
+        let n1 = Ident::create_normal(IdentName::from_string("n"), 1);
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![
+                Instr::Load {
+                    id: n0.clone(),
+                    e: Exp::Lvar(formal),
+                    typ: int_ptr_typ,
+                    loc: Location::dummy(),
+                },
+                Instr::Load {
+                    id: n1,
+                    e: Exp::Var(n0),
+                    typ: int_typ,
+                    loc: Location::dummy(),
+                },
+            ],
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
+
     #[test]
     fn test_two_hop_field_write_keeps_local_null_derefs_latent() {
         let pdesc = make_two_hop_field_write_proc();
@@ -1708,6 +1745,39 @@ mod tests {
                 .any(|diag| diag.get_issue_type_id()
                     == diagnostics::issue_type::IssueTypeId::NullptrDereference),
             "expected the trailing local abort to stay manifest, summary={summary:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "documents pending non-exit latent-read recovery when another path reaches exit"]
+    fn test_normal_exit_keeps_non_exit_latent_abort() {
+        let pdesc = make_formal_load_then_exit_proc();
+        let summary = analyze(&pdesc);
+
+        let continue_paths = summary
+            .pre_posts
+            .iter()
+            .filter(|pp| pp.kind == PrePostKind::ContinueProgram)
+            .count();
+        let latent_null_derefs = summary
+            .pre_posts
+            .iter()
+            .filter(|pp| {
+                pp.kind == PrePostKind::LatentInvalidAccess
+                    && pp.diagnostic.as_ref().is_some_and(|diag| {
+                        diag.get_issue_type_id()
+                            == diagnostics::issue_type::IssueTypeId::NullptrDereference
+                    })
+            })
+            .count();
+
+        assert_eq!(
+            continue_paths, 1,
+            "expected the non-null path to keep a normal continue summary, summary={summary:?}"
+        );
+        assert_eq!(
+            latent_null_derefs, 1,
+            "expected the null path to stay latent even when the procedure also has a normal exit, summary={summary:?}"
         );
     }
 

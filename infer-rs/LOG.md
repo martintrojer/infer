@@ -1110,3 +1110,61 @@ If resuming after compaction:
   - `cargo test -p ondemand --lib` passed
   - `cargo test -p infer-rs --test cli_tests test_multiple_files_unify_cross_file_pulse_analysis`
     passed
+
+## 2026-04-09 Pulse Parity Checkpoint
+
+- Current authoritative specialization comparator is still:
+  - `Matching: 13`
+  - `Differences: 8`
+  - command:
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+
+- Safe changes kept in the worktree:
+  - `crates/pulse/src/transfer.rs`
+    - recoverable load/store invalid-access paths now stop instead of exporting
+      `ContinueProgram + AbortProgram`
+    - targeted tests still pass, but this does not move `specialization.c`
+  - `crates/pulse/src/models/c.rs`
+    - recoverable C-model invalid accesses now stop instead of exporting a normal continue
+    - added `test_double_free_stops_without_continue`
+    - targeted tests still pass, but this also does not move `specialization.c`
+
+- Important failed experiment:
+  - broad checker-side recovery of non-exit latent invalid accesses when a normal exit path also
+    exists
+  - this did reproduce the missing direct-formal-read shape, but it badly regressed summary parity
+    by surfacing extra latent summaries in `test_alias`, `test_unalias`, caller wrappers, and
+    recursion cases
+  - that experiment was reverted
+
+- Focused regression kept as documentation:
+  - `crates/pulse/src/checker.rs`
+  - ignored test:
+    - `test_normal_exit_keeps_non_exit_latent_abort`
+  - purpose:
+    - capture the still-missing case where a direct formal read should stay latent even though
+      another path reaches the exit
+  - current status:
+    - ignored on purpose because the obvious checker-side fix is not correct yet
+
+- OCaml cross-check from `/tmp/spec-ocaml.pzUKtI/out/all_summaries.json`:
+  - `may_double_free_if_alias`
+    - exactly 2 `LatentInvalidAccess` summaries from the read sites at lines `79` and `80`
+    - plus 1 `ContinueProgram`
+  - `test_alias`
+    - only `ContinueProgram`
+    - no latent invalid-access summaries from the store/write paths
+  - `test_unalias`
+    - same story as `test_alias`
+
+- Best next step from here:
+  - do not retry broad checker non-exit recovery
+  - instead trace why Rust still keeps the `may_double_free_if_alias` null-read paths inside
+    `ContinueProgram` summaries at all
+  - likely places:
+    - `crates/pulse/src/operations.rs`
+    - `crates/pulse/src/transfer.rs`
+    - `crates/pulse/src/summary.rs`
+  - question to answer next:
+    - where does the null read stop get lost before summary export, given that `load n6` /
+      `load n4` should be fatal in Rust too

@@ -2,9 +2,30 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely by conservatively initializing reachable funptr/actual values before model handling, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 13`, `Differences: 8`) after fixing wrapper latent-invalid-access over-recovery, OCaml heap-target value-id parsing, and unresolved-call argument initialization; the remaining diffs are centered on alias/double-free recursion and a smaller arithmetic / attr-export set.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely by conservatively initializing reachable funptr/actual values before model handling, stop recoverable transfer/model invalid accesses once they have been classified, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 13`, `Differences: 8`). A broader checker-side attempt to recover non-exit latent invalid accesses when another path reaches exit was reverted after OCaml summary cross-checks showed that it over-published latent summaries in alias/wrapper/recursion cases; the remaining diffs are still centered on alias/double-free recursion and a smaller arithmetic / attr-export set, with `may_double_free_if_alias` as the next focused fault line.**
 
 Recent correctness / robustness fixes:
+- Recoverable transfer-side invalid accesses now stop instead of exporting
+  `ContinueProgram + AbortProgram`: recoverable `Load` / `Store` errors in
+  `Pulse.ml`-style transfer now go through summary-side classification and
+  produce a single stopped state. The focused regression
+  `test_store_through_null_formal_stops_as_latent_without_continue` keeps the
+  null-formal-store case pinned down. This is correct cleanup, but it does not
+  move the current `specialization.c` comparator from `Matching: 13`,
+  `Differences: 8`.
+- Recoverable C-model invalid accesses now also stop instead of exporting a
+  normal continue path. This keeps double-free / invalid model access behavior
+  closer to OCaml reporting, and the focused regression
+  `test_double_free_stops_without_continue` documents it. This also does not
+  change the current summary comparator.
+- A broader checker-side attempt to recover non-exit latent invalid accesses
+  when another path also reaches exit was tried and reverted. OCaml summary
+  dumps for `may_double_free_if_alias`, `test_alias`, and `test_unalias`
+  showed that the broad recovery was wrong: it reproduced the missing
+  direct-formal-read shape, but also surfaced bogus latent summaries in
+  alias/wrapper/recursion cases. The ignored
+  `checker::tests::test_normal_exit_keeps_non_exit_latent_abort` remains only
+  as a documentation repro for the still-missing case.
 - Exact summary-equality work now has a semantic driver instead of raw JSON diffs:
   `crates/test-harness/src/summary_compare.rs` canonicalizes OCaml and Rust
   `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
