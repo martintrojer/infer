@@ -30,10 +30,12 @@ The config surface now also supports OCaml's `pulse-force-continue` flag through
 `.inferconfig` and CLI override. Rust summaries now retain OCaml-style
 `has_dropped_disjuncts` metadata, and known-callee calls only fall back to unknown-call semantics
 when the selected summary is empty or marked incomplete for the same reason. That narrow
-force-continue path is correct and tested, but it does not move the current
-`specialization.c` comparator: `Matching: 13`, `Differences: 8` still holds, and
-`call_may_double_free_if_alias_bad` remains the clearest proof that the remaining wrapper gap is
-deeper than the previously missing flag surface.
+force-continue path is correct and tested. The latest checker pass also restores the missing
+skipped-call continue for selected alias-specialized latent-invalid-access summaries with no
+`ContinueProgram`, which is the OCaml-backed shape behind
+`call_may_double_free_if_alias_bad`. The headline comparator still stays at
+`Matching: 14`, `Differences: 7`, but that procedure is now narrowed from a missing branch to a
+single remaining attr-surface mismatch on `return.*`.
 
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
@@ -54,12 +56,14 @@ file. The latest OCaml-backed access-mode, interproc, exporter, and unresolved-c
 Rust's local read/write bookkeeping with `PulseOperations.check_addr_access`, restore leaf
 `MustBeValid` handling, stop replaying formal-stack bookkeeping onto by-value actuals, and
 initialize unresolved call arguments the same way OCaml does. The current comparator checkpoint is
-now `Matching: 13`, `Differences: 8`: the old self-edge bug and formal-root `Initialized` export
-noise are gone, `add_one` and `invoke` are now matching, wrapper latent-invalid-access recovery no
-longer republishes imported callee `MustBeValid` obligations, and the comparator now parses both
-stack-style and heap-target OCaml value-id shapes from `all_summaries.json`. The remaining
-semantic diffs are concentrated in alias / double-free recursion
-(`alias_recursion`, `call_may_double_free_if_alias_bad`, `may_double_free_if_alias`, `test_unalias`)
+now `Matching: 14`, `Differences: 7`: the old self-edge bug and formal-root `Initialized` export
+noise are gone, `add_one`, `invoke`, and `alias_recursion` are now matching, wrapper
+latent-invalid-access recovery no longer republishes imported callee `MustBeValid` obligations,
+the checker now restores the missing skipped-call branch in
+`call_may_double_free_if_alias_bad`, and the comparator now parses both stack-style and
+heap-target OCaml value-id shapes from `all_summaries.json`. The remaining semantic diffs are
+concentrated in alias / double-free parity
+(`call_may_double_free_if_alias_bad`, `may_double_free_if_alias`, `test_unalias`)
 plus a smaller arithmetic / attr-export cluster (`add_more_bad`, `add_two`,
 `invoke_itself_bad`, `two_pointers_recursion_bad`).
 
@@ -79,9 +83,10 @@ monotonic per-state timestamps instead of hardcoding `0`, and latent-invalid-acc
 shaping now orders direct-formal accesses by `(timestamp, location)` rather than raw `.sil`
 location alone. That removes the extra latent branch and brings the raw main summary down to the
 OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. The overall comparator still
-stays at `Matching: 13`, `Differences: 8`, but the remaining specialization work is now narrower:
-`call_may_double_free_if_alias_bad` plus latent payload / attr / phi parity in
-`may_double_free_if_alias`, and the existing recursion / arithmetic / attr-export cluster.
+stays at `Matching: 14`, `Differences: 7`, but the remaining specialization work is now narrower:
+the `return.*` attr surface in `call_may_double_free_if_alias_bad`, latent payload / attr / phi
+parity in `may_double_free_if_alias`, and the existing recursion / arithmetic / attr-export
+cluster.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

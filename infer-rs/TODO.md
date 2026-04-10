@@ -103,12 +103,14 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    OCaml-compatible
    `pulse-force-continue` support is now wired through config/CLI and the
    known-callee checker path, with dropped-disjunct summary metadata preserved
-   on both main and specialized summaries. That groundwork is correct and stays,
-   but the comparator remains stuck beyond the scheduler fix, and
-   `call_may_double_free_if_alias_bad` still exports only
-   `AbortProgram + ContinueProgram` on Rust. The remaining wrapper gap is
-   therefore deeper than the missing flag surface and likely lives in summary
-   application / latent-invalid-access reification rather than config.
+   on both main and specialized summaries. The latest OCaml-backed checker pass
+   also restores the missing skipped-call branch for selected
+   alias-specialized latent-invalid-access summaries with no continue path.
+   That keeps `alias_recursion` fixed while narrowing
+   `call_may_double_free_if_alias_bad` from a missing pre/post to one remaining
+   caller-visible attr mismatch: Rust still lacks `Initialized` on `return.*`.
+   The remaining wrapper gap is therefore no longer "missing force-continue";
+   it is now summary/export attr fidelity on top of the restored branch shape.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

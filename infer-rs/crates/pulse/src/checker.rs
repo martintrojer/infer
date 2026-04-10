@@ -794,11 +794,28 @@ fn apply_pre_posts_with_specialization_loop(
                 merge_alias_groups(&mut alias_groups, groups);
             }
         }
-
         if !results.is_empty() || alias_groups.is_empty() {
+            // Cross-ref: OCaml keeps dropped-disjunct bookkeeping in the
+            // hidden non-disj summary sideband. Callers can still
+            // `pulse_force_continue` when the selected alias-specialized
+            // summary contains only stopped states rooted in latent invalid
+            // accesses
+            // (`specialization.c:call_may_double_free_if_alias_bad`).
+            //
+            // Rust does not yet mirror that non-disj sideband, so preserve
+            // the same observable caller behavior here: a selected
+            // alias-specialized latent-invalid-access summary with no
+            // ContinueProgram is treated as incomplete for the narrow purpose
+            // of force-continue.
+            let alias_specialization_needs_force_continue = current_spec.aliases.is_some()
+                && !has_continue_program(&results)
+                && current_pre_posts
+                    .iter()
+                    .any(|pp| matches!(pp.kind, crate::summary::PrePostKind::LatentInvalidAccess));
             return KnownCalleeResults {
                 results,
-                used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
+                used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts
+                    || alias_specialization_needs_force_continue,
                 used_summary_was_empty: false,
             };
         }
@@ -1240,6 +1257,34 @@ mod tests {
             alias_spec,
             next_field,
         )
+    }
+
+    fn make_alias_specialization_latent_invalid_summary(
+    ) -> (Procname, PulseSummary, PulseSpecialization, Fieldname) {
+        let (callee_pname, mut callee_summary, alias_spec, next_field) =
+            make_alias_specialization_summary(true);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            access_history: ValueHistory::epoch(),
+            invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
+        };
+        let specialized = callee_summary
+            .specialized
+            .iter_mut()
+            .find(|(spec, _)| spec == &alias_spec)
+            .expect("cached alias specialization should exist");
+        let pre_post = specialized
+            .1
+            .pre_posts
+            .first_mut()
+            .expect("specialized summary should contain one pre/post");
+        pre_post.kind = PrePostKind::LatentInvalidAccess;
+        pre_post.diagnostic = Some(diagnostic.clone());
+        callee_summary.diagnostics = vec![];
+        (callee_pname, callee_summary, alias_spec, next_field)
     }
 
     fn make_abort_only_summary(has_dropped_disjuncts: bool) -> (Procname, PulseSummary) {
@@ -2200,6 +2245,60 @@ mod tests {
                 .find_edge(x_addr, &Access::Dereference)
                 .is_some(),
             "specialized summary effect should apply after alias-specialized retry"
+        );
+        assert!(
+            requests.into_inner().is_empty(),
+            "cached specialization should avoid re-enqueueing the same alias request"
+        );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_force_continue_for_alias_specialized_latent_invalid_summary_without_continue(
+    ) {
+        let (callee_pname, callee_summary, _alias_spec, next_field) =
+            make_alias_specialization_latent_invalid_summary();
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(sil::var::Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+        caller_state
+            .post
+            .heap
+            .add_edge(x_addr, Access::FieldAccess(next_field), x_addr);
+        let requests = RefCell::new(Vec::new());
+        let ret_id = Ident::create_none();
+        let ret_typ = Typ::void();
+        let args = [(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))];
+        let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
+
+        let results = exec_known_callee_summary(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    call_flags: &call_flags,
+                    spec_requests: Some(&requests),
+                },
+            },
+            caller_state,
+        );
+
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
+            "alias-specialized summaries with only stopped states should still gain the OCaml-style unknown-call continue, got {results:?}"
         );
         assert!(
             requests.into_inner().is_empty(),

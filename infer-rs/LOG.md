@@ -6,6 +6,42 @@ Keep it current when the active line of investigation changes.
 ## Current Focus
 
 - Latest stable checkpoint:
+  - `crates/pulse/src/checker.rs`
+    - selected alias-specialized summaries that contain
+      `LatentInvalidAccess` but no `ContinueProgram` now participate in the
+      OCaml-style `pulse_force_continue` fallback
+    - cross-ref:
+      - OCaml `PulseCallOperations.iter_call` force-continues using hidden
+        `PulseNonDisjunctiveDomain.Summary.has_dropped_disjuncts`
+      - fresh OCaml JSON for `call_may_double_free_if_alias_bad` confirmed the
+        missing branch was the empty skipped-call continue, not the `return 0`
+        branch
+    - focused regression:
+      - `test_exec_known_callee_summary_force_continue_for_alias_specialized_latent_invalid_summary_without_continue`
+    - validations on the current tree:
+      - `cargo test -q -p pulse test_exec_known_callee_summary_force_continue_for_alias_specialized_latent_invalid_summary_without_continue`
+      - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+    - important observed effect:
+      - headline comparator stays:
+        - `Matching: 14`
+        - `Differences: 7`
+      - but `call_may_double_free_if_alias_bad` is now narrowed from a
+        missing skipped-call branch to a single remaining attr-surface delta:
+        Rust still lacks `Initialized` on `return.*`
+      - crucial negative result from this pass:
+        - a broader rule of "force-continue any alias-specialized summary with
+          no continue" was wrong and reintroduced `alias_recursion`
+        - the correct narrower discriminator is the selected
+          alias-specialized latent-invalid-access shape above
+    - implication:
+      - next work should stay on summary/export fidelity:
+        1. latent-invalid-access export parity in
+           `may_double_free_if_alias`
+        2. remaining caller-visible attr surface in
+           `call_may_double_free_if_alias_bad`
+        3. then recursion/arithmetic cluster
+
+- Latest stable checkpoint:
   - `crates/ondemand/src/callgraph.rs`
     - fixed cycle-wave scheduling to treat a single-node SCC with a self-edge
       as a real recursive cycle
