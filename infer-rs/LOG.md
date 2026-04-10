@@ -1168,3 +1168,121 @@ If resuming after compaction:
   - question to answer next:
     - where does the null read stop get lost before summary export, given that `load n6` /
       `load n4` should be fatal in Rust too
+
+## 2026-04-10 PotentialInvalidAccessSummary Checkpoint
+
+- Current authoritative specialization comparator is still:
+  - `Matching: 13`
+  - `Differences: 8`
+  - command:
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+
+- Latest Rust changes on this line of investigation:
+  - `crates/pulse/src/summary.rs`
+    - ContinueProgram exit states can now be converted into
+      `LatentInvalidAccess` during summary creation when a caller-controlled
+      `must_be_valid` address is known zero in the normalized summary state
+    - cross-ref:
+      - OCaml `PulseAbductiveDomain.Summary.of_post`
+      - OCaml `PulseSummary.exec_summary_of_post_common`
+      - specifically the `PotentialInvalidAccessSummary` path
+    - selected latent addresses now prefer source-location order over raw
+      internal timestamps, since the desired behavior is "first source access
+      wins"
+    - selected latent addresses also drop their synthetic
+      `Invalid(ConstantDereference(0))` attr on the chosen summary path
+  - `crates/pulse/tests/end_to_end.rs`
+    - `test_debug_specialization_summary` now prints raw
+      `may_double_free_if_alias` pre/posts too, which was necessary to inspect
+      the remaining extra latent summary shape directly
+
+- What changed in behavior:
+  - `may_double_free_if_alias` is no longer `4 x ContinueProgram`
+  - current Rust raw main summary is now:
+    - `LatentInvalidAccess` with `cond:v6 = 0`
+    - `LatentInvalidAccess` with `cond:0 < v6` and `cond:v3 = 0`
+    - `LatentInvalidAccess` with `cond:0 < v3` and `cond:v6 = 0`
+    - `ContinueProgram` with `cond:0 < v3` and `cond:0 < v6`
+  - OCaml still wants:
+    - latent `x == 0`
+    - latent `x > 0 && y == 0`
+    - continue `x > 0 && y > 0`
+
+- Important conclusion from the raw dump:
+  - summary-side "look at the final normalized state and pick a zero
+    `must_be_valid` address" gets closer, but it is not enough to reproduce
+    OCaml's exact latent choice
+  - the remaining extra latent is not just a dedup problem; it reflects that
+    Rust still does not know which `EqZero` became newly derivable first during
+    summary simplification
+  - this now looks like a lower-level formula / new-equality issue, not
+    something that should be papered over with more post-summary trimming
+
+- Best next step from here:
+  - inspect `crates/pulse/src/formula/mod.rs` and `crates/pulse/src/formula/phi.rs`
+    with the OCaml cross-ref:
+    - `infer/src/pulse/PulseAbductiveDomain.ml`
+      - `filter_for_summary`
+      - `incorporate_new_eqs`
+    - goal:
+      - expose the Rust analogue of OCaml's newly derived `EqZero` list during
+        summary simplification, then drive potential-invalid-access selection
+        from that ordered signal instead of from the final normalized state
+
+## 2026-04-10 Direct-Formal Ordering Fix
+
+- The previous "ordered new_eqs during summary simplify" hypothesis was wrong
+  for the checked-in OCaml source in this workspace:
+  - `infer/src/pulse/PulseFormula.ml` currently returns `RevList.empty` from
+    `simplify`
+  - the real active bug was lower-level and Rust-specific:
+    - `MustBeValid` summary attrs were all being stamped with timestamp `0`
+    - direct-formal latent shaping in `crates/pulse/src/summary.rs` then
+      compared only raw `.sil` locations, which are not stable source-order
+      proxies
+
+- Correctness fix landed in Rust:
+  - `crates/pulse/src/abductive.rs`
+    - `mark_must_be_valid_at` and `mark_must_be_initialized_at` now allocate
+      monotonic per-state timestamps instead of hardcoding `0`
+  - `crates/pulse/src/summary.rs`
+    - direct-formal latent normalization now compares
+      `(MustBeValid timestamp, location)` rather than location alone
+    - latent invalid-access pre/posts now:
+      - require earlier direct-formal accesses to stay non-null on the latent
+        path
+      - forget later direct-formal pure constraints when exporting an earlier
+        latent access
+    - this normalization now runs for all latent invalid-access pre/posts, not
+      only summary-synthesized `PotentialInvalidAccessSummary` cases
+  - `crates/pulse/src/formula/mod.rs`
+  - `crates/pulse/src/formula/phi.rs`
+    - added a targeted "forget constraints involving these values" helper so
+      summary shaping can drop later pure guards without lying about heap shape
+
+- Verification:
+  - unit tests added/passing:
+    - `test_direct_formal_ordering_prefers_timestamp_over_location`
+    - `test_potential_invalid_access_requires_earlier_direct_formals_nonzero`
+    - `test_potential_invalid_access_forgets_later_direct_formal_constraints`
+    - `test_forget_constraints_involving_drops_conditions_and_phi_facts`
+  - specialization raw dump now shows the desired `may_double_free_if_alias`
+    main summary shape:
+    - latent `x == 0`
+    - latent `x > 0 && y == 0`
+    - continue `x > 0 && y > 0`
+
+- Current authoritative comparator is still:
+  - `Matching: 13`
+  - `Differences: 8`
+  - but the `may_double_free_if_alias` diff is narrower now:
+    - the extra latent branch is gone
+    - remaining delta in that procedure is down to latent diagnostic payload /
+      attr / phi parity, not disjunct-count or guard-ordering parity
+
+- Most realistic next step:
+  - stay on the specialization cluster, but move from disjunct-ordering to
+    payload parity:
+    - latent-invalid-access diagnostic payload in summaries
+    - `Initialized` attr retention on latent paths
+    - positive-guard representation (`eq ... = 1` vs `0 < ...`)

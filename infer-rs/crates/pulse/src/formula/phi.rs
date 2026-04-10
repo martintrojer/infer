@@ -466,6 +466,40 @@ impl Phi {
         self.linear_eqs.retain(|v, _| keep.contains(v));
     }
 
+    /// Forget pure constraints mentioning the given canonical values while
+    /// preserving the remaining heap-facing equality classes.
+    pub fn forget_constraints_involving(&mut self, ignored: &HashSet<AbstractValue>) {
+        if ignored.is_empty() {
+            return;
+        }
+
+        let touches_ignored = |v: AbstractValue| ignored.contains(&self.var_eqs.find_immut(v));
+        let operand_touches_ignored = |operand: &super::Operand| match operand {
+            super::Operand::AbstractValue(v) => touches_ignored(*v),
+            super::Operand::ConstOperand(_) => false,
+        };
+
+        self.atoms
+            .retain(|atom| atom.all_vars().into_iter().all(|v| !touches_ignored(v)));
+        self.linear_eqs.retain(|v, lin| {
+            !touches_ignored(*v) && lin.get_variables().all(|var| !touches_ignored(var))
+        });
+        self.term_eqs.retain(|v, term_eq| {
+            !touches_ignored(*v)
+                && !operand_touches_ignored(&term_eq.lhs)
+                && !operand_touches_ignored(&term_eq.rhs)
+        });
+        self.intervals.retain(|v, _interval| !touches_ignored(*v));
+        self.is_int_vars.retain(|v| !touches_ignored(*v));
+        self.fn_app_eqs.retain(|key, ret| {
+            !touches_ignored(*ret)
+                && key.actuals.iter().all(|actual| match actual {
+                    FnAppActual::Const(_) => true,
+                    FnAppActual::Var(v) => !touches_ignored(*v),
+                })
+        });
+    }
+
     // --- Internal helpers ---
 
     /// Add a linear equation `x = solution` to the solver.

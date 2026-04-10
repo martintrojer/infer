@@ -24,6 +24,7 @@ use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
+use crate::formula::Operand;
 use crate::value_history::HistoryEvent;
 
 /// The summary of a Pulse analysis on a single procedure.
@@ -594,9 +595,25 @@ impl PulseSummary {
             let mut pp =
                 build_pre_post(pdesc, state.get_astate().clone(), initial_kind, abort_diag);
             let leak_diags = pp.normalize();
-            // Only report leaks from ContinueProgram paths — error paths
-            // (ExitProgram/AbortProgram) typically produce spurious leaks.
-            // Cross-ref: OCaml PulseReport.ml summary_of_error_post ignores leaks.
+            let potential_invalid_access = if pp.kind == PrePostKind::ContinueProgram {
+                potential_invalid_access_from_normalized_continue_pre_post(pdesc, &pp)
+            } else {
+                None
+            };
+            if let Some((_addr, diagnostic)) = potential_invalid_access {
+                pp.kind = PrePostKind::LatentInvalidAccess;
+                pp.diagnostic = Some(diagnostic);
+            }
+            if pp.kind == PrePostKind::LatentInvalidAccess
+                && !normalize_direct_formal_latent_invalid_access_shape(pdesc, &mut pp)
+            {
+                continue;
+            }
+            // Only report leaks from ordinary ContinueProgram paths — latent /
+            // error paths (ExitProgram/AbortProgram/Latent*) typically
+            // produce spurious leaks.
+            // Cross-ref: OCaml PulseReport.ml summary_of_error_post ignores
+            // leaks on stopped states, including PotentialInvalidAccessSummary.
             if pp.kind == PrePostKind::ContinueProgram {
                 diagnostics.extend(leak_diags);
             }
@@ -849,6 +866,262 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
             }
         })
         .collect()
+}
+
+/// Cross-ref: OCaml `PulseAbductiveDomain.Summary.of_post` can turn a normal
+/// exit state into `PotentialInvalidAccessSummary` when summary simplification
+/// discovers that a caller-controlled `must_be_valid` address is equal to
+/// zero. `PulseSummary.exec_summary_of_post_common` then exports that as a
+/// single `LatentInvalidAccess`, not as an additional ContinueProgram.
+fn potential_invalid_access_from_normalized_continue_pre_post(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> Option<(AbstractValue, Diagnostic)> {
+    if pre_post.kind != PrePostKind::ContinueProgram {
+        return None;
+    }
+
+    let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
+    let formal_stack_addrs = formal_stack_addrs(pdesc, pre_post);
+    let deref_value_targets = pre_heap_deref_value_targets(pre_post);
+    let mut candidates: Vec<_> = pre_post.post.must_be_valid.iter().copied().collect();
+    candidates.sort();
+
+    let mut best: Option<((sil::location::Location, u64, AbstractValue), Diagnostic)> = None;
+    let mut seen = std::collections::HashSet::new();
+
+    for addr in candidates {
+        let repr = pre_post.post.path_condition.get_var_repr(addr);
+        if !seen.insert(repr) {
+            continue;
+        }
+        if !pre_post.post.path_condition.is_known_zero(repr) {
+            continue;
+        }
+        if formal_stack_addrs.contains(&repr) || !deref_value_targets.contains(&repr) {
+            continue;
+        }
+
+        let invalid_attr = pre_post
+            .post
+            .post
+            .attrs
+            .get(&repr)
+            .and_then(|attrs| attrs.get_invalid());
+        if invalid_attr.is_some_and(|(inv, _history)| !inv.is_null_deref()) {
+            continue;
+        }
+
+        if post_addr_was_compared_to_null(pre_post, repr) {
+            continue;
+        }
+
+        let access_history = pre_post.post.history_of_value(repr).unwrap_or_default();
+        if latent_invalid_access_is_imported_from_call(pdesc, pre_post, repr, &access_history) {
+            continue;
+        }
+        if !caller_controlled.contains(&repr) && !access_history.contains_formal_origin() {
+            continue;
+        }
+
+        let Some((timestamp, location)) = pre_post
+            .pre
+            .attrs
+            .get(&repr)
+            .and_then(|attrs| attrs.get_must_be_valid())
+            .map(|(ts, loc, _reason)| (ts, loc.clone()))
+            .or_else(|| {
+                access_history
+                    .last_location()
+                    .cloned()
+                    .map(|loc| (u64::MAX, loc))
+            })
+        else {
+            continue;
+        };
+
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        let invalidation_history = access_history.append_event(HistoryEvent::Invalidated {
+            invalidation: invalidation.clone(),
+            location: location.clone(),
+        });
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: repr,
+            invalidation,
+            access_location: location.clone(),
+            access_history,
+            invalidation_history,
+        };
+        let key = (location, timestamp, repr);
+        match &best {
+            Some((best_key, _)) if &key >= best_key => {}
+            _ => best = Some((key, diagnostic)),
+        }
+    }
+
+    best.map(|((_location, _timestamp, addr), diagnostic)| (addr, diagnostic))
+}
+
+fn drop_selected_null_invalidation(pre_post: &mut PrePost, addr: AbstractValue) {
+    let repr = pre_post.post.path_condition.get_var_repr(addr);
+    let Some(attrs) = pre_post.post.post.attrs.get_mut(&repr) else {
+        return;
+    };
+
+    let invalids_to_remove: Vec<_> = attrs
+        .iter()
+        .filter(|attr| {
+            matches!(
+                attr,
+                crate::attribute::Attribute::Invalid(inv, _history) if inv.is_null_deref()
+            )
+        })
+        .cloned()
+        .collect();
+    for attr in invalids_to_remove {
+        attrs.remove(&attr);
+    }
+    if attrs.is_empty() {
+        pre_post.post.post.attrs.remove_addr(&repr);
+    }
+}
+
+fn normalize_direct_formal_latent_invalid_access_shape(
+    pdesc: &Procdesc,
+    pre_post: &mut PrePost,
+) -> bool {
+    let Some(addr) = diagnostic_addr_repr(pre_post) else {
+        return true;
+    };
+
+    if !require_earlier_direct_formals_nonzero_for_potential_invalid_access(pdesc, pre_post, addr) {
+        return false;
+    }
+    prune_later_direct_formal_artifacts_for_potential_invalid_access(pdesc, pre_post, addr);
+    drop_selected_null_invalidation(pre_post, addr);
+    true
+}
+
+/// Cross-ref: OCaml publishes `PotentialInvalidAccessSummary` obligations in
+/// source order on direct-formal reads. If we export a later direct-formal
+/// access as latent, every earlier direct-formal read must already have
+/// succeeded, so record those reads as non-null guards on the summary path.
+fn require_earlier_direct_formals_nonzero_for_potential_invalid_access(
+    pdesc: &Procdesc,
+    pre_post: &mut PrePost,
+    selected_addr: AbstractValue,
+) -> bool {
+    let selected_repr = pre_post.post.path_condition.get_var_repr(selected_addr);
+    let direct_formal_ordering = direct_formal_value_must_be_valid_ordering(pdesc, pre_post);
+    let Some(selected_order) = direct_formal_ordering.get(&selected_repr).cloned() else {
+        return true;
+    };
+
+    let mut earlier_formals: Vec<_> = direct_formal_ordering
+        .into_iter()
+        .filter_map(|(addr, order)| {
+            (addr != selected_repr && order < selected_order).then_some(addr)
+        })
+        .collect();
+    earlier_formals.sort();
+
+    for addr in earlier_formals {
+        if pre_post
+            .post
+            .path_condition
+            .prune_less_than(&Operand::ConstOperand(0), &Operand::AbstractValue(addr))
+            .is_unsat()
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn prune_later_direct_formal_artifacts_for_potential_invalid_access(
+    pdesc: &Procdesc,
+    pre_post: &mut PrePost,
+    selected_addr: AbstractValue,
+) {
+    let selected_repr = pre_post.post.path_condition.get_var_repr(selected_addr);
+    let Some(selected_order) = pre_post.diagnostic.as_ref().and_then(|_| {
+        direct_formal_value_must_be_valid_ordering(pdesc, pre_post)
+            .get(&selected_repr)
+            .cloned()
+    }) else {
+        return;
+    };
+    let direct_formal_ordering = direct_formal_value_must_be_valid_ordering(pdesc, pre_post);
+
+    let later_formal_roots: Vec<_> = direct_formal_ordering
+        .into_iter()
+        .filter_map(|(addr, order)| {
+            (addr != selected_repr && order > selected_order).then_some(addr)
+        })
+        .collect();
+    if later_formal_roots.is_empty() {
+        return;
+    }
+
+    let later_reachable: std::collections::HashSet<_> = pre_post
+        .collect_reachable_from_seeds(later_formal_roots, true, true)
+        .into_iter()
+        .map(|addr| pre_post.post.path_condition.get_var_repr(addr))
+        .collect();
+    if later_reachable.is_empty() {
+        return;
+    }
+
+    pre_post
+        .post
+        .path_condition
+        .forget_constraints_involving(&later_reachable);
+
+    for addr in &later_reachable {
+        pre_post.post.post.attrs.remove_addr(addr);
+    }
+
+    let mut summary_roots: Vec<AbstractValue> =
+        pre_post.pre.stack.iter().map(|(_, addr)| *addr).collect();
+    summary_roots.extend(pre_post.post.post.stack.iter().map(|(_, addr)| *addr));
+    summary_roots.extend(pre_post.formals.iter().map(|(_, addr)| *addr));
+    if let Some(result) = pre_post.result {
+        summary_roots.push(result);
+    }
+
+    let post_reachable: std::collections::HashSet<_> = pre_post
+        .collect_reachable_from_seeds(summary_roots, true, true)
+        .into_iter()
+        .filter(|addr| !later_reachable.contains(&pre_post.post.path_condition.get_var_repr(*addr)))
+        .collect();
+    let mut formula_reachable: std::collections::HashSet<_> = post_reachable
+        .iter()
+        .map(|addr| pre_post.post.path_condition.get_var_repr(*addr))
+        .collect();
+    formula_reachable.extend(expand_formula_reachable(
+        &pre_post.post.path_condition,
+        &formula_reachable,
+    ));
+
+    let pre_reachable = pre_post.collect_reachable_from_seeds(
+        pre_post.pre.stack.iter().map(|(_, addr)| *addr),
+        true,
+        false,
+    );
+    let mut precondition_vocabulary: std::collections::HashSet<_> = pre_reachable
+        .iter()
+        .map(|addr| pre_post.post.path_condition.get_var_repr(*addr))
+        .collect();
+    precondition_vocabulary.extend(expand_formula_reachable(
+        &pre_post.post.path_condition,
+        &precondition_vocabulary,
+    ));
+
+    pre_post
+        .post
+        .path_condition
+        .simplify_for_summary(&precondition_vocabulary, &formula_reachable);
 }
 
 fn classify_recovered_invalid_access_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
@@ -1130,6 +1403,25 @@ fn direct_formal_value_addrs(
                 .find(&var)
                 .and_then(|addr| pre_post.pre.heap.find_edge(addr, &Access::Dereference))
                 .map(|value| pre_post.post.path_condition.get_var_repr(value))
+        })
+        .collect()
+}
+
+fn direct_formal_value_must_be_valid_ordering(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> HashMap<AbstractValue, (u64, sil::location::Location)> {
+    pdesc
+        .formals
+        .iter()
+        .filter_map(|(mangled, _typ, _annot)| {
+            let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+            let var = Var::ProgramVar(Box::new(pvar));
+            let addr = pre_post.pre.stack.find(&var)?;
+            let value = pre_post.pre.heap.find_edge(addr, &Access::Dereference)?;
+            let repr = pre_post.post.path_condition.get_var_repr(value);
+            let (timestamp, loc, _reason) = pre_post.pre.attrs.get(&repr)?.get_must_be_valid()?;
+            Some((repr, (timestamp, loc.clone())))
         })
         .collect()
 }
@@ -1713,21 +2005,76 @@ mod tests {
         pdesc
     }
 
-    fn invalidation_history(invalidation: &crate::invalidation::Invalidation) -> ValueHistory {
-        ValueHistory::invalidated(invalidation.clone(), Location::dummy())
-    }
-
     fn dummy_invalid_access_diagnostic(
         addr: AbstractValue,
         invalidation: crate::invalidation::Invalidation,
     ) -> Diagnostic {
+        dummy_invalid_access_diagnostic_at(addr, invalidation, Location::dummy())
+    }
+
+    fn dummy_invalid_access_diagnostic_at(
+        addr: AbstractValue,
+        invalidation: crate::invalidation::Invalidation,
+        access_location: Location,
+    ) -> Diagnostic {
         Diagnostic::AccessToInvalidAddress {
             addr,
             invalidation: invalidation.clone(),
-            access_location: Location::dummy(),
-            access_history: ValueHistory::assignment(Location::dummy()),
-            invalidation_history: invalidation_history(&invalidation),
+            access_location: access_location.clone(),
+            access_history: ValueHistory::assignment(access_location.clone()),
+            invalidation_history: ValueHistory::invalidated(invalidation.clone(), access_location),
         }
+    }
+
+    fn make_continue_pre_post_with_two_direct_formals() -> (
+        Procdesc,
+        PrePost,
+        AbstractValue,
+        AbstractValue,
+        Location,
+        Location,
+    ) {
+        let pdesc = make_pdesc_with_formals(&["x", "y"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let x_var = Var::ProgramVar(Box::new(x_pvar.clone()));
+        let x_formal_addr = astate.post.stack.find(&x_var).unwrap();
+        let x_val = astate.read_heap(x_formal_addr, Access::Dereference);
+
+        let y_pvar = Pvar::mk(Mangled::from_string("y"), pdesc.proc_name.clone());
+        let y_var = Var::ProgramVar(Box::new(y_pvar.clone()));
+        let y_formal_addr = astate.post.stack.find(&y_var).unwrap();
+        let y_val = astate.read_heap(y_formal_addr, Access::Dereference);
+
+        let x_loc = Location {
+            line: 79,
+            col: 3,
+            ..Location::dummy()
+        };
+        let y_loc = Location {
+            line: 80,
+            col: 3,
+            ..Location::dummy()
+        };
+        astate.mark_must_be_valid_at(x_val, &x_loc);
+        astate.mark_must_be_valid_at(y_val, &y_loc);
+
+        (
+            pdesc,
+            PrePost {
+                pre: astate.pre.clone(),
+                post: astate,
+                formals: vec![(x_pvar, x_formal_addr), (y_pvar, y_formal_addr)],
+                result: None,
+                kind: PrePostKind::ContinueProgram,
+                diagnostic: None,
+            },
+            x_val,
+            y_val,
+            x_loc,
+            y_loc,
+        )
     }
 
     #[test]
@@ -2846,6 +3193,149 @@ mod tests {
             summary.diagnostics,
             vec![diagnostic],
             "the local abort should stay the only published issue"
+        );
+    }
+
+    #[test]
+    fn test_potential_invalid_access_requires_earlier_direct_formals_nonzero() {
+        let (pdesc, mut pre_post, x_val, y_val, _x_loc, y_loc) =
+            make_continue_pre_post_with_two_direct_formals();
+
+        assert!(pre_post
+            .post
+            .path_condition
+            .prune_eq_const(y_val, 0, false)
+            .is_sat());
+        pre_post.diagnostic = Some(dummy_invalid_access_diagnostic_at(
+            y_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            y_loc,
+        ));
+
+        assert!(
+            require_earlier_direct_formals_nonzero_for_potential_invalid_access(
+                &pdesc,
+                &mut pre_post,
+                y_val,
+            ),
+            "later direct-formal latent accesses should keep the earlier access-success prefix"
+        );
+
+        assert_eq!(
+            pre_post
+                .post
+                .path_condition
+                .conditions()
+                .get(&Atom::Equal(Term::Var(y_val), Term::Const(0))),
+            Some(&0)
+        );
+        assert_eq!(
+            pre_post
+                .post
+                .path_condition
+                .conditions()
+                .get(&Atom::LessThan(Term::Const(0), Term::Var(x_val))),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn test_direct_formal_ordering_prefers_timestamp_over_location() {
+        let pdesc = make_pdesc_with_formals(&["x", "y"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let x_var = Var::ProgramVar(Box::new(x_pvar.clone()));
+        let x_formal_addr = astate.post.stack.find(&x_var).unwrap();
+        let x_val = astate.read_heap(x_formal_addr, Access::Dereference);
+
+        let y_pvar = Pvar::mk(Mangled::from_string("y"), pdesc.proc_name.clone());
+        let y_var = Var::ProgramVar(Box::new(y_pvar.clone()));
+        let y_formal_addr = astate.post.stack.find(&y_var).unwrap();
+        let y_val = astate.read_heap(y_formal_addr, Access::Dereference);
+
+        let x_loc = Location {
+            line: 200,
+            col: 1,
+            ..Location::dummy()
+        };
+        let y_loc = Location {
+            line: 100,
+            col: 1,
+            ..Location::dummy()
+        };
+
+        // Record x first even though its textual location sorts after y.
+        astate.mark_must_be_valid_at(x_val, &x_loc);
+        astate.mark_must_be_valid_at(y_val, &y_loc);
+
+        let pre_post = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(x_pvar, x_formal_addr), (y_pvar, y_formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let ordering = direct_formal_value_must_be_valid_ordering(&pdesc, &pre_post);
+        assert!(
+            ordering[&x_val] < ordering[&y_val],
+            "direct-formal ordering should follow dynamic access order, not raw location order"
+        );
+    }
+
+    #[test]
+    fn test_potential_invalid_access_forgets_later_direct_formal_constraints() {
+        let (pdesc, mut pre_post, x_val, y_val, x_loc, _y_loc) =
+            make_continue_pre_post_with_two_direct_formals();
+
+        assert!(pre_post
+            .post
+            .path_condition
+            .prune_eq_const(x_val, 0, false)
+            .is_sat());
+        assert!(pre_post
+            .post
+            .path_condition
+            .prune_less_than(&Operand::ConstOperand(0), &Operand::AbstractValue(y_val))
+            .is_sat());
+        pre_post.diagnostic = Some(dummy_invalid_access_diagnostic_at(
+            x_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            x_loc,
+        ));
+
+        prune_later_direct_formal_artifacts_for_potential_invalid_access(
+            &pdesc,
+            &mut pre_post,
+            x_val,
+        );
+
+        assert_eq!(
+            pre_post
+                .post
+                .path_condition
+                .conditions()
+                .get(&Atom::Equal(Term::Var(x_val), Term::Const(0))),
+            Some(&0)
+        );
+        assert!(
+            !pre_post
+                .post
+                .path_condition
+                .conditions()
+                .contains_key(&Atom::LessThan(Term::Const(0), Term::Var(y_val))),
+            "later direct-formal success guards should not survive when exporting an earlier latent access"
+        );
+        assert!(
+            !pre_post
+                .post
+                .path_condition
+                .phi()
+                .atoms
+                .contains(&Atom::LessThan(Term::Const(0), Term::Var(y_val))),
+            "later direct-formal pure atoms should be erased alongside remembered conditions"
         );
     }
 

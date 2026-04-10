@@ -62,8 +62,17 @@ not move the current `specialization.c` comparator. A broader checker-side attem
 non-exit latent invalid accesses when another path reaches exit was cross-checked against OCaml and
 reverted because it over-published latent summaries in `test_alias`, `test_unalias`, and wrapper /
 recursion cases. The ignored `test_normal_exit_keeps_non_exit_latent_abort` now exists only to
-document that still-missing direct-formal-read case. The next semantic target is tracing where the
-`may_double_free_if_alias` null-read stop paths turn into `ContinueProgram` before summary export.
+document that still-missing direct-formal-read case.
+
+The latest direct-formal ordering fix closes the main `may_double_free_if_alias` shape bug without
+cheating the counts: Rust now stamps `MustBeValid` / `MustBeInitialized` summary attrs with real
+monotonic per-state timestamps instead of hardcoding `0`, and latent-invalid-access summary
+shaping now orders direct-formal accesses by `(timestamp, location)` rather than raw `.sil`
+location alone. That removes the extra latent branch and brings the raw main summary down to the
+OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. The overall comparator still
+stays at `Matching: 13`, `Differences: 8`, but the remaining specialization work is now narrower:
+`call_may_double_free_if_alias_bad` plus latent payload / attr / phi parity in
+`may_double_free_if_alias`, and the existing recursion / arithmetic / attr-export cluster.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

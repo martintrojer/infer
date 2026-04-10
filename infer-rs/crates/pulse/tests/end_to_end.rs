@@ -3473,6 +3473,7 @@ fn test_debug_specialization_summary() {
                 || name == "test_unalias"
                 || name == "call_test_alias_bad"
                 || name == "call_test_unalias_bad"
+                || name == "may_double_free_if_alias"
             {
                 for (i, pp) in summary.pre_posts.iter().enumerate() {
                     eprintln!("    raw_main[{i}]={:#?}", rust_pre_post_to_raw(pp));

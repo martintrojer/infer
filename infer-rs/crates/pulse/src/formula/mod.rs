@@ -601,6 +601,30 @@ impl Formula {
         self.conditions = conditions;
     }
 
+    /// Forget summary-only constraints that mention the given values.
+    ///
+    /// Cross-ref: OCaml summary export can drop later caller-controlled guards
+    /// when publishing an earlier `PotentialInvalidAccessSummary` obligation.
+    /// Keep the heap shape, but erase pure constraints on the forgotten roots
+    /// so the exported summary only retains the selected access prefix.
+    pub fn forget_constraints_involving(&mut self, ignored: &HashSet<AbstractValue>) {
+        if ignored.is_empty() {
+            return;
+        }
+
+        let ignored_reprs: HashSet<_> = ignored
+            .iter()
+            .map(|addr| self.phi.get_repr(*addr))
+            .collect();
+
+        self.conditions.retain(|atom, _depth| {
+            atom.all_vars()
+                .into_iter()
+                .all(|v| !ignored_reprs.contains(&self.phi.get_repr(v)))
+        });
+        self.phi.forget_constraints_involving(&ignored_reprs);
+    }
+
     fn record_condition_if_meaningful(&mut self, atom: Atom, depth: usize) {
         if atom.is_trivially_true() == Some(true) {
             return;
@@ -901,6 +925,37 @@ mod tests {
             f.conditions().get(&Atom::Equal(Term::Var(x), Term::Const(0))),
             Some(&0),
             "summary simplification should rewrite dead condition vars onto the visible precondition alias instead of erasing the caller-controlled guard"
+        );
+    }
+
+    #[test]
+    fn test_forget_constraints_involving_drops_conditions_and_phi_facts() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+
+        assert!(f.prune_eq_const(x, 0, false).is_sat());
+        assert!(f
+            .prune_less_than(&Operand::ConstOperand(0), &Operand::AbstractValue(y))
+            .is_sat());
+
+        f.forget_constraints_involving(&HashSet::from([y]));
+
+        assert_eq!(
+            f.conditions()
+                .get(&Atom::Equal(Term::Var(x), Term::Const(0))),
+            Some(&0)
+        );
+        assert!(
+            !f.conditions()
+                .contains_key(&Atom::LessThan(Term::Const(0), Term::Var(y))),
+            "forgotten roots should not keep remembered summary conditions"
+        );
+        assert!(
+            !f.phi()
+                .atoms
+                .contains(&Atom::LessThan(Term::Const(0), Term::Var(y))),
+            "forgotten roots should not keep pure phi atoms either"
         );
     }
 

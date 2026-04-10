@@ -62,6 +62,9 @@ pub struct AbductiveDomain {
     /// addresses the callee actually dereferences, not all pre-edges.
     /// Cross-ref: OCaml MustBeValid attribute in PulseAttribute.ml.
     pub must_be_valid: std::collections::HashSet<AbstractValue>,
+    /// Monotonic attribute timestamp used to preserve path-local event order
+    /// for exported summary attributes such as `MustBeValid`.
+    next_attr_timestamp: crate::attribute::Timestamp,
 }
 
 /// Outcome of applying callee-imported equalities to an abductive state.
@@ -88,6 +91,7 @@ impl AbductiveDomain {
             const_cache: std::collections::BTreeMap::new(),
             need_dynamic_type_specialization: std::collections::HashSet::new(),
             must_be_valid: std::collections::HashSet::new(),
+            next_attr_timestamp: 1,
         };
 
         // Bind each formal parameter to a fresh abstract value.
@@ -267,9 +271,10 @@ impl AbductiveDomain {
             .and_then(|attrs| attrs.get_written_to())
             .is_some();
         if !is_written_to && self.pre.heap.get_edges(repr).is_some() {
+            let timestamp = self.fresh_attr_timestamp();
             self.pre
                 .attrs
-                .add_one(repr, Attribute::MustBeInitialized(0, loc.clone()));
+                .add_one(repr, Attribute::MustBeInitialized(timestamp, loc.clone()));
         }
     }
 
@@ -562,9 +567,10 @@ impl AbductiveDomain {
         let repr = self.path_condition.get_var_repr(addr);
         self.must_be_valid.insert(repr);
         if self.pre.heap.get_edges(repr).is_some() {
+            let timestamp = self.fresh_attr_timestamp();
             self.pre
                 .attrs
-                .add_one(repr, Attribute::MustBeValid(0, loc.clone(), None));
+                .add_one(repr, Attribute::MustBeValid(timestamp, loc.clone(), None));
         }
     }
 
@@ -572,6 +578,12 @@ impl AbductiveDomain {
     pub fn is_must_be_valid(&self, addr: AbstractValue) -> bool {
         let repr = self.path_condition.get_var_repr(addr);
         self.must_be_valid.contains(&repr)
+    }
+
+    fn fresh_attr_timestamp(&mut self) -> crate::attribute::Timestamp {
+        let timestamp = self.next_attr_timestamp;
+        self.next_attr_timestamp += 1;
+        timestamp
     }
 
     /// Record that an abstract value needs dynamic type information for

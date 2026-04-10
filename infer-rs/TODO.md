@@ -84,9 +84,16 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    non-exit latent invalid accesses when another path reaches exit was
    reverted after OCaml summary cross-checks showed it spuriously adds latent
    summaries to `test_alias`, `test_unalias`, and wrapper / recursion cases.
-   The next real question is narrower: where do the `may_double_free_if_alias`
-   null-read stop paths get folded back into `ContinueProgram` before summary
-   export?
+   That direct-formal ordering bug is now fixed correctly: Rust now gives
+   summary `MustBeValid` / `MustBeInitialized` attrs real per-state timestamps
+   instead of hardcoded `0`, and latent summary shaping orders direct-formal
+   accesses by `(timestamp, location)` rather than raw `.sil` location alone.
+   `may_double_free_if_alias` now has the correct three-way raw shape
+   (`x == 0`, `x > 0 && y == 0`, continue), so the next real specialization
+   targets are narrower:
+   `call_may_double_free_if_alias_bad`, the remaining latent payload / attr /
+   phi parity inside `may_double_free_if_alias`, and then the existing
+   recursion / arithmetic / attr-export cluster.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

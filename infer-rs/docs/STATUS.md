@@ -2,9 +2,21 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely by conservatively initializing reachable funptr/actual values before model handling, stop recoverable transfer/model invalid accesses once they have been classified, and mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 13`, `Differences: 8`). A broader checker-side attempt to recover non-exit latent invalid accesses when another path reaches exit was reverted after OCaml summary cross-checks showed that it over-published latent summaries in alias/wrapper/recursion cases; the remaining diffs are still centered on alias/double-free recursion and a smaller arithmetic / attr-export set, with `may_double_free_if_alias` as the next focused fault line.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. Recent OCaml-backed correctness edits keep interproc formula import aligned with `PulseFormula.and_callee_formula`, use pre-call allocation snapshots when importing summary `EqZero`, reuse summary-side latent/manifest classification at caller boundaries for imported invalid accesses, restore leaf `MustBeValid` precondition handling, avoid replaying callee formal-stack bookkeeping onto by-value actuals, strip hidden formal/local stack-root `Initialized` attrs from exported summaries after `restore_formals_for_summary`, keep locally-proven direct-formal null dereferences manifest, preserve branch-conditioned null provenance from real prunes and `free(NULL)` / `free(non-null)` model splits, make unresolved `__call_c_function_ptr` mirror OCaml's unspecialized path more closely by conservatively initializing reachable funptr/actual values before model handling, stop recoverable transfer/model invalid accesses once they have been classified, mirror OCaml suppressed-report behavior via `--pulse-report-issues-for-tests`, and now preserve direct-formal latent ordering with real per-state `MustBeValid` timestamps instead of hardcoded `0`. The remaining count deltas are now the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Exact issue-set parity work is now concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root`, richer trace/report parity, and the remaining `specialization.c` semantic cluster (`Matching: 13`, `Differences: 8`). A broader checker-side attempt to recover non-exit latent invalid accesses when another path reaches exit was reverted after OCaml summary cross-checks showed that it over-published latent summaries in alias/wrapper/recursion cases; the remaining diffs are still centered on alias/double-free recursion and a smaller arithmetic / attr-export set, but `may_double_free_if_alias` itself is now narrowed to latent payload / attr / phi parity rather than the old extra-disjunct bug, so the next focused fault line is `call_may_double_free_if_alias_bad` plus the residual specialization payload cluster.**
 
 Recent correctness / robustness fixes:
+- Direct-formal latent summary shaping now uses real per-state summary-event
+  order instead of fake location order. Rust previously stamped
+  `MustBeValid` / `MustBeInitialized` attrs with timestamp `0`, so
+  `summary.rs` fell back to comparing raw `.sil` locations and could export
+  the wrong direct-formal latent branch ordering. `abductive.rs` now assigns
+  monotonic timestamps, `summary.rs` orders direct-formal accesses by
+  `(timestamp, location)`, and latent-invalid-access shaping now also drops
+  later direct-formal pure constraints via a targeted formula helper. This
+  removes the extra latent branch from `may_double_free_if_alias`: the raw
+  main summary is now `x == 0`, `x > 0 && y == 0`, and the normal continue
+  path. The overall comparator remains `Matching: 13`, `Differences: 8`, but
+  the remaining delta in that procedure is now payload / attr / phi parity.
 - Recoverable transfer-side invalid accesses now stop instead of exporting
   `ContinueProgram + AbortProgram`: recoverable `Load` / `Store` errors in
   `Pulse.ml`-style transfer now go through summary-side classification and
@@ -83,7 +95,10 @@ Recent correctness / robustness fixes:
   `two_pointers_recursion_bad`. `add_one` and `invoke` now match after the
   unresolved-call conservative-initialization fix. The remaining themes are
   representative / formula normalization detail plus harder alias /
-  double-free / recursion / attr-export mismatches.
+  double-free / recursion / attr-export mismatches. `may_double_free_if_alias`
+  no longer has the old extra latent-disjunct bug; what remains there is
+  diagnostic payload / attr / phi detail, while `call_may_double_free_if_alias_bad`
+  is the next sharper wrapper/caller target.
 - Summary import now snapshots caller allocation state after `materialize_pre`
   but before `apply_post`, and imported `EqZero` handling consults those
   pre-call snapshots instead of the rejected broad formula-before-post reorder.
