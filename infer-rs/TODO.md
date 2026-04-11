@@ -102,8 +102,13 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    reconstructing that diagnostic on import. That removes the remaining
    `may_double_free_if_alias` attr/payload gap: the procedure now matches
    OCaml on latent diagnostic shape and caller-visible `Initialized` attrs, so
-   only formula parity remains there. After that, the next real targets are
-   the remaining linear-phi parity inside `may_double_free_if_alias`, and then
+   only formula parity remains there. The semantic comparator now also
+   canonicalizes OCaml restricted-witness inequality encodings
+   (`eq:x=lin(1*a1,const=1)` => `0 < x`,
+   `eq:x=lin(-1*a1)` => `x <= 0`) plus the corresponding `is_int(...)`
+   witness terms, so the remaining `16 / 5` diff set is less polluted by
+   solver-presentation noise. After that, the next real targets are the
+   remaining linear-phi parity inside `may_double_free_if_alias`, and then
    the existing recursion /
    arithmetic / attr-export cluster. A direct self-recursion cut
    now also matches OCaml `PulseCallOperations.on_recursive_call` for the

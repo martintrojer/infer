@@ -73,7 +73,12 @@ export noise are gone, `add_one`, `invoke`, `alias_recursion`,
 latent-invalid-access recovery no longer republishes imported callee `MustBeValid` obligations,
 the checker restores the missing skipped-call branch in
 `call_may_double_free_if_alias_bad`, and the comparator parses both stack-style and heap-target
-OCaml value-id shapes from `all_summaries.json`. The remaining semantic diffs are now
+OCaml value-id shapes from `all_summaries.json`. It also now collapses OCaml's
+restricted-witness inequality encodings from `PulseArithmetic.solve_lin_ineq` /
+`PulseFormulaPhi` into the same semantic atoms Rust emits
+(`eq:x=lin(1*a1,const=1)` => `0 < x`, `eq:x=lin(-1*a1)` => `x <= 0`), so the
+remaining semantic diffs are less affected by solver presentation. The remaining
+semantic diffs are now
 `add_more_bad`, `add_two`, `invoke_itself_bad`, `may_double_free_if_alias`, and
 `two_pointers_recursion_bad`.
 

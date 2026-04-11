@@ -213,11 +213,16 @@ fn canonicalize_phi_items(phi: &[String]) -> Vec<String> {
             Some((lhs.to_string(), rhs.to_string()))
         })
         .collect();
+    let witness_equivs = build_witness_equivalences(&eqs);
 
     let mut normalized = BTreeSet::new();
     for item in phi {
-        if let Some(term) = parse_is_int_item(item) {
-            for normalized_term in normalize_is_int_terms(term, &eqs) {
+        if let Some(lhs) = parse_positive_witness_eq(item) {
+            normalized.insert(format!("atom:0 < {lhs}"));
+        } else if let Some(lhs) = parse_nonpositive_witness_eq(item) {
+            normalized.insert(format!("atom:{lhs} <= 0"));
+        } else if let Some(term) = parse_is_int_item(item) {
+            for normalized_term in normalize_is_int_terms(term, &eqs, &witness_equivs) {
                 normalized.insert(format!("is_int({normalized_term})"));
             }
         } else {
@@ -232,16 +237,21 @@ fn parse_is_int_item(item: &str) -> Option<&str> {
     item.strip_prefix("is_int(")?.strip_suffix(')')
 }
 
-fn normalize_is_int_terms(term: &str, eqs: &HashMap<String, String>) -> BTreeSet<String> {
+fn normalize_is_int_terms(
+    term: &str,
+    eqs: &HashMap<String, String>,
+    witness_equivs: &HashMap<String, String>,
+) -> BTreeSet<String> {
     let mut normalized = BTreeSet::new();
     let mut visiting = BTreeSet::new();
-    normalize_is_int_term(term, eqs, &mut visiting, &mut normalized);
+    normalize_is_int_term(term, eqs, witness_equivs, &mut visiting, &mut normalized);
     normalized
 }
 
 fn normalize_is_int_term(
     term: &str,
     eqs: &HashMap<String, String>,
+    witness_equivs: &HashMap<String, String>,
     visiting: &mut BTreeSet<String>,
     normalized: &mut BTreeSet<String>,
 ) {
@@ -249,8 +259,14 @@ fn normalize_is_int_term(
         return;
     }
 
+    if let Some(canonical) = witness_equivs.get(term) {
+        normalized.insert(canonical.clone());
+        visiting.remove(term);
+        return;
+    }
+
     if let Some(rhs) = eqs.get(term) {
-        normalize_is_int_term(rhs, eqs, visiting, normalized);
+        normalize_is_int_term(rhs, eqs, witness_equivs, visiting, normalized);
         visiting.remove(term);
         return;
     }
@@ -258,7 +274,7 @@ fn normalize_is_int_term(
     if let Some(vars) = parse_linear_term_vars(term) {
         normalized.insert(term.to_string());
         if vars.len() == 1 && matches!(vars[0].1, -1 | 1) {
-            normalize_is_int_term(&vars[0].0, eqs, visiting, normalized);
+            normalize_is_int_term(&vars[0].0, eqs, witness_equivs, visiting, normalized);
         }
         visiting.remove(term);
         return;
@@ -268,18 +284,80 @@ fn normalize_is_int_term(
     visiting.remove(term);
 }
 
-fn parse_linear_term_vars(term: &str) -> Option<Vec<(String, i32)>> {
+/// OCaml `PulseArithmetic.solve_lin_ineq` / `PulseFormulaPhi` often encode
+/// inequalities through restricted witnesses, for example `x = a + 1`
+/// for `0 < x` and `x = -a` for `x <= 0`.
+/// Collapse those presentation-only forms so comparator diffs stay focused on
+/// real summary semantics rather than solver encoding details.
+fn build_witness_equivalences(eqs: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for (lhs, rhs) in eqs {
+        for witness in [
+            parse_positive_witness_rhs(rhs),
+            parse_nonpositive_witness_rhs(rhs),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            result.insert(lhs.clone(), lhs.clone());
+            result.insert(rhs.clone(), lhs.clone());
+            result.insert(witness, lhs.clone());
+        }
+    }
+    result
+}
+
+fn parse_positive_witness_eq(item: &str) -> Option<String> {
+    let rest = item.strip_prefix("eq:")?;
+    let (lhs, rhs) = rest.split_once('=')?;
+    parse_positive_witness_rhs(rhs).map(|_| lhs.to_string())
+}
+
+fn parse_positive_witness_rhs(rhs: &str) -> Option<String> {
+    let (vars, constant) = parse_linear_term(rhs)?;
+    if constant != 1 || vars.len() != 1 || vars[0].1 != 1 {
+        return None;
+    }
+    let witness = &vars[0].0;
+    witness.starts_with('a').then(|| witness.clone())
+}
+
+fn parse_nonpositive_witness_eq(item: &str) -> Option<String> {
+    let rest = item.strip_prefix("eq:")?;
+    let (lhs, rhs) = rest.split_once('=')?;
+    parse_nonpositive_witness_rhs(rhs).map(|_| lhs.to_string())
+}
+
+fn parse_nonpositive_witness_rhs(rhs: &str) -> Option<String> {
+    let (vars, constant) = parse_linear_term(rhs)?;
+    if constant != 0 || vars.len() != 1 || vars[0].1 != -1 {
+        return None;
+    }
+    let witness = &vars[0].0;
+    witness.starts_with('a').then(|| witness.clone())
+}
+
+fn parse_linear_term(term: &str) -> Option<(Vec<(String, i32)>, i32)> {
     let inner = term.strip_prefix("lin(")?.strip_suffix(')')?;
     let mut vars = Vec::new();
+    let mut constant = 0;
     for part in inner.split(',') {
-        if part.is_empty() || part.starts_with("const=") {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(value) = part.strip_prefix("const=") {
+            constant = value.parse().ok()?;
             continue;
         }
         let (coeff, var) = part.split_once('*')?;
         let coeff = coeff.parse().ok()?;
         vars.push((var.to_string(), coeff));
     }
-    Some(vars)
+    Some((vars, constant))
+}
+
+fn parse_linear_term_vars(term: &str) -> Option<Vec<(String, i32)>> {
+    parse_linear_term(term).map(|(vars, _constant)| vars)
 }
 
 fn is_integer_constant(term: &str) -> bool {
@@ -1782,6 +1860,82 @@ mod tests {
                     "is_int(lin(1*v11,const=-1))".to_string(),
                     "eq:v12=1".to_string(),
                 ],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_phi_normalization_collapses_positivity_witness_equalities() {
+        let left = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v1".to_string())],
+                post_stack: vec![("x".to_string(), "v1".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v1=lin(1*a1,const=1)".to_string(),
+                    "is_int(a1)".to_string(),
+                    "is_int(lin(1*a1,const=1))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v10".to_string())],
+                post_stack: vec![("x".to_string(), "v10".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec!["atom:0 < v10".to_string(), "is_int(v10)".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_phi_normalization_collapses_nonpositive_witness_equalities() {
+        let left = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v1".to_string())],
+                post_stack: vec![("x".to_string(), "v1".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v1=lin(-1*a1)".to_string(),
+                    "is_int(a1)".to_string(),
+                    "is_int(lin(-1*a1))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v10".to_string())],
+                post_stack: vec![("x".to_string(), "v10".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec!["atom:v10 <= 0".to_string(), "is_int(v10)".to_string()],
                 diagnostic: None,
             }],
         };

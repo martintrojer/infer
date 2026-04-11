@@ -6,6 +6,39 @@ Keep it current when the active line of investigation changes.
 ## Current Focus
 
 - Latest stable checkpoint:
+  - `crates/test-harness/src/summary_compare.rs`
+    - semantic summary comparison now canonicalizes OCaml restricted-witness
+      inequality encodings emitted by `PulseArithmetic.solve_lin_ineq` /
+      `PulseFormulaPhi`
+    - covered forms:
+      - `eq:x=lin(1*a1,const=1)` => `atom:0 < x`
+      - `eq:x=lin(-1*a1)` => `atom:x <= 0`
+      - corresponding `is_int(a1)` / `is_int(lin(...))` collapse to
+        `is_int(x)`
+    - focused regressions:
+      - `test_phi_normalization_collapses_positivity_witness_equalities`
+      - `test_phi_normalization_collapses_nonpositive_witness_equalities`
+    - validations on the current tree:
+      - `cargo test -q -p test-harness test_phi_normalization_collapses_positivity_witness_equalities -- --nocapture`
+      - `cargo test -q -p test-harness test_phi_normalization_collapses_nonpositive_witness_equalities -- --nocapture`
+      - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+    - important observed effect:
+      - headline comparator still stays:
+        - `Matching: 16`
+        - `Differences: 5`
+      - but the remaining diff set is less contaminated by OCaml solver
+        presentation:
+        - `may_double_free_if_alias` is down to a single residual
+          `is_int(y.*.*)` formula delta
+        - `add_more_bad` / `add_two` are now cleaner arithmetic parity targets
+        - `invoke_itself_bad` / `two_pointers_recursion_bad` remain real
+          recursion/materialization gaps
+    - current next target:
+      - keep the comparator normalization as correctness-preserving
+        instrumentation, then work the remaining arithmetic cluster
+        (`add_two`, `add_more_bad`) before the harder recursion pair
+
+- Latest stable checkpoint:
   - `crates/pulse/src/summary.rs`
     - continue-derived latent-invalid-access summaries now export without an
       embedded diagnostic payload
