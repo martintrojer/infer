@@ -436,8 +436,20 @@ fn exec_call(
 ) -> Vec<ExecutionDomain> {
     // Try to dispatch to a built-in model
     if let Exp::Const(sil::const_val::Const::Cfun(callee)) = fun_exp {
-        if let Some(results) = crate::models::dispatch(callee, ret_id, args, loc, state.clone()) {
-            return results;
+        if crate::models::has_model(callee) {
+            let model_actual_vals: Vec<_> = args
+                .iter()
+                .map(|(arg_exp, _arg_typ)| operations::eval_or_fresh(arg_exp, loc, &mut state))
+                .collect();
+            // Cross-ref: OCaml `Pulse.ml` initializes model arguments before
+            // entering `PulseModels.dispatch`. This keeps caller-visible
+            // reachable values, such as `*x` in `free(x)`, marked
+            // `Initialized` in exported summaries.
+            state.conservatively_initialize_args(model_actual_vals.iter().copied());
+            if let Some(results) = crate::models::dispatch(callee, ret_id, args, loc, state.clone())
+            {
+                return results;
+            }
         }
     }
 
@@ -512,6 +524,7 @@ mod tests {
     use super::*;
     use crate::access::Access;
     use crate::diagnostic::Diagnostic;
+    use crate::formula::Operand;
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
     use sil::ident::{Ident, IdentName};
@@ -1081,6 +1094,47 @@ mod tests {
         assert!(
             has_freed,
             "some disjunct should have freed pointer as invalid"
+        );
+    }
+
+    #[test]
+    fn test_known_model_conservatively_initializes_actual_reachable_values() {
+        let mut state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let ptr = AbstractValue::mk_fresh();
+        let loaded = AbstractValue::mk_fresh();
+        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(pvar.clone())), ptr);
+        state.write_heap(ptr, Access::Dereference, loaded);
+        state.allocate(ptr, crate::attribute::Allocator::CMalloc, Location::dummy());
+        let _ = state.and_not_equal(&Operand::AbstractValue(ptr), &Operand::ConstOperand(0));
+
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::void()),
+            fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string("free"))),
+            args: vec![(Exp::Lvar(pvar), Typ::void())],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+        let results = exec_instr(&instr, state);
+        let state = results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("free should keep a valid non-null path");
+
+        assert!(
+            state
+                .post
+                .attrs
+                .get(&loaded)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
+            "known-model calls should conservatively initialize caller-visible values reachable from actuals"
         );
     }
 

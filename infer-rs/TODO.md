@@ -96,8 +96,15 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    accesses by `(timestamp, location)` rather than raw `.sil` location alone.
    `may_double_free_if_alias` now has the correct three-way raw shape
    (`x == 0`, `x > 0 && y == 0`, continue), so the next real specialization
-   targets are narrower: the remaining latent payload / attr / phi parity
-   inside `may_double_free_if_alias`, and then the existing recursion /
+   targets are narrower. A newer OCaml-backed pass now also initializes known
+   model actual roots before model dispatch and exports continue-derived latent
+   invalid-access summaries without embedding a concrete diagnostic, while
+   reconstructing that diagnostic on import. That removes the remaining
+   `may_double_free_if_alias` attr/payload gap: the procedure now matches
+   OCaml on latent diagnostic shape and caller-visible `Initialized` attrs, so
+   only formula parity remains there. After that, the next real targets are
+   the remaining linear-phi parity inside `may_double_free_if_alias`, and then
+   the existing recursion /
    arithmetic / attr-export cluster. A direct self-recursion cut
    now also matches OCaml `PulseCallOperations.on_recursive_call` for the
    simple self-call case and should stay even though it does not move the
@@ -113,7 +120,7 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    post-summary-filtering cleanup finishes off
    `call_may_double_free_if_alias_bad`. The next highest-value wrapper / alias
    gap is therefore no longer "missing force-continue"; it is the remaining
-   summary/export payload parity inside `may_double_free_if_alias`.
+   formula parity inside `may_double_free_if_alias`.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

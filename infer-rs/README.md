@@ -29,6 +29,13 @@ invalidations such as `ConstantDereference(0)`. Together these fixes remove the 
 `Initialized` gap from `invoke`-style summaries, bring `test_unalias` to parity, and stop
 over-exporting the wrapper shape in `call_may_double_free_if_alias_bad`.
 
+A newer OCaml-backed model/export pass now also conservatively initializes actual roots before
+entering known models, matching the `OCamlModel` path in `Pulse.ml`, and exports
+continue-derived latent invalid-access summaries with `diagnostic=None`, reconstructing the
+diagnostic again during summary import. That aligns `may_double_free_if_alias` with OCaml on
+latent diagnostic shape and caller-visible pointee `Initialized` attrs; the remaining delta there
+is now formula shape only.
+
 The config surface now also supports OCaml's `pulse-force-continue` flag through both
 `.inferconfig` and CLI override. Rust summaries now retain OCaml-style
 `has_dropped_disjuncts` metadata, and known-callee calls only fall back to unknown-call semantics
@@ -87,8 +94,8 @@ shaping now orders direct-formal accesses by `(timestamp, location)` rather than
 location alone. That removes the extra latent branch and brings the raw main summary down to the
 OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. After the later
 integer-literal interning and post-summary attr-filtering pass, the remaining specialization work
-is narrower: latent payload / attr / phi parity in `may_double_free_if_alias`, plus the existing
-recursion / arithmetic / attr-export cluster.
+is narrower: linear-phi parity in `may_double_free_if_alias`, plus the existing recursion /
+arithmetic / attr-export cluster.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

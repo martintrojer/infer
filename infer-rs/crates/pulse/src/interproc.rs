@@ -415,9 +415,11 @@ pub(crate) fn apply_summary_with_aliasing(
             }
         }
         crate::summary::PrePostKind::LatentInvalidAccess => {
-            if let Some(diag) = &pre_post.diagnostic {
+            if let Some(diag) = pre_post.diagnostic.clone().or_else(|| {
+                crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
+            }) {
                 let diag =
-                    translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories, loc);
+                    translate_diagnostic(&diag, &mut subst, &caller_state, &formal_histories, loc);
                 mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
                 if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
@@ -1362,6 +1364,21 @@ mod tests {
             access_history: ValueHistory::assignment(Location::dummy()),
             invalidation_history: invalidation_history(&invalidation),
         }
+    }
+
+    fn add_local_load(pdesc: &mut Procdesc, pvar: Pvar, loc: Location) {
+        let load_node = pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
+            vec![sil::instr::Instr::Load {
+                id: Ident::create_none(),
+                e: Exp::Lvar(pvar),
+                typ: Typ::void(),
+                loc: loc.clone(),
+            }],
+            loc,
+        );
+        pdesc.set_succs(0, vec![load_node]);
+        pdesc.set_succs(load_node, vec![1]);
     }
 
     fn mk_callee_summary_null_return() -> (Procdesc, PrePost) {
@@ -2595,6 +2612,91 @@ mod tests {
                     diagnostic.as_ref(),
                     Diagnostic::AccessToInvalidAddress { addr, .. }
                         if state.check_valid(*addr).is_ok()
+                )
+        ));
+    }
+
+    #[test]
+    fn test_apply_summary_reconstructs_exported_latent_invalid_access_without_diagnostic() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let access_loc = Location {
+            line: 11,
+            col: 7,
+            ..Location::dummy()
+        };
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname.clone());
+        add_local_load(&mut callee_pdesc, formal_pvar.clone(), access_loc.clone());
+
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let _heap_target = callee_state.read_heap(formal_val, Access::Dereference);
+        callee_state.mark_must_be_valid_at(formal_val, &access_loc);
+        assert!(callee_state.and_equal_const(formal_val, 0).is_sat());
+
+        let summary = crate::summary::PulseSummary::of_proc(
+            &callee_pdesc,
+            &[ExecutionDomain::ContinueProgram(callee_state)],
+            vec![],
+            false,
+        );
+        let pre_post = summary
+            .pre_posts
+            .iter()
+            .find(|pp| pp.kind == crate::summary::PrePostKind::LatentInvalidAccess)
+            .cloned()
+            .expect("expected a latent invalid-access summary pre/post");
+        assert!(
+            pre_post.diagnostic.is_none(),
+            "exported latent invalid-access summaries should omit the diagnostic payload"
+        );
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar.clone())))
+            .unwrap();
+        let caller_formal_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let _caller_heap_target = caller_state.read_heap(caller_formal_val, Access::Dereference);
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_formal_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(matches!(
+            results.as_slice(),
+            [ExecutionDomain::LatentInvalidAccess { diagnostic, .. }]
+                if matches!(
+                    diagnostic.as_ref(),
+                    Diagnostic::AccessToInvalidAddress {
+                        invalidation: crate::invalidation::Invalidation::ConstantDereference(_),
+                        ..
+                    }
                 )
         ));
     }

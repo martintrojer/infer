@@ -6,55 +6,48 @@ Keep it current when the active line of investigation changes.
 ## Current Focus
 
 - Latest stable checkpoint:
-  - `crates/pulse/src/transfer.rs`
-    - direct unknown calls now conservatively initialize evaluated actuals
-      before unknown-call semantics
-    - cross-ref: OCaml `PulseCallOperations.call_aux_unknown`
-    - focused regression:
-      - `test_unknown_call_conservatively_initializes_constant_actuals`
-  - `crates/pulse/src/abductive.rs`
-    - added `absval_of_int(...)` so normal integer literal evaluation reuses
-      existing formula representatives
-    - cross-ref: OCaml `PulseFormula.absval_of_int`
-    - focused regression:
-      - `test_eval_const_reuses_existing_integer_literal_value`
-  - `crates/pulse/src/attribute.rs`
-  - `crates/pulse/src/base_attrs.rs`
   - `crates/pulse/src/summary.rs`
-    - summary normalization now filters exported pre/post attrs using OCaml
-      `PulseAttribute.is_suitable_for_pre_summary` and
-      `PulseAttribute.is_suitable_for_post_summary`
-    - key effect: exported post summaries drop
-      `Invalid(ComparedToNullInThisProcedure(..))` but keep real
-      caller-visible invalidations such as `ConstantDereference(0)`
+    - continue-derived latent-invalid-access summaries now export without an
+      embedded diagnostic payload
+    - cross-ref: OCaml `PulseSummary.ml` `PotentialInvalidAccessSummary`
     - focused regression:
-      - `test_normalize_drops_compared_to_null_invalid_from_post_summary`
+      - `test_of_proc_drops_exported_diagnostic_for_continue_derived_latent_invalid_access`
+  - `crates/pulse/src/interproc.rs`
+    - latent-invalid-access import now reconstructs the omitted diagnostic from
+      exported summary state when needed
+    - focused regression:
+      - `test_apply_summary_reconstructs_exported_latent_invalid_access_without_diagnostic`
+  - `crates/pulse/src/transfer.rs`
+    - known model calls now conservatively initialize actual roots before
+      model dispatch, matching OCaml `Pulse.ml`'s `OCamlModel` path
+    - focused regression:
+      - `test_known_model_conservatively_initializes_actual_reachable_values`
   - validations on the current tree:
-    - `cargo test -q -p pulse test_unknown_call_conservatively_initializes_constant_actuals -- --nocapture`
-    - `cargo test -q -p pulse test_eval_const_reuses_existing_integer_literal_value -- --nocapture`
-    - `cargo test -q -p pulse test_normalize_drops_compared_to_null_invalid_from_post_summary -- --nocapture`
+    - `cargo test -q -p pulse test_of_proc_drops_exported_diagnostic_for_continue_derived_latent_invalid_access -- --nocapture`
+    - `cargo test -q -p pulse test_apply_summary_reconstructs_exported_latent_invalid_access_without_diagnostic -- --nocapture`
+    - `cargo test -q -p pulse test_known_model_conservatively_initializes_actual_reachable_values -- --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
     - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
   - important observed effect:
-    - headline comparator now is:
+    - headline comparator stays:
       - `Matching: 16`
       - `Differences: 5`
-    - `call_may_double_free_if_alias_bad` now matches
-    - `test_unalias` now matches
+    - `may_double_free_if_alias` is now aligned with OCaml on:
+      - latent pre/post `diagnostic=None`
+      - caller-visible `Initialized` attrs on the loaded pointees
+        (`x.*.*`, `y.*.*`)
+    - the remaining `may_double_free_if_alias` delta is now formula-only:
+      - OCaml linear equalities such as `x.* = a1 + 1`
+      - Rust positivity atoms such as `0 < x.*`
     - remaining diff set:
       - `add_more_bad`
       - `add_two`
       - `invoke_itself_bad`
       - `may_double_free_if_alias`
       - `two_pointers_recursion_bad`
-    - most promising next semantic target remains `may_double_free_if_alias`:
-      - still missing exported `Initialized` attrs on `x.*.*` / `y.*.*`
-      - still differs on phi shape (OCaml linear equalities vs Rust positivity atoms)
-      - latent invalid-access summaries still export `diagnostic=Some(...)`
-        on Rust where OCaml exports `diagnostic=None`
-  - important negative result:
-    - do not reuse constants in `eval_const_no_invalidate` / prune-only paths
-    - that pulled `ComparedToNullInThisProcedure` into exported summaries and
-      was wrong
+  - current next target:
+    - keep driving formula/import parity for `may_double_free_if_alias`
+      without regressing the newly aligned latent/export/model-call surface
 
 - Latest stable checkpoint:
   - `crates/pulse/src/checker.rs`
