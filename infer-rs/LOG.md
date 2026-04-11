@@ -6,6 +6,57 @@ Keep it current when the active line of investigation changes.
 ## Current Focus
 
 - Latest stable checkpoint:
+  - `crates/pulse/src/transfer.rs`
+    - direct unknown calls now conservatively initialize evaluated actuals
+      before unknown-call semantics
+    - cross-ref: OCaml `PulseCallOperations.call_aux_unknown`
+    - focused regression:
+      - `test_unknown_call_conservatively_initializes_constant_actuals`
+  - `crates/pulse/src/abductive.rs`
+    - added `absval_of_int(...)` so normal integer literal evaluation reuses
+      existing formula representatives
+    - cross-ref: OCaml `PulseFormula.absval_of_int`
+    - focused regression:
+      - `test_eval_const_reuses_existing_integer_literal_value`
+  - `crates/pulse/src/attribute.rs`
+  - `crates/pulse/src/base_attrs.rs`
+  - `crates/pulse/src/summary.rs`
+    - summary normalization now filters exported pre/post attrs using OCaml
+      `PulseAttribute.is_suitable_for_pre_summary` and
+      `PulseAttribute.is_suitable_for_post_summary`
+    - key effect: exported post summaries drop
+      `Invalid(ComparedToNullInThisProcedure(..))` but keep real
+      caller-visible invalidations such as `ConstantDereference(0)`
+    - focused regression:
+      - `test_normalize_drops_compared_to_null_invalid_from_post_summary`
+  - validations on the current tree:
+    - `cargo test -q -p pulse test_unknown_call_conservatively_initializes_constant_actuals -- --nocapture`
+    - `cargo test -q -p pulse test_eval_const_reuses_existing_integer_literal_value -- --nocapture`
+    - `cargo test -q -p pulse test_normalize_drops_compared_to_null_invalid_from_post_summary -- --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+  - important observed effect:
+    - headline comparator now is:
+      - `Matching: 16`
+      - `Differences: 5`
+    - `call_may_double_free_if_alias_bad` now matches
+    - `test_unalias` now matches
+    - remaining diff set:
+      - `add_more_bad`
+      - `add_two`
+      - `invoke_itself_bad`
+      - `may_double_free_if_alias`
+      - `two_pointers_recursion_bad`
+    - most promising next semantic target remains `may_double_free_if_alias`:
+      - still missing exported `Initialized` attrs on `x.*.*` / `y.*.*`
+      - still differs on phi shape (OCaml linear equalities vs Rust positivity atoms)
+      - latent invalid-access summaries still export `diagnostic=Some(...)`
+        on Rust where OCaml exports `diagnostic=None`
+  - important negative result:
+    - do not reuse constants in `eval_const_no_invalidate` / prune-only paths
+    - that pulled `ComparedToNullInThisProcedure` into exported summaries and
+      was wrong
+
+- Latest stable checkpoint:
   - `crates/pulse/src/checker.rs`
     - selected alias-specialized summaries that contain
       `LatentInvalidAccess` but no `ContinueProgram` now participate in the

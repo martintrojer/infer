@@ -121,6 +121,32 @@ impl fmt::Display for Attribute {
     }
 }
 
+impl Attribute {
+    /// Cross-ref: OCaml `PulseAttribute.is_suitable_for_pre_summary`.
+    pub fn is_suitable_for_pre_summary(&self) -> bool {
+        matches!(
+            self,
+            Attribute::MustBeAwaited
+                | Attribute::MustBeInitialized(_, _)
+                | Attribute::MustBeValid(_, _, _)
+                | Attribute::UsedAsBranchCond(_, _)
+        )
+    }
+
+    /// Cross-ref: OCaml `PulseAttribute.is_suitable_for_post_summary`.
+    pub fn is_suitable_for_post_summary(&self) -> bool {
+        !matches!(
+            self,
+            Attribute::Invalid(Invalidation::ComparedToNullInThisProcedure(_), _)
+                | Attribute::MustBeAwaited
+                | Attribute::MustBeInitialized(_, _)
+                | Attribute::MustBeValid(_, _, _)
+                | Attribute::UnreachableAt(_)
+                | Attribute::UsedAsBranchCond(_, _)
+        )
+    }
+}
+
 /// A set of attributes on an abstract value.
 ///
 /// Uses `BTreeSet` for deterministic iteration order.
@@ -152,12 +178,31 @@ impl Attributes {
         self.0.iter()
     }
 
+    pub fn retain_for_pre_summary(&mut self) {
+        self.0.retain(Attribute::is_suitable_for_pre_summary);
+    }
+
+    pub fn retain_for_post_summary(&mut self) {
+        self.0.retain(Attribute::is_suitable_for_post_summary);
+    }
+
     /// Find the `Invalid` attribute, if any.
     pub fn get_invalid(&self) -> Option<(&Invalidation, &ValueHistory)> {
-        self.0.iter().find_map(|a| match a {
-            Attribute::Invalid(inv, history) => Some((inv, history)),
-            _ => None,
-        })
+        let mut compared_to_null = None;
+        self.0
+            .iter()
+            .find_map(|a| match a {
+                Attribute::Invalid(
+                    inv @ Invalidation::ComparedToNullInThisProcedure(_),
+                    history,
+                ) => {
+                    compared_to_null = Some((inv, history));
+                    None
+                }
+                Attribute::Invalid(inv, history) => Some((inv, history)),
+                _ => None,
+            })
+            .or(compared_to_null)
     }
 
     /// Find the `MustBeValid` attribute, if any.
@@ -270,6 +315,27 @@ mod tests {
         ));
         let (inv, _loc) = attrs.get_invalid().unwrap();
         assert!(inv.is_null_deref());
+    }
+
+    #[test]
+    fn test_get_invalid_prefers_stronger_invalidation_over_compared_to_null() {
+        let mut attrs = Attributes::empty();
+        let loc = Location::dummy();
+
+        attrs.add(Attribute::Invalid(
+            Invalidation::ComparedToNullInThisProcedure(loc.clone()),
+            ValueHistory::invalidated(
+                Invalidation::ComparedToNullInThisProcedure(loc.clone()),
+                loc.clone(),
+            ),
+        ));
+        attrs.add(Attribute::Invalid(
+            Invalidation::ConstantDereference(IntLit::zero()),
+            ValueHistory::invalidated(Invalidation::ConstantDereference(IntLit::zero()), loc),
+        ));
+
+        let (inv, _history) = attrs.get_invalid().expect("expected an invalidation");
+        assert_eq!(*inv, Invalidation::ConstantDereference(IntLit::zero()));
     }
 
     #[test]

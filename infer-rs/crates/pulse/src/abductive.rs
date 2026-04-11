@@ -497,6 +497,35 @@ impl AbductiveDomain {
         self.apply_formula_result(result)
     }
 
+    /// Get an abstract value for an integer literal, reusing an existing
+    /// representative when the same constant already appears in the current
+    /// formula.
+    ///
+    /// Cross-ref: OCaml `PulseFormula.absval_of_int`.
+    pub fn absval_of_int(&mut self, c: i64) -> AbstractValue {
+        if let Some(existing) = self
+            .path_condition
+            .phi()
+            .linear_eqs
+            .iter()
+            .find_map(|(v, lin)| {
+                lin.get_as_const()
+                    .filter(|q| *q == crate::formula::lin_arith::Q::from_integer(c))
+                    .map(|_| *v)
+            })
+        {
+            return existing;
+        }
+
+        let v = AbstractValue::mk_fresh();
+        let result = self.path_condition.and_equal_const(v, c);
+        assert!(
+            self.apply_formula_result(result).is_sat(),
+            "fresh integer literal should never make the formula unsat"
+        );
+        v
+    }
+
     /// Record that an abstract value is positive (> 0, i.e., non-null for pointers).
     /// Cross-ref: OCaml PulseArithmetic.ml and_positive.
     pub fn and_positive(&mut self, v: AbstractValue) -> SatUnsat<()> {

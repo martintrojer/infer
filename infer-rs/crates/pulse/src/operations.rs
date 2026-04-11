@@ -273,11 +273,10 @@ fn eval_const(
 ) -> PulseResult<ValueWithHistory, Diagnostic> {
     match c {
         Const::Cint(i) => {
-            let v = AbstractValue::mk_fresh();
-            // Record the constant value in the formula
-            if let Some(n) = i.to_i64() {
-                state.and_equal_const(v, n);
-            }
+            let v = i
+                .to_i64()
+                .map(|n| state.absval_of_int(n))
+                .unwrap_or_else(AbstractValue::mk_fresh);
             // Cross-ref: OCaml `PulseOperations.eval_const` invalidates every
             // integer literal under `ConstantDereference`, while prune uses a
             // separate non-invalidating path. Keeping normal eval aligned with
@@ -678,6 +677,48 @@ mod tests {
         assert!(
             state.check_valid(p).is_err(),
             "known-zero access should materialize a null invalidation for later reporting"
+        );
+    }
+
+    #[test]
+    fn test_eval_const_reuses_existing_integer_literal_value() {
+        let loc = Location::dummy();
+        let pdesc = Procdesc::new(Procname::c_from_string("test"), Typ::void(), loc.clone());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+        let first = match eval(&Exp::Const(Const::Cint(IntLit::zero())), &loc, &mut state) {
+            PulseResult::Ok(v) => v,
+            other => panic!("expected ok constant evaluation, got {other:?}"),
+        };
+        state.initialize(first);
+
+        let second = match eval(&Exp::Const(Const::Cint(IntLit::zero())), &loc, &mut state) {
+            PulseResult::Ok(v) => v,
+            other => panic!("expected ok constant evaluation, got {other:?}"),
+        };
+
+        assert_eq!(
+            first, second,
+            "integer literals should reuse the existing formula representative"
+        );
+        let attrs = state
+            .post
+            .attrs
+            .get(&first)
+            .expect("reused literal should keep attrs on the shared address");
+        assert!(
+            attrs.contains(&Attribute::Initialized),
+            "reused literal should preserve prior Initialized side effects"
+        );
+        assert!(
+            matches!(
+                attrs.get_invalid(),
+                Some((
+                    crate::invalidation::Invalidation::ConstantDereference(value),
+                    _
+                )) if *value == IntLit::zero()
+            ),
+            "reused literal should stay invalidated as the null constant"
         );
     }
 

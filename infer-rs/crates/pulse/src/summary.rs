@@ -424,11 +424,13 @@ impl PrePost {
         // values can stay in the post, but they must not leak into `pre`.
         self.pre.heap.retain_reachable(&pre_heap_reachable);
         self.pre.attrs.retain_reachable(&pre_canonical_reachable);
+        self.pre.attrs.retain_for_pre_summary();
         self.post.post.heap.retain_reachable(&post_heap_reachable);
         self.post
             .post
             .attrs
             .retain_reachable(&post_canonical_reachable);
+        self.post.post.attrs.retain_for_post_summary();
         self.post
             .must_be_valid
             .retain(|addr| post_canonical_reachable.contains(addr));
@@ -2521,6 +2523,84 @@ mod tests {
         assert!(
             pp.post.post.attrs.get(&stale_result).is_none(),
             "stale pre-canonicalization roots should not survive summary export"
+        );
+    }
+
+    #[test]
+    fn test_normalize_drops_compared_to_null_invalid_from_post_summary() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let result = AbstractValue::of_raw(2);
+
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, result);
+        astate.initialize(return_addr);
+        astate.initialize(result);
+        astate.invalidate(
+            result,
+            crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
+                Location::dummy(),
+            ),
+        );
+        astate.invalidate(
+            result,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
+        );
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(result),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        let attrs = pp
+            .post
+            .post
+            .attrs
+            .get(&result)
+            .expect("return-visible attrs should survive normalization");
+        assert!(
+            attrs.contains(&crate::attribute::Attribute::Initialized),
+            "post-summary filtering should keep caller-visible Initialized attrs"
+        );
+        assert!(
+            attrs.iter().any(|attr| matches!(
+                attr,
+                crate::attribute::Attribute::Invalid(
+                    crate::invalidation::Invalidation::ConstantDereference(value),
+                    _
+                ) if *value == IntLit::zero()
+            )),
+            "post-summary filtering should keep real invalidations"
+        );
+        assert!(
+            !attrs.iter().any(|attr| matches!(
+                attr,
+                crate::attribute::Attribute::Invalid(
+                    crate::invalidation::Invalidation::ComparedToNullInThisProcedure(_),
+                    _
+                )
+            )),
+            "post-summary filtering should drop ComparedToNull post attrs like OCaml"
         );
     }
 

@@ -17,14 +17,17 @@ actuals. This fixes the lost latent precondition regressions and removes the old
 `invoke(id)` / `add_one` / `add_two` `v -*-> v` self-edge without papering over the remaining
 semantic mismatches.
 
-The latest specialization/summarization cleanup tightened two more OCaml-backed surfaces:
+The latest specialization/summarization cleanup tightened three more OCaml-backed surfaces:
 summary normalization now strips post-summary `Initialized` attrs from hidden formal/local stack
-roots after `restore_formals_for_summary`, and unresolved `__call_c_function_ptr` now
+roots after `restore_formals_for_summary`, unresolved `__call_c_function_ptr` now
 conservatively initializes values reachable from the function pointer and actual roots before
-model / unknown-call handling, while still dereferencing the function-pointer value, recording
-`UnknownEffect` on actuals, and preserving `is_int` on fresh integer returns. This mirrors OCaml
-`PulseOperations.conservatively_initialize_args` more closely and removes the old unresolved-call
-`Initialized` gap from `invoke`-style summaries.
+model / unknown-call handling, and normal integer literal evaluation now reuses existing formula
+representatives like OCaml `PulseFormula.absval_of_int`. Summary normalization also now filters
+pre/post attrs with the same suitability rules as OCaml `PulseAttribute`, which drops exported
+post-summary `ComparedToNullInThisProcedure` invalidations while keeping real caller-visible
+invalidations such as `ConstantDereference(0)`. Together these fixes remove the old unresolved-call
+`Initialized` gap from `invoke`-style summaries, bring `test_unalias` to parity, and stop
+over-exporting the wrapper shape in `call_may_double_free_if_alias_bad`.
 
 The config surface now also supports OCaml's `pulse-force-continue` flag through both
 `.inferconfig` and CLI override. Rust summaries now retain OCaml-style
@@ -33,9 +36,9 @@ when the selected summary is empty or marked incomplete for the same reason. Tha
 force-continue path is correct and tested. The latest checker pass also restores the missing
 skipped-call continue for selected alias-specialized latent-invalid-access summaries with no
 `ContinueProgram`, which is the OCaml-backed shape behind
-`call_may_double_free_if_alias_bad`. The headline comparator still stays at
-`Matching: 14`, `Differences: 7`, but that procedure is now narrowed from a missing branch to a
-single remaining attr-surface mismatch on `return.*`.
+`call_may_double_free_if_alias_bad`. Combined with the newer integer-literal interning and
+post-summary attr filtering, the headline comparator is now `Matching: 16`, `Differences: 5`, and
+both `call_may_double_free_if_alias_bad` and `test_unalias` now match.
 
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
@@ -54,18 +57,18 @@ alpha-renamed abstract values), and the ignored
 `test_summary_comparison_specialization_main` test uses `specialization.c` as the current gold
 file. The latest OCaml-backed access-mode, interproc, exporter, and unresolved-call fixes align
 Rust's local read/write bookkeeping with `PulseOperations.check_addr_access`, restore leaf
-`MustBeValid` handling, stop replaying formal-stack bookkeeping onto by-value actuals, and
-initialize unresolved call arguments the same way OCaml does. The current comparator checkpoint is
-now `Matching: 14`, `Differences: 7`: the old self-edge bug and formal-root `Initialized` export
-noise are gone, `add_one`, `invoke`, and `alias_recursion` are now matching, wrapper
+`MustBeValid` handling, stop replaying formal-stack bookkeeping onto by-value actuals, initialize
+unresolved call arguments the same way OCaml does, reuse existing integer-literal representatives,
+and filter exported post-summary attrs the same way OCaml does. The current comparator checkpoint
+is now `Matching: 16`, `Differences: 5`: the old self-edge bug and formal-root `Initialized`
+export noise are gone, `add_one`, `invoke`, `alias_recursion`,
+`call_may_double_free_if_alias_bad`, and `test_unalias` are now matching, wrapper
 latent-invalid-access recovery no longer republishes imported callee `MustBeValid` obligations,
-the checker now restores the missing skipped-call branch in
-`call_may_double_free_if_alias_bad`, and the comparator now parses both stack-style and
-heap-target OCaml value-id shapes from `all_summaries.json`. The remaining semantic diffs are
-concentrated in alias / double-free parity
-(`call_may_double_free_if_alias_bad`, `may_double_free_if_alias`, `test_unalias`)
-plus a smaller arithmetic / attr-export cluster (`add_more_bad`, `add_two`,
-`invoke_itself_bad`, `two_pointers_recursion_bad`).
+the checker restores the missing skipped-call branch in
+`call_may_double_free_if_alias_bad`, and the comparator parses both stack-style and heap-target
+OCaml value-id shapes from `all_summaries.json`. The remaining semantic diffs are now
+`add_more_bad`, `add_two`, `invoke_itself_bad`, `may_double_free_if_alias`, and
+`two_pointers_recursion_bad`.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model
@@ -82,11 +85,10 @@ cheating the counts: Rust now stamps `MustBeValid` / `MustBeInitialized` summary
 monotonic per-state timestamps instead of hardcoding `0`, and latent-invalid-access summary
 shaping now orders direct-formal accesses by `(timestamp, location)` rather than raw `.sil`
 location alone. That removes the extra latent branch and brings the raw main summary down to the
-OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. The overall comparator still
-stays at `Matching: 14`, `Differences: 7`, but the remaining specialization work is now narrower:
-the `return.*` attr surface in `call_may_double_free_if_alias_bad`, latent payload / attr / phi
-parity in `may_double_free_if_alias`, and the existing recursion / arithmetic / attr-export
-cluster.
+OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. After the later
+integer-literal interning and post-summary attr-filtering pass, the remaining specialization work
+is narrower: latent payload / attr / phi parity in `may_double_free_if_alias`, plus the existing
+recursion / arithmetic / attr-export cluster.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

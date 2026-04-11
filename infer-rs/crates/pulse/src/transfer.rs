@@ -443,6 +443,17 @@ fn exec_call(
 
     // Default: treat as unknown — havoc the return value and pointer args.
     log::debug!("  [call] unknown: {fun_exp}");
+    let actual_vals: Vec<_> = args
+        .iter()
+        .map(|(arg_exp, _arg_typ)| operations::eval_or_fresh(arg_exp, loc, &mut state))
+        .collect();
+    // Cross-ref: OCaml `PulseCallOperations.call_aux_unknown` conservatively
+    // initializes actual argument roots before entering unknown-call
+    // semantics. This matters even for constant actuals such as
+    // `__infer_skip(0)`: later summary canonicalization can expose the same
+    // reused constant cell at the caller surface, where OCaml expects
+    // `Initialized + Invalid(ConstantDereference(0))`.
+    state.conservatively_initialize_args(actual_vals.iter().copied());
     let ret_val = AbstractValue::mk_fresh();
     operations::write_id_with_history(
         ret_id,
@@ -462,11 +473,8 @@ fn exec_call(
     };
     if let Some(callee_name) = callee_name {
         let mut is_pure = true;
-        let mut actual_vals = Vec::with_capacity(args.len());
-        for (arg_exp, _arg_typ) in args {
-            let arg_val = operations::eval_or_fresh(arg_exp, loc, &mut state);
-            actual_vals.push(arg_val);
-            if _arg_typ.is_pointer() {
+        for ((arg_exp, arg_typ), arg_val) in args.iter().zip(actual_vals.iter().copied()) {
+            if arg_typ.is_pointer() {
                 is_pure = false;
                 state.apply_unknown_effect(arg_val);
                 operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
@@ -794,6 +802,47 @@ mod tests {
         let results = exec_instr(&instr, state);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_continue());
+    }
+
+    #[test]
+    fn test_unknown_call_conservatively_initializes_constant_actuals() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let callee = Procname::c_from_string("__infer_skip");
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::int(sil::typ::IKind::IInt)),
+            fun_exp: Exp::Const(Const::Cfun(callee)),
+            args: vec![(
+                Exp::Const(Const::Cint(IntLit::zero())),
+                Typ::int(sil::typ::IKind::IInt),
+            )],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+        let results = exec_instr(&instr, state);
+
+        let continue_state = results.into_iter().find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        });
+        let state = continue_state.expect("unknown call should continue");
+
+        let has_initialized_zero_actual = state.post.attrs.iter().any(|(_addr, attrs)| {
+            attrs.contains(&crate::attribute::Attribute::Initialized)
+                && attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        crate::attribute::Attribute::Invalid(
+                            crate::invalidation::Invalidation::ConstantDereference(value),
+                            _
+                        ) if *value == IntLit::zero()
+                    )
+                })
+        });
+        assert!(
+            has_initialized_zero_actual,
+            "unknown-call argument handling should conservatively initialize constant actuals"
+        );
     }
 
     #[test]

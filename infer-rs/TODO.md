@@ -53,7 +53,7 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `test_summary_comparison_specialization_main`. Step 1 compares canonical
    `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
    diagnostic, alpha-renamed) and is now the authoritative fine-grained driver.
-   Current checkpoint is now `Matching: 14`, `Differences: 7`. The local
+   Current checkpoint is now `Matching: 16`, `Differences: 5`. The local
    access-mode fix removed the simple missing-`MustBeInitialized` gap, and the
    latest correctness pass restored leaf `MustBeValid` precondition handling
    plus skipping formal-stack replay for value-style actuals. The latest
@@ -71,11 +71,15 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    `call_test_alias_bad` and `call_test_unalias_bad` from the diff set and
    deletes a chunk of bogus graph-shape noise. The latest callgraph fix now
    also treats self-loops as real recursive cycles, which removes
-   `alias_recursion` from the diff set and moves the comparator to `14 / 7`.
-   The remaining seven diffs are now `add_more_bad`, `add_two`,
-   `call_may_double_free_if_alias_bad`, `invoke_itself_bad`,
-   `may_double_free_if_alias`, `test_unalias`, and
-   `two_pointers_recursion_bad`. Important
+   `alias_recursion` from the diff set and moved the comparator to `14 / 7`.
+   The newest OCaml-backed pass also makes direct unknown calls
+   conservatively initialize constant actuals, reuses existing integer-literal
+   representatives during normal evaluation, and drops exported post-summary
+   `ComparedToNullInThisProcedure` attrs. That moves the comparator again to
+   `16 / 5` and removes `call_may_double_free_if_alias_bad` plus
+   `test_unalias` from the diff set. The remaining five diffs are now
+   `add_more_bad`, `add_two`, `invoke_itself_bad`,
+   `may_double_free_if_alias`, and `two_pointers_recursion_bad`. Important
    OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
    the dereferenced formal value, so do not try to "fix" this by blindly
    propagating formal-stack `MustBe*` attrs through the current Rust
@@ -92,13 +96,12 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    accesses by `(timestamp, location)` rather than raw `.sil` location alone.
    `may_double_free_if_alias` now has the correct three-way raw shape
    (`x == 0`, `x > 0 && y == 0`, continue), so the next real specialization
-   targets are narrower:
-   `call_may_double_free_if_alias_bad`, the remaining latent payload / attr /
-   phi parity inside `may_double_free_if_alias`, and then the existing
-   recursion / arithmetic / attr-export cluster. A direct self-recursion cut
+   targets are narrower: the remaining latent payload / attr / phi parity
+   inside `may_double_free_if_alias`, and then the existing recursion /
+   arithmetic / attr-export cluster. A direct self-recursion cut
    now also matches OCaml `PulseCallOperations.on_recursive_call` for the
    simple self-call case and should stay even though it does not move the
-   current `14 / 7` comparator; the remaining recursion-heavy diffs still need
+   current `16 / 5` comparator; the remaining recursion-heavy diffs still need
    richer recursive-call bookkeeping than generic unknown-call fallback.
    OCaml-compatible
    `pulse-force-continue` support is now wired through config/CLI and the
@@ -106,11 +109,11 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    on both main and specialized summaries. The latest OCaml-backed checker pass
    also restores the missing skipped-call branch for selected
    alias-specialized latent-invalid-access summaries with no continue path.
-   That keeps `alias_recursion` fixed while narrowing
-   `call_may_double_free_if_alias_bad` from a missing pre/post to one remaining
-   caller-visible attr mismatch: Rust still lacks `Initialized` on `return.*`.
-   The remaining wrapper gap is therefore no longer "missing force-continue";
-   it is now summary/export attr fidelity on top of the restored branch shape.
+   That keeps `alias_recursion` fixed, and the later integer-literal /
+   post-summary-filtering cleanup finishes off
+   `call_may_double_free_if_alias_bad`. The next highest-value wrapper / alias
+   gap is therefore no longer "missing force-continue"; it is the remaining
+   summary/export payload parity inside `may_double_free_if_alias`.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

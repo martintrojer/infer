@@ -141,6 +141,20 @@ impl BaseAddressAttributes {
         self.map.retain(|addr, _| reachable.contains(addr));
     }
 
+    pub fn retain_for_pre_summary(&mut self) {
+        self.map.retain(|_addr, attrs| {
+            attrs.retain_for_pre_summary();
+            !attrs.is_empty()
+        });
+    }
+
+    pub fn retain_for_post_summary(&mut self) {
+        self.map.retain(|_addr, attrs| {
+            attrs.retain_for_post_summary();
+            !attrs.is_empty()
+        });
+    }
+
     /// Substitute abstract values.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
         if let Some(attrs) = self.map.remove(&old) {
