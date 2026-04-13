@@ -387,11 +387,21 @@ fn exec_instr_with_summaries(
         }
 
         if *callee_pname == pdesc.proc_name {
-            // Cross-ref: OCaml PulseCallOperations.on_recursive_call returns
-            // the current state for direct self-recursion instead of routing
-            // the call through generic unknown-call havoc.
-            log::debug!("  [call] cut direct self recursion: {callee_pname}");
-            return vec![ExecutionDomain::ContinueProgram(state)];
+            // Cross-ref: OCaml `PulseCallOperations.on_recursive_call` only
+            // annotates the state before `call_aux_unknown` still applies the
+            // ordinary unknown-call fallback for the recursive call.
+            log::debug!(
+                "  [call] direct self recursion without summary: treating {callee_pname} as unknown call"
+            );
+            let fallback_state = state.clone();
+            let results = exec_known_call_as_unknown(callsite, callee_pname, state);
+            return merge_return_history_from_equal_actuals(
+                results,
+                ret_id,
+                args,
+                loc,
+                &fallback_state,
+            );
         }
     }
 
@@ -1083,6 +1093,69 @@ fn exec_call_c_function_ptr(
                 state,
             );
         }
+
+        if target_pname == pdesc.proc_name {
+            // Cross-ref: once the function pointer has been resolved, OCaml
+            // treats this like an ordinary direct call. Recursive known calls
+            // still go through the known-call unknown fallback rather than the
+            // unresolved-funptr path.
+            log::debug!(
+                "  [call_c_function_ptr] direct self recursion without summary: treating {target_pname} as unknown call"
+            );
+            let fallback_state = state.clone();
+            let results = exec_known_call_as_unknown(
+                CallSite {
+                    pdesc,
+                    ret_id,
+                    ret_typ,
+                    args: actual_args,
+                    loc,
+                    call_flags,
+                    spec_requests,
+                },
+                &target_pname,
+                state,
+            );
+            return merge_return_history_from_equal_actuals(
+                results,
+                ret_id,
+                actual_args,
+                loc,
+                &fallback_state,
+            );
+        }
+
+        // Resolved closure target, but no summary is available yet. This is
+        // not the same as an unresolved function pointer: the dynamic target
+        // is already known, so match the direct-call fallback path instead of
+        // adding `UnknownEffect` / specialization requests for the funptr.
+        // Cross-ref: OCaml `PulseModelsC.call_c_function_ptr` dispatches to
+        // the resolved target, after which ordinary known-call recursion /
+        // unknown-call handling applies.
+        log::debug!(
+            "  [call_c_function_ptr] resolved target {target_pname} has no summary; treating as direct unknown call"
+        );
+        let fallback_state = state.clone();
+        let results = exec_known_call_as_unknown(
+            CallSite {
+                pdesc,
+                ret_id,
+                ret_typ,
+                args: actual_args,
+                loc,
+                call_flags,
+                spec_requests,
+            },
+            &target_pname,
+            state,
+        );
+        return merge_return_history_from_equal_actuals(
+            results,
+            ret_id,
+            actual_args,
+            loc,
+            &fallback_state,
+        );
     }
 
     // Unresolved function pointer: record the need for dynamic type
@@ -1613,37 +1686,211 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_instr_cuts_direct_self_recursion_before_unknown_call_havoc() {
+    fn test_exec_call_c_function_ptr_resolved_target_without_summary_uses_direct_unknown_call() {
+        let caller_pname = Procname::c_from_string("invoke");
+        let mut pdesc = Procdesc::new(
+            caller_pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        pdesc.formals = vec![
+            (
+                Mangled::from_string("f"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("i"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+        ];
+
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let f_pvar = Pvar::mk(Mangled::from_string("f"), caller_pname.clone());
+        let f_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(f_pvar)))
+            .unwrap();
+        let funptr_val = state.read_heap(f_addr, Access::Dereference);
+        let target_pname = Procname::c_from_string("recursive_target");
+        state.add_attr(
+            funptr_val,
+            crate::attribute::Attribute::Closure(target_pname.clone()),
+        );
+
+        let i_pvar = Pvar::mk(Mangled::from_string("i"), caller_pname);
+        let i_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(i_pvar)))
+            .unwrap();
+        let arg_val = state.read_heap(i_addr, Access::Dereference);
+
+        let fp_id = Ident::create_normal(IdentName::from_string("fp"), 0);
+        crate::operations::write_id(&fp_id, funptr_val, &mut state);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 1);
+        crate::operations::write_id(&arg_id, arg_val, &mut state);
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 2);
+
+        let args = vec![
+            (Exp::Var(fp_id), Typ::mk_ptr(Typ::void())),
+            (Exp::Var(arg_id), Typ::int(sil::typ::IKind::IInt)),
+        ];
+        let requests = RefCell::new(Vec::new());
+        let call_flags = sil::call_flags::CallFlags::default();
+
+        let results = exec_call_c_function_ptr(
+            CallSite {
+                pdesc: &pdesc,
+                ret_id: &ret_id,
+                ret_typ: &Typ::int(sil::typ::IKind::IInt),
+                args: &args,
+                loc: &Location::dummy(),
+                call_flags: &call_flags,
+                spec_requests: Some(&requests),
+            },
+            state,
+            &HashMap::new(),
+        );
+
+        let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
+            panic!(
+                "expected resolved known target without summary to keep one continue state, got {results:?}"
+            );
+        };
+
+        assert!(
+            !state.need_dynamic_type_specialization.contains(&funptr_val),
+            "resolved target should not be treated as unresolved funptr specialization work"
+        );
+        assert!(
+            !state
+                .post
+                .attrs
+                .get(&arg_val)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::UnknownEffect)),
+            "resolved known target without summary should not mark integer actuals UnknownEffect"
+        );
+
+        let ret_val = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return id should be written");
+        assert!(
+            state.path_condition.phi().is_marked_int(ret_val),
+            "integer return type should keep the is_int fact on the fallback result"
+        );
+
+        let fn_apps: Vec<_> = state.path_condition.phi().iter_fn_app_eqs().collect();
+        assert_eq!(
+            fn_apps.len(),
+            1,
+            "direct unknown-call fallback should retain the pure function application"
+        );
+        let (key, ret) = fn_apps[0];
+        assert_eq!(key.callee, format!("{target_pname}"));
+        assert_eq!(
+            state.path_condition.get_var_repr(*ret),
+            state.path_condition.get_var_repr(ret_val),
+            "the pure function application should define the written return value"
+        );
+    }
+
+    #[test]
+    fn test_exec_instr_direct_self_recursion_uses_unknown_call_fallback() {
         let pname = Procname::c_from_string("self_rec");
-        let pdesc = Procdesc::new(
+        let mut pdesc = Procdesc::new(
             pname.clone(),
             Typ::int(sil::typ::IKind::IInt),
             Location::dummy(),
         );
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt))),
+            Default::default(),
+        )];
+
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), pname.clone());
+        let p_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar)))
+            .expect("formal should be bound");
+        let p_val = state.read_heap(p_root, Access::Dereference);
+        let mid_ptr = state.read_heap(p_val, Access::Dereference);
+        let leaf_int = state.read_heap(mid_ptr, Access::Dereference);
+        state.path_condition.and_is_int(leaf_int);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 1);
+        crate::operations::write_id(&arg_id, p_val, &mut state);
+
         let ret_id = Ident::create_normal(IdentName::from_string("ret"), 0);
         let instr = Instr::Call {
             ret: (ret_id.clone(), Typ::int(sil::typ::IKind::IInt)),
             fun_exp: Exp::Const(Const::Cfun(pname)),
-            args: vec![],
+            args: vec![(
+                Exp::Var(arg_id),
+                Typ::mk_ptr(Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt))),
+            )],
             loc: Location::dummy(),
             flags: sil::call_flags::CallFlags::default(),
         };
 
-        let results = exec_instr_with_summaries(
-            &pdesc,
-            &instr,
-            crate::abductive::AbductiveDomain::mk_initial(&pdesc),
-            &HashMap::new(),
-            None,
-        );
+        let results = exec_instr_with_summaries(&pdesc, &instr, state, &HashMap::new(), None);
 
         let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
             panic!("expected direct self recursion to keep one continue state, got {results:?}");
         };
 
+        let ret_val = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("recursive unknown-call fallback should write a return value");
         assert!(
-            state.post.stack.find(&Var::LogicalVar(ret_id)).is_none(),
-            "direct self recursion should return the current state, not write an unknown return"
+            state.path_condition.phi().is_marked_int(ret_val),
+            "recursive unknown-call fallback should keep integer return typing"
+        );
+
+        let actual_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(p_val))
+            .expect("pointer actual should keep post attrs");
+        assert!(
+            actual_attrs.contains(&crate::attribute::Attribute::UnknownEffect),
+            "recursive unknown-call fallback should record UnknownEffect on pointer actual roots"
+        );
+        assert!(
+            actual_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "recursive unknown-call fallback should record WrittenTo on pointer actual roots"
+        );
+        let mid_ptr_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(mid_ptr))
+            .expect("reachable pointer should keep post attrs");
+        assert!(
+            mid_ptr_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "recursive unknown-call fallback should record WrittenTo on reachable pointers"
+        );
+        let leaf_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(leaf_int))
+            .expect("reachable integer leaf should keep post attrs");
+        assert!(
+            !leaf_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "recursive unknown-call fallback should not mark integer leaves WrittenTo"
         );
     }
 

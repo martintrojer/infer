@@ -1099,6 +1099,9 @@ fn translate_formula(
             ensure_formula_var(v);
         }
     }
+    for &callee_v in &phi.is_int_vars {
+        ensure_formula_var(callee_v);
+    }
     for (key, ret) in phi.iter_fn_app_eqs() {
         ensure_formula_var(*ret);
         for actual in &key.actuals {
@@ -1303,6 +1306,17 @@ fn translate_formula(
             return TranslateFormulaResult::Unsat;
         }
     }
+
+    // Cross-ref: OCaml `PulseFormula.and_callee_formula` also imports `IsInt`
+    // facts, not just conditions / equalities / function applications. The
+    // caller needs those facts for integer-return recursive summaries such as
+    // `specialization.c:add_more_bad`.
+    for &callee_v in &phi.is_int_vars {
+        let Some(&caller_v) = subst.get(&callee_v) else {
+            continue;
+        };
+        caller_state.path_condition.and_is_int(caller_v);
+    }
     TranslateFormulaResult::Sat
 }
 
@@ -1441,6 +1455,61 @@ mod tests {
             let ret_addr = s.post.stack.find(&ret_var);
             assert!(ret_addr.is_some(), "return value should be bound");
         }
+    }
+
+    #[test]
+    fn test_apply_summary_imports_is_int_for_result_value() {
+        let callee_pname = Procname::c_from_string("callee");
+        let callee_pdesc = Procdesc::new(
+            callee_pname,
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let ret_val = AbstractValue::mk_fresh();
+        callee_state.path_condition.and_is_int(ret_val);
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![],
+            result: Some(ret_val),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(
+            caller_pname,
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let Some(ExecutionDomain::ContinueProgram(state)) =
+            results.iter().find(|r| r.is_continue())
+        else {
+            panic!("expected a continuing result");
+        };
+        let ret_addr = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return value should be bound");
+        assert!(
+            state.path_condition.phi().is_marked_int(ret_addr),
+            "callee is_int facts should be imported onto the caller result value"
+        );
     }
 
     #[test]

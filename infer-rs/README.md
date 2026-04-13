@@ -4,6 +4,27 @@ Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory sa
 
 Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 134. Leaks: expected 20, found 20. UAF: expected 7, found 7.
 
+Exact summary-equality work now uses a semantic driver instead of raw JSON diffs:
+`crates/test-harness/src/summary_compare.rs` canonicalizes both
+`main.pre_post_list` and specialized summaries from `specialization.c`.
+Current verified checkpoint:
+
+- main summaries: `21 / 21` procedures match
+- combined per-procedure harness: `Matching: 17`, `Differences: 4`
+- remaining specialized-summary diffs:
+  `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`,
+  `two_pointers_recursion_bad`
+
+The latest OCaml-backed pass keeps three correctness fixes in place while widening that harness:
+resolved `__call_c_function_ptr` targets with no available summary now use the direct known-call
+unknown fallback instead of the unresolved-funptr path, summary import now preserves callee
+`is_int(...)` facts, and the comparator now uses deterministic specialization keys plus semantic
+normalization for affine integer witnesses and function-application arguments. The remaining
+`invoke` / `invoke_itself_bad` drift looks like a real analyzer mismatch rather than comparator
+noise: OCaml `PulseSpecialization.apply` adds dynamic-type constraints via
+`PulseArithmetic.and_dynamic_type_is_unsafe`, while Rust still seeds `Closure(...)` attrs on the
+specialized heap-path value.
+
 Recent OCaml-backed parity work also restored `traces.c`: Rust now preserves branch-conditioned
 null provenance from both real `Prune` instructions and model-generated
 `free(NULL)` / `free(non-null)` splits, so locally branch-proven direct-formal null dereferences
@@ -43,9 +64,10 @@ when the selected summary is empty or marked incomplete for the same reason. Tha
 force-continue path is correct and tested. The latest checker pass also restores the missing
 skipped-call continue for selected alias-specialized latent-invalid-access summaries with no
 `ContinueProgram`, which is the OCaml-backed shape behind
-`call_may_double_free_if_alias_bad`. Combined with the newer integer-literal interning and
-post-summary attr filtering, the headline comparator is now `Matching: 16`, `Differences: 5`, and
-both `call_may_double_free_if_alias_bad` and `test_unalias` now match.
+`call_may_double_free_if_alias_bad`. Together with the newer integer-literal interning and
+post-summary attr filtering, those fixes remain part of the current
+`21 / 21` main-summary and `Matching: 17`, `Differences: 4` widened-summary checkpoint.
+`call_may_double_free_if_alias_bad` and `test_unalias` continue to match.
 
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
@@ -56,31 +78,6 @@ remaining published NPE delta is:
 - `sizeof.c` (+2): accepted `--store-textual` / `--export-textual` fidelity limitation. Exported
   Textual lowers array `sizeof(...)` expressions to `<int[]>` without `nbytes` or array length, so
   the Rust roundtrip cannot constant-fold those branches.
-
-Exact summary-equality work now uses a semantic driver instead of raw JSON diffs:
-`crates/test-harness/src/summary_compare.rs` canonicalizes OCaml and Rust
-`main.pre_post_list` state (stack / heap / attrs / conditions / phi / diagnostic with
-alpha-renamed abstract values), and the ignored
-`test_summary_comparison_specialization_main` test uses `specialization.c` as the current gold
-file. The latest OCaml-backed access-mode, interproc, exporter, and unresolved-call fixes align
-Rust's local read/write bookkeeping with `PulseOperations.check_addr_access`, restore leaf
-`MustBeValid` handling, stop replaying formal-stack bookkeeping onto by-value actuals, initialize
-unresolved call arguments the same way OCaml does, reuse existing integer-literal representatives,
-and filter exported post-summary attrs the same way OCaml does. The current comparator checkpoint
-is now `Matching: 16`, `Differences: 5`: the old self-edge bug and formal-root `Initialized`
-export noise are gone, `add_one`, `invoke`, `alias_recursion`,
-`call_may_double_free_if_alias_bad`, and `test_unalias` are now matching, wrapper
-latent-invalid-access recovery no longer republishes imported callee `MustBeValid` obligations,
-the checker restores the missing skipped-call branch in
-`call_may_double_free_if_alias_bad`, and the comparator parses both stack-style and heap-target
-OCaml value-id shapes from `all_summaries.json`. It also now collapses OCaml's
-restricted-witness inequality encodings from `PulseArithmetic.solve_lin_ineq` /
-`PulseFormulaPhi` into the same semantic atoms Rust emits
-(`eq:x=lin(1*a1,const=1)` => `0 < x`, `eq:x=lin(-1*a1)` => `x <= 0`), so the
-remaining semantic diffs are less affected by solver presentation. The remaining
-semantic diffs are now
-`add_more_bad`, `add_two`, `invoke_itself_bad`, `may_double_free_if_alias`, and
-`two_pointers_recursion_bad`.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model

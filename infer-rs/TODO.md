@@ -48,84 +48,36 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
 
 **Active OCaml-backed correctness focus:**
 
-3. **Main-summary semantic parity (`specialization.c`)**: keep driving parity through
-   `crates/test-harness/src/summary_compare.rs` and
-   `test_summary_comparison_specialization_main`. Step 1 compares canonical
-   `main.pre_post_list` state (stack / heap / attrs / conditions / phi /
-   diagnostic, alpha-renamed) and is now the authoritative fine-grained driver.
-   Current checkpoint is now `Matching: 16`, `Differences: 5`. The local
-   access-mode fix removed the simple missing-`MustBeInitialized` gap, and the
-   latest correctness pass restored leaf `MustBeValid` precondition handling
-   plus skipping formal-stack replay for value-style actuals. The latest
-   exporter/model cleanup also strips hidden formal/local stack-root
-   `Initialized` attrs from normalized summaries and makes unresolved
-   `__call_c_function_ptr` mirror OCaml's unspecialized path more closely
-   (funptr dereference, conservative initialization of funptr/actual
-   reachable values, `UnknownEffect` on actuals, integer-return `is_int`).
-   That fixed the lost latent regressions, removed the old `invoke(id)` /
-   `add_one` / `add_two` self-edge bug, eliminated the old formal-root
-   `Initialized` summary noise, and brings `add_one` / `invoke` to parity.
-   The latest pass also stops wrapper abort recovery from republishing
-   imported callee `MustBeValid` obligations and fixes the OCaml heap-target
-   value-id parser used on `all_summaries.json`. That removes
-   `call_test_alias_bad` and `call_test_unalias_bad` from the diff set and
-   deletes a chunk of bogus graph-shape noise. The latest callgraph fix now
-   also treats self-loops as real recursive cycles, which removes
-   `alias_recursion` from the diff set and moved the comparator to `14 / 7`.
-   The newest OCaml-backed pass also makes direct unknown calls
-   conservatively initialize constant actuals, reuses existing integer-literal
-   representatives during normal evaluation, and drops exported post-summary
-   `ComparedToNullInThisProcedure` attrs. That moves the comparator again to
-   `16 / 5` and removes `call_may_double_free_if_alias_bad` plus
-   `test_unalias` from the diff set. The remaining five diffs are now
-   `add_more_bad`, `add_two`, `invoke_itself_bad`,
-   `may_double_free_if_alias`, and `two_pointers_recursion_bad`. Important
-   OCaml constraint: `PulseInterproc.materialize_pre_from_actual` starts from
-   the dereferenced formal value, so do not try to "fix" this by blindly
-   propagating formal-stack `MustBe*` attrs through the current Rust
-   substitution map. The latest recoverable-stop cleanup also stays in place:
-   recoverable transfer/model invalid accesses now stop instead of exporting
-   `ContinueProgram + AbortProgram`, but this does not change the `13 / 8`
-   comparator checkpoint. A broader checker-side attempt to recover
-   non-exit latent invalid accesses when another path reaches exit was
-   reverted after OCaml summary cross-checks showed it spuriously adds latent
-   summaries to `test_alias`, `test_unalias`, and wrapper / recursion cases.
-   That direct-formal ordering bug is now fixed correctly: Rust now gives
-   summary `MustBeValid` / `MustBeInitialized` attrs real per-state timestamps
-   instead of hardcoded `0`, and latent summary shaping orders direct-formal
-   accesses by `(timestamp, location)` rather than raw `.sil` location alone.
-   `may_double_free_if_alias` now has the correct three-way raw shape
-   (`x == 0`, `x > 0 && y == 0`, continue), so the next real specialization
-   targets are narrower. A newer OCaml-backed pass now also initializes known
-   model actual roots before model dispatch and exports continue-derived latent
-   invalid-access summaries without embedding a concrete diagnostic, while
-   reconstructing that diagnostic on import. That removes the remaining
-   `may_double_free_if_alias` attr/payload gap: the procedure now matches
-   OCaml on latent diagnostic shape and caller-visible `Initialized` attrs, so
-   only formula parity remains there. The semantic comparator now also
-   canonicalizes OCaml restricted-witness inequality encodings
-   (`eq:x=lin(1*a1,const=1)` => `0 < x`,
-   `eq:x=lin(-1*a1)` => `x <= 0`) plus the corresponding `is_int(...)`
-   witness terms, so the remaining `16 / 5` diff set is less polluted by
-   solver-presentation noise. After that, the next real targets are the
-   remaining linear-phi parity inside `may_double_free_if_alias`, and then
-   the existing recursion /
-   arithmetic / attr-export cluster. A direct self-recursion cut
-   now also matches OCaml `PulseCallOperations.on_recursive_call` for the
-   simple self-call case and should stay even though it does not move the
-   current `16 / 5` comparator; the remaining recursion-heavy diffs still need
-   richer recursive-call bookkeeping than generic unknown-call fallback.
-   OCaml-compatible
-   `pulse-force-continue` support is now wired through config/CLI and the
-   known-callee checker path, with dropped-disjunct summary metadata preserved
-   on both main and specialized summaries. The latest OCaml-backed checker pass
-   also restores the missing skipped-call branch for selected
-   alias-specialized latent-invalid-access summaries with no continue path.
-   That keeps `alias_recursion` fixed, and the later integer-literal /
-   post-summary-filtering cleanup finishes off
-   `call_may_double_free_if_alias_bad`. The next highest-value wrapper / alias
-   gap is therefore no longer "missing force-continue"; it is the remaining
-   formula parity inside `may_double_free_if_alias`.
+3. **Specialized-summary semantic parity (`specialization.c`)**: keep driving
+   parity through `crates/test-harness/src/summary_compare.rs` and
+   `test_summary_comparison_specialization_main`. The harness now compares both
+   canonical `main.pre_post_list` state and canonical specialized summaries
+   keyed by deterministic specialization strings.
+   Verified checkpoint on the current tree:
+   - main summaries: `21 / 21` procedures match
+   - combined per-procedure harness: `Matching: 17`, `Differences: 4`
+   - remaining specialized-summary diffs:
+     `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`,
+     `two_pointers_recursion_bad`
+   Recent correctness groundwork that should stay:
+   resolved `__call_c_function_ptr` targets with no available summary now use
+   the direct known-call unknown fallback instead of the unresolved-funptr
+   path, summary import now preserves callee `is_int(...)` facts, summary
+   export/import still keeps the OCaml-backed latent-invalid-access shaping,
+   and the comparator only normalizes true semantic noise
+   (deterministic specialization keys, witness inequalities, unit-affine
+   `is_int(...)`, function-application args through affine equalities).
+   Highest-confidence remaining analyzer mismatch:
+   OCaml `PulseSpecialization.apply` uses
+   `PulseArithmetic.and_dynamic_type_is_unsafe` when applying dynamic-type
+   specializations, while Rust `crates/pulse/src/specialization.rs` still
+   seeds `Attribute::Closure(pname)` on the specialized heap-path value. That
+   likely explains much of the remaining `invoke` /
+   `invoke_itself_bad` drift, so do not paper it over in the comparator.
+   The other two remaining specialized gaps are narrower:
+   `may_double_free_if_alias` still exports an extra latent diagnostic on the
+   alias-specialized branch, and `two_pointers_recursion_bad` still differs on
+   invalid/int export shape inside the recursive alias specialization.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

@@ -1109,11 +1109,10 @@ fn test_e2e_fopen_null_deref() {
 }
 
 /// Summary comparison: run OCaml and Rust on the same C file and compare
-/// canonicalized main summaries.
+/// canonicalized procedure summaries.
 ///
-/// Step 1 focuses on a single gold file and `main.pre_post_list`.
-/// Specialized-summary comparison is the next layer to add on top of the same
-/// canonical model.
+/// The harness currently compares both `main.pre_post_list` and specialized
+/// summaries under the same alpha-renamed canonical model.
 ///
 /// Heavy test — spawns infer.
 ///   cargo test --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture
@@ -1176,6 +1175,18 @@ fn rust_summary_to_canonical(
 ) -> test_harness::summary_compare::CanonicalProcedureSummary {
     let raw = test_harness::summary_compare::RawProcedureSummary {
         main: summary.pre_posts.iter().map(rust_pre_post_to_raw).collect(),
+        specialized: summary
+            .specialized
+            .iter()
+            .map(
+                |(spec, data)| test_harness::summary_compare::RawSpecializedSummary {
+                    specialization: test_harness::summary_compare::format_rust_specialization_key(
+                        spec,
+                    ),
+                    pre_posts: data.pre_posts.iter().map(rust_pre_post_to_raw).collect(),
+                },
+            )
+            .collect(),
     };
     raw.canonicalize()
 }
@@ -3445,6 +3456,8 @@ fn test_debug_specialization_summary() {
             || name.contains("call_test_unalias")
             || name.contains("may_double_free")
             || name.contains("call_may_double_free")
+            || name.contains("invoke_itself_bad")
+            || name.contains("two_pointers_recursion_bad")
         {
             let issues: Vec<_> = summary
                 .diagnostics
@@ -3484,11 +3497,20 @@ fn test_debug_specialization_summary() {
                 || name == "test_unalias"
                 || name == "call_test_alias_bad"
                 || name == "call_test_unalias_bad"
+                || name == "invoke"
                 || name == "may_double_free_if_alias"
                 || name == "call_may_double_free_if_alias_bad"
+                || name == "invoke_itself_bad"
+                || name == "two_pointers_recursion_bad"
             {
                 for (i, pp) in summary.pre_posts.iter().enumerate() {
                     eprintln!("    raw_main[{i}]={:#?}", rust_pre_post_to_raw(pp));
+                }
+                for (spec, data) in &summary.specialized {
+                    eprintln!("    specialized[{spec}]");
+                    for (i, pp) in data.pre_posts.iter().enumerate() {
+                        eprintln!("      raw_spec[{i}]={:#?}", rust_pre_post_to_raw(pp));
+                    }
                 }
             }
         }

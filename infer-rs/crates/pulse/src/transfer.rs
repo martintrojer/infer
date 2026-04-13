@@ -488,8 +488,7 @@ fn exec_call(
         for ((arg_exp, arg_typ), arg_val) in args.iter().zip(actual_vals.iter().copied()) {
             if arg_typ.is_pointer() {
                 is_pure = false;
-                state.apply_unknown_effect(arg_val);
-                operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
+                apply_unknown_call_pointer_actual_effect(arg_exp, arg_val, loc, &mut state);
             }
         }
         // Pure unknown calls should keep stable FunctionApplication results
@@ -506,6 +505,24 @@ fn exec_call(
     }
 
     vec![ExecutionDomain::ContinueProgram(state)]
+}
+
+fn apply_unknown_call_pointer_actual_effect(
+    arg_exp: &Exp,
+    arg_val: AbstractValue,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) {
+    let reachable_before_havoc = state.reachable_from_post(arg_val);
+    let written_before_havoc: Vec<_> = reachable_before_havoc
+        .iter()
+        .copied()
+        .filter(|addr| !state.path_condition.phi().is_marked_int(*addr))
+        .collect();
+    state.apply_unknown_effect(arg_val);
+    state.add_attr(arg_val, crate::attribute::Attribute::UnknownEffect);
+    state.mark_written_to_addrs_at(written_before_havoc, loc);
+    operations::refresh_unknown_lvalue_root(arg_exp, arg_val, state);
 }
 
 fn mark_call_result_type(
@@ -855,6 +872,90 @@ mod tests {
         assert!(
             has_initialized_zero_actual,
             "unknown-call argument handling should conservatively initialize constant actuals"
+        );
+    }
+
+    #[test]
+    fn test_unknown_call_pointer_actual_records_unknown_effect_and_written_to() {
+        let pname = Procname::c_from_string("test");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt))),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), pname);
+        let p_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .expect("p should be bound");
+        let p_val = state.read_heap(p_root, Access::Dereference);
+        let mid_ptr = state.read_heap(p_val, Access::Dereference);
+        let leaf_int = state.read_heap(mid_ptr, Access::Dereference);
+        state.path_condition.and_is_int(leaf_int);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        state.post.stack.add(Var::LogicalVar(arg_id.clone()), p_val);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::void()),
+            fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string("unknown"))),
+            args: vec![(
+                Exp::Var(arg_id),
+                Typ::mk_ptr(Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt))),
+            )],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let continue_state = results.into_iter().find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        });
+        let state = continue_state.expect("unknown call should continue");
+
+        let actual_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(p_val))
+            .expect("pointer actual should keep post attrs");
+        assert!(
+            actual_attrs.contains(&crate::attribute::Attribute::UnknownEffect),
+            "pointer actual roots should record UnknownEffect for caller import"
+        );
+        assert!(
+            actual_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "pointer actual roots should record WrittenTo"
+        );
+
+        let mid_ptr_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(mid_ptr))
+            .expect("reachable pointer should keep post attrs");
+        assert!(
+            mid_ptr_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "unknown calls should record WrittenTo on reachable pointer values"
+        );
+
+        let leaf_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(leaf_int))
+            .expect("reachable integer leaf should stay materialized");
+        assert!(
+            !leaf_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "known integer leaves should not be marked WrittenTo by unknown-call fallback"
         );
     }
 

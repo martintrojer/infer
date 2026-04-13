@@ -625,6 +625,27 @@ impl Formula {
         self.phi.forget_constraints_involving(&ignored_reprs);
     }
 
+    /// Forget summary-only constraints that mention the given values while
+    /// preserving `is_int` facts on those values.
+    pub fn forget_non_type_constraints_involving(&mut self, ignored: &HashSet<AbstractValue>) {
+        if ignored.is_empty() {
+            return;
+        }
+
+        let ignored_reprs: HashSet<_> = ignored
+            .iter()
+            .map(|addr| self.phi.get_repr(*addr))
+            .collect();
+
+        self.conditions.retain(|atom, _depth| {
+            atom.all_vars()
+                .into_iter()
+                .all(|v| !ignored_reprs.contains(&self.phi.get_repr(v)))
+        });
+        self.phi
+            .forget_non_type_constraints_involving(&ignored_reprs);
+    }
+
     fn record_condition_if_meaningful(&mut self, atom: Atom, depth: usize) {
         if atom.is_trivially_true() == Some(true) {
             return;

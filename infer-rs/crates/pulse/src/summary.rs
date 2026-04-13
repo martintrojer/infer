@@ -1120,7 +1120,7 @@ fn prune_later_direct_formal_artifacts_for_potential_invalid_access(
     pre_post
         .post
         .path_condition
-        .forget_constraints_involving(&later_reachable);
+        .forget_non_type_constraints_involving(&later_reachable);
 
     for addr in &later_reachable {
         pre_post.post.post.attrs.remove_addr(addr);
@@ -1147,6 +1147,16 @@ fn prune_later_direct_formal_artifacts_for_potential_invalid_access(
         &pre_post.post.path_condition,
         &formula_reachable,
     ));
+    // Cross-ref: OCaml still keeps `IsInt` facts on restored later-formal
+    // values even when pruning later direct-formal success guards from an
+    // earlier latent invalid-access summary. Keep those typed values alive for
+    // summary simplification after erasing the non-type constraints above.
+    formula_reachable.extend(
+        later_reachable
+            .iter()
+            .copied()
+            .filter(|addr| pre_post.post.path_condition.phi().is_marked_int(*addr)),
+    );
 
     let pre_reachable = pre_post.collect_reachable_from_seeds(
         pre_post.pre.stack.iter().map(|(_, addr)| *addr),
@@ -3618,6 +3628,87 @@ mod tests {
                 .atoms
                 .contains(&Atom::LessThan(Term::Const(0), Term::Var(y_val))),
             "later direct-formal pure atoms should be erased alongside remembered conditions"
+        );
+    }
+
+    #[test]
+    fn test_potential_invalid_access_keeps_later_direct_formal_is_int_facts() {
+        let pname = Procname::c_from_string("test_proc");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let int_typ = Typ::int(sil::typ::IKind::IInt);
+        let int_ptr_typ = Typ::mk_ptr(int_typ);
+        pdesc.formals = vec![
+            (
+                Mangled::from_string("x"),
+                int_ptr_typ.clone(),
+                Default::default(),
+            ),
+            (Mangled::from_string("y"), int_ptr_typ, Default::default()),
+        ];
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let x_var = Var::ProgramVar(Box::new(x_pvar.clone()));
+        let x_formal_addr = astate.post.stack.find(&x_var).unwrap();
+        let x_val = astate.read_heap(x_formal_addr, Access::Dereference);
+        let _x_loaded = astate.read_heap(x_val, Access::Dereference);
+
+        let y_pvar = Pvar::mk(Mangled::from_string("y"), pdesc.proc_name.clone());
+        let y_var = Var::ProgramVar(Box::new(y_pvar.clone()));
+        let y_formal_addr = astate.post.stack.find(&y_var).unwrap();
+        let y_val = astate.read_heap(y_formal_addr, Access::Dereference);
+        let y_loaded = astate.read_heap(y_val, Access::Dereference);
+
+        let x_loc = Location {
+            line: 79,
+            col: 3,
+            ..Location::dummy()
+        };
+        let y_loc = Location {
+            line: 80,
+            col: 3,
+            ..Location::dummy()
+        };
+        astate.mark_must_be_valid_at(x_val, &x_loc);
+        astate.mark_must_be_valid_at(y_val, &y_loc);
+        astate.path_condition.and_is_int(y_loaded);
+        assert!(astate.and_equal_const(x_val, 0).is_sat());
+        assert!(astate
+            .path_condition
+            .prune_less_than(&Operand::ConstOperand(0), &Operand::AbstractValue(y_val))
+            .is_sat());
+
+        let mut pre_post = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(x_pvar, x_formal_addr), (y_pvar, y_formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: Some(dummy_invalid_access_diagnostic_at(
+                x_val,
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                x_loc,
+            )),
+        };
+
+        prune_later_direct_formal_artifacts_for_potential_invalid_access(
+            &pdesc,
+            &mut pre_post,
+            x_val,
+        );
+
+        assert!(
+            !pre_post
+                .post
+                .path_condition
+                .conditions()
+                .contains_key(&Atom::LessThan(Term::Const(0), Term::Var(y_val))),
+            "later direct-formal success guards should still be erased"
+        );
+        assert!(
+            pre_post.post.path_condition.phi().is_marked_int(y_loaded),
+            "later restored direct-formal value typing should survive latent pruning"
         );
     }
 

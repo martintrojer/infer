@@ -316,6 +316,25 @@ impl AbductiveDomain {
         self.post.attrs.add_one(repr, attr);
     }
 
+    /// Mark a set of caller-visible values as written by the same effect.
+    ///
+    /// Cross-ref: OCaml `PulseCallOperations.unknown_call` stamps the same
+    /// `WrittenTo` event onto every reachable value of a pointer actual.
+    pub fn mark_written_to_addrs_at(
+        &mut self,
+        addrs: impl IntoIterator<Item = AbstractValue>,
+        loc: &Location,
+    ) {
+        let timestamp = self.fresh_attr_timestamp();
+        for addr in addrs {
+            let repr = self.path_condition.get_var_repr(addr);
+            self.initialize(repr);
+            self.post
+                .attrs
+                .mark_written_to(repr, timestamp, loc.clone());
+        }
+    }
+
     fn apply_formula_result(&mut self, result: SatUnsat<Vec<NewEq>>) -> SatUnsat<()> {
         result.and_then(|new_eqs| self.incorporate_new_eqs(new_eqs))
     }
@@ -783,6 +802,15 @@ impl AbductiveDomain {
             }
         }
         visited
+    }
+
+    /// Collect values reachable from `root` through the current post-state
+    /// heap. Call fallback semantics use this before havocing pointer actuals.
+    pub fn reachable_from_post(
+        &self,
+        root: AbstractValue,
+    ) -> std::collections::HashSet<AbstractValue> {
+        self.reachable_from(root)
     }
 
     /// Add a prune constraint (from a branch condition).

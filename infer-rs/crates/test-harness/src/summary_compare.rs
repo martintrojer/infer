@@ -10,11 +10,8 @@
 //! - keeps fine-grained `PrePost` state
 //! - alpha-renames abstract values
 //! - ignores presentation-only ordering noise
-//!
-//! Step 1 compares `main.pre_post_list`. Specialized summaries are the next
-//! layer to add on top of the same canonical model.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// Raw pre/post state before abstract values are alpha-renamed.
@@ -44,12 +41,14 @@ pub struct RawEdge {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RawProcedureSummary {
     pub main: Vec<RawPrePost>,
+    pub specialized: Vec<RawSpecializedSummary>,
 }
 
 /// Canonical semantic summary used for comparison.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CanonicalProcedureSummary {
     pub main: Vec<CanonicalPrePost>,
+    pub specialized: Vec<CanonicalSpecializedSummary>,
 }
 
 /// Canonical `PrePost` with alpha-renamed abstract values.
@@ -67,47 +66,81 @@ pub struct CanonicalPrePost {
     pub diagnostic: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawSpecializedSummary {
+    pub specialization: String,
+    pub pre_posts: Vec<RawPrePost>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CanonicalSpecializedSummary {
+    pub specialization: String,
+    pub pre_posts: Vec<CanonicalPrePost>,
+}
+
 impl RawProcedureSummary {
     pub fn canonicalize(&self) -> CanonicalProcedureSummary {
         let mut main: Vec<_> = self.main.iter().map(RawPrePost::canonicalize).collect();
         main.sort();
-        CanonicalProcedureSummary { main }
+        let mut specialized: Vec<_> = self
+            .specialized
+            .iter()
+            .map(RawSpecializedSummary::canonicalize)
+            .collect();
+        specialized.sort();
+        CanonicalProcedureSummary { main, specialized }
+    }
+}
+
+impl RawSpecializedSummary {
+    fn canonicalize(&self) -> CanonicalSpecializedSummary {
+        let mut pre_posts: Vec<_> = self
+            .pre_posts
+            .iter()
+            .map(RawPrePost::canonicalize)
+            .collect();
+        pre_posts.sort();
+        CanonicalSpecializedSummary {
+            specialization: self.specialization.clone(),
+            pre_posts,
+        }
     }
 }
 
 impl RawPrePost {
     pub fn canonicalize(&self) -> CanonicalPrePost {
-        let mut id_canonicalizer = IdCanonicalizer::new(self);
+        let pruned = self.pruned_for_comparison();
+        let mut id_canonicalizer = IdCanonicalizer::new(&pruned);
 
-        let mut pre_stack = self.pre_stack.clone();
+        let mut pre_stack = pruned.pre_stack.clone();
         pre_stack.sort();
         for (_, addr) in &pre_stack {
             id_canonicalizer.visit_id(addr);
         }
 
-        let mut post_stack = self.post_stack.clone();
+        let mut post_stack = pruned.post_stack.clone();
         post_stack.sort();
         for (_, addr) in &post_stack {
             id_canonicalizer.visit_id(addr);
         }
 
-        for (addr, _) in &self.pre_attrs {
+        for (addr, _) in &pruned.pre_attrs {
             id_canonicalizer.visit_id(addr);
         }
-        for (addr, _) in &self.post_attrs {
+        for (addr, _) in &pruned.post_attrs {
             id_canonicalizer.visit_id(addr);
         }
 
-        for text in self
+        for text in pruned
             .conditions
             .iter()
-            .chain(self.phi.iter())
-            .chain(self.diagnostic.iter())
+            .chain(pruned.phi.iter())
+            .chain(pruned.diagnostic.iter())
         {
             id_canonicalizer.visit_ids_in_text(text);
         }
 
-        let mut pre_heap: Vec<_> = self
+        let mut pre_heap: Vec<_> = pruned
             .pre_heap
             .iter()
             .map(|edge| {
@@ -121,7 +154,7 @@ impl RawPrePost {
             .collect();
         pre_heap.sort();
 
-        let mut post_heap: Vec<_> = self
+        let mut post_heap: Vec<_> = pruned
             .post_heap
             .iter()
             .map(|edge| {
@@ -135,6 +168,16 @@ impl RawPrePost {
             .collect();
         post_heap.sort();
 
+        let anchored_ids = collect_canonical_anchor_ids(
+            &id_canonicalizer,
+            &pre_stack,
+            &post_stack,
+            &pruned.pre_heap,
+            &pruned.post_heap,
+            &pruned.pre_attrs,
+            &pruned.post_attrs,
+        );
+
         let pre_stack: Vec<_> = pre_stack
             .into_iter()
             .map(|(var, addr)| format!("{var}={}", id_canonicalizer.canonical_id(&addr)))
@@ -145,25 +188,44 @@ impl RawPrePost {
             .map(|(var, addr)| format!("{var}={}", id_canonicalizer.canonical_id(&addr)))
             .collect();
 
-        let pre_attrs = canonicalize_attrs(&self.pre_attrs, &id_canonicalizer);
-        let post_attrs = canonicalize_attrs(&self.post_attrs, &id_canonicalizer);
+        let pre_attrs = canonicalize_attrs(&pruned.pre_attrs, &id_canonicalizer);
+        let post_attrs = canonicalize_attrs(&pruned.post_attrs, &id_canonicalizer);
 
-        let mut conditions: Vec<_> = self
+        let mut conditions: Vec<_> = pruned
             .conditions
             .iter()
             .map(|condition| id_canonicalizer.replace_ids(condition))
             .collect();
         conditions.sort();
 
-        let mut phi: Vec<_> = self
+        let mut phi: Vec<_> = pruned
             .phi
             .iter()
             .map(|item| id_canonicalizer.replace_ids(item))
             .collect();
-        phi = canonicalize_phi_items(&phi);
+        phi = canonicalize_phi_items(&phi, &anchored_ids);
+        let mut diagnostic = pruned
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| id_canonicalizer.replace_ids(diagnostic));
+
+        renumber_formula_only_ids(
+            pre_stack
+                .iter()
+                .chain(post_stack.iter())
+                .chain(pre_heap.iter())
+                .chain(post_heap.iter())
+                .chain(pre_attrs.iter())
+                .chain(post_attrs.iter())
+                .map(String::as_str),
+            &mut conditions,
+            &mut phi,
+            &mut diagnostic,
+        );
+        drop_phi_atoms_redundant_with_conditions(&conditions, &mut phi);
 
         CanonicalPrePost {
-            kind: self.kind.clone(),
+            kind: pruned.kind.clone(),
             pre_stack,
             post_stack,
             pre_heap,
@@ -172,12 +234,145 @@ impl RawPrePost {
             post_attrs,
             conditions,
             phi,
-            diagnostic: self
-                .diagnostic
-                .as_ref()
-                .map(|diagnostic| id_canonicalizer.replace_ids(diagnostic)),
+            diagnostic,
         }
     }
+
+    fn pruned_for_comparison(&self) -> Self {
+        let mut pruned = self.clone();
+        prune_unused_formal_materialization(&mut pruned);
+        pruned
+    }
+}
+
+fn collect_canonical_anchor_ids(
+    id_canonicalizer: &IdCanonicalizer,
+    pre_stack: &[(String, String)],
+    post_stack: &[(String, String)],
+    pre_heap: &[RawEdge],
+    post_heap: &[RawEdge],
+    pre_attrs: &[(String, Vec<String>)],
+    post_attrs: &[(String, Vec<String>)],
+) -> HashSet<String> {
+    pre_stack
+        .iter()
+        .chain(post_stack.iter())
+        .map(|(_, addr)| id_canonicalizer.canonical_id(addr))
+        .chain(pre_heap.iter().chain(post_heap.iter()).flat_map(|edge| {
+            [
+                id_canonicalizer.canonical_id(&edge.src),
+                id_canonicalizer.canonical_id(&edge.dst),
+            ]
+        }))
+        .chain(
+            pre_attrs
+                .iter()
+                .chain(post_attrs.iter())
+                .map(|(addr, _)| id_canonicalizer.canonical_id(addr)),
+        )
+        .collect()
+}
+
+fn prune_unused_formal_materialization(pre_post: &mut RawPrePost) {
+    let adjacency = build_raw_adjacency(pre_post);
+    pre_post.post_attrs.retain(|(addr, attrs)| {
+        !(attrs.len() == 1 && attrs[0] == "Initialized" && adjacency.contains_key(addr))
+    });
+
+    let mut protected: HashSet<String> = pre_post
+        .conditions
+        .iter()
+        .chain(pre_post.phi.iter())
+        .chain(pre_post.diagnostic.iter())
+        .flat_map(|text| extract_abstract_ids(text))
+        .collect();
+
+    for (addr, attrs) in &pre_post.post_attrs {
+        protected.insert(addr.clone());
+        for attr in attrs {
+            protected.extend(extract_abstract_ids(attr));
+        }
+    }
+
+    let mut queue: VecDeque<_> = pre_post
+        .post_stack
+        .iter()
+        .filter(|(var, _)| var == "return")
+        .map(|(_, addr)| addr.clone())
+        .collect();
+    while let Some(addr) = queue.pop_front() {
+        if !protected.insert(addr.clone()) {
+            continue;
+        }
+        if let Some(dsts) = adjacency.get(&addr) {
+            queue.extend(dsts.iter().cloned());
+        }
+    }
+
+    let mut prunable = HashSet::new();
+    let candidate_roots: BTreeSet<_> = pre_post
+        .pre_stack
+        .iter()
+        .chain(pre_post.post_stack.iter())
+        .filter(|(var, _)| var != "return")
+        .map(|(_, addr)| addr.clone())
+        .collect();
+
+    for root in candidate_roots {
+        let subtree = collect_raw_reachable(&adjacency, root.clone());
+        if subtree.iter().all(|addr| !protected.contains(addr)) {
+            prunable.extend(subtree);
+        }
+    }
+
+    if prunable.is_empty() {
+        return;
+    }
+
+    pre_post
+        .pre_heap
+        .retain(|edge| !prunable.contains(&edge.src) && !prunable.contains(&edge.dst));
+    pre_post
+        .post_heap
+        .retain(|edge| !prunable.contains(&edge.src) && !prunable.contains(&edge.dst));
+    pre_post
+        .pre_attrs
+        .retain(|(addr, _)| !prunable.contains(addr));
+    pre_post
+        .post_attrs
+        .retain(|(addr, _)| !prunable.contains(addr));
+}
+
+fn build_raw_adjacency(pre_post: &RawPrePost) -> HashMap<String, Vec<String>> {
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in pre_post.pre_heap.iter().chain(pre_post.post_heap.iter()) {
+        adjacency
+            .entry(edge.src.clone())
+            .or_default()
+            .push(edge.dst.clone());
+    }
+    for dsts in adjacency.values_mut() {
+        dsts.sort();
+        dsts.dedup();
+    }
+    adjacency
+}
+
+fn collect_raw_reachable(
+    adjacency: &HashMap<String, Vec<String>>,
+    root: String,
+) -> HashSet<String> {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([root]);
+    while let Some(addr) = queue.pop_front() {
+        if !reachable.insert(addr.clone()) {
+            continue;
+        }
+        if let Some(dsts) = adjacency.get(&addr) {
+            queue.extend(dsts.iter().cloned());
+        }
+    }
+    reachable
 }
 
 fn canonicalize_attrs(
@@ -204,7 +399,7 @@ fn canonicalize_attrs(
     result
 }
 
-fn canonicalize_phi_items(phi: &[String]) -> Vec<String> {
+fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec<String> {
     let eqs: HashMap<_, _> = phi
         .iter()
         .filter_map(|item| {
@@ -214,6 +409,9 @@ fn canonicalize_phi_items(phi: &[String]) -> Vec<String> {
         })
         .collect();
     let witness_equivs = build_witness_equivalences(&eqs);
+    let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
+    let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
+    let affine_env = build_unit_affine_equivalences(&eqs);
 
     let mut normalized = BTreeSet::new();
     for item in phi {
@@ -221,30 +419,171 @@ fn canonicalize_phi_items(phi: &[String]) -> Vec<String> {
             normalized.insert(format!("atom:0 < {lhs}"));
         } else if let Some(lhs) = parse_nonpositive_witness_eq(item) {
             normalized.insert(format!("atom:{lhs} <= 0"));
+        } else if let Some((lhs, rhs)) = parse_eq_item(item) {
+            if let Some((callee, args)) = parse_fn_app(rhs) {
+                let normalized_args: Vec<_> = args
+                    .into_iter()
+                    .map(|arg| normalize_fn_app_arg_for_phi(&arg, &affine_env))
+                    .collect();
+                normalized.insert(format!("eq:{lhs}={callee}({})", normalized_args.join(",")));
+            } else {
+                normalized.insert(format!("eq:{lhs}={}", normalize_term_syntax_for_phi(rhs)));
+            }
         } else if let Some(term) = parse_is_int_item(item) {
-            for normalized_term in normalize_is_int_terms(term, &eqs, &witness_equivs) {
+            for normalized_term in normalize_is_int_terms(term, &eqs, &witness_equivs, &affine_env)
+            {
                 normalized.insert(format!("is_int({normalized_term})"));
+            }
+        } else if let Some(atom) = parse_atom_item(item) {
+            let lhs = normalize_term_syntax_for_phi(&atom.lhs);
+            let rhs = normalize_term_syntax_for_phi(&atom.rhs);
+            if let Some(witness_atom) = collapse_witness_atom(
+                &lhs,
+                atom.operator,
+                &rhs,
+                &positive_witness_atoms,
+                &nonpositive_witness_atoms,
+            ) {
+                normalized.insert(witness_atom);
+            } else {
+                normalized.insert(format!("atom:{lhs} {} {rhs}", atom.operator));
             }
         } else {
             normalized.insert(item.clone());
         }
     }
 
-    normalized.into_iter().collect()
+    canonicalize_is_int_closure(normalized, anchored_ids)
+}
+
+fn canonicalize_is_int_closure(
+    items: BTreeSet<String>,
+    anchored_ids: &HashSet<String>,
+) -> Vec<String> {
+    let mut others = BTreeSet::new();
+    let mut is_int_terms = Vec::new();
+    for item in items {
+        if let Some(term) = parse_is_int_item(&item) {
+            is_int_terms.push(term.to_string());
+        } else {
+            others.insert(item);
+        }
+    }
+
+    let original_plain_ints: HashSet<_> = is_int_terms
+        .iter()
+        .filter(|term| looks_like_term_identifier(term))
+        .cloned()
+        .collect();
+    let mut known_int_vars = original_plain_ints.clone();
+
+    loop {
+        let mut changed = false;
+        for term in &is_int_terms {
+            if let Some(var) = derive_is_int_var(term, &known_int_vars) {
+                if known_int_vars.insert(var) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for var in &known_int_vars {
+        if anchored_ids.contains(var) || original_plain_ints.contains(var) {
+            others.insert(format!("is_int({var})"));
+        }
+    }
+
+    for term in is_int_terms {
+        if should_keep_is_int_term(&term, &known_int_vars) {
+            others.insert(format!("is_int({term})"));
+        }
+    }
+
+    others.into_iter().collect()
+}
+
+fn derive_is_int_var(term: &str, known_int_vars: &HashSet<String>) -> Option<String> {
+    if looks_like_term_identifier(term) {
+        return Some(term.to_string());
+    }
+
+    let (vars, _constant) = parse_linear_term(term)?;
+    let unknowns: Vec<_> = vars
+        .into_iter()
+        .filter(|(var, coeff)| !known_int_vars.contains(var) && matches!(coeff, -1 | 1))
+        .collect();
+    (unknowns.len() == 1).then(|| unknowns[0].0.clone())
+}
+
+fn should_keep_is_int_term(term: &str, known_int_vars: &HashSet<String>) -> bool {
+    if looks_like_term_identifier(term) {
+        return false;
+    }
+
+    let Some((vars, _constant)) = parse_linear_term(term) else {
+        return true;
+    };
+    let reducible_unknowns = vars
+        .iter()
+        .filter(|(var, coeff)| !known_int_vars.contains(var) && matches!(coeff, -1 | 1))
+        .count();
+    reducible_unknowns > 1
 }
 
 fn parse_is_int_item(item: &str) -> Option<&str> {
     item.strip_prefix("is_int(")?.strip_suffix(')')
 }
 
+fn collapse_witness_atom(
+    lhs: &str,
+    operator: &str,
+    rhs: &str,
+    positive_witness_atoms: &HashMap<String, String>,
+    nonpositive_witness_atoms: &HashMap<String, String>,
+) -> Option<String> {
+    match (lhs, operator, rhs) {
+        ("0", "<", term) => positive_witness_atoms
+            .get(term)
+            .map(|canonical| format!("atom:0 < {canonical}")),
+        (term, "<=", "0") => nonpositive_witness_atoms
+            .get(term)
+            .map(|canonical| format!("atom:{canonical} <= 0")),
+        _ => None,
+    }
+}
+
+fn drop_phi_atoms_redundant_with_conditions(conditions: &[String], phi: &mut Vec<String>) {
+    let condition_atoms: HashSet<_> = conditions
+        .iter()
+        .filter_map(|condition| condition.strip_prefix("cond:"))
+        .map(ToOwned::to_owned)
+        .collect();
+    phi.retain(|item| {
+        item.strip_prefix("atom:")
+            .is_none_or(|atom| !condition_atoms.contains(atom))
+    });
+}
+
 fn normalize_is_int_terms(
     term: &str,
     eqs: &HashMap<String, String>,
     witness_equivs: &HashMap<String, String>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
 ) -> BTreeSet<String> {
     let mut normalized = BTreeSet::new();
     let mut visiting = BTreeSet::new();
-    normalize_is_int_term(term, eqs, witness_equivs, &mut visiting, &mut normalized);
+    normalize_is_int_term(
+        term,
+        eqs,
+        witness_equivs,
+        affine_env,
+        &mut visiting,
+        &mut normalized,
+    );
     normalized
 }
 
@@ -252,6 +591,7 @@ fn normalize_is_int_term(
     term: &str,
     eqs: &HashMap<String, String>,
     witness_equivs: &HashMap<String, String>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
     visiting: &mut BTreeSet<String>,
     normalized: &mut BTreeSet<String>,
 ) {
@@ -266,22 +606,67 @@ fn normalize_is_int_term(
     }
 
     if let Some(rhs) = eqs.get(term) {
-        normalize_is_int_term(rhs, eqs, witness_equivs, visiting, normalized);
+        normalize_is_int_term(rhs, eqs, witness_equivs, affine_env, visiting, normalized);
         visiting.remove(term);
         return;
     }
 
-    if let Some(vars) = parse_linear_term_vars(term) {
-        normalized.insert(term.to_string());
-        if vars.len() == 1 && matches!(vars[0].1, -1 | 1) {
-            normalize_is_int_term(&vars[0].0, eqs, witness_equivs, visiting, normalized);
+    if let Some(expr) = parse_affine_expr(term) {
+        if expr.coeff == 1 && expr.constant == 0 && expr.base == term {
+            // Plain identifiers need the equivalence environment to prefer
+            // stable reachable names such as `i.*` over formula-only temps.
+            if let Some(best) = best_affine_expr(term, affine_env) {
+                if best.coeff == 1 && best.constant == 0 && best.base == term {
+                    normalized.insert(term.to_string());
+                } else if matches!(best.coeff, -1 | 1) {
+                    normalize_is_int_term(
+                        &best.base,
+                        eqs,
+                        witness_equivs,
+                        affine_env,
+                        visiting,
+                        normalized,
+                    );
+                } else {
+                    normalized.insert(normalize_term_for_phi(term, affine_env));
+                }
+            } else {
+                normalized.insert(normalize_term_for_phi(term, affine_env));
+            }
+        } else if matches!(expr.coeff, -1 | 1) {
+            // `is_int(x + k)` and `is_int(-x + k)` are equivalent to
+            // `is_int(x)` for integer constants `k`.
+            normalize_is_int_term(
+                &expr.base,
+                eqs,
+                witness_equivs,
+                affine_env,
+                visiting,
+                normalized,
+            );
+        } else {
+            normalized.insert(normalize_term_for_phi(term, affine_env));
         }
         visiting.remove(term);
         return;
     }
 
-    normalized.insert(term.to_string());
+    normalized.insert(normalize_term_for_phi(term, affine_env));
     visiting.remove(term);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AffineExpr {
+    coeff: i32,
+    base: String,
+    constant: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedAtom {
+    lhs: String,
+    operator: &'static str,
+    rhs: String,
 }
 
 /// OCaml `PulseArithmetic.solve_lin_ineq` / `PulseFormulaPhi` often encode
@@ -307,6 +692,26 @@ fn build_witness_equivalences(eqs: &HashMap<String, String>) -> HashMap<String, 
     result
 }
 
+fn build_positive_witness_atom_equivalences(
+    eqs: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    eqs.iter()
+        .filter_map(|(lhs, rhs)| {
+            parse_positive_witness_rhs(rhs).map(|_| (rhs.clone(), lhs.clone()))
+        })
+        .collect()
+}
+
+fn build_nonpositive_witness_atom_equivalences(
+    eqs: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    eqs.iter()
+        .filter_map(|(lhs, rhs)| {
+            parse_nonpositive_witness_rhs(rhs).map(|_| (rhs.clone(), lhs.clone()))
+        })
+        .collect()
+}
+
 fn parse_positive_witness_eq(item: &str) -> Option<String> {
     let rest = item.strip_prefix("eq:")?;
     let (lhs, rhs) = rest.split_once('=')?;
@@ -319,7 +724,7 @@ fn parse_positive_witness_rhs(rhs: &str) -> Option<String> {
         return None;
     }
     let witness = &vars[0].0;
-    witness.starts_with('a').then(|| witness.clone())
+    looks_like_abstract_id(witness).then(|| witness.clone())
 }
 
 fn parse_nonpositive_witness_eq(item: &str) -> Option<String> {
@@ -334,7 +739,7 @@ fn parse_nonpositive_witness_rhs(rhs: &str) -> Option<String> {
         return None;
     }
     let witness = &vars[0].0;
-    witness.starts_with('a').then(|| witness.clone())
+    looks_like_abstract_id(witness).then(|| witness.clone())
 }
 
 fn parse_linear_term(term: &str) -> Option<(Vec<(String, i32)>, i32)> {
@@ -356,15 +761,336 @@ fn parse_linear_term(term: &str) -> Option<(Vec<(String, i32)>, i32)> {
     Some((vars, constant))
 }
 
-fn parse_linear_term_vars(term: &str) -> Option<Vec<(String, i32)>> {
-    parse_linear_term(term).map(|(vars, _constant)| vars)
-}
-
 fn is_integer_constant(term: &str) -> bool {
     !term.is_empty()
         && term
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'/'))
+}
+
+fn parse_eq_item(item: &str) -> Option<(&str, &str)> {
+    let rest = item.strip_prefix("eq:")?;
+    rest.split_once('=')
+}
+
+fn parse_atom_item(item: &str) -> Option<ParsedAtom> {
+    let rest = item.strip_prefix("atom:")?;
+    for operator in [" <= ", " < ", " != ", " = "] {
+        if let Some((lhs, rhs)) = rest.split_once(operator) {
+            return Some(ParsedAtom {
+                lhs: lhs.to_string(),
+                operator: match operator {
+                    " <= " => "<=",
+                    " < " => "<",
+                    " != " => "!=",
+                    " = " => "=",
+                    _ => unreachable!(),
+                },
+                rhs: rhs.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn parse_fn_app(term: &str) -> Option<(String, Vec<String>)> {
+    let open = term.find('(')?;
+    if !term.ends_with(')') {
+        return None;
+    }
+    let callee = &term[..open];
+    if callee.is_empty()
+        || matches!(
+            callee,
+            "lin" | "add" | "sub" | "mult" | "neg" | "not" | "is_zero"
+        )
+        || callee.starts_with("binop::")
+    {
+        return None;
+    }
+    let inner = &term[open + 1..term.len() - 1];
+    Some((callee.to_string(), split_top_level_args(inner)))
+}
+
+fn split_top_level_args(inner: &str) -> Vec<String> {
+    if inner.is_empty() {
+        return Vec::new();
+    }
+
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(inner[start..index].trim().to_string());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim().to_string());
+    args
+}
+
+fn build_unit_affine_equivalences(
+    eqs: &HashMap<String, String>,
+) -> HashMap<String, Vec<AffineExpr>> {
+    let mut result: HashMap<String, Vec<AffineExpr>> = HashMap::new();
+    for (lhs, rhs) in eqs {
+        let Some(expr) = parse_affine_expr(rhs) else {
+            continue;
+        };
+        result.entry(lhs.clone()).or_default().push(expr.clone());
+        result
+            .entry(expr.base.clone())
+            .or_default()
+            .push(AffineExpr {
+                coeff: expr.coeff,
+                base: lhs.clone(),
+                constant: -expr.coeff * expr.constant,
+            });
+    }
+    result
+}
+
+fn parse_affine_expr(term: &str) -> Option<AffineExpr> {
+    if is_integer_constant(term) {
+        return None;
+    }
+
+    if let Some((vars, constant)) = parse_linear_term(term) {
+        if vars.len() == 1 && matches!(vars[0].1, -1 | 1) {
+            return Some(AffineExpr {
+                coeff: vars[0].1,
+                base: vars[0].0.clone(),
+                constant,
+            });
+        }
+        return None;
+    }
+
+    if let Some(inner) = term
+        .strip_prefix("add(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            if let Some(base) = parse_affine_expr(&args[0]) {
+                if let Ok(value) = args[1].parse::<i32>() {
+                    return Some(AffineExpr {
+                        coeff: base.coeff,
+                        base: base.base,
+                        constant: base.constant + value,
+                    });
+                }
+            }
+            if let Some(base) = parse_affine_expr(&args[1]) {
+                if let Ok(value) = args[0].parse::<i32>() {
+                    return Some(AffineExpr {
+                        coeff: base.coeff,
+                        base: base.base,
+                        constant: base.constant + value,
+                    });
+                }
+            }
+        }
+        return None;
+    }
+
+    if let Some(inner) = term
+        .strip_prefix("sub(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            let base = parse_affine_expr(&args[0])?;
+            let value = args[1].parse::<i32>().ok()?;
+            return Some(AffineExpr {
+                coeff: base.coeff,
+                base: base.base,
+                constant: base.constant - value,
+            });
+        }
+        return None;
+    }
+
+    looks_like_term_identifier(term).then(|| AffineExpr {
+        coeff: 1,
+        base: term.to_string(),
+        constant: 0,
+    })
+}
+
+fn looks_like_term_identifier(term: &str) -> bool {
+    !term.is_empty()
+        && !term.contains('(')
+        && !term.contains(')')
+        && !term.contains(',')
+        && !term.contains(' ')
+}
+
+fn best_affine_expr(term: &str, env: &HashMap<String, Vec<AffineExpr>>) -> Option<AffineExpr> {
+    let start = parse_affine_expr(term)?;
+    let mut best = start.clone();
+    let mut worklist = vec![start];
+    let mut visited = BTreeSet::new();
+
+    while let Some(expr) = worklist.pop() {
+        let key = format_affine_expr(&expr);
+        if !visited.insert(key) {
+            continue;
+        }
+        if affine_expr_sort_key(&expr) < affine_expr_sort_key(&best) {
+            best = expr.clone();
+        }
+        let Some(next_exprs) = env.get(&expr.base) else {
+            continue;
+        };
+        for next in next_exprs {
+            let coeff = expr.coeff * next.coeff;
+            if !matches!(coeff, -1 | 1) {
+                continue;
+            }
+            worklist.push(AffineExpr {
+                coeff,
+                base: next.base.clone(),
+                constant: expr.coeff * next.constant + expr.constant,
+            });
+        }
+    }
+
+    Some(best)
+}
+
+fn affine_expr_sort_key(expr: &AffineExpr) -> (bool, bool, bool, usize, bool, i32, String) {
+    let base_is_abstract = looks_like_abstract_id(&expr.base);
+    (
+        base_is_abstract,
+        expr.coeff != 1 || expr.constant != 0,
+        expr.base.starts_with('a'),
+        expr.base.len(),
+        expr.coeff == -1,
+        expr.constant.abs(),
+        format_affine_expr(expr),
+    )
+}
+
+fn format_affine_expr(expr: &AffineExpr) -> String {
+    match (expr.coeff, expr.constant) {
+        (1, 0) => expr.base.clone(),
+        (-1, 0) => format!("lin(-1*{})", expr.base),
+        (1, constant) => format!("lin(1*{},const={constant})", expr.base),
+        (-1, constant) => format!("lin(-1*{},const={constant})", expr.base),
+        _ => unreachable!(),
+    }
+}
+
+fn normalize_term_syntax_for_phi(term: &str) -> String {
+    if let Some((callee, args)) = parse_fn_app(term) {
+        let normalized_args: Vec<_> = args
+            .into_iter()
+            .map(|arg| normalize_term_syntax_for_phi(&arg))
+            .collect();
+        return format!("{callee}({})", normalized_args.join(","));
+    }
+    if let Some(expr) = parse_affine_expr(term) {
+        return format_affine_expr(&expr);
+    }
+    if let Some(linear) = normalize_general_linear_term(term) {
+        return linear;
+    }
+    term.to_string()
+}
+
+fn normalize_fn_app_arg_for_phi(term: &str, env: &HashMap<String, Vec<AffineExpr>>) -> String {
+    if let Some((callee, args)) = parse_fn_app(term) {
+        let normalized_args: Vec<_> = args
+            .into_iter()
+            .map(|arg| normalize_fn_app_arg_for_phi(&arg, env))
+            .collect();
+        return format!("{callee}({})", normalized_args.join(","));
+    }
+    normalize_term_for_phi(term, env)
+}
+
+fn normalize_term_for_phi(term: &str, env: &HashMap<String, Vec<AffineExpr>>) -> String {
+    if let Some(expr) = best_affine_expr(term, env) {
+        return format_affine_expr(&expr);
+    }
+    if let Some(linear) = normalize_general_linear_term(term) {
+        return linear;
+    }
+    term.to_string()
+}
+
+fn normalize_general_linear_term(term: &str) -> Option<String> {
+    let (mut vars, constant) = parse_linear_term(term)?;
+    vars.sort();
+
+    let mut parts: Vec<String> = vars
+        .into_iter()
+        .map(|(var, coeff)| format!("{coeff}*{var}"))
+        .collect();
+    if constant != 0 {
+        parts.push(format!("const={constant}"));
+    }
+    Some(format!("lin({})", parts.join(",")))
+}
+
+fn renumber_formula_only_ids<'a>(
+    anchored_texts: impl IntoIterator<Item = &'a str>,
+    conditions: &mut Vec<String>,
+    phi: &mut Vec<String>,
+    diagnostic: &mut Option<String>,
+) {
+    let anchored_ids: HashSet<_> = anchored_texts
+        .into_iter()
+        .flat_map(extract_abstract_ids)
+        .collect();
+    let mut mapping = HashMap::new();
+    let mut next_formula_only = next_formula_only_index(&anchored_ids);
+
+    for text in conditions.iter().chain(phi.iter()).chain(diagnostic.iter()) {
+        for id in extract_abstract_ids(text) {
+            if anchored_ids.contains(&id) || mapping.contains_key(&id) {
+                continue;
+            }
+            let canonical = format!("v{next_formula_only}");
+            next_formula_only += 1;
+            mapping.insert(id, canonical);
+        }
+    }
+
+    if mapping.is_empty() {
+        return;
+    }
+
+    *conditions = conditions
+        .iter()
+        .map(|text| replace_abstract_ids(text, &mapping))
+        .collect();
+    conditions.sort();
+
+    *phi = phi
+        .iter()
+        .map(|text| replace_abstract_ids(text, &mapping))
+        .collect();
+    phi.sort();
+
+    *diagnostic = diagnostic
+        .as_ref()
+        .map(|text| replace_abstract_ids(text, &mapping));
+}
+
+fn next_formula_only_index(anchored_ids: &HashSet<String>) -> usize {
+    let mut next = 1;
+    while anchored_ids.contains(&format!("v{next}")) {
+        next += 1;
+    }
+    next
 }
 
 struct IdCanonicalizer {
@@ -571,7 +1297,18 @@ fn parse_ocaml_pulse_summary(value: &serde_json::Value) -> RawProcedureSummary {
         })
         .unwrap_or_default();
 
-    RawProcedureSummary { main }
+    let specialized = value
+        .get("specialized")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(parse_ocaml_specialized_summary)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    RawProcedureSummary { main, specialized }
 }
 
 fn parse_ocaml_pre_post(value: &serde_json::Value) -> Option<RawPrePost> {
@@ -590,6 +1327,153 @@ fn parse_ocaml_pre_post(value: &serde_json::Value) -> Option<RawPrePost> {
         phi: parse_ocaml_phi(state.get("path_condition").and_then(|pc| pc.get("phi"))),
         diagnostic: detail.get("diagnostic").map(format_ocaml_diagnostic),
     })
+}
+
+fn parse_ocaml_specialized_summary(value: &serde_json::Value) -> Option<RawSpecializedSummary> {
+    let entry = value.as_array()?;
+    if entry.len() != 2 {
+        return None;
+    }
+
+    let specialization = format_ocaml_specialization(&entry[0]);
+    let pre_posts = entry[1]
+        .get("pre_post_list")
+        .and_then(serde_json::Value::as_array)
+        .map(|pre_posts| {
+            pre_posts
+                .iter()
+                .filter_map(parse_ocaml_pre_post)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(RawSpecializedSummary {
+        specialization,
+        pre_posts,
+    })
+}
+
+fn format_ocaml_specialization(value: &serde_json::Value) -> String {
+    let aliases = value.get("aliases").and_then(serde_json::Value::as_array);
+    let dynamic_types = value
+        .get("dynamic_types")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            let mut entries: Vec<_> = entries
+                .iter()
+                .filter_map(format_ocaml_dynamic_type_binding)
+                .collect();
+            entries.sort();
+            entries
+        })
+        .unwrap_or_default();
+
+    let mut parts = Vec::new();
+
+    if let Some(alias_groups) = aliases {
+        let mut alias_groups: Vec<_> = alias_groups
+            .iter()
+            .filter_map(format_ocaml_alias_group)
+            .collect();
+        alias_groups.sort();
+        if !alias_groups.is_empty() {
+            parts.push(format!("alias: {}", alias_groups.join(" && ")));
+        }
+    }
+
+    if !dynamic_types.is_empty() {
+        parts.push(format!("dynamic_types: {{{}}}", dynamic_types.join(", ")));
+    }
+
+    if parts.is_empty() {
+        "⊥".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_ocaml_alias_group(value: &serde_json::Value) -> Option<String> {
+    let group = value.as_array()?;
+    let mut paths: Vec<_> = group.iter().filter_map(format_ocaml_heap_path).collect();
+    paths.sort();
+    Some(paths.join(" = "))
+}
+
+fn format_ocaml_dynamic_type_binding(value: &serde_json::Value) -> Option<String> {
+    let binding = value.as_array()?;
+    if binding.len() != 2 {
+        return None;
+    }
+    let path = format_ocaml_heap_path(&binding[0])?;
+    let ty = format_ocaml_type_name(&binding[1]);
+    Some(format!("{path}: {ty}"))
+}
+
+fn format_ocaml_heap_path(value: &serde_json::Value) -> Option<String> {
+    let arr = value.as_array()?;
+    let tag = arr.first()?.as_str()?;
+    match tag {
+        "Pvar" => arr.get(1).and_then(format_ocaml_specialization_pvar),
+        "FieldAccess" => {
+            let field = arr.get(1).map(extract_field_name)?;
+            let path = arr.get(2).and_then(format_ocaml_heap_path)?;
+            Some(format!("{path}->{field}"))
+        }
+        "Dereference" => {
+            let path = arr.get(1).and_then(format_ocaml_heap_path)?;
+            Some(format!("*{path}"))
+        }
+        _ => None,
+    }
+}
+
+fn format_ocaml_specialization_pvar(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("plain")
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_var_name)
+}
+
+fn format_ocaml_type_name(value: &serde_json::Value) -> String {
+    let Some(arr) = value.as_array() else {
+        return compact_json(value);
+    };
+    let Some(tag) = arr.first().and_then(serde_json::Value::as_str) else {
+        return compact_json(value);
+    };
+
+    match tag {
+        "CFunction" => arr
+            .get(1)
+            .and_then(|sig| sig.get("c_name"))
+            .map(format_ocaml_qualified_cpp_name)
+            .unwrap_or_else(|| compact_json(value)),
+        "CStruct" | "CUnion" | "ObjcClass" | "ObjcProtocol" => arr
+            .get(1)
+            .map(format_ocaml_qualified_cpp_name)
+            .unwrap_or_else(|| compact_json(value)),
+        "JavaClass" | "HackClass" | "PythonClass" | "ErlangType" | "SwiftClass" | "CSharpClass"
+        | "SwiftClosure" => arr
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| compact_json(value)),
+        _ => compact_json(value),
+    }
+}
+
+fn format_ocaml_qualified_cpp_name(value: &serde_json::Value) -> String {
+    value
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("::")
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| compact_json(value))
 }
 
 fn extract_ocaml_pre_post_kind_and_detail(
@@ -1246,6 +2130,53 @@ fn compact_json(value: &serde_json::Value) -> String {
     }
 }
 
+pub fn format_rust_specialization_key(spec: &sil::specialization::PulseSpecialization) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(alias_groups) = &spec.aliases {
+        let mut alias_groups: Vec<_> = alias_groups
+            .iter()
+            .map(|group| {
+                let mut paths: Vec<_> = group.iter().map(format_rust_heap_path).collect();
+                paths.sort();
+                paths.join(" = ")
+            })
+            .collect();
+        alias_groups.sort();
+        if !alias_groups.is_empty() {
+            parts.push(format!("alias: {}", alias_groups.join(" && ")));
+        }
+    }
+
+    if !spec.dynamic_types.is_empty() {
+        let mut dynamic_types: Vec<_> = spec
+            .dynamic_types
+            .iter()
+            .map(|(path, ty)| format!("{}: {}", format_rust_heap_path(path), ty))
+            .collect();
+        dynamic_types.sort();
+        parts.push(format!("dynamic_types: {{{}}}", dynamic_types.join(", ")));
+    }
+
+    if parts.is_empty() {
+        "⊥".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_rust_heap_path(path: &sil::specialization::HeapPath) -> String {
+    match path {
+        sil::specialization::HeapPath::Pvar(pvar) => normalize_var_name(&pvar.name.plain),
+        sil::specialization::HeapPath::FieldAccess(field, path) => {
+            format!("{}->{}", format_rust_heap_path(path), field.field_name)
+        }
+        sil::specialization::HeapPath::Dereference(path) => {
+            format!("*{}", format_rust_heap_path(path))
+        }
+    }
+}
+
 /// Compare OCaml and Rust canonical summaries, returning a report.
 pub fn compare_summaries(
     ocaml: &HashMap<String, CanonicalProcedureSummary>,
@@ -1288,25 +2219,68 @@ fn diff_procedure_summary(
     rust: &CanonicalProcedureSummary,
 ) -> Vec<String> {
     let mut diffs = Vec::new();
-    if ocaml.main.len() != rust.main.len() {
-        diffs.push(format!(
-            "main pre_post count: ocaml={}, rust={}",
-            ocaml.main.len(),
-            rust.main.len()
-        ));
-    }
+    diffs.extend(diff_pre_post_collection("main", &ocaml.main, &rust.main));
 
-    for (index, (o, r)) in ocaml.main.iter().zip(rust.main.iter()).enumerate() {
-        if o != r {
-            diffs.push(format!("main[{index}] {}", diff_pre_post(o, r).join("; ")));
+    let ocaml_specialized: HashMap<_, _> = ocaml
+        .specialized
+        .iter()
+        .map(|summary| (summary.specialization.as_str(), summary))
+        .collect();
+    let rust_specialized: HashMap<_, _> = rust
+        .specialized
+        .iter()
+        .map(|summary| (summary.specialization.as_str(), summary))
+        .collect();
+    let all_specs: BTreeSet<_> = ocaml_specialized
+        .keys()
+        .chain(rust_specialized.keys())
+        .copied()
+        .collect();
+
+    for spec in all_specs {
+        match (ocaml_specialized.get(spec), rust_specialized.get(spec)) {
+            (Some(ocaml), Some(rust)) => diffs.extend(diff_pre_post_collection(
+                &format!("specialized[{spec}]"),
+                &ocaml.pre_posts,
+                &rust.pre_posts,
+            )),
+            (Some(_), None) => diffs.push(format!("specialized missing in rust: {spec}")),
+            (None, Some(_)) => diffs.push(format!("specialized extra in rust: {spec}")),
+            (None, None) => {}
         }
     }
 
-    for extra in ocaml.main.iter().skip(rust.main.len()) {
-        diffs.push(format!("main missing in rust: {extra:?}"));
+    diffs
+}
+
+fn diff_pre_post_collection(
+    label: &str,
+    ocaml: &[CanonicalPrePost],
+    rust: &[CanonicalPrePost],
+) -> Vec<String> {
+    let mut diffs = Vec::new();
+    if ocaml.len() != rust.len() {
+        diffs.push(format!(
+            "{label} pre_post count: ocaml={}, rust={}",
+            ocaml.len(),
+            rust.len()
+        ));
     }
-    for extra in rust.main.iter().skip(ocaml.main.len()) {
-        diffs.push(format!("main extra in rust: {extra:?}"));
+
+    for (index, (o, r)) in ocaml.iter().zip(rust.iter()).enumerate() {
+        if o != r {
+            diffs.push(format!(
+                "{label}[{index}] {}",
+                diff_pre_post(o, r).join("; ")
+            ));
+        }
+    }
+
+    for extra in ocaml.iter().skip(rust.len()) {
+        diffs.push(format!("{label} missing in rust: {extra:?}"));
+    }
+    for extra in rust.iter().skip(ocaml.len()) {
+        diffs.push(format!("{label} extra in rust: {extra:?}"));
     }
 
     diffs
@@ -1485,6 +2459,7 @@ mod tests {
     #[test]
     fn test_raw_pre_post_canonicalization_alpha_renames_equivalent_states() {
         let left = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v10".to_string())],
@@ -1524,6 +2499,7 @@ mod tests {
         };
 
         let right = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v3".to_string())],
@@ -1581,6 +2557,7 @@ mod tests {
     #[test]
     fn test_canonicalization_prefers_stack_paths_for_reachable_values() {
         let raw = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("i".to_string(), "v1".to_string())],
@@ -1631,6 +2608,7 @@ mod tests {
     #[test]
     fn test_canonicalization_matches_alias_wrapper_abort_shape() {
         let ocaml = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "AbortProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v1".to_string())],
@@ -1676,6 +2654,7 @@ mod tests {
         };
 
         let rust = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "AbortProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v1".to_string())],
@@ -1826,6 +2805,7 @@ mod tests {
     #[test]
     fn test_phi_normalization_resolves_is_int_through_equalities() {
         let left = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("i".to_string(), "v1".to_string())],
@@ -1845,6 +2825,7 @@ mod tests {
             }],
         };
         let right = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("i".to_string(), "v10".to_string())],
@@ -1870,6 +2851,7 @@ mod tests {
     #[test]
     fn test_phi_normalization_collapses_positivity_witness_equalities() {
         let left = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v1".to_string())],
@@ -1888,6 +2870,7 @@ mod tests {
             }],
         };
         let right = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v10".to_string())],
@@ -1908,6 +2891,7 @@ mod tests {
     #[test]
     fn test_phi_normalization_collapses_nonpositive_witness_equalities() {
         let left = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v1".to_string())],
@@ -1926,6 +2910,7 @@ mod tests {
             }],
         };
         let right = RawProcedureSummary {
+            specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
                 pre_stack: vec![("x".to_string(), "v10".to_string())],
@@ -1941,5 +2926,461 @@ mod tests {
         };
 
         assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_phi_normalization_collapses_unit_affine_is_int_chains() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("i".to_string(), "v1".to_string()),
+                    ("return".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("i".to_string(), "v1".to_string()),
+                    ("return".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v1=lin(1*v2,const=-2)".to_string(),
+                    "eq:v3=lin(1*v2,const=-1)".to_string(),
+                    "is_int(v1)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("i".to_string(), "v10".to_string()),
+                    ("return".to_string(), "v11".to_string()),
+                ],
+                post_stack: vec![
+                    ("i".to_string(), "v10".to_string()),
+                    ("return".to_string(), "v11".to_string()),
+                ],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v10=lin(1*v11,const=-2)".to_string(),
+                    "eq:v12=lin(1*v11,const=-1)".to_string(),
+                    "is_int(v11)".to_string(),
+                    "is_int(lin(1*v11,const=-1))".to_string(),
+                    "is_int(lin(1*v11,const=-2))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_canonicalization_prunes_unused_formal_materialization() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("f".to_string(), "v1".to_string()),
+                    ("i".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("f".to_string(), "v1".to_string()),
+                    ("i".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                ],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                ],
+                pre_attrs: vec![
+                    (
+                        "v1".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                    (
+                        "v2".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                    (
+                        "v3".to_string(),
+                        vec!["UsedAsBranchCond(invoke_itself_bad)".to_string()],
+                    ),
+                ],
+                post_attrs: vec![],
+                conditions: vec!["cond:v3 <= 0".to_string()],
+                phi: vec!["atom:v3 <= 0".to_string(), "is_int(v3)".to_string()],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("f".to_string(), "v10".to_string()),
+                    ("i".to_string(), "v11".to_string()),
+                ],
+                post_stack: vec![
+                    ("f".to_string(), "v10".to_string()),
+                    ("i".to_string(), "v11".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v11".to_string(),
+                    access: "*".to_string(),
+                    dst: "v12".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v11".to_string(),
+                    access: "*".to_string(),
+                    dst: "v12".to_string(),
+                }],
+                pre_attrs: vec![
+                    (
+                        "v11".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                    (
+                        "v12".to_string(),
+                        vec!["UsedAsBranchCond(invoke_itself_bad)".to_string()],
+                    ),
+                ],
+                post_attrs: vec![],
+                conditions: vec!["cond:v12 <= 0".to_string()],
+                phi: vec!["atom:v12 <= 0".to_string(), "is_int(v12)".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_canonicalization_keeps_formal_materialization_when_formula_uses_it() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v1".to_string())],
+                post_stack: vec![("x".to_string(), "v1".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                pre_attrs: vec![
+                    (
+                        "v1".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                    (
+                        "v2".to_string(),
+                        vec!["MustBeInitialized".to_string(), "MustBeValid".to_string()],
+                    ),
+                ],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v2".to_string()],
+                phi: vec!["atom:0 < v2".to_string(), "is_int(v2)".to_string()],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v10".to_string())],
+                post_stack: vec![("x".to_string(), "v10".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v11".to_string()],
+                phi: vec!["atom:0 < v11".to_string(), "is_int(v11)".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        assert_ne!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_canonicalization_drops_standalone_initialized_on_non_leaf_post_value() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("f".to_string(), "v1".to_string())],
+                post_stack: vec![("f".to_string(), "v1".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v2".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![("v2".to_string(), vec!["Initialized".to_string()])],
+                conditions: vec![],
+                phi: vec![],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("f".to_string(), "v10".to_string())],
+                post_stack: vec![("f".to_string(), "v10".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v10".to_string(),
+                    access: "*".to_string(),
+                    dst: "v11".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v10".to_string(),
+                        access: "*".to_string(),
+                        dst: "v11".to_string(),
+                    },
+                    RawEdge {
+                        src: "v11".to_string(),
+                        access: "*".to_string(),
+                        dst: "v12".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_phi_normalization_sorts_linear_term_operands() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("return".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("return".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v3=lin(1*v1,-1*v2)".to_string(),
+                    "is_int(lin(1*v1,-1*v2))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("return".to_string(), "v10".to_string()),
+                    ("y".to_string(), "v11".to_string()),
+                ],
+                post_stack: vec![
+                    ("return".to_string(), "v10".to_string()),
+                    ("y".to_string(), "v11".to_string()),
+                ],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v12=lin(-1*v11,1*v10)".to_string(),
+                    "is_int(lin(-1*v11,1*v10))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_phi_normalization_normalizes_function_application_args_through_affine_eqs() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v1".to_string())],
+                post_stack: vec![
+                    ("i".to_string(), "v1".to_string()),
+                    ("return".to_string(), "v3".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v2".to_string(),
+                    },
+                    RawEdge {
+                        src: "v3".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v2".to_string()],
+                phi: vec![
+                    "eq:v5=add_more_bad(a1)".to_string(),
+                    "eq:v5=lin(1*v4,const=-1)".to_string(),
+                    "eq:v2=lin(1*a1,const=1)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v10".to_string())],
+                post_stack: vec![
+                    ("i".to_string(), "v10".to_string()),
+                    ("return".to_string(), "v30".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v10".to_string(),
+                    access: "*".to_string(),
+                    dst: "v20".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v10".to_string(),
+                        access: "*".to_string(),
+                        dst: "v20".to_string(),
+                    },
+                    RawEdge {
+                        src: "v30".to_string(),
+                        access: "*".to_string(),
+                        dst: "v40".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v20".to_string()],
+                phi: vec![
+                    "eq:v50=add_more_bad(v60)".to_string(),
+                    "eq:v50=lin(1*v40,const=-1)".to_string(),
+                    "eq:v20=lin(1*v60,const=1)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_phi_normalization_derives_anchored_is_int_from_linear_closure() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("return".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("return".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "is_int(v2)".to_string(),
+                    "is_int(lin(1*v3,-1*v2))".to_string(),
+                    "is_int(lin(1*v1,-1*v3))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            pre_post.phi.contains(&"is_int(return)".to_string()),
+            "integer closure should derive anchored return facts"
+        );
+        assert!(
+            !pre_post
+                .phi
+                .iter()
+                .any(|item| item.contains("lin(1*return,-1")),
+            "redundant linear is_int facts should be reduced away"
+        );
     }
 }

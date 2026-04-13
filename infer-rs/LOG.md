@@ -5,6 +5,70 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Current dirty work (not committed yet):
+  - `crates/pulse/src/checker.rs`
+    - resolved `__call_c_function_ptr` targets with no available summary now
+      use the direct-call unknown fallback instead of the unresolved-funptr
+      fallback
+    - direct self-recursive known calls with no available summary now also use
+      the ordinary known-call unknown fallback, matching the OCaml control flow
+      after `PulseCallOperations.on_recursive_call`
+    - effect:
+      - no spurious `UnknownEffect` on integer actuals
+      - no bogus dynamic-type-specialization request once the closure target is
+        already known
+      - integer-return fallback keeps the pure-call + `is_int(...)` facts that
+        OCaml carries through these unresolved-summary edges
+    - focused regression:
+      - `test_exec_call_c_function_ptr_resolved_target_without_summary_uses_direct_unknown_call`
+      - `test_exec_instr_direct_self_recursion_uses_unknown_call_fallback`
+  - `crates/pulse/src/interproc.rs`
+    - `translate_formula` now imports callee `is_int` facts in addition to
+      conditions / equalities / pure-call terms
+    - this was the missing piece behind the imported integer-return parity in
+      recursive pure-call summaries
+    - focused regression:
+      - `test_apply_summary_imports_is_int_for_result_value`
+  - `crates/test-harness/src/summary_compare.rs`
+    - semantic comparator now also:
+      - collapses unit-affine `is_int` chains
+        (`is_int(x + k)` / `is_int(-x + k)`) onto the same canonical
+        representative
+      - normalizes function-application args and atom operands through
+        unit-affine equalities
+      - treats restricted and unrestricted pure witness ids the same when they
+        only encode the same strict/non-strict inequality witness shape
+    - focused regression:
+      - `test_phi_normalization_collapses_unit_affine_is_int_chains`
+  - current validations on the dirty tree:
+    - `cargo test -q -p pulse test_exec_call_c_function_ptr_resolved_target_without_summary_uses_direct_unknown_call -- --nocapture`
+    - `cargo test -q -p pulse test_apply_summary_imports_is_int_for_result_value -- --nocapture`
+    - `cargo test -q -p test-harness --lib`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+  - important observed effect:
+    - current verified specialization checkpoint:
+      - main summaries: `21 / 21` procedures match
+      - combined per-procedure harness: `Matching: 17`, `Differences: 4`
+    - remaining specialized-only diff set:
+      - `invoke`
+      - `invoke_itself_bad`
+      - `may_double_free_if_alias`
+      - `two_pointers_recursion_bad`
+    - important root-cause note:
+      - the remaining `invoke` / `invoke_itself_bad` drift still looks like a
+        real specialization-apply mismatch, not comparator noise:
+        - OCaml `PulseSpecialization.apply` adds dynamic-type constraints via
+          `PulseArithmetic.and_dynamic_type_is_unsafe`
+        - Rust specialization currently seeds `Attribute::Closure(pname)` on
+          the specialized heap-path value
+  - current next target:
+    - fix specialization application first:
+      - replace/align the Rust closure-attr seeding with the OCaml
+        dynamic-type-constraint path
+    - then revisit the remaining specialized gaps:
+      - `may_double_free_if_alias` extra latent diagnostic
+      - `two_pointers_recursion_bad` recursive alias/int export mismatch
+
 - Latest stable checkpoint:
   - `crates/test-harness/src/summary_compare.rs`
     - semantic summary comparison now canonicalizes OCaml restricted-witness
@@ -1499,3 +1563,133 @@ If resuming after compaction:
     - latent-invalid-access diagnostic payload in summaries
     - `Initialized` attr retention on latent paths
     - positive-guard representation (`eq ... = 1` vs `0 < ...`)
+
+## 2026-04-13 Specialization Main Comparator Closure
+
+- Carried forward the earlier semantic Pulse fixes as-is:
+  - direct self-recursive known calls now use unknown-call fallback
+  - unknown calls on pointer actuals now record `UnknownEffect` on the root and
+    `WrittenTo` on reachable pointer values, while skipping integer leaves
+  - these were already the right correctness fixes; no analyzer rollback here
+
+- Stabilized `crates/test-harness/src/summary_compare.rs` after the half-landed
+  integer-closure pass:
+  - wired `canonicalize_phi_items` to real canonical structural anchor ids
+    collected from stack / heap / attrs, instead of the stale one-arg call
+  - kept the good earlier comparator work:
+    - prune unused formal materialization subgraphs
+    - sort linear-term operands
+  - fixed a real pruning-order bug:
+    - drop standalone non-leaf post `Initialized` attrs before using post attrs
+      to protect subgraphs
+
+- Backed out one unsafe normalization and replaced it with narrower ones:
+  - top-level `eq:` RHS terms no longer use affine-alias normalization
+    wholesale; that was collapsing informative equalities like
+    `eq:i.*=lin(1*return.*,const=-1)` into tautologies (`eq:i.*=i.*`)
+  - kept affine normalization for:
+    - `is_int(...)` closure / canonicalization
+    - function application args inside `eq:callee(...)`, where using the affine
+      environment is safe and needed to align OCaml restricted witnesses
+      (`a1`) with Rust formula-only vars (`vN`)
+  - added witness-atom collapsing:
+    - `atom:0 < lin(1*w,const=1)` now canonicalizes to the same representative
+      as the paired witness equality when that equality is already present
+    - this removes redundant Rust-only witness atoms without hiding any real
+      semantics
+
+- Verification now passes:
+  - `cargo test -q -p test-harness --lib`
+    - `26 passed`
+  - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+    - `Matching: 21`
+    - no remaining differences
+
+- New comparator regression tests added:
+  - anchored `is_int(...)` derivation through linear closure
+  - standalone non-leaf `Initialized` pruning
+  - function application arg normalization through affine witness equalities
+
+- Current state:
+  - specialization **main** summaries for the focused corpus now match OCaml in
+    the canonical comparator (`21/21`)
+  - this is comparator-side closure only; it does not yet prove parity for:
+    - specialized summary bodies
+    - diagnostic payload details
+    - broader non-specialization summary corpora
+
+- Most realistic next step from here:
+  - extend the same canonical comparison machinery beyond
+    `main.pre_post_list`, starting with specialized summaries, then re-run the
+    same focused specialization corpus before widening to larger sweeps
+
+## 2026-04-13 Specialized Summary Comparator Pass
+
+- Extended the canonical summary comparator from `main.pre_post_list` to
+  `specialized` summaries:
+  - `RawProcedureSummary` / `CanonicalProcedureSummary` now carry
+    specialized-summary entries keyed by a stable specialization string
+  - OCaml specialization keys are parsed from the `specialized` JSON using
+    stable sorting for alias groups / dynamic-type bindings
+  - Rust specialization keys no longer rely on `Display` order from
+    `HashMap`; the harness formats them deterministically
+
+- Comparator-side improvements that remain good:
+  - function application args normalize through affine equalities
+  - formula-only ids are renumbered into one neutral `vN` namespace
+  - duplicate phi atoms that exactly repeat a `cond:` fact are dropped
+  - fixed an unsound witness-atom collapse:
+    - only exact witness RHS forms collapse now
+    - do **not** rewrite `witness <= 0` through a positive-witness equality
+
+- Verification after the specialized extension:
+  - `cargo test -q -p test-harness --lib`
+    - `26 passed`
+  - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+    - `Matching: 17`
+    - `Differences: 4`
+
+- Current remaining specialized-summary buckets:
+  - `invoke`
+    - specialized dynamic-type summaries still differ on function-pointer cell
+      attrs and `ReturnedFromUnknown(...)`
+  - `invoke_itself_bad`
+    - specialized dynamic-type summaries still differ on function-pointer heap
+      materialization and on recursive integer-branch strength
+  - `may_double_free_if_alias`
+    - specialized alias summary still differs on latent diagnostic presence
+  - `two_pointers_recursion_bad`
+    - specialized alias summary still differs on invalid-attr export and exact
+      integer-branch simplification
+
+- Most important new finding, with OCaml cross-ref:
+  - OCaml specialization application does **not** seed `Closure(...)`
+    attributes
+  - OCaml source:
+    - `infer/src/pulse/PulseSpecialization.ml`
+      - `apply`
+      - for each dynamic-type binding it calls
+        `PulseArithmetic.and_dynamic_type_is_unsafe addr typ location astate`
+  - Rust source today:
+    - `crates/pulse/src/specialization.rs`
+      - `apply`
+      - seeds `Attribute::Closure(pname)` on the specialized heap-path value
+  - This is a real semantic mismatch, not a parser bug:
+    - the OCaml parser already understands `Closure(...)`
+    - OCaml specialized summaries for these cases genuinely do not export the
+      `Closure(...)` attrs that Rust currently exports
+
+- Practical consequence of that mismatch:
+  - some remaining `invoke*` specialized diffs are likely analyzer-side, not
+    comparator-only
+  - a principled fix will probably require replacing or containing the Rust
+    `Closure(...)`-seeded specialization mechanism with something closer to
+    OCaml's dynamic-type constraint flow, rather than continuing to shave
+    comparator output
+
+- Best next step from here:
+  - inspect whether Rust already has enough type-constraint machinery to model
+    OCaml's `and_dynamic_type_is_unsafe` path for specialization
+  - if not, the fallback is to identify exactly which specialization-seeded
+    `Closure(...)` artifacts are safe to erase at summary export without lying
+    about behavior
