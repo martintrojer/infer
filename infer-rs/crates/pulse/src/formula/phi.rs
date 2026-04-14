@@ -326,7 +326,7 @@ impl Phi {
     /// Cross-ref: OCaml `PulseFormula.ml` `prune_atom` normalizes a translated
     /// condition against the current caller-side phi before remembering it.
     pub(crate) fn normalize_condition_atom(&self, atom: &Atom) -> Atom {
-        self.resolve_atom(atom)
+        self.resolve_condition_atom(atom)
     }
 
     /// Summary-time condition simplification.
@@ -339,6 +339,7 @@ impl Phi {
         &self,
         atom: &Atom,
         precondition_vocabulary: &HashSet<AbstractValue>,
+        keep: &HashSet<AbstractValue>,
     ) -> Atom {
         fn is_preferred_visible_var(lhs: AbstractValue, rhs: AbstractValue) -> bool {
             if lhs.is_unrestricted() && rhs.is_restricted() {
@@ -353,15 +354,15 @@ impl Phi {
         fn visible_summary_var(
             phi: &Phi,
             v: AbstractValue,
-            precondition_vocabulary: &HashSet<AbstractValue>,
+            _precondition_vocabulary: &HashSet<AbstractValue>,
+            keep: &HashSet<AbstractValue>,
         ) -> Option<AbstractValue> {
-            if precondition_vocabulary.contains(&v) {
+            if keep.contains(&v) {
                 return Some(v);
             }
 
             let repr = phi.get_repr(v);
-            precondition_vocabulary
-                .iter()
+            keep.iter()
                 .copied()
                 .filter(|candidate| phi.get_repr(*candidate) == repr)
                 .min_by(|lhs, rhs| {
@@ -375,47 +376,116 @@ impl Phi {
                 })
         }
 
+        fn coeff_term(coeff: &Q, term: Term) -> Term {
+            if *coeff == Q::from_integer(1) {
+                term
+            } else if *coeff == Q::from_integer(-1) {
+                Term::Neg(Box::new(term))
+            } else {
+                Term::Mult(
+                    Box::new(Term::Const(*coeff.numer() / *coeff.denom())),
+                    Box::new(term),
+                )
+            }
+        }
+
+        fn add_term(lhs: Option<Term>, rhs: Term) -> Term {
+            match lhs {
+                Some(lhs) => match (lhs.as_const(), rhs.as_const()) {
+                    (Some(x), Some(y)) => Term::Const(x + y),
+                    _ => Term::Add(Box::new(lhs), Box::new(rhs)),
+                },
+                None => rhs,
+            }
+        }
+
+        fn simplify_visible_linear_term(
+            phi: &Phi,
+            v: AbstractValue,
+            precondition_vocabulary: &HashSet<AbstractValue>,
+            keep: &HashSet<AbstractValue>,
+            visited: &mut HashSet<AbstractValue>,
+        ) -> Option<Term> {
+            if let Some(visible_var) = visible_summary_var(phi, v, precondition_vocabulary, keep) {
+                return Some(Term::Var(visible_var));
+            }
+
+            let repr = phi.get_repr(v);
+            if !visited.insert(repr) {
+                return None;
+            }
+
+            let simplified = phi.linear_eqs.get(&repr).and_then(|lin| {
+                let mut result = (!lin.constant.is_zero())
+                    .then_some(Term::Const(*lin.constant.numer() / *lin.constant.denom()));
+                for (&dep, coeff) in &lin.vars {
+                    let dep_term = simplify_visible_linear_term(
+                        phi,
+                        dep,
+                        precondition_vocabulary,
+                        keep,
+                        visited,
+                    )?;
+                    result = Some(add_term(result, coeff_term(coeff, dep_term)));
+                }
+                Some(result.unwrap_or(Term::Const(0)))
+            });
+
+            visited.remove(&repr);
+            simplified
+        }
+
         fn simplify_term(
             phi: &Phi,
             term: &Term,
             precondition_vocabulary: &HashSet<AbstractValue>,
+            keep: &HashSet<AbstractValue>,
         ) -> Term {
             match term {
                 Term::Var(v) => {
-                    if let Some(visible_var) = visible_summary_var(phi, *v, precondition_vocabulary)
+                    if let Some(visible_var) =
+                        visible_summary_var(phi, *v, precondition_vocabulary, keep)
                     {
                         Term::Var(visible_var)
+                    } else if let Some(term) = simplify_visible_linear_term(
+                        phi,
+                        *v,
+                        precondition_vocabulary,
+                        keep,
+                        &mut HashSet::new(),
+                    ) {
+                        term
                     } else {
                         phi.resolve_term(term)
                     }
                 }
                 Term::Const(_) => term.clone(),
                 Term::Add(a, b) => {
-                    let a = simplify_term(phi, a, precondition_vocabulary);
-                    let b = simplify_term(phi, b, precondition_vocabulary);
+                    let a = simplify_term(phi, a, precondition_vocabulary, keep);
+                    let b = simplify_term(phi, b, precondition_vocabulary, keep);
                     match (a.as_const(), b.as_const()) {
                         (Some(x), Some(y)) => Term::Const(x + y),
                         _ => Term::Add(Box::new(a), Box::new(b)),
                     }
                 }
                 Term::Sub(a, b) => {
-                    let a = simplify_term(phi, a, precondition_vocabulary);
-                    let b = simplify_term(phi, b, precondition_vocabulary);
+                    let a = simplify_term(phi, a, precondition_vocabulary, keep);
+                    let b = simplify_term(phi, b, precondition_vocabulary, keep);
                     match (a.as_const(), b.as_const()) {
                         (Some(x), Some(y)) => Term::Const(x - y),
                         _ => Term::Sub(Box::new(a), Box::new(b)),
                     }
                 }
                 Term::Mult(a, b) => {
-                    let a = simplify_term(phi, a, precondition_vocabulary);
-                    let b = simplify_term(phi, b, precondition_vocabulary);
+                    let a = simplify_term(phi, a, precondition_vocabulary, keep);
+                    let b = simplify_term(phi, b, precondition_vocabulary, keep);
                     match (a.as_const(), b.as_const()) {
                         (Some(x), Some(y)) => Term::Const(x * y),
                         _ => Term::Mult(Box::new(a), Box::new(b)),
                     }
                 }
                 Term::Neg(a) => {
-                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    let a = simplify_term(phi, a, precondition_vocabulary, keep);
                     if let Some(x) = a.as_const() {
                         Term::Const(-x)
                     } else {
@@ -423,7 +493,7 @@ impl Phi {
                     }
                 }
                 Term::Not(a) => {
-                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    let a = simplify_term(phi, a, precondition_vocabulary, keep);
                     if let Some(x) = a.as_const() {
                         Term::Const(if x == 0 { 1 } else { 0 })
                     } else {
@@ -431,7 +501,7 @@ impl Phi {
                     }
                 }
                 Term::IsZero(a) => {
-                    let a = simplify_term(phi, a, precondition_vocabulary);
+                    let a = simplify_term(phi, a, precondition_vocabulary, keep);
                     if let Some(x) = a.as_const() {
                         Term::Const(if x == 0 { 1 } else { 0 })
                     } else {
@@ -443,20 +513,20 @@ impl Phi {
 
         match atom {
             Atom::Equal(a, b) => Atom::Equal(
-                simplify_term(self, a, precondition_vocabulary),
-                simplify_term(self, b, precondition_vocabulary),
+                simplify_term(self, a, precondition_vocabulary, keep),
+                simplify_term(self, b, precondition_vocabulary, keep),
             ),
             Atom::NotEqual(a, b) => Atom::NotEqual(
-                simplify_term(self, a, precondition_vocabulary),
-                simplify_term(self, b, precondition_vocabulary),
+                simplify_term(self, a, precondition_vocabulary, keep),
+                simplify_term(self, b, precondition_vocabulary, keep),
             ),
             Atom::LessEqual(a, b) => Atom::LessEqual(
-                simplify_term(self, a, precondition_vocabulary),
-                simplify_term(self, b, precondition_vocabulary),
+                simplify_term(self, a, precondition_vocabulary, keep),
+                simplify_term(self, b, precondition_vocabulary, keep),
             ),
             Atom::LessThan(a, b) => Atom::LessThan(
-                simplify_term(self, a, precondition_vocabulary),
-                simplify_term(self, b, precondition_vocabulary),
+                simplify_term(self, a, precondition_vocabulary, keep),
+                simplify_term(self, b, precondition_vocabulary, keep),
             ),
         }
     }
@@ -757,6 +827,18 @@ impl Phi {
         }
     }
 
+    fn resolve_condition_atom(&self, atom: &Atom) -> Atom {
+        let resolve_term = |t: &Term| -> Term {
+            self.resolve_condition_term(t, &mut std::collections::HashSet::new())
+        };
+        match atom {
+            Atom::Equal(a, b) => Atom::Equal(resolve_term(a), resolve_term(b)),
+            Atom::NotEqual(a, b) => Atom::NotEqual(resolve_term(a), resolve_term(b)),
+            Atom::LessEqual(a, b) => Atom::LessEqual(resolve_term(a), resolve_term(b)),
+            Atom::LessThan(a, b) => Atom::LessThan(resolve_term(a), resolve_term(b)),
+        }
+    }
+
     /// Resolve a term by substituting canonical reps and known constants.
     fn resolve_term(&self, t: &Term) -> Term {
         match t {
@@ -810,6 +892,128 @@ impl Phi {
             Term::Not(a) => Term::Not(Box::new(self.resolve_term(a))),
             Term::IsZero(a) => {
                 let ra = self.resolve_term(a);
+                if let Some(x) = ra.as_const() {
+                    Term::Const(if x == 0 { 1 } else { 0 })
+                } else {
+                    Term::IsZero(Box::new(ra))
+                }
+            }
+        }
+    }
+
+    fn resolve_condition_term(
+        &self,
+        t: &Term,
+        visited: &mut std::collections::HashSet<AbstractValue>,
+    ) -> Term {
+        fn coeff_term(coeff: &Q, term: Term) -> Term {
+            if *coeff == Q::from_integer(1) {
+                term
+            } else if *coeff == Q::from_integer(-1) {
+                Term::Neg(Box::new(term))
+            } else {
+                Term::Mult(
+                    Box::new(Term::Const(*coeff.numer() / *coeff.denom())),
+                    Box::new(term),
+                )
+            }
+        }
+
+        fn add_term(lhs: Option<Term>, rhs: Term) -> Term {
+            match lhs {
+                Some(lhs) => match (lhs.as_const(), rhs.as_const()) {
+                    (Some(x), Some(y)) => Term::Const(x + y),
+                    _ => Term::Add(Box::new(lhs), Box::new(rhs)),
+                },
+                None => rhs,
+            }
+        }
+
+        fn lin_to_condition_term(phi: &Phi, lin: &LinArith) -> Term {
+            let mut result = (!lin.constant.is_zero())
+                .then_some(Term::Const(*lin.constant.numer() / *lin.constant.denom()));
+            for (&dep, coeff) in &lin.vars {
+                let dep_term = Term::Var(phi.get_repr(dep));
+                result = Some(add_term(result, coeff_term(coeff, dep_term)));
+            }
+            result.unwrap_or(Term::Const(0))
+        }
+
+        match t {
+            Term::Var(v) => {
+                let repr = self.get_repr(*v);
+                if !visited.insert(repr) {
+                    return Term::Var(repr);
+                }
+
+                let resolved = if let Some(lin) = self.linear_eqs.get(&repr) {
+                    if let Some(q) = lin.get_as_const() {
+                        if q.is_integer() {
+                            Term::Const(*q.numer() / *q.denom())
+                        } else {
+                            Term::Var(repr)
+                        }
+                    } else {
+                        Term::Var(repr)
+                    }
+                } else if let Some(solution) = self.linear_eqs.iter().find_map(|(&lhs, lin)| {
+                    let coeff = lin.get_coefficient(repr)?;
+                    let mut equation = LinArith::of_var(lhs).sub(lin);
+                    equation.vars.remove(&repr)?;
+                    let scale = Q::from_integer(1) / *coeff;
+                    Some(equation.mult_scalar(&scale))
+                }) {
+                    lin_to_condition_term(self, &solution)
+                } else {
+                    Term::Var(repr)
+                };
+
+                visited.remove(&repr);
+                resolved
+            }
+            Term::Const(_) => t.clone(),
+            Term::Add(a, b) => {
+                let ra = self.resolve_condition_term(a, visited);
+                let rb = self.resolve_condition_term(b, visited);
+                match (ra.as_const(), rb.as_const()) {
+                    (Some(x), Some(y)) => Term::Const(x + y),
+                    _ => Term::Add(Box::new(ra), Box::new(rb)),
+                }
+            }
+            Term::Sub(a, b) => {
+                let ra = self.resolve_condition_term(a, visited);
+                let rb = self.resolve_condition_term(b, visited);
+                match (ra.as_const(), rb.as_const()) {
+                    (Some(x), Some(y)) => Term::Const(x - y),
+                    _ => Term::Sub(Box::new(ra), Box::new(rb)),
+                }
+            }
+            Term::Mult(a, b) => {
+                let ra = self.resolve_condition_term(a, visited);
+                let rb = self.resolve_condition_term(b, visited);
+                match (ra.as_const(), rb.as_const()) {
+                    (Some(x), Some(y)) => Term::Const(x * y),
+                    _ => Term::Mult(Box::new(ra), Box::new(rb)),
+                }
+            }
+            Term::Neg(a) => {
+                let ra = self.resolve_condition_term(a, visited);
+                if let Some(x) = ra.as_const() {
+                    Term::Const(-x)
+                } else {
+                    Term::Neg(Box::new(ra))
+                }
+            }
+            Term::Not(a) => {
+                let ra = self.resolve_condition_term(a, visited);
+                if let Some(x) = ra.as_const() {
+                    Term::Const(if x == 0 { 1 } else { 0 })
+                } else {
+                    Term::Not(Box::new(ra))
+                }
+            }
+            Term::IsZero(a) => {
+                let ra = self.resolve_condition_term(a, visited);
                 if let Some(x) = ra.as_const() {
                     Term::Const(if x == 0 { 1 } else { 0 })
                 } else {

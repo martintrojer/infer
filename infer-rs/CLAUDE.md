@@ -53,6 +53,22 @@ solver equalities.
 - Do not treat "the formula contains `addr == 0`" as sufficient evidence that a direct-formal null
   dereference should be manifest. `latent.c:deref_then_free_then_deref_bad` is the counterexample.
 
+## Imported arithmetic latent-summary gotcha
+
+When debugging latent-vs-manifest parity for arithmetic guards imported through calls, preserve the
+caller-visible arithmetic structure in recorded summary conditions.
+
+- Cross-reference `PulseFormula.ml`, `PulseFormulaPhi.ml`, `PulseSummary.ml`, and
+  `PulseLatentIssue.ml`.
+- If Rust stores `neg_x = -x` as the reverse linear equation `x = -neg_x`, the imported condition
+  must still survive summary recording/export as a caller-visible `-x == 0`-style guard, not
+  collapse into a dead temp or `0 == 0`.
+- `simplify_for_summary(...)` should rewrite dead arithmetic temps onto kept precondition vars
+  before pruning phi facts.
+- Local invalid accesses should only keep the Rust manifest+latent twin on non-manifest paths when
+  the caller-sensitive signal comes from heap shape or imported call-side validity, not pure
+  imported arithmetic.
+
 ## Compliance debugging recipe
 
 When investigating why a C test file produces different results from OCaml:

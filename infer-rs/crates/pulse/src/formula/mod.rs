@@ -578,20 +578,30 @@ impl Formula {
         precondition_vocabulary: &HashSet<AbstractValue>,
         keep: &HashSet<AbstractValue>,
     ) {
+        let rewritten_conditions: Vec<_> = std::mem::take(&mut self.conditions)
+            .into_iter()
+            .filter_map(|(atom, depth)| {
+                let atom = self.phi.simplify_condition_atom_for_summary(
+                    &atom,
+                    precondition_vocabulary,
+                    keep,
+                );
+                (atom.is_trivially_true() != Some(true)).then_some((atom, depth))
+            })
+            .collect();
+
         self.phi.simplify(keep);
 
         let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
-        for (atom, depth) in std::mem::take(&mut self.conditions) {
-            let atom = self
-                .phi
-                .simplify_condition_atom_for_summary(&atom, precondition_vocabulary);
+        let keep_reprs: HashSet<_> = keep.iter().map(|v| self.phi.get_repr(*v)).collect();
+        for (atom, depth) in rewritten_conditions {
             if atom.is_trivially_true() == Some(true) {
                 continue;
             }
             if atom
                 .all_vars()
                 .into_iter()
-                .all(|v| keep.contains(&self.phi.get_repr(v)))
+                .all(|v| keep_reprs.contains(&self.phi.get_repr(v)))
             {
                 match conditions.get_mut(&atom) {
                     Some(existing_depth) => *existing_depth = (*existing_depth).min(depth),
@@ -754,10 +764,10 @@ fn result_of_binop_is_integer(
 ) -> bool {
     use sil::binop::Binop;
 
-    match op {
-        Binop::Eq | Binop::Ne | Binop::Lt | Binop::Gt | Binop::Le | Binop::Ge => true,
-        _ => false,
-    }
+    matches!(
+        op,
+        Binop::Eq | Binop::Ne | Binop::Lt | Binop::Gt | Binop::Le | Binop::Ge
+    )
 }
 
 fn simple_operand_of_term(term: &Term) -> Option<Operand> {
@@ -998,6 +1008,38 @@ mod tests {
             f.conditions().get(&Atom::Equal(Term::Var(x), Term::Const(0))),
             Some(&0),
             "summary simplification should rewrite dead condition vars onto the visible precondition alias instead of erasing the caller-controlled guard"
+        );
+    }
+
+    #[test]
+    fn test_simplify_for_summary_rewrites_dead_linear_guard_to_visible_operands() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let neg_x = AbstractValue::of_raw(2);
+
+        assert!(f
+            .and_equal_linear(neg_x, LinArith::of_var(x).neg())
+            .is_sat());
+        assert!(f
+            .and_condition_direct(Atom::Equal(Term::Var(neg_x), Term::Const(0)), 1)
+            .is_sat());
+        f.simplify_for_summary(&HashSet::from([x, neg_x]), &HashSet::from([x]));
+
+        let only_condition = f
+            .conditions()
+            .keys()
+            .next()
+            .expect("expected the imported linear guard to survive summary simplification");
+        let condition_vars: HashSet<_> = only_condition.all_vars().into_iter().collect();
+        assert_eq!(
+            condition_vars,
+            HashSet::from([x]),
+            "summary simplification should rewrite dead arithmetic temps back to visible operands"
+        );
+        assert_ne!(
+            only_condition.is_trivially_true(),
+            Some(true),
+            "summary simplification should not erase caller-controlled linear guards"
         );
     }
 

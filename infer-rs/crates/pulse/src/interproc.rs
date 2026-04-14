@@ -159,12 +159,14 @@ pub(crate) fn apply_summary_with_aliasing(
     let pre_error = match materialize_pre(
         &pre_post.pre,
         &pre_post.post,
-        &formal_stack_addrs,
-        &value_actual_formal_stack_addrs,
-        &mut subst,
-        &mut callee_heap_paths,
-        &mut caller_state,
-        loc,
+        MaterializePreContext {
+            formal_stack_addrs: &formal_stack_addrs,
+            value_actual_formal_stack_addrs: &value_actual_formal_stack_addrs,
+            subst: &mut subst,
+            callee_heap_paths: &mut callee_heap_paths,
+            caller_state: &mut caller_state,
+            loc,
+        },
     ) {
         PreMaterializeResult::PreConditionViolation(diag) => Some(*diag),
         PreMaterializeResult::AliasingContradiction {
@@ -400,15 +402,17 @@ pub(crate) fn apply_summary_with_aliasing(
             // in the caller's summarized state before deciding whether it is
             // still latent or has become manifest here.
             if let Some(diag) = &pre_post.diagnostic {
+                let diag =
+                    translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories, loc);
                 if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
                     vec![ExecutionDomain::AbortProgram {
                         state: Box::new(caller_state),
-                        diagnostic: Box::new(diag.clone()),
+                        diagnostic: Box::new(diag),
                     }]
                 } else {
                     vec![ExecutionDomain::LatentAbortProgram {
                         state: Box::new(caller_state),
-                        diagnostic: Box::new(diag.clone()),
+                        diagnostic: Box::new(diag),
                     }]
                 }
             } else {
@@ -562,6 +566,15 @@ enum PreMaterializeResult {
         other_callee_addr: AbstractValue,
         alias_groups: Option<Vec<Vec<HeapPath>>>,
     },
+}
+
+struct MaterializePreContext<'a> {
+    formal_stack_addrs: &'a std::collections::HashSet<AbstractValue>,
+    value_actual_formal_stack_addrs: &'a std::collections::HashSet<AbstractValue>,
+    subst: &'a mut HashMap<AbstractValue, AbstractValue>,
+    callee_heap_paths: &'a mut HashMap<AbstractValue, Option<HeapPath>>,
+    caller_state: &'a mut AbductiveDomain,
+    loc: &'a Location,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -731,13 +744,16 @@ fn find_aliasing_contradiction(
 fn materialize_pre(
     callee_pre: &crate::base_domain::BaseDomain,
     callee_post: &AbductiveDomain,
-    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
-    value_actual_formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
-    subst: &mut HashMap<AbstractValue, AbstractValue>,
-    callee_heap_paths: &mut HashMap<AbstractValue, Option<HeapPath>>,
-    caller_state: &mut AbductiveDomain,
-    loc: &Location,
+    ctx: MaterializePreContext<'_>,
 ) -> PreMaterializeResult {
+    let MaterializePreContext {
+        formal_stack_addrs,
+        value_actual_formal_stack_addrs,
+        subst,
+        callee_heap_paths,
+        caller_state,
+        loc,
+    } = ctx;
     let mut visited = std::collections::HashSet::new();
     let mut caller_alias_roots: HashMap<AbstractValue, CallerAliasRoots> = HashMap::new();
     let mut alias_groups: HashMap<AbstractValue, HashSet<HeapPath>> = HashMap::new();
@@ -831,8 +847,10 @@ fn materialize_pre(
                     // from the dereferenced formal value for non-struct/value
                     // actuals; it does not replay the callee formal stack
                     // bookkeeping cell itself onto the caller.
-                    if let Some(existing) =
-                        caller_state.post.heap.find_edge(caller_addr, &caller_access)
+                    if let Some(existing) = caller_state
+                        .post
+                        .heap
+                        .find_edge(caller_addr, &caller_access)
                     {
                         existing
                     } else {
@@ -2002,8 +2020,11 @@ mod tests {
 
         let caller_pname = Procname::c_from_string("caller");
         let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
-        caller_pdesc.formals =
-            vec![(Mangled::from_string("cb"), Typ::mk_ptr(Typ::void()), Default::default())];
+        caller_pdesc.formals = vec![(
+            Mangled::from_string("cb"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
         let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
         let caller_formal_pvar = Pvar::mk(Mangled::from_string("cb"), caller_pname);
         let caller_formal_addr = caller_state
@@ -2646,13 +2667,21 @@ mod tests {
         // conditions before the rest of the callee phi. The imported `*p == 4`
         // guard is therefore still caller-controlled here and must remain
         // latent until some caller proves `x == 4`.
-        assert!(
-            matches!(
-                results.as_slice(),
-                [ExecutionDomain::LatentAbortProgram { diagnostic: found, .. }]
-                    if found.as_ref() == &diagnostic
-            ),
-            "expected caller-dependent imported condition to keep latent abort, got {results:?}"
+        let [ExecutionDomain::LatentAbortProgram {
+            diagnostic: found, ..
+        }] = results.as_slice()
+        else {
+            panic!("expected caller-dependent imported condition to keep latent abort, got {results:?}");
+        };
+        assert_eq!(
+            found.get_issue_type_id(),
+            diagnostic.get_issue_type_id(),
+            "latent abort kind should stay stable after caller-space translation"
+        );
+        assert_eq!(
+            found.get_location(),
+            &Location::dummy(),
+            "dummy callsites should keep the translated latent abort at the dummy location"
         );
     }
 
@@ -2682,11 +2711,70 @@ mod tests {
             caller_state,
         );
 
-        assert!(matches!(
-            results.as_slice(),
-            [ExecutionDomain::AbortProgram { diagnostic: found, .. }]
-                if found.as_ref() == &diagnostic
-        ));
+        let [ExecutionDomain::AbortProgram {
+            diagnostic: found, ..
+        }] = results.as_slice()
+        else {
+            panic!("expected latent abort to reify at the entry point, got {results:?}");
+        };
+        assert_eq!(
+            found.get_issue_type_id(),
+            diagnostic.get_issue_type_id(),
+            "entry-point reification should preserve the invalid-access kind"
+        );
+        assert_eq!(
+            found.get_location(),
+            &Location::dummy(),
+            "dummy entry-point callsites should keep the translated abort at the dummy location"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_translates_latent_abort_location_to_callsite() {
+        let (pre_post, _diagnostic) = mk_latent_abort_pre_post();
+
+        let caller_pname = Procname::c_from_string("main");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(
+            Mangled::from_string("argc"),
+            Typ::void(),
+            Default::default(),
+        )];
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let actuals = vec![(
+            Exp::Lvar(Pvar::mk(Mangled::from_string("argc"), caller_pname)),
+            Typ::void(),
+        )];
+        let callsite = Location {
+            line: 99,
+            col: 3,
+            ..Location::dummy()
+        };
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &actuals,
+            &callsite,
+            caller_state,
+        );
+
+        let [ExecutionDomain::AbortProgram { diagnostic, .. }] = results.as_slice() else {
+            panic!("expected a manifest abort translated to the callsite, got {results:?}");
+        };
+        match diagnostic.as_ref() {
+            Diagnostic::AccessToInvalidAddress {
+                access_location, ..
+            } => {
+                assert_eq!(
+                    access_location, &callsite,
+                    "latent abort diagnostics should be translated through the caller callsite"
+                );
+                assert_eq!(diagnostic.get_location(), &callsite);
+            }
+            other => panic!("expected invalid-access diagnostic, got {other:?}"),
+        }
     }
 
     #[test]

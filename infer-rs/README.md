@@ -12,6 +12,16 @@ Current verified checkpoint:
 - main summaries: `21 / 21` procedures match
 - combined per-procedure harness: `Matching: 21`
 
+A newer OCaml-backed latent-summary fix also preserves imported arithmetic guards through summary
+recording and export, including reverse-pivoted linear equalities such as `neg_x = -x` that the
+solver stores as `x = -neg_x`. Summary condition recording now keeps the caller-visible `-x`
+shape instead of collapsing it to a dead temp or `0 == 0`, `simplify_for_summary(...)` rewrites
+those dead arithmetic temps before pruning phi facts, and local invalid accesses only keep the
+manifest+latent twin on non-manifest paths when the caller-sensitive signal comes from heap shape
+or imported call-side validity rather than pure imported arithmetic. This restores
+`if_negative_then_crash_latent` / `test_e2e_negated_actual_keeps_arithmetic_latent_summary`
+without regressing the earlier cyclic-field-write latent-null behavior.
+
 The latest OCaml-backed specialization pass now mirrors OCaml's dynamic-type path more closely:
 the abductive domain tracks known dynamic types directly, `PulseSpecialization.apply` now seeds
 dynamic-type constraints (the Rust analogue of `PulseArithmetic.and_dynamic_type_is_unsafe`)

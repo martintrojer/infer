@@ -558,8 +558,10 @@ fn close_known_int_vars(
         if extend_known_int_vars_from_linear_eqs(&mut known_int_vars, eqs) {
             changed = true;
         }
-        if extend_known_int_vars_from_scaling_implications(&mut known_int_vars, scaling_implications)
-        {
+        if extend_known_int_vars_from_scaling_implications(
+            &mut known_int_vars,
+            scaling_implications,
+        ) {
             changed = true;
         }
         if !changed {
@@ -671,7 +673,9 @@ struct RationalCoeff {
     den: i32,
 }
 
-fn build_integer_scaling_implications(eqs: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
+fn build_integer_scaling_implications(
+    eqs: &HashMap<String, String>,
+) -> HashMap<String, Vec<String>> {
     let mut result: HashMap<String, BTreeSet<String>> = HashMap::new();
 
     for (lhs, rhs) in eqs {
@@ -3763,10 +3767,7 @@ mod tests {
                 pre_attrs: vec![],
                 post_attrs: vec![],
                 conditions: vec![],
-                phi: vec![
-                    "eq:v9=lin(1/2*v18)".to_string(),
-                    "is_int(v9)".to_string(),
-                ],
+                phi: vec!["eq:v9=lin(1/2*v18)".to_string(), "is_int(v9)".to_string()],
                 diagnostic: None,
             }],
         };
@@ -3780,10 +3781,7 @@ mod tests {
             "integer closure should derive anchored return facts from inverse scaling equalities"
         );
         assert!(
-            !pre_post
-                .phi
-                .iter()
-                .any(|item| item.starts_with("is_int(v")),
+            !pre_post.phi.iter().any(|item| item.starts_with("is_int(v")),
             "inverse scaling should not leave formula-only integer witnesses behind: {:?}",
             pre_post.phi
         );
@@ -3965,17 +3963,47 @@ mod tests {
             specialized: vec![],
             main: vec![RawPrePost {
                 kind: "ContinueProgram".to_string(),
-                pre_stack: vec![("f".to_string(), "v1".to_string()), ("i".to_string(), "v2".to_string())],
-                post_stack: vec![("f".to_string(), "v1".to_string()), ("i".to_string(), "v2".to_string())],
+                pre_stack: vec![
+                    ("f".to_string(), "v1".to_string()),
+                    ("i".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("f".to_string(), "v1".to_string()),
+                    ("i".to_string(), "v2".to_string()),
+                ],
                 pre_heap: vec![
-                    RawEdge { src: "v1".to_string(), access: "*".to_string(), dst: "v3".to_string() },
-                    RawEdge { src: "v2".to_string(), access: "*".to_string(), dst: "v4".to_string() },
-                    RawEdge { src: "v3".to_string(), access: "*".to_string(), dst: "v11".to_string() },
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                    RawEdge {
+                        src: "v3".to_string(),
+                        access: "*".to_string(),
+                        dst: "v11".to_string(),
+                    },
                 ],
                 post_heap: vec![
-                    RawEdge { src: "v1".to_string(), access: "*".to_string(), dst: "v3".to_string() },
-                    RawEdge { src: "v2".to_string(), access: "*".to_string(), dst: "v4".to_string() },
-                    RawEdge { src: "v3".to_string(), access: "*".to_string(), dst: "v12".to_string() },
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v3".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                    RawEdge {
+                        src: "v3".to_string(),
+                        access: "*".to_string(),
+                        dst: "v12".to_string(),
+                    },
                 ],
                 pre_attrs: vec![],
                 post_attrs: vec![],

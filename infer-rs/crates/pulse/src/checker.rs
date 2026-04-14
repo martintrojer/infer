@@ -1227,17 +1227,118 @@ fn exec_call_c_function_ptr(
 
 /// Convert Pulse diagnostics to an IssueLog for reporting.
 pub fn to_issue_log(summary: &PulseSummary, proc_name: &str) -> IssueLog {
+    to_issue_log_impl(summary, proc_name, None)
+}
+
+/// Convert Pulse diagnostics to an IssueLog for reporting with procedure
+/// context available for OCaml-style latent-issue publication filtering.
+pub fn to_issue_log_with_pdesc(summary: &PulseSummary, pdesc: &Procdesc) -> IssueLog {
+    to_issue_log_impl(summary, &format!("{}", pdesc.proc_name), Some(pdesc))
+}
+
+fn to_issue_log_impl(
+    summary: &PulseSummary,
+    proc_name: &str,
+    pdesc: Option<&Procdesc>,
+) -> IssueLog {
     let mut log = IssueLog::new();
+    let mut seen = std::collections::HashSet::new();
     let report_suppressed = config::get().pulse_report_issues_for_tests;
     for diag in &summary.diagnostics {
-        let suppressed = diag.is_suppressed();
-        if suppressed && !report_suppressed {
-            continue;
+        report_diagnostic_issue(
+            &mut log,
+            &mut seen,
+            diag,
+            proc_name,
+            false,
+            report_suppressed,
+            None,
+        );
+    }
+    for pre_post in &summary.pre_posts {
+        match pre_post.kind {
+            crate::summary::PrePostKind::LatentAbortProgram => {
+                if let Some(diag) = &pre_post.diagnostic {
+                    report_diagnostic_issue(
+                        &mut log,
+                        &mut seen,
+                        diag,
+                        proc_name,
+                        true,
+                        report_suppressed,
+                        None,
+                    );
+                }
+            }
+            crate::summary::PrePostKind::LatentInvalidAccess => {
+                let should_report = pdesc.is_none_or(|pdesc| {
+                    crate::summary::exported_latent_invalid_access_is_reportable(pdesc, pre_post)
+                });
+                let diag = pdesc
+                    .map(|_| {
+                        crate::summary::latent_invalid_access_diagnostic_from_summary_state(
+                            pre_post,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        pre_post.diagnostic.as_ref().cloned().or_else(|| {
+                            crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(
+                                pre_post,
+                            )
+                        })
+                    })
+                    .or_else(|| pre_post.diagnostic.clone());
+                if should_report {
+                    if let Some(diag) = diag {
+                        let latent_key = pdesc
+                            .and_then(|_| {
+                                crate::summary::latent_invalid_access_report_key(pre_post)
+                                    .map(|key| format!("true|{key}"))
+                            })
+                            .unwrap_or_else(|| diagnostic_dedup_key(&diag, true));
+                        report_diagnostic_issue(
+                            &mut log,
+                            &mut seen,
+                            &diag,
+                            proc_name,
+                            true,
+                            report_suppressed,
+                            Some(&latent_key),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
-        log.report(diag.to_issue_with_reporting(proc_name, false, suppressed));
     }
     log.sort();
     log
+}
+
+fn report_diagnostic_issue(
+    log: &mut IssueLog,
+    seen: &mut std::collections::HashSet<String>,
+    diagnostic: &Diagnostic,
+    proc_name: &str,
+    latent: bool,
+    report_suppressed: bool,
+    dedup_key_override: Option<&str>,
+) {
+    let suppressed = diagnostic.is_suppressed();
+    if suppressed && !report_suppressed {
+        return;
+    }
+    let dedup_key = dedup_key_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| diagnostic_dedup_key(diagnostic, latent));
+    if !seen.insert(dedup_key) {
+        return;
+    }
+    log.report(diagnostic.to_issue_with_reporting(proc_name, latent, suppressed));
+}
+
+fn diagnostic_dedup_key(diagnostic: &Diagnostic, latent: bool) -> String {
+    format!("{latent}|{}", diagnostic.dedup_key())
 }
 
 #[cfg(test)]
@@ -1580,6 +1681,43 @@ mod tests {
         assert!(
             log.is_empty(),
             "suppressed constant-dereference diagnostics should stay out of default reporting"
+        );
+    }
+
+    #[test]
+    fn test_to_issue_log_reports_latent_abort_pre_post() {
+        let pdesc = make_safe_proc();
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let local_root = AbstractValue::mk_fresh();
+        let local_val = AbstractValue::mk_fresh();
+        state.post.stack.add(
+            Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0)),
+            local_root,
+        );
+        state.write_heap(local_root, Access::Dereference, local_val);
+        let invalidation = crate::invalidation::Invalidation::CFree;
+        let diagnostic = Diagnostic::AccessToInvalidAddress {
+            addr: local_val,
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            access_history: ValueHistory::assignment(Location::dummy()),
+            invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
+        };
+        let mut summary = PulseSummary::intra_only(vec![]);
+        summary.pre_posts.push(PrePost {
+            pre: state.pre.clone(),
+            post: state,
+            formals: vec![],
+            result: None,
+            kind: PrePostKind::LatentAbortProgram,
+            diagnostic: Some(diagnostic),
+        });
+
+        let log = to_issue_log(&summary, "latent_abort");
+
+        assert!(
+            log.to_issues_exp().contains("USE_AFTER_FREE_LATENT"),
+            "latent abort pre/posts should be published into the issue log"
         );
     }
 

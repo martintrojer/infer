@@ -5,6 +5,41 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active parity target:
+  - resume the remaining `latent.c` latent-invalid-access publication /
+    dedup cluster now that the arithmetic latent-summary regression is closed
+- What moved this turn:
+  - `crates/pulse/src/formula/phi.rs`
+    - condition normalization now preserves reverse-pivoted imported linear
+      guards such as `neg_x = -x` recorded as `x = -neg_x`
+    - hidden condition temps now normalize back to caller-visible forms like
+      `-x == 0` instead of collapsing to dead temps or `0 == 0`
+  - `crates/pulse/src/formula/mod.rs`
+    - `simplify_for_summary(...)` now rewrites summary conditions before phi
+      pruning so imported arithmetic guards survive export
+    - focused regression:
+      - `test_simplify_for_summary_rewrites_dead_linear_guard_to_visible_operands`
+  - `crates/pulse/src/summary.rs`
+    - local invalid accesses on non-manifest paths now keep the
+      manifest+latent twin only for caller-sensitive heap-shape /
+      imported-call contexts, not pure imported arithmetic
+    - focused regression:
+      - `test_of_proc_keeps_imported_arithmetic_guarded_local_invalid_access_latent`
+  - `crates/pulse/tests/end_to_end.rs`
+    - `test_e2e_negated_actual_keeps_arithmetic_latent_summary` is green again
+- Current verified effects:
+  - `cargo test -q -p pulse` is green
+  - the arithmetic-latent regression is fixed without regressing the earlier
+    field-shape behavior:
+    - `test_e2e_negated_actual_keeps_arithmetic_latent_summary`
+    - `test_e2e_cyclic_field_write_reifies_latent_abort_in_caller`
+- Current next step:
+  - go back to the remaining real `latent.c` report gaps:
+    - duplicate latent null publication in UAF wrappers
+    - deep-chain latent-path identity / dedup
+    - the remaining wrong manifest publication at
+      `FN_crash_after_six_nodes_bad`
+
 - Current parity checkpoint:
   - main summaries: `21 / 21` procedures match
   - specialized summary harness: `Matching: 21`

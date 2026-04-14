@@ -58,6 +58,7 @@ active OCaml-parity gap.
    `test_e2e_write_through_ptr`, `test_e2e_manifest_use_after_free_reports_only_uaf`,
    `test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf`,
    `test_e2e_local_zero_proof_on_formal_keeps_null_deref_manifest`,
+   `test_e2e_negated_actual_keeps_arithmetic_latent_summary`,
    `test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent`,
    `test_e2e_latent_chain_stays_latent_until_manifest_callsite`,
    `test_e2e_callee_local_abort_is_not_republished_on_caller`, and
@@ -97,6 +98,10 @@ Recent groundwork that should stay in place even though the current NPE total mo
   (`--pulse-report-issues-for-tests`) emits them as `*** SUPPRESSED ***`
 - summary normalization now uses `simplify_for_summary(precondition_vocabulary, keep)` and includes
   OCaml-style `pre_heap_has_assumptions`
+- condition recording / summary export now preserves imported linear guards
+  even when the solver pivots them onto the opposite variable
+  (`neg_x = -x` stored as `x = -neg_x`), and pure imported arithmetic must
+  not trigger the local manifest+latent twin path for invalid accesses
 - latent invalid-access classification is now narrower than "any caller-visible constant deref":
   pre-existing caller-controlled values can stay latent, true by-ref/outparam slot writes can stay
   latent, and ordinary callee-written field nulls stay manifest again

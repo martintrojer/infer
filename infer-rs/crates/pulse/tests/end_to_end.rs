@@ -2537,8 +2537,21 @@ fn test_e2e_cyclic_field_write_reifies_latent_abort_in_caller() {
         .map(|(_, summary)| summary)
         .expect("traverse summary should exist");
     assert!(
-        traverse.diagnostics.is_empty(),
-        "callee should keep the null dereference latent before the caller shape is known"
+        traverse
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "callee should keep its local null dereference manifest"
+    );
+    assert!(
+        traverse.pre_posts.iter().any(|pp| {
+            pp.kind == pulse::summary::PrePostKind::LatentAbortProgram
+                && pp
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+        }),
+        "callee should also export a latent twin for caller-sensitive cycle shape"
     );
 
     let caller = store

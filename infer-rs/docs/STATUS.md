@@ -5,6 +5,18 @@
 **~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
 
 Recent correctness / robustness fixes:
+- Imported arithmetic latent-summary parity is fixed again:
+  `PulseFormulaPhi` condition normalization now preserves reverse-pivoted
+  linear guards (for example, a stored `x = -neg_x` relation still records the
+  imported condition as a caller-visible `-x == 0` shape),
+  `Formula::simplify_for_summary(...)` rewrites dead arithmetic temps before
+  phi pruning, and summary-side local-invalid-access manifest+twin export now
+  stays reserved for caller-sensitive heap-shape / imported-call cases instead
+  of pure imported arithmetic. Focused regressions pin down the new behavior
+  (`test_simplify_for_summary_rewrites_dead_linear_guard_to_visible_operands`,
+  `test_of_proc_keeps_imported_arithmetic_guarded_local_invalid_access_latent`,
+  `test_e2e_negated_actual_keeps_arithmetic_latent_summary`), and
+  `cargo test -q -p pulse` is green again.
 - Function-pointer specialization now uses OCaml-style dynamic types end to
   end: `abductive.rs` tracks known dynamic types and rewrites them through
   equalities, `specialization.rs` applies `TypeName::CFunction(...)` /

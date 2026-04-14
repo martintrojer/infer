@@ -484,17 +484,17 @@ fn main() {
             if config::get().pulse_intraprocedural_only {
                 for pdesc in merged_cfg.iter_proc_descs() {
                     let summary = pulse::checker::analyze(pdesc);
-                    all_issues.merge(pulse::checker::to_issue_log(
-                        &summary,
-                        &format!("{}", pdesc.proc_name),
-                    ));
+                    all_issues.merge(pulse::checker::to_issue_log_with_pdesc(&summary, pdesc));
                 }
             } else {
                 let checker = PulseInterChecker;
                 let (store, _stats) =
                     ondemand::runner::run_inter(&checker, &merged_cfg, &merged_tenv);
                 for (pname, summary) in store.to_vec() {
-                    all_issues.merge(pulse::checker::to_issue_log(&summary, &format!("{pname}")));
+                    let Some(pdesc) = merged_cfg.get_proc_desc(&pname) else {
+                        continue;
+                    };
+                    all_issues.merge(pulse::checker::to_issue_log_with_pdesc(&summary, pdesc));
                 }
             }
         }

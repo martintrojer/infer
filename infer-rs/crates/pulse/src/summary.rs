@@ -716,6 +716,9 @@ impl PulseSummary {
                 &pp,
                 &existing_latent_invalid_access_keys,
             );
+            let export_local_latent_abort_twin = pp.kind == PrePostKind::AbortProgram
+                && !pre_post_is_manifest(pdesc, &pp)
+                && abort_should_keep_local_manifest_twin(pdesc, &pp);
 
             // Classify AbortProgram as manifest or latent.
             // Manifest errors: publish the diagnostic now.
@@ -724,14 +727,18 @@ impl PulseSummary {
             // Cross-ref: OCaml PulseSummary.ml exec_summary_of_post_common
             // reports only after latent-vs-manifest classification.
             if pp.kind == PrePostKind::AbortProgram {
-                if !proc_is_entry_point(pdesc)
-                    && pre_post_has_direct_formal_constant_deref(pdesc, &mut pp)
+                let direct_formal_constant_deref = !proc_is_entry_point(pdesc)
+                    && pre_post_has_direct_formal_constant_deref(pdesc, &mut pp);
+                if direct_formal_constant_deref
+                    && !abort_invalid_access_is_imported_from_call(pdesc, &pp)
                 {
                     pp.kind = PrePostKind::LatentInvalidAccess;
                 }
                 // Reclassify as latent if the error depends on caller inputs.
                 // Latent pre_posts propagate to callers for re-evaluation.
-                else if !pre_post_is_manifest(pdesc, &pp) {
+                else if !pre_post_is_manifest(pdesc, &pp)
+                    && !abort_should_keep_local_manifest_twin(pdesc, &pp)
+                {
                     pp.kind = PrePostKind::LatentAbortProgram;
                 } else if let Some(diag) = &pp.diagnostic {
                     diagnostics.push(diag.clone());
@@ -746,7 +753,15 @@ impl PulseSummary {
                 pp.diagnostic = None;
             }
 
+            let latent_abort_twin = export_local_latent_abort_twin.then(|| {
+                let mut twin = pp.clone();
+                twin.kind = PrePostKind::LatentAbortProgram;
+                twin
+            });
             pre_posts.push(pp);
+            if let Some(twin) = latent_abort_twin {
+                pre_posts.push(twin);
+            }
             for recovered in &recovered_invalid_accesses {
                 if recovered.kind == PrePostKind::AbortProgram {
                     if let Some(diag) = &recovered.diagnostic {
@@ -933,41 +948,21 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
     pre_post: &PrePost,
     existing_latent_invalid_access_keys: &std::collections::HashSet<String>,
 ) -> Vec<PrePost> {
-    if pre_post.kind != PrePostKind::AbortProgram {
+    if pre_post.kind != PrePostKind::AbortProgram
+        || (!pre_heap_has_assumptions(pre_post)
+            && !abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
+            && !abort_invalid_access_is_imported_from_call(pdesc, pre_post))
+    {
         return Vec::new();
     }
 
     let excluded_addr = diagnostic_addr_repr(pre_post);
-    let abort_location = pre_post
-        .diagnostic
-        .as_ref()
-        .map(|diag| diag.get_location().clone());
     latent_invalid_access_diagnostics_from_normalized_pre_post(pdesc, pre_post, excluded_addr)
         .into_iter()
         .filter(|(_, diagnostic)| {
             !existing_latent_invalid_access_keys.contains(&diagnostic.dedup_key())
         })
         .filter_map(|(addr, diagnostic)| {
-            let diagnostic = if let Some(location) = abort_location.as_ref() {
-                match diagnostic {
-                    Diagnostic::AccessToInvalidAddress {
-                        addr,
-                        invalidation,
-                        access_location: _,
-                        access_history,
-                        invalidation_history,
-                    } => Diagnostic::AccessToInvalidAddress {
-                        addr,
-                        invalidation,
-                        access_location: location.clone(),
-                        access_history,
-                        invalidation_history,
-                    },
-                    other => other,
-                }
-            } else {
-                diagnostic
-            };
             let mut latent_state = pre_post.post.clone();
             if latent_state.and_equal_const(addr, 0).is_sat() {
                 let mut recovered = PrePost {
@@ -1292,6 +1287,84 @@ fn latent_invalid_access_is_imported_from_call(
         })
 }
 
+fn heap_has_field_edge(
+    heap: &crate::base_memory::BaseMemory,
+    addr: AbstractValue,
+    repr_of: impl Fn(AbstractValue) -> AbstractValue,
+) -> bool {
+    heap.iter().any(|(src, edges)| {
+        repr_of(*src) == addr
+            && edges
+                .iter()
+                .any(|(access, _target)| matches!(access, Access::FieldAccess(_)))
+    })
+}
+
+fn pre_heap_values_reachable_via_field_from_formals(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> std::collections::HashSet<AbstractValue> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    let seeds = pdesc.formals.iter().filter_map(|(mangled, _typ, _annot)| {
+        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        pre_post.pre.stack.find(&var)
+    });
+
+    let mut reachable = std::collections::HashSet::new();
+    let mut worklist: Vec<_> = seeds.into_iter().map(|addr| (addr, false)).collect();
+
+    while let Some((addr, seen_field)) = worklist.pop() {
+        let repr = repr_of(addr);
+        if seen_field {
+            reachable.insert(repr);
+        }
+
+        let Some(edges) = pre_post.pre.heap.get_edges(addr) else {
+            continue;
+        };
+        for (access, target) in edges.iter() {
+            let next_seen_field = seen_field || matches!(access, Access::FieldAccess(_));
+            worklist.push((*target, next_seen_field));
+        }
+    }
+
+    reachable
+}
+
+fn abort_state_has_caller_sensitive_field_write(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    let reachable_via_field = pre_heap_values_reachable_via_field_from_formals(pdesc, pre_post);
+    pre_heap_values_reachable_from_formals(pdesc, pre_post)
+        .into_iter()
+        .any(|addr| {
+            post_addr_has_written_to(pre_post, addr)
+                && (reachable_via_field.contains(&addr)
+                    || heap_has_field_edge(&pre_post.pre.heap, addr, repr_of)
+                    || heap_has_field_edge(&pre_post.post.post.heap, addr, repr_of))
+        })
+}
+
+pub(crate) fn exported_latent_invalid_access_is_reportable(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> bool {
+    if pre_post.kind != PrePostKind::LatentInvalidAccess {
+        return false;
+    }
+
+    let Some(Diagnostic::AccessToInvalidAddress {
+        addr,
+        access_history,
+        ..
+    }) = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
+    else {
+        return pre_post.diagnostic.is_some();
+    };
+
+    !latent_invalid_access_is_imported_from_call(pdesc, pre_post, addr, &access_history)
+}
+
 fn proc_has_call_at_location(pdesc: &Procdesc, location: &sil::location::Location) -> bool {
     pdesc.nodes.iter().any(|node| {
         node.instrs.iter().any(|instr| {
@@ -1468,7 +1541,9 @@ fn classify_non_exit_abort_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
 
     if !proc_is_entry_point(pdesc) && pre_post_has_direct_formal_constant_deref(pdesc, pre_post) {
         pre_post.kind = PrePostKind::LatentInvalidAccess;
-    } else if !pre_post_is_manifest(pdesc, pre_post) {
+    } else if !pre_post_is_manifest(pdesc, pre_post)
+        && !abort_should_keep_local_manifest_twin(pdesc, pre_post)
+    {
         pre_post.kind = PrePostKind::LatentAbortProgram;
     }
 }
@@ -1615,6 +1690,22 @@ pub(crate) fn latent_invalid_access_diagnostic_from_exported_pre_post(
         return Some(diag.clone());
     }
 
+    latent_invalid_access_diagnostic_from_summary_state(pre_post)
+}
+
+pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
+    pre_post: &PrePost,
+) -> Option<Diagnostic> {
+    if pre_post.kind != PrePostKind::LatentInvalidAccess {
+        return pre_post.diagnostic.clone();
+    }
+
+    let preferred_addr = pre_post.diagnostic.as_ref().and_then(|diag| match diag {
+        Diagnostic::AccessToInvalidAddress { addr, .. } => {
+            Some(pre_post.post.path_condition.get_var_repr(*addr))
+        }
+        _ => None,
+    });
     let caller_controlled = pre_heap_values_reachable_from_summary_formals(pre_post);
     let formal_stack_addrs = summary_formal_stack_addrs(pre_post);
     let deref_value_targets = pre_heap_deref_value_targets(pre_post);
@@ -1626,6 +1717,9 @@ pub(crate) fn latent_invalid_access_diagnostic_from_exported_pre_post(
     for addr in candidates {
         let repr = pre_post.post.path_condition.get_var_repr(addr);
         if !seen.insert(repr) {
+            continue;
+        }
+        if preferred_addr.is_some() && preferred_addr != Some(repr) {
             continue;
         }
         if formal_stack_addrs.contains(&repr) || !deref_value_targets.contains(&repr) {
@@ -1677,6 +1771,9 @@ pub(crate) fn latent_invalid_access_diagnostic_from_exported_pre_post(
             access_history,
             invalidation_history,
         };
+        if preferred_addr == Some(repr) {
+            return Some(diagnostic);
+        }
         let key = (location, timestamp, repr);
         match &best {
             Some((best_key, _)) if &key >= best_key => {}
@@ -1684,7 +1781,90 @@ pub(crate) fn latent_invalid_access_diagnostic_from_exported_pre_post(
         }
     }
 
+    if preferred_addr.is_some() {
+        return None;
+    }
     best.map(|((_location, _timestamp, _addr), diagnostic)| diagnostic)
+}
+
+pub(crate) fn latent_invalid_access_report_key(pre_post: &PrePost) -> Option<String> {
+    let Diagnostic::AccessToInvalidAddress {
+        addr,
+        access_location,
+        ..
+    } = latent_invalid_access_diagnostic_from_summary_state(pre_post)?
+    else {
+        return None;
+    };
+    let target = pre_post.post.path_condition.get_var_repr(addr);
+    let path_key = latent_invalid_access_heap_path(pre_post, target)
+        .map(|path| format!("{path}"))
+        .unwrap_or_else(|| format!("{target}"));
+    Some(format!(
+        "{}|{}|{}",
+        diagnostics::issue_type::IssueTypeId::NullptrDereference.id(),
+        access_location,
+        path_key
+    ))
+}
+
+fn latent_invalid_access_heap_path(pre_post: &PrePost, target: AbstractValue) -> Option<HeapPath> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    let mut best: Option<HeapPath> = None;
+
+    for (formal, stack_addr) in &pre_post.formals {
+        let root = HeapPath::Pvar(formal.clone());
+        find_heap_path_to_target(
+            pre_post,
+            *stack_addr,
+            root,
+            target,
+            &repr_of,
+            &mut std::collections::HashSet::new(),
+            &mut best,
+        );
+    }
+
+    best
+}
+
+fn find_heap_path_to_target(
+    pre_post: &PrePost,
+    addr: AbstractValue,
+    path: HeapPath,
+    target: AbstractValue,
+    repr_of: &impl Fn(AbstractValue) -> AbstractValue,
+    visited: &mut std::collections::HashSet<AbstractValue>,
+    best: &mut Option<HeapPath>,
+) {
+    let repr = repr_of(addr);
+    if !visited.insert(repr) {
+        return;
+    }
+
+    if repr == target {
+        match best {
+            Some(current) if format!("{current}") <= format!("{path}") => {}
+            _ => *best = Some(path.clone()),
+        }
+        return;
+    }
+
+    let Some(edges) = pre_post.pre.heap.get_edges(addr) else {
+        return;
+    };
+    for (access, next_addr) in edges.iter() {
+        let next_path = match access {
+            Access::Dereference => HeapPath::Dereference(Box::new(path.clone())),
+            Access::FieldAccess(field) => {
+                HeapPath::FieldAccess(field.clone(), Box::new(path.clone()))
+            }
+            Access::ArrayAccess(_, _) => continue,
+        };
+        find_heap_path_to_target(
+            pre_post, *next_addr, next_path, target, repr_of, visited, best,
+        );
+    }
 }
 
 fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut PrePost) -> bool {
@@ -1726,6 +1906,58 @@ fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut Pr
     caller_owned
         && !pre_post_has_locally_written_direct_formal(pdesc, pre_post, diag_addr)
         && !pre_post_diag_addr_has_non_null_invalidation(pre_post)
+}
+
+fn abort_has_local_invalid_access(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    let Some((diag_addr, access_history_has_formal_origin)) =
+        pre_post.diagnostic.as_ref().and_then(|diag| match diag {
+            Diagnostic::AccessToInvalidAddress {
+                addr,
+                access_history,
+                ..
+            } => Some((
+                pre_post.post.path_condition.get_var_repr(*addr),
+                access_history.contains_formal_origin(),
+            )),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+
+    let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
+    !caller_controlled.contains(&diag_addr) && !access_history_has_formal_origin
+}
+
+/// OCaml only keeps a local manifest invalid-access report when the
+/// caller-sensitive part of the summary comes from heap reachability or an
+/// imported call-side must-be-valid obligation. Pure imported arithmetic
+/// conditions should keep the local crash latent.
+fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    abort_has_local_invalid_access(pdesc, pre_post)
+        && (pre_heap_has_assumptions(pre_post)
+            || abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
+            || abort_invalid_access_is_imported_from_call(pdesc, pre_post))
+}
+
+fn abort_invalid_access_is_imported_from_call(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    let Some((diag_addr, access_history)) =
+        pre_post.diagnostic.as_ref().and_then(|diag| match diag {
+            Diagnostic::AccessToInvalidAddress {
+                addr,
+                access_history,
+                ..
+            } => Some((
+                pre_post.post.path_condition.get_var_repr(*addr),
+                access_history.clone(),
+            )),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+
+    latent_invalid_access_is_imported_from_call(pdesc, pre_post, diag_addr, &access_history)
 }
 
 /// OCaml still keeps locally-proven direct-formal null dereferences manifest.
@@ -3585,6 +3817,151 @@ mod tests {
             summary.pre_posts[0].kind,
             PrePostKind::AbortProgram
         ));
+    }
+
+    #[test]
+    fn test_of_proc_keeps_local_invalid_access_manifest_and_latent_when_pre_heap_is_non_manifest() {
+        let pdesc = make_pdesc_with_formals(&["x", "y"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let y_pvar = Pvar::mk(Mangled::from_string("y"), pdesc.proc_name.clone());
+        let x_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(x_pvar)))
+            .unwrap();
+        let y_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(y_pvar)))
+            .unwrap();
+        let x_val = astate.read_heap(x_addr, Access::Dereference);
+        let y_val = astate.read_heap(y_addr, Access::Dereference);
+        let shared = AbstractValue::mk_fresh();
+        astate.pre.heap.add_edge(x_val, Access::Dereference, shared);
+        astate.pre.heap.add_edge(y_val, Access::Dereference, shared);
+        astate.pre.heap.register_address(shared);
+
+        let local_root = AbstractValue::mk_fresh();
+        let local_null = AbstractValue::mk_fresh();
+        let local_var = Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0));
+        astate.post.stack.add(local_var, local_root);
+        astate.write_heap(local_root, Access::Dereference, local_null);
+        astate.mark_must_be_valid(local_null);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        astate.invalidate(
+            local_null,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(local_null, invalidation);
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic.clone()),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.iter().any(|diag| diag == &diagnostic),
+            "local invalid accesses should stay manifest even when the pre heap has latent assumptions"
+        );
+        assert!(
+            summary.pre_posts.iter().any(|pp| {
+                pp.kind == PrePostKind::AbortProgram && pp.diagnostic.as_ref() == Some(&diagnostic)
+            }),
+            "expected the manifest abort summary to stay exported"
+        );
+        assert!(
+            summary.pre_posts.iter().any(|pp| {
+                pp.kind == PrePostKind::LatentAbortProgram
+                    && pp.diagnostic.as_ref() == Some(&diagnostic)
+            }),
+            "expected a latent twin for caller-sensitive reachability, matching OCaml latent.c behavior"
+        );
+    }
+
+    #[test]
+    fn test_of_proc_keeps_imported_arithmetic_guarded_local_invalid_access_latent() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let x_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(x_pvar)))
+            .unwrap();
+        let x_val = astate.read_heap(x_addr, Access::Dereference);
+        let neg_x = AbstractValue::mk_fresh();
+        assert!(
+            astate
+                .path_condition
+                .and_equal_linear(
+                    neg_x,
+                    crate::formula::lin_arith::LinArith::of_var(x_val).neg()
+                )
+                .is_sat(),
+            "negated formal arithmetic should stay satisfiable"
+        );
+        let imported_guard = crate::formula::atom::Atom::Equal(
+            crate::formula::term::Term::Var(neg_x),
+            crate::formula::term::Term::Const(0),
+        );
+        assert!(
+            astate
+                .path_condition
+                .and_condition_direct(imported_guard, 1)
+                .is_sat(),
+            "imported arithmetic guard should stay in the summary path condition"
+        );
+
+        let local_root = AbstractValue::mk_fresh();
+        let local_null = AbstractValue::mk_fresh();
+        let local_var = Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0));
+        astate.post.stack.add(local_var, local_root);
+        astate.write_heap(local_root, Access::Dereference, local_null);
+        astate.mark_must_be_valid(local_null);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        astate.invalidate(
+            local_null,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(local_null, invalidation);
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic.clone()),
+            }],
+            vec![],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "imported arithmetic guards should keep local invalid accesses latent"
+        );
+        assert!(
+            summary.pre_posts.iter().all(|pp| {
+                pp.kind != PrePostKind::AbortProgram || pp.diagnostic.as_ref() != Some(&diagnostic)
+            }),
+            "no manifest abort summary should be exported for the local invalid access"
+        );
+        assert!(
+            summary.pre_posts.iter().any(|pp| {
+                pp.kind == PrePostKind::LatentAbortProgram
+                    && pp.diagnostic.as_ref() == Some(&diagnostic)
+            }),
+            "expected the local invalid access to remain latent under imported arithmetic"
+        );
     }
 
     #[test]
