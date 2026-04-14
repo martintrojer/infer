@@ -10,20 +10,33 @@ Exact summary-equality work now uses a semantic driver instead of raw JSON diffs
 Current verified checkpoint:
 
 - main summaries: `21 / 21` procedures match
-- combined per-procedure harness: `Matching: 17`, `Differences: 4`
+- combined per-procedure harness: `Matching: 19`, `Differences: 2`
 - remaining specialized-summary diffs:
-  `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`,
-  `two_pointers_recursion_bad`
+  `invoke_itself_bad`, `two_pointers_recursion_bad`
 
-The latest OCaml-backed pass keeps three correctness fixes in place while widening that harness:
-resolved `__call_c_function_ptr` targets with no available summary now use the direct known-call
-unknown fallback instead of the unresolved-funptr path, summary import now preserves callee
-`is_int(...)` facts, and the comparator now uses deterministic specialization keys plus semantic
-normalization for affine integer witnesses and function-application arguments. The remaining
-`invoke` / `invoke_itself_bad` drift looks like a real analyzer mismatch rather than comparator
-noise: OCaml `PulseSpecialization.apply` adds dynamic-type constraints via
-`PulseArithmetic.and_dynamic_type_is_unsafe`, while Rust still seeds `Closure(...)` attrs on the
-specialized heap-path value.
+The latest OCaml-backed specialization pass now mirrors OCaml's dynamic-type path more closely:
+the abductive domain tracks known dynamic types directly, `PulseSpecialization.apply` now seeds
+dynamic-type constraints (the Rust analogue of `PulseArithmetic.and_dynamic_type_is_unsafe`)
+instead of exporting `Closure(...)` attrs, specialization keys use `TypeName::CFunction(...)`,
+and `__call_c_function_ptr` resolves known dynamic types before falling back to direct closure
+attrs. `invoke` now matches.
+
+Unknown-call fallback and summary export were also tightened again: bare pointer and bare `Tfun`
+actuals materialize their missing pointee cell before havoc, unknown-call returns record
+`ReturnedFromUnknown(actuals)`, specialized latent abort diagnostics are cached sideband and
+rehydrated on apply, and summary normalization recreates caller-visible non-zero
+`Invalid(ConstantDereference(k))` attrs when a value is only known constant through phi. Together
+these changes bring `may_double_free_if_alias` to parity and restore the missing specialized
+recursive invalidation surface in `two_pointers_recursion_bad`.
+
+The remaining two diffs are narrower. `invoke_itself_bad` still has a real analyzer gap in the
+specialized recursive branch: Rust misses pre `f.* -*-> f.*.*`, misses post
+`f.*.*:[Initialized, WrittenTo]`, and still exports an extra phi atom
+`atom:0 < lin(1*v2,const=2)`. `two_pointers_recursion_bad` is now down to integer-fact comparison
+drift: `main[1]` has extra `is_int(v1)` and `specialized[alias: *x = *y][1]` is still missing
+`is_int(return.*)`. The comparator now anchors exact-RHS equalities back to visible summary values,
+but affine `is_int` closure over non-unit equalities still needs OCaml-backed refinement; do not
+widen Rust raw summaries just to hide it.
 
 Recent OCaml-backed parity work also restored `traces.c`: Rust now preserves branch-conditioned
 null provenance from both real `Prune` instructions and model-generated
@@ -53,9 +66,10 @@ over-exporting the wrapper shape in `call_may_double_free_if_alias_bad`.
 A newer OCaml-backed model/export pass now also conservatively initializes actual roots before
 entering known models, matching the `OCamlModel` path in `Pulse.ml`, and exports
 continue-derived latent invalid-access summaries with `diagnostic=None`, reconstructing the
-diagnostic again during summary import. That aligns `may_double_free_if_alias` with OCaml on
-latent diagnostic shape and caller-visible pointee `Initialized` attrs; the remaining delta there
-is now formula shape only.
+diagnostic again during summary import. That aligned `may_double_free_if_alias` with OCaml on
+latent diagnostic shape and caller-visible pointee `Initialized` attrs; the later visible-constant
+invalidation fix and exact-RHS `is_int` anchoring closed the last remaining summary-surface delta
+there.
 
 The config surface now also supports OCaml's `pulse-force-continue` flag through both
 `.inferconfig` and CLI override. Rust summaries now retain OCaml-style
@@ -66,8 +80,9 @@ skipped-call continue for selected alias-specialized latent-invalid-access summa
 `ContinueProgram`, which is the OCaml-backed shape behind
 `call_may_double_free_if_alias_bad`. Together with the newer integer-literal interning and
 post-summary attr filtering, those fixes remain part of the current
-`21 / 21` main-summary and `Matching: 17`, `Differences: 4` widened-summary checkpoint.
-`call_may_double_free_if_alias_bad` and `test_unalias` continue to match.
+`21 / 21` main-summary and `Matching: 19`, `Differences: 2` widened-summary checkpoint.
+`invoke`, `call_may_double_free_if_alias_bad`, `may_double_free_if_alias`, and `test_unalias`
+now match.
 
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
 remaining published NPE delta is:
@@ -96,8 +111,8 @@ shaping now orders direct-formal accesses by `(timestamp, location)` rather than
 location alone. That removes the extra latent branch and brings the raw main summary down to the
 OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. After the later
 integer-literal interning and post-summary attr-filtering pass, the remaining specialization work
-is narrower: linear-phi parity in `may_double_free_if_alias`, plus the existing recursion /
-arithmetic / attr-export cluster.
+is narrower: the specialized recursive pre/post shape gap in `invoke_itself_bad`, plus the
+remaining affine-`is_int` comparison drift in `two_pointers_recursion_bad`.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

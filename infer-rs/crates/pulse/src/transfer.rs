@@ -455,9 +455,13 @@ fn exec_call(
 
     // Default: treat as unknown — havoc the return value and pointer args.
     log::debug!("  [call] unknown: {fun_exp}");
-    let actual_vals: Vec<_> = args
+    let actuals_with_history: Vec<_> = args
         .iter()
-        .map(|(arg_exp, _arg_typ)| operations::eval_or_fresh(arg_exp, loc, &mut state))
+        .map(|(arg_exp, _arg_typ)| operations::eval_or_fresh_with_history(arg_exp, loc, &mut state))
+        .collect();
+    let actual_vals: Vec<_> = actuals_with_history
+        .iter()
+        .map(|actual| actual.addr)
         .collect();
     // Cross-ref: OCaml `PulseCallOperations.call_aux_unknown` conservatively
     // initializes actual argument roots before entering unknown-call
@@ -472,6 +476,16 @@ fn exec_call(
         ValueWithHistory::new(ret_val, ValueHistory::assignment(loc.clone())),
         &mut state,
     );
+    // Cross-ref: OCaml `PulseCallOperations.add_returned_from_unknown`.
+    // Keep the actual-value dependency on the fresh return so specialized
+    // summaries preserve copy / provenance shape for unknown calls such as
+    // `invoke(*f = add_more_bad)`.
+    if !actual_vals.is_empty() {
+        state.add_attr(
+            ret_val,
+            crate::attribute::Attribute::ReturnedFromUnknown(actual_vals.clone()),
+        );
+    }
     mark_call_result_type(ret_val, ret_typ, &mut state);
 
     // Havoc pointer arguments for C/C++ unknown calls: unknown functions
@@ -485,10 +499,11 @@ fn exec_call(
     };
     if let Some(callee_name) = callee_name {
         let mut is_pure = true;
-        for ((arg_exp, arg_typ), arg_val) in args.iter().zip(actual_vals.iter().copied()) {
-            if arg_typ.is_pointer() {
+        for ((arg_exp, arg_typ), actual) in args.iter().zip(actuals_with_history.iter()) {
+            if should_havoc_unknown_call_arg(arg_typ) {
                 is_pure = false;
-                apply_unknown_call_pointer_actual_effect(arg_exp, arg_val, loc, &mut state);
+                materialize_unknown_call_pointer_if_needed(actual, &mut state);
+                apply_unknown_call_pointer_actual_effect(arg_exp, actual.addr, loc, &mut state);
             }
         }
         // Pure unknown calls should keep stable FunctionApplication results
@@ -507,6 +522,10 @@ fn exec_call(
     vec![ExecutionDomain::ContinueProgram(state)]
 }
 
+fn should_havoc_unknown_call_arg(arg_typ: &sil::typ::Typ) -> bool {
+    arg_typ.is_pointer() || matches!(&*arg_typ.desc, sil::typ::TypeDesc::Tfun(_))
+}
+
 fn apply_unknown_call_pointer_actual_effect(
     arg_exp: &Exp,
     arg_val: AbstractValue,
@@ -523,6 +542,43 @@ fn apply_unknown_call_pointer_actual_effect(
     state.add_attr(arg_val, crate::attribute::Attribute::UnknownEffect);
     state.mark_written_to_addrs_at(written_before_havoc, loc);
     operations::refresh_unknown_lvalue_root(arg_exp, arg_val, state);
+}
+
+fn materialize_unknown_call_pointer_if_needed(
+    actual: &ValueWithHistory,
+    state: &mut AbductiveDomain,
+) {
+    let actual_addr = state.path_condition.get_var_repr(actual.addr);
+    if state.check_valid(actual_addr).is_err()
+        || state
+            .post
+            .heap
+            .find_edge(actual_addr, &crate::access::Access::Dereference)
+            .is_some()
+    {
+        return;
+    }
+
+    // Cross-ref: OCaml unknown-call havoc can expose a fresh pointee cell even
+    // when the caller only passed a pointer value (for example a loaded
+    // callback actual in recursive specialization cases). Materialize that
+    // pointee first so the later havoc rewrites the post edge but keeps the
+    // pre/post reachable-cell shape.
+    let target = state.read_heap_with_history(actual.clone(), crate::access::Access::Dereference);
+    if state
+        .pre
+        .heap
+        .find_edge(actual_addr, &crate::access::Access::Dereference)
+        .is_none()
+        && state.pre.heap.get_edges(actual_addr).is_some()
+    {
+        state.pre.heap.add_edge_with_history(
+            actual_addr,
+            crate::access::Access::Dereference,
+            target.clone(),
+        );
+        state.pre.heap.register_address(target.addr);
+    }
 }
 
 fn mark_call_result_type(
@@ -956,6 +1012,221 @@ mod tests {
                 .iter()
                 .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
             "known integer leaves should not be marked WrittenTo by unknown-call fallback"
+        );
+    }
+
+    #[test]
+    fn test_unknown_call_pointer_value_materializes_missing_pointee_before_havoc() {
+        let pname = Procname::c_from_string("test");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt))),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), pname);
+        let p_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .expect("p should be bound");
+        let p_val = state.read_heap(p_root, Access::Dereference);
+        assert!(
+            state.pre.heap.get_edges(p_val).is_some(),
+            "loading the formal pointer should register the pointee root in pre"
+        );
+        assert!(
+            state
+                .pre
+                .heap
+                .find_edge(p_val, &Access::Dereference)
+                .is_none(),
+            "the pointee cell should start unmaterialized"
+        );
+
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        state.post.stack.add(Var::LogicalVar(arg_id.clone()), p_val);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::void()),
+            fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string("unknown"))),
+            args: vec![(
+                Exp::Var(arg_id),
+                Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+            )],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let continue_state = results.into_iter().find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        });
+        let state = continue_state.expect("unknown call should continue");
+
+        let pre_target = state
+            .pre
+            .heap
+            .find_edge(p_val, &Access::Dereference)
+            .expect("unknown-call pointer havoc should materialize a pre pointee");
+        let post_target = state
+            .post
+            .heap
+            .find_edge(p_val, &Access::Dereference)
+            .expect("unknown-call pointer havoc should keep a post pointee");
+        assert_ne!(
+            state.path_condition.get_var_repr(pre_target),
+            state.path_condition.get_var_repr(post_target),
+            "havoc should replace the post pointee with a fresh value"
+        );
+
+        let pre_target_attrs = state
+            .post
+            .attrs
+            .get(&state.path_condition.get_var_repr(pre_target))
+            .expect("the pre pointee should remain visible in post attrs");
+        assert!(
+            pre_target_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "the old pointee should record WrittenTo before the post edge is refreshed"
+        );
+    }
+
+    #[test]
+    fn test_unknown_call_function_value_materializes_missing_pointee_before_havoc() {
+        let pname = Procname::c_from_string("test");
+        let fun_typ = Typ::mk(sil::typ::TypeDesc::Tfun(None));
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("f"),
+            Typ::mk_ptr(fun_typ.clone()),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let f_pvar = Pvar::mk(Mangled::from_string("f"), pname);
+        let f_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(f_pvar.clone())))
+            .expect("f should be bound");
+        let fun_val = state.read_heap(f_root, Access::Dereference);
+        assert!(
+            state.pre.heap.get_edges(fun_val).is_some(),
+            "loading the formal function pointer should register the pointee root in pre"
+        );
+        assert!(
+            state
+                .pre
+                .heap
+                .find_edge(fun_val, &Access::Dereference)
+                .is_none(),
+            "the function-value pointee should start unmaterialized"
+        );
+
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        state
+            .post
+            .stack
+            .add(Var::LogicalVar(arg_id.clone()), fun_val);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::void()),
+            fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string("unknown"))),
+            args: vec![(Exp::Var(arg_id), fun_typ)],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let continue_state = results.into_iter().find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        });
+        let state = continue_state.expect("unknown call should continue");
+
+        let pre_target = state
+            .pre
+            .heap
+            .find_edge(fun_val, &Access::Dereference)
+            .expect("function-value unknown-call havoc should materialize a pre pointee");
+        let post_target = state
+            .post
+            .heap
+            .find_edge(fun_val, &Access::Dereference)
+            .expect("function-value unknown-call havoc should keep a post pointee");
+        assert_ne!(
+            state.path_condition.get_var_repr(pre_target),
+            state.path_condition.get_var_repr(post_target),
+            "havoc should replace the post function-value pointee with a fresh value"
+        );
+    }
+
+    #[test]
+    fn test_unknown_call_return_records_returned_from_unknown_actuals() {
+        let pname = Procname::c_from_string("test");
+        let mut pdesc = Procdesc::new(
+            pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        pdesc.formals = vec![(
+            Mangled::from_string("i"),
+            Typ::int(sil::typ::IKind::IInt),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let i_pvar = Pvar::mk(Mangled::from_string("i"), pname);
+        let i_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(i_pvar)))
+            .expect("i should be bound");
+        let i_val = state.read_heap(i_addr, Access::Dereference);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        state.post.stack.add(Var::LogicalVar(arg_id.clone()), i_val);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+        let instr = Instr::Call {
+            ret: (ret_id.clone(), Typ::int(sil::typ::IKind::IInt)),
+            fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string("unknown"))),
+            args: vec![(Exp::Var(arg_id), Typ::int(sil::typ::IKind::IInt))],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let continue_state = results.into_iter().find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        });
+        let state = continue_state.expect("unknown call should continue");
+        let ret_val = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return should be bound");
+        let ret_attrs = state
+            .post
+            .attrs
+            .get(&ret_val)
+            .expect("return should keep post attrs");
+        assert!(
+            ret_attrs.iter().any(|attr| {
+                matches!(
+                    attr,
+                    crate::attribute::Attribute::ReturnedFromUnknown(values)
+                        if values == &vec![state.path_condition.get_var_repr(i_val)]
+                )
+            }),
+            "unknown-call return should record ReturnedFromUnknown(actuals)"
         );
     }
 

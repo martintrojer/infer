@@ -21,6 +21,25 @@ Key OCaml files to cross-reference:
 - Do not add workarounds, special cases, or heuristic hacks whose main purpose is to make the sweep numbers look better without fixing the underlying behavior.
 - When a correct fix regresses totals, keep the correct fix and investigate the newly exposed gaps separately.
 
+## Function Pointer Specialization Gotcha
+
+When debugging `__call_c_function_ptr` / specialization parity, remember that
+OCaml's specialization surface is dynamic-type driven, not Closure-attr
+driven.
+
+- Cross-reference `PulseAbductiveDomain.need_dynamic_type_specialization`,
+  `PulseAbductiveDomain.Summary.heap_paths_that_need_dynamic_type_specialization`,
+  `PulseArithmetic.and_dynamic_type_is_unsafe`,
+  `PulseSpecialization.apply`, and `PulseCallOperations.ml`.
+- Prefer storing and resolving known dynamic types in the abductive /
+  path-condition state, and preserve them through equalities/substitution.
+- Use `Closure(...)` only as a fallback for direct `Cfun` / closure values. Do
+  not seed exported `Closure(...)` attrs onto specialized heap-path values just
+  to make summaries match.
+- Keep unknown-call behavior aligned too: bare pointer/function-value actuals
+  may need pointee materialization before havoc, and unknown-call returns can
+  carry `ReturnedFromUnknown(actuals)`.
+
 ## Direct-formal null parity gotcha
 
 When debugging direct-formal null dereferences, separate real local branch proofs from generic

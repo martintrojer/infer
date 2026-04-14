@@ -55,29 +55,34 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    keyed by deterministic specialization strings.
    Verified checkpoint on the current tree:
    - main summaries: `21 / 21` procedures match
-   - combined per-procedure harness: `Matching: 17`, `Differences: 4`
+   - combined per-procedure harness: `Matching: 19`, `Differences: 2`
    - remaining specialized-summary diffs:
-     `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`,
-     `two_pointers_recursion_bad`
+     `invoke_itself_bad`, `two_pointers_recursion_bad`
    Recent correctness groundwork that should stay:
-   resolved `__call_c_function_ptr` targets with no available summary now use
-   the direct known-call unknown fallback instead of the unresolved-funptr
-   path, summary import now preserves callee `is_int(...)` facts, summary
-   export/import still keeps the OCaml-backed latent-invalid-access shaping,
-   and the comparator only normalizes true semantic noise
+   specialization now uses dynamic-type information from caller state and
+   `TypeName::CFunction(...)` bindings instead of seeding exported
+   `Closure(...)` attrs, `__call_c_function_ptr` resolves dynamic type first,
+   and `need_dynamic_type_specialization` propagation treats an existing known
+   dynamic type as already satisfying the request. Unknown-call fallback now
+   materializes missing pointee cells for pointer and bare `Tfun` actuals
+   before havoc, and unknown-call returns record
+   `ReturnedFromUnknown(actuals)`. Summary export/import still keeps the
+   OCaml-backed latent-invalid-access shaping, specialized latent abort
+   diagnostics are cached sideband and reified on apply, summary
+   normalization now recreates caller-visible non-zero
+   `Invalid(ConstantDereference(k))` attrs when const-ness survives only in
+   phi, and the comparator only normalizes true semantic noise
    (deterministic specialization keys, witness inequalities, unit-affine
-   `is_int(...)`, function-application args through affine equalities).
-   Highest-confidence remaining analyzer mismatch:
-   OCaml `PulseSpecialization.apply` uses
-   `PulseArithmetic.and_dynamic_type_is_unsafe` when applying dynamic-type
-   specializations, while Rust `crates/pulse/src/specialization.rs` still
-   seeds `Attribute::Closure(pname)` on the specialized heap-path value. That
-   likely explains much of the remaining `invoke` /
-   `invoke_itself_bad` drift, so do not paper it over in the comparator.
-   The other two remaining specialized gaps are narrower:
-   `may_double_free_if_alias` still exports an extra latent diagnostic on the
-   alias-specialized branch, and `two_pointers_recursion_bad` still differs on
-   invalid/int export shape inside the recursive alias specialization.
+   `is_int(...)`, exact-RHS `is_int(...)` anchoring, and function-application
+   args through affine equalities).
+   Remaining gaps are now narrower:
+   `invoke_itself_bad` still has a real analyzer mismatch in the specialized
+   recursive branch (missing pre `f.* -*-> f.*.*`, missing post
+   `f.*.*:[Initialized, WrittenTo]`, plus extra phi
+   `atom:0 < lin(1*v2,const=2)`), while `two_pointers_recursion_bad` is down
+   to integer-fact parity (`main[1]` extra `is_int(v1)` and
+   `specialized[alias: *x = *y][1]` missing `is_int(return.*)`). Do not hide
+   either one with comparator-only hacks or Rust-side widening.
 
 4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,

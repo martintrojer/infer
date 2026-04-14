@@ -18,6 +18,7 @@ use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
+use sil::typ::Typ;
 use sil::var::Var;
 
 use crate::abstract_value::AbstractValue;
@@ -57,6 +58,13 @@ pub struct AbductiveDomain {
     /// these are converted to HeapPaths for the specialization request.
     /// Cross-ref: OCaml `PulseAbductiveDomain.need_dynamic_type_specialization`.
     pub need_dynamic_type_specialization: std::collections::HashSet<AbstractValue>,
+    /// Known dynamic types for abstract values.
+    ///
+    /// This is the Rust analogue of OCaml Pulse's path-condition
+    /// `type_constraints` surface. We currently track only known positive
+    /// dynamic types, which is enough for specialization-driven function
+    /// pointer resolution without exporting spurious `Closure(...)` attrs.
+    dynamic_types: std::collections::BTreeMap<AbstractValue, Typ>,
     /// Addresses the analysis checked validity for (via eval_deref).
     /// Used by interproc to only report pre-condition violations for
     /// addresses the callee actually dereferences, not all pre-edges.
@@ -90,6 +98,7 @@ impl AbductiveDomain {
             path_condition: Formula::ttrue(),
             const_cache: std::collections::BTreeMap::new(),
             need_dynamic_type_specialization: std::collections::HashSet::new(),
+            dynamic_types: std::collections::BTreeMap::new(),
             must_be_valid: std::collections::HashSet::new(),
             next_attr_timestamp: 1,
         };
@@ -466,6 +475,8 @@ impl AbductiveDomain {
             std::mem::take(&mut self.need_dynamic_type_specialization);
         self.need_dynamic_type_specialization =
             self.subst_value_set(need_dynamic_type_specialization, old, new);
+        let dynamic_types = std::mem::take(&mut self.dynamic_types);
+        self.dynamic_types = self.subst_typed_value_map(dynamic_types, old, new);
         for value in self.const_cache.values_mut() {
             let value0 = if *value == old { new } else { *value };
             *value = self.path_condition.get_var_repr(value0);
@@ -485,6 +496,21 @@ impl AbductiveDomain {
                 self.path_condition.get_var_repr(value)
             })
             .collect()
+    }
+
+    fn subst_typed_value_map(
+        &self,
+        values: std::collections::BTreeMap<AbstractValue, Typ>,
+        old: AbstractValue,
+        new: AbstractValue,
+    ) -> std::collections::BTreeMap<AbstractValue, Typ> {
+        let mut result = std::collections::BTreeMap::new();
+        for (value, typ) in values {
+            let value = if value == old { new } else { value };
+            let value = self.path_condition.get_var_repr(value);
+            result.entry(value).or_insert(typ);
+        }
+        result
     }
 
     fn is_heap_allocated(&self, addr: AbstractValue) -> bool {
@@ -597,6 +623,20 @@ impl AbductiveDomain {
     /// Cross-ref: OCaml `AddressAttributes.get_closure_proc_name`.
     pub fn get_closure_proc_name(&self, addr: AbstractValue) -> Option<&sil::procname::Procname> {
         self.post.attrs.get_closure_proc_name(addr)
+    }
+
+    /// Get the known dynamic type of an abstract value, if any.
+    pub fn get_dynamic_type(&self, addr: AbstractValue) -> Option<&Typ> {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.dynamic_types.get(&repr)
+    }
+
+    /// Record a known dynamic type for an abstract value.
+    ///
+    /// Cross-ref: OCaml `PulseArithmetic.and_dynamic_type_is_unsafe`.
+    pub fn add_dynamic_type_unsafe(&mut self, addr: AbstractValue, typ: Typ) {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.dynamic_types.entry(repr).or_insert(typ);
     }
 
     /// Mark an address as requiring validity (the callee dereferences it).
@@ -1012,6 +1052,12 @@ mod tests {
         state.add_attr(old, Attribute::Initialized);
         state.must_be_valid.insert(old);
         state.need_dynamic_type_specialization.insert(old);
+        state.add_dynamic_type_unsafe(
+            old,
+            Typ::mk_struct(sil::typ::TypeName::CStruct(
+                sil::qualified_cpp_name::QualifiedCppName::from_string("Callback"),
+            )),
+        );
 
         assert!(state.and_equal(old, new).is_sat());
         assert_eq!(
@@ -1029,6 +1075,12 @@ mod tests {
             .is_some_and(|attrs| attrs.contains(&Attribute::Initialized)));
         assert!(state.must_be_valid.contains(&new));
         assert!(state.need_dynamic_type_specialization.contains(&new));
+        assert_eq!(
+            state.get_dynamic_type(new),
+            Some(&Typ::mk_struct(sil::typ::TypeName::CStruct(
+                sil::qualified_cpp_name::QualifiedCppName::from_string("Callback"),
+            )))
+        );
     }
 
     #[test]

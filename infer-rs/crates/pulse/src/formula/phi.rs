@@ -183,15 +183,27 @@ impl Phi {
     /// Cross-ref: OCaml `PulseFormulaPhi.add_interval_`.
     pub fn add_interval(&mut self, v: AbstractValue, citv: super::citv::CItv) -> SatUnsat<()> {
         let repr = self.get_repr(v);
-        if let Some(existing) = self.intervals.get(&repr) {
+        let refined = if let Some(existing) = self.intervals.get(&repr) {
             match existing.intersection(&citv) {
                 None => return SatUnsat::Unsat,
-                Some(better) => {
-                    self.intervals.insert(repr, better);
-                }
+                Some(better) => better,
             }
         } else {
-            self.intervals.insert(repr, citv);
+            citv
+        };
+        self.intervals.insert(repr, refined.clone());
+
+        if let super::citv::CItv::Between(
+            super::citv::Bound::Int(lower),
+            super::citv::Bound::Int(upper),
+        ) = refined
+        {
+            if lower == upper
+                && self.get_known_const(repr) != Some(Q::from_integer(lower))
+                && self.and_linear_eq(repr, LinArith::of_int(lower)).is_unsat()
+            {
+                return SatUnsat::Unsat;
+            }
         }
         SatUnsat::Sat(())
     }

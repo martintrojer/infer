@@ -411,6 +411,7 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
     let witness_equivs = build_witness_equivalences(&eqs);
     let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
     let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
+    let reverse_eqs = build_exact_rhs_equivalences(&eqs);
     let affine_env = build_unit_affine_equivalences(&eqs);
 
     let mut normalized = BTreeSet::new();
@@ -430,7 +431,8 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
                 normalized.insert(format!("eq:{lhs}={}", normalize_term_syntax_for_phi(rhs)));
             }
         } else if let Some(term) = parse_is_int_item(item) {
-            for normalized_term in normalize_is_int_terms(term, &eqs, &witness_equivs, &affine_env)
+            for normalized_term in
+                normalize_is_int_terms(term, &eqs, &reverse_eqs, &witness_equivs, &affine_env)
             {
                 normalized.insert(format!("is_int({normalized_term})"));
             }
@@ -571,6 +573,7 @@ fn drop_phi_atoms_redundant_with_conditions(conditions: &[String], phi: &mut Vec
 fn normalize_is_int_terms(
     term: &str,
     eqs: &HashMap<String, String>,
+    reverse_eqs: &HashMap<String, Vec<String>>,
     witness_equivs: &HashMap<String, String>,
     affine_env: &HashMap<String, Vec<AffineExpr>>,
 ) -> BTreeSet<String> {
@@ -579,6 +582,7 @@ fn normalize_is_int_terms(
     normalize_is_int_term(
         term,
         eqs,
+        reverse_eqs,
         witness_equivs,
         affine_env,
         &mut visiting,
@@ -590,6 +594,7 @@ fn normalize_is_int_terms(
 fn normalize_is_int_term(
     term: &str,
     eqs: &HashMap<String, String>,
+    reverse_eqs: &HashMap<String, Vec<String>>,
     witness_equivs: &HashMap<String, String>,
     affine_env: &HashMap<String, Vec<AffineExpr>>,
     visiting: &mut BTreeSet<String>,
@@ -605,8 +610,22 @@ fn normalize_is_int_term(
         return;
     }
 
+    if let Some(lhss) = reverse_eqs.get(&normalize_term_syntax_for_phi(term)) {
+        for lhs in lhss {
+            normalized.insert(normalize_term_for_phi(lhs, affine_env));
+        }
+    }
+
     if let Some(rhs) = eqs.get(term) {
-        normalize_is_int_term(rhs, eqs, witness_equivs, affine_env, visiting, normalized);
+        normalize_is_int_term(
+            rhs,
+            eqs,
+            reverse_eqs,
+            witness_equivs,
+            affine_env,
+            visiting,
+            normalized,
+        );
         visiting.remove(term);
         return;
     }
@@ -622,6 +641,7 @@ fn normalize_is_int_term(
                     normalize_is_int_term(
                         &best.base,
                         eqs,
+                        reverse_eqs,
                         witness_equivs,
                         affine_env,
                         visiting,
@@ -639,6 +659,7 @@ fn normalize_is_int_term(
             normalize_is_int_term(
                 &expr.base,
                 eqs,
+                reverse_eqs,
                 witness_equivs,
                 affine_env,
                 visiting,
@@ -688,6 +709,21 @@ fn build_witness_equivalences(eqs: &HashMap<String, String>) -> HashMap<String, 
             result.insert(rhs.clone(), lhs.clone());
             result.insert(witness, lhs.clone());
         }
+    }
+    result
+}
+
+fn build_exact_rhs_equivalences(eqs: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+    for (lhs, rhs) in eqs {
+        result
+            .entry(normalize_term_syntax_for_phi(rhs))
+            .or_default()
+            .push(lhs.clone());
+    }
+    for lhss in result.values_mut() {
+        lhss.sort();
+        lhss.dedup();
     }
     result
 }
@@ -3381,6 +3417,41 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("lin(1*return,-1")),
             "redundant linear is_int facts should be reduced away"
+        );
+    }
+
+    #[test]
+    fn test_phi_normalization_derives_is_int_from_exact_rhs_equality() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![],
+                post_stack: vec![("return".to_string(), "v1".to_string())],
+                pre_heap: vec![],
+                post_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v7".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v7=lin(1/2*v23)".to_string(),
+                    "is_int(lin(1/2*v23))".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            pre_post.phi.contains(&"is_int(return.*)".to_string()),
+            "exact is_int term equalities should anchor back to the visible summary value"
         );
     }
 }

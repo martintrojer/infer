@@ -18,20 +18,19 @@ use sil::location::Location;
 use sil::procname::Procname;
 use sil::pvar::Pvar;
 use sil::specialization::{HeapPath, PulseSpecialization};
-use sil::typ::Typ;
+use sil::typ::{Typ, TypeDesc, TypeName};
 use sil::var::Var;
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
-use crate::attribute::Attribute;
 use crate::pulse_result::PulseResult;
 
 /// Apply a specialization to an AbductiveDomain.
 ///
 /// For each dynamic type binding in the specialization, walk the heap path
-/// to find or create the abstract value, then set its Closure attribute
-/// to the specified procedure name.
+/// to find or create the abstract value, then add the corresponding dynamic
+/// type constraint to the specialized state.
 ///
 /// Cross-ref: OCaml `PulseSpecialization.apply`.
 pub fn apply(spec: &PulseSpecialization, state: &mut AbductiveDomain) {
@@ -42,11 +41,44 @@ pub fn apply(spec: &PulseSpecialization, state: &mut AbductiveDomain) {
     }
     for (heap_path, type_name) in &spec.dynamic_types {
         let val = initialize_heap_path(heap_path, state);
-        // For C function pointers, the TypeName encodes the procedure name.
-        // Set the Closure attribute so __call_c_function_ptr can resolve it.
-        let pname = Procname::c_from_string(&format!("{type_name}"));
-        state.post.attrs.add_one(val, Attribute::Closure(pname));
+        state.add_dynamic_type_unsafe(val, Typ::mk_struct(type_name.clone()));
     }
+}
+
+fn procname_to_dynamic_type_name(pname: &Procname) -> Option<TypeName> {
+    match pname {
+        Procname::C(sig) => Some(TypeName::CFunction(sig.clone())),
+        Procname::Block(sig) => Some(TypeName::ObjcBlock(sig.clone())),
+        _ => None,
+    }
+}
+
+fn procname_from_dynamic_type_name(type_name: &TypeName) -> Option<Procname> {
+    match type_name {
+        TypeName::CFunction(sig) => Some(Procname::C(sig.clone())),
+        TypeName::ObjcBlock(sig) => Some(Procname::Block(sig.clone())),
+        _ => None,
+    }
+}
+
+fn dynamic_type_name_for_value(state: &AbductiveDomain, value: AbstractValue) -> Option<TypeName> {
+    if let Some(typ) = state.get_dynamic_type(value) {
+        if let TypeDesc::Tstruct(type_name) = typ.desc.as_ref() {
+            return Some(type_name.clone());
+        }
+    }
+    state
+        .get_closure_proc_name(value)
+        .and_then(procname_to_dynamic_type_name)
+}
+
+pub(crate) fn resolve_procname_for_value(
+    state: &AbductiveDomain,
+    value: AbstractValue,
+) -> Option<Procname> {
+    dynamic_type_name_for_value(state, value)
+        .and_then(|type_name| procname_from_dynamic_type_name(&type_name))
+        .or_else(|| state.get_closure_proc_name(value).cloned())
 }
 
 fn prune_eq_list_values(state: &mut AbductiveDomain, alias_group: &[HeapPath]) {
@@ -136,12 +168,11 @@ pub fn make_specialization_from_caller(
             continue;
         };
 
-        // Check the translated caller-side value for a Closure attribute,
-        // using the eval state where eval_const can synthesize one for Cfun.
-        if let Some(pname) = eval_state.get_closure_proc_name(needed_val) {
-            let type_name = sil::typ::TypeName::CStruct(
-                sil::qualified_cpp_name::QualifiedCppName::from_string(format!("{pname}")),
-            );
+        // OCaml specialization keys use dynamic type information, not
+        // exported `Closure(...)` attrs. Fall back to Closure only for direct
+        // constants/closures where the caller has not materialized a separate
+        // dynamic-type fact.
+        if let Some(type_name) = dynamic_type_name_for_value(&eval_state, needed_val) {
             dynamic_types.insert(heap_path.clone(), type_name);
         }
     }
@@ -246,6 +277,7 @@ fn extract_root_pvar(path: &HeapPath) -> Option<&Pvar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribute::Attribute;
     use sil::exp::Exp;
     use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
@@ -321,6 +353,43 @@ mod tests {
         assert!(
             state.path_condition.conditions().is_empty(),
             "specialization equalities should be baked into phi, not exported as caller conditions"
+        );
+    }
+
+    #[test]
+    fn test_apply_dynamic_type_specialization_sets_dynamic_type_without_closure_attr() {
+        let pdesc = make_pdesc("callee", &["f"]);
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal = Pvar::mk(Mangled::from_string("f"), pdesc.proc_name.clone());
+        let funptr_val = state.read_heap(
+            state
+                .post
+                .stack
+                .find(&Var::ProgramVar(Box::new(formal.clone())))
+                .expect("formal should be bound"),
+            Access::Dereference,
+        );
+        let target = Procname::c_from_string("assign_NULL");
+        let spec = PulseSpecialization {
+            aliases: None,
+            dynamic_types: HashMap::from([(
+                formal_value_heap_path(&formal),
+                TypeName::CFunction(match target {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("c procname expected"),
+                }),
+            )]),
+        };
+
+        apply(&spec, &mut state);
+
+        assert_eq!(
+            resolve_procname_for_value(&state, funptr_val),
+            Some(Procname::c_from_string("assign_NULL"))
+        );
+        assert!(
+            state.get_closure_proc_name(funptr_val).is_none(),
+            "specialization should seed dynamic type constraints, not exported Closure attrs"
         );
     }
 
@@ -424,9 +493,66 @@ mod tests {
 
         assert_eq!(
             spec.dynamic_types.get(&needed_path),
-            Some(&sil::typ::TypeName::CStruct(QualifiedCppName::from_string(
-                "assign_NULL"
-            )))
+            Some(&sil::typ::TypeName::CFunction(
+                match Procname::c_from_string("assign_NULL") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("c procname expected"),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_make_specialization_from_caller_uses_dynamic_type_without_closure_attr() {
+        let callee_pdesc = make_pdesc("apply_callback", &["callback"]);
+        let callback_formal = Pvar::mk(
+            Mangled::from_string("callback"),
+            callee_pdesc.proc_name.clone(),
+        );
+        let needed_path = formal_value_heap_path(&callback_formal);
+
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let callback_pvar = Pvar::mk(Mangled::from_string("cb"), caller_pdesc.proc_name.clone());
+        let callback_addr = AbstractValue::mk_fresh();
+        caller_state.post.stack.add(
+            Var::ProgramVar(Box::new(callback_pvar.clone())),
+            callback_addr,
+        );
+        caller_state.add_dynamic_type_unsafe(
+            callback_addr,
+            Typ::mk_struct(TypeName::CFunction(
+                match Procname::c_from_string("assign_NULL") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("c procname expected"),
+                },
+            )),
+        );
+
+        let mut callee_needs = HashMap::new();
+        callee_needs.insert(needed_path.clone(), AbstractValue::mk_fresh());
+
+        let spec = make_specialization_from_caller(
+            &callee_needs,
+            &caller_state,
+            &[(callback_formal, AbstractValue::mk_fresh())],
+            &[Typ::mk_ptr(Typ::void())],
+            &[(Exp::Lvar(callback_pvar), Typ::mk_ptr(Typ::void()))],
+        )
+        .expect("expected dynamic-type specialization from caller state");
+
+        assert_eq!(
+            spec.dynamic_types.get(&needed_path),
+            Some(&TypeName::CFunction(
+                match Procname::c_from_string("assign_NULL") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("c procname expected"),
+                }
+            ))
         );
     }
 }

@@ -2,21 +2,44 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries, with a current verified per-procedure checkpoint of `Matching: 17`, `Differences: 4`. The remaining diffs are all specialized-summary mismatches in `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad`. Recent OCaml-backed correctness work that stays in place routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback instead of the unresolved-funptr path, imports callee `is_int(...)` facts during summary application, preserves the existing latent-invalid-access export/import parity work, and extends the comparator to deterministic specialization keys plus semantic normalization of witness inequalities and unit-affine integer facts. The remaining `invoke` / `invoke_itself_bad` drift looks like real analyzer mismatch rather than comparator noise: OCaml `PulseSpecialization.apply` uses `PulseArithmetic.and_dynamic_type_is_unsafe`, while Rust still seeds `Closure(...)` attrs on the specialized heap-path value. `may_double_free_if_alias` still differs by exporting an extra latent diagnostic on the alias-specialized branch, and `two_pointers_recursion_bad` still differs on invalid/int export shape inside the recursive alias specialization. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries, with a current verified per-procedure checkpoint of `Matching: 19`, `Differences: 2`. The remaining diffs are `invoke_itself_bad` and `two_pointers_recursion_bad`. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing pointee cells for bare pointer/function-value unknown-call actuals before havoc, records `ReturnedFromUnknown(actuals)` on unknown-call returns, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, unit-affine `is_int(...)`, exact-RHS `is_int(...)` anchoring). `invoke` and `may_double_free_if_alias` now match. The remaining `invoke_itself_bad` delta is a real recursive specialized-summary shape mismatch, while `two_pointers_recursion_bad` is down to affine `is_int(...)` comparison drift. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
 
 Recent correctness / robustness fixes:
-- Specialized-summary comparison widened again:
-  `crates/test-harness/src/summary_compare.rs` and
-  `crates/pulse/tests/end_to_end.rs` now compare canonicalized specialized
-  summaries alongside `main.pre_post_list`, keyed by deterministic
-  specialization strings. The same pass also keeps resolved
-  `__call_c_function_ptr` targets without summaries on the direct-call unknown
-  fallback path and preserves imported callee `is_int(...)` facts. Verified
-  checkpoint on the current tree:
-  main summaries match for all `21 / 21` procedures, while the widened
-  per-procedure harness is `Matching: 17`, `Differences: 4`, with remaining
-  specialized-only diffs in `invoke`, `invoke_itself_bad`,
-  `may_double_free_if_alias`, and `two_pointers_recursion_bad`.
+- Function-pointer specialization now uses OCaml-style dynamic types end to
+  end: `abductive.rs` tracks known dynamic types and rewrites them through
+  equalities, `specialization.rs` applies `TypeName::CFunction(...)` /
+  `TypeName::ObjcBlock(...)` bindings instead of seeding exported
+  `Closure(...)` attrs, and `checker.rs` resolves `__call_c_function_ptr`
+  through dynamic type first and treats an already-known dynamic type as
+  satisfying `need_dynamic_type_specialization`. Focused regressions pin down
+  the new shape
+  (`test_and_equal_substitutes_heap_attrs_and_sets`,
+  `test_apply_dynamic_type_specialization_sets_dynamic_type_without_closure_attr`,
+  `test_make_specialization_from_caller_uses_dynamic_type_without_closure_attr`,
+  `test_exec_call_c_function_ptr_dynamic_type_target_without_summary_uses_direct_unknown_call`),
+  and `invoke` now matches OCaml again.
+- Specialized-summary parity tightened again:
+  unknown-call fallback now materializes missing pointee cells for bare
+  pointer and bare `Tfun` actuals before havoc, unknown-call returns record
+  `ReturnedFromUnknown(actuals)`, specialized latent abort diagnostics are
+  cached sideband and reified on apply, summary normalization recreates
+  caller-visible non-zero `Invalid(ConstantDereference(k))` attrs when a value
+  is only known constant through phi, and the comparator now anchors exact-RHS
+  `is_int(...)` equalities back to visible summary values. Focused regressions
+  pin down those behaviors
+  (`test_unknown_call_function_value_materializes_missing_pointee_before_havoc`,
+  `test_unknown_call_return_records_returned_from_unknown_actuals`,
+  `test_add_specialized_summary_strips_latent_abort_diagnostic_from_cached_pre_post`,
+  `test_normalize_materializes_nonzero_constant_invalid_for_visible_value`,
+  `test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value`,
+  `test_phi_normalization_derives_is_int_from_exact_rhs_equality`), and the
+  ignored `specialization.c` comparator now sits at `Matching: 19`,
+  `Differences: 2`. The remaining deltas are:
+  `invoke_itself_bad` still misses pre `f.* -*-> f.*.*`, misses post
+  `f.*.*:[Initialized, WrittenTo]`, and keeps an extra phi atom
+  `atom:0 < lin(1*v2,const=2)`; `two_pointers_recursion_bad` is now down to
+  `main[1]` extra `is_int(v1)` plus
+  `specialized[alias: *x = *y][1]` missing `is_int(return.*)`.
 - Summary-comparison normalization tightened again:
   `crates/test-harness/src/summary_compare.rs` now canonicalizes the OCaml
   restricted-witness inequalities emitted by
@@ -434,7 +457,7 @@ Pulse analysis engine. Depends on `sil`, `diagnostics`, `num-rational`. See [PUL
 | `base_memory.rs` | `PulseBaseMemory.ml` | AbstractValue → Edges heap graph |
 | `base_attrs.rs` | `PulseBaseAddressAttributes.ml` | AbstractValue → Attributes map, check_valid |
 | `base_domain.rs` | `PulseBaseDomain.ml` | Composite {stack, heap, attrs} |
-| `abductive.rs` | `PulseAbductiveDomain.ml` | Post-state + formula, validity checking, OCaml-style `NewEq` incorporation |
+| `abductive.rs` | `PulseAbductiveDomain.ml` | Post-state + formula, validity checking, OCaml-style `NewEq` incorporation, known dynamic-type tracking for specialization |
 | `value_history.rs` | `PulseValueHistory.ml` + `PulseTrace.ml` | Minimal invalid-access provenance paths, formal-to-actual substitution, history-sensitive dedup support |
 | `operations.rs` | `PulseOperations.ml` | eval, eval_deref, write_deref, check_addr_access, eval_or_fresh |
 | `transfer.rs` | `Pulse.ml` | SIL instruction → state transition. Prune, UnOp folding (LNot/Neg/BNot), path sensitivity |
@@ -442,11 +465,11 @@ Pulse analysis engine. Depends on `sil`, `diagnostics`, `num-rational`. See [PUL
 | `models/c.rs` | `PulseModelsC.ml` | C models: malloc/free, new/delete, exit/abort (noreturn), fopen (null/non-null), 18 stdio arg-validity checks |
 | `models/configured.rs` | `PulseModelsImport.ml` | Generic config-driven models: abort, unreachable, return-{nonnull,this,first-arg,nullable}, skip-pattern, unknown-pure |
 | `summary.rs` | `PulseSummary.ml` | PulseSummary with Vec<PrePost> (multi-disjunct), specialized summaries, needs_specialization HeapPaths, is_noreturn flag |
-| `specialization.rs` | `PulseSpecialization.ml` | apply() binds HeapPaths to Closure attrs, make_specialization_from_caller(), eval_for_prune |
+| `specialization.rs` | `PulseSpecialization.ml` | apply() binds HeapPaths to dynamic-type constraints, make_specialization_from_caller(), eval_for_prune |
 | `interproc.rs` | `PulseInterproc.ml` | apply_summary: callee→caller effect propagation, formal-value mapping for write-through-pointer, preserve abort summaries |
 | `diagnostic.rs` | `PulseDiagnostic.ml` | History-aware AccessToInvalidAddress, MemoryLeak, RetainCycle |
 | `execution_domain.rs` | `PulseExecutionDomain.ml` | ContinueProgram, AbortProgram, ExitProgram |
-| `checker.rs` | `Pulse.ml` + `PulseCallOperations.ml` | analyze, analyze_with_specialization, select_pre_posts, __call_c_function_ptr dispatch, propagate_specialization_need |
+| `checker.rs` | `Pulse.ml` + `PulseCallOperations.ml` | analyze, analyze_with_specialization, select_pre_posts, dynamic-type-aware `__call_c_function_ptr` dispatch, propagate_specialization_need |
 
 ### ondemand crate
 Parallel analysis runner. Depends on `sil`, `absint`, `rayon`, `dashmap`.
@@ -489,7 +512,7 @@ Shared test infrastructure. Depends on `sil`, `textual`, `serde_json`.
 9. **Interprocedural via ondemand**: CLI wires Pulse as an `InterChecker` into the ondemand runner. Bottom-up call graph scheduling ensures callee summaries are available before callers. Parallel via rayon.
 10. **Disjunctive interpreter**: `DisjunctiveDomain<D>` in absint implements `AbstractDomain` with join=union, widen=stop-after-N, leq=subset. Pulse checker uses `compute_fixpoint_wto` with this domain, matching OCaml's `MakeDisjunctive(PulseTransferFunctions)` exactly. No custom iteration loops.
 11. **Configuration**: `config` crate with global `OnceLock<InferConfig>`. Set once at startup via `config::init()`, read anywhere via `config::get()`. Supports `.inferconfig` JSON (OCaml-compatible, unknown fields ignored). `#[serde(rename)]` is the single source of truth for flag names.
-12. **Summary specialization**: `sil::specialization` (HeapPath, PulseSpecialization) mirrors `IR/Specialization.ml`. `pulse::specialization::apply()` now supports alias groups as well as dynamic types, so aliased actuals can be re-analyzed with the correct heap semantics before dispatch/reporting. Recursive specialization through multi-level call chains. `needs_specialization` propagation from callees to callers enables the ultimate caller (with known Closure) to trigger the chain. `eval_for_prune` evaluates constants without Invalid marking for comparison contexts. Cross-ref: `PulseSpecialization.ml`, `PulseCallOperations.ml` iter_call, `Pulse.ml` analyze with specialization.
+12. **Summary specialization**: `sil::specialization` (HeapPath, PulseSpecialization) mirrors `IR/Specialization.ml`. `pulse::specialization::apply()` now supports alias groups as well as dynamic types, so aliased actuals can be re-analyzed with the correct heap semantics before dispatch/reporting. Dynamic-type requests now follow OCaml's path-condition-driven shape instead of inventing exported `Closure(...)` attrs on specialized heap paths; callers can satisfy specialization either from known dynamic types or direct closure/Cfun values. Recursive specialization through multi-level call chains. `needs_specialization` propagation from callees to callers enables the ultimate caller to trigger the chain. `eval_for_prune` evaluates constants without Invalid marking for comparison contexts. Cross-ref: `PulseSpecialization.ml`, `PulseCallOperations.ml` iter_call, `Pulse.ml` analyze with specialization.
 13. **Call graph Cfun scanning**: `CallGraph::from_cfg` scans ALL Cfun references in ALL expressions (Store values, Call args, Load expressions), not just Call.fun_exp. Captures function pointer targets for dependency scheduling.
 14. **Biabduction formal-value mapping**: `apply_summary` maps each formal's loaded value (one deref from stack) to the actual value, ensuring write-through-pointer patterns propagate correctly. Without this, writes go one indirection level too deep.
 

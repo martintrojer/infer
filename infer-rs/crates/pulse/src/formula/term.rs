@@ -56,7 +56,13 @@ impl Term {
     pub fn as_const(&self) -> Option<i64> {
         match self {
             Term::Const(c) => Some(*c),
-            _ => None,
+            Term::Add(a, b) => Some(a.as_const()? + b.as_const()?),
+            Term::Sub(a, b) => Some(a.as_const()? - b.as_const()?),
+            Term::Mult(a, b) => Some(a.as_const()? * b.as_const()?),
+            Term::Neg(t) => Some(-t.as_const()?),
+            Term::Not(t) => Some(if t.as_const()? == 0 { 1 } else { 0 }),
+            Term::IsZero(t) => Some(if t.as_const()? == 0 { 1 } else { 0 }),
+            Term::Var(_) => None,
         }
     }
 
@@ -134,5 +140,37 @@ impl fmt::Display for Term {
             Term::Not(t) => write!(f, "!{t}"),
             Term::IsZero(t) => write!(f, "({t} == 0)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Term;
+
+    #[test]
+    fn test_as_const_folds_nested_constant_terms() {
+        assert_eq!(
+            Term::Add(Box::new(Term::Const(0)), Box::new(Term::Const(1))).as_const(),
+            Some(1)
+        );
+        assert_eq!(
+            Term::Sub(
+                Box::new(Term::Const(5)),
+                Box::new(Term::Add(
+                    Box::new(Term::Const(2)),
+                    Box::new(Term::Const(1))
+                )),
+            )
+            .as_const(),
+            Some(2)
+        );
+        assert_eq!(
+            Term::Not(Box::new(Term::Sub(
+                Box::new(Term::Const(1)),
+                Box::new(Term::Const(1)),
+            )))
+            .as_const(),
+            Some(1)
+        );
     }
 }

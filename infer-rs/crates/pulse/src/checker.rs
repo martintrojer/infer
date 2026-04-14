@@ -485,6 +485,7 @@ struct KnownCalleeCall<'a> {
 #[derive(Clone)]
 struct SelectedSummary<'a> {
     pre_posts: &'a [crate::summary::PrePost],
+    latent_abort_diagnostics: Option<&'a [Option<Diagnostic>]>,
     specialization: PulseSpecialization,
     has_dropped_disjuncts: bool,
 }
@@ -599,8 +600,8 @@ fn is_pointer_to_function(typ: &sil::typ::Typ) -> bool {
 ///
 /// Strategy: for each heap path in needs_specialization, find the formal
 /// Pvar at the root, map it to the corresponding actual, evaluate the
-/// actual to get the caller's abstract value, and if it doesn't have a
-/// Closure attribute, propagate the need.
+/// actual to get the caller's abstract value, and if it doesn't already carry
+/// known dynamic-type information, propagate the need.
 ///
 /// Cross-ref: OCaml PulseCallOperations.ml propagation of needs_from_caller.
 fn propagate_specialization_need(
@@ -623,8 +624,14 @@ fn propagate_specialization_need(
                     if let Some((actual_exp, _)) = actuals.get(i) {
                         let actual_val =
                             crate::operations::eval_or_fresh(actual_exp, loc, caller_state);
-                        // Only propagate if the caller doesn't have a Closure for this
-                        if caller_state.get_closure_proc_name(actual_val).is_none() {
+                        // Only propagate if the caller does not already know
+                        // a dynamic type / direct target for this value.
+                        if crate::specialization::resolve_procname_for_value(
+                            caller_state,
+                            actual_val,
+                        )
+                        .is_none()
+                        {
                             caller_state.add_need_dynamic_type_specialization(actual_val);
                         }
                     }
@@ -736,6 +743,7 @@ fn select_pre_posts_and_specialization<'a>(
         if let Some(specialized) = callee_summary.get_specialized_data(spec) {
             return SelectedSummary {
                 pre_posts: &specialized.pre_posts,
+                latent_abort_diagnostics: Some(&specialized.latent_abort_diagnostics),
                 specialization: spec.clone(),
                 has_dropped_disjuncts: specialized.has_dropped_disjuncts,
             };
@@ -744,6 +752,7 @@ fn select_pre_posts_and_specialization<'a>(
 
     SelectedSummary {
         pre_posts: &callee_summary.pre_posts,
+        latent_abort_diagnostics: None,
         specialization: PulseSpecialization::bottom(),
         has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
     }
@@ -769,6 +778,7 @@ fn apply_pre_posts_with_specialization_loop(
     let callee_pname = known_callee.callee_pname;
     let callee_summary = known_callee.callee_summary;
     let mut current_pre_posts = initial_summary.pre_posts;
+    let mut current_latent_abort_diagnostics = initial_summary.latent_abort_diagnostics;
     let mut current_spec = initial_summary.specialization;
     let mut current_has_dropped_disjuncts = initial_summary.has_dropped_disjuncts;
     let mut tried_specs: Vec<PulseSpecialization> = Vec::new();
@@ -790,6 +800,19 @@ fn apply_pre_posts_with_specialization_loop(
         let mut results = Vec::new();
         let mut alias_groups = Vec::new();
         for (j, pre_post) in current_pre_posts.iter().enumerate() {
+            let effective_pre_post = current_latent_abort_diagnostics
+                .and_then(|diagnostics| diagnostics.get(j))
+                .and_then(|diag| diag.as_ref())
+                .filter(|_| {
+                    pre_post.kind == crate::summary::PrePostKind::LatentAbortProgram
+                        && pre_post.diagnostic.is_none()
+                })
+                .map(|diag| {
+                    let mut recovered = pre_post.clone();
+                    recovered.diagnostic = Some(diag.clone());
+                    recovered
+                });
+            let pre_post = effective_pre_post.as_ref().unwrap_or(pre_post);
             let outcome = crate::interproc::apply_summary_with_aliasing(
                 pdesc,
                 pre_post,
@@ -844,6 +867,7 @@ fn apply_pre_posts_with_specialization_loop(
             log::debug!("  [call] retrying {callee_pname} with alias specialization {next_spec}");
             current_spec = next_spec;
             current_pre_posts = &specialized.pre_posts;
+            current_latent_abort_diagnostics = Some(&specialized.latent_abort_diagnostics);
             current_has_dropped_disjuncts = specialized.has_dropped_disjuncts;
             continue;
         }
@@ -874,6 +898,7 @@ fn exec_known_callee_summary(
     let callee_pname = known_callee.callee_pname;
     let callee_summary = known_callee.callee_summary;
     let caller_spec = infer_caller_specialization(callee_summary, args, &state);
+
     if let Some(spec) = caller_spec.clone() {
         queue_specialization_request(spec_requests, callee_pname, callee_summary, spec);
     }
@@ -1051,12 +1076,16 @@ fn exec_call_c_function_ptr(
         std::iter::once(funptr_val).chain(actual_arg_values.iter().copied()),
     );
 
-    // Look up the Closure attribute to find the target procname
+    // Resolve the target from dynamic type information first, then fall back
+    // to direct Closure attrs for concrete Cfun / closure values.
     log::debug!(
-        "  [call_c_function_ptr] funptr_val={funptr_val}, closure={:?}",
-        state.get_closure_proc_name(funptr_val)
+        "  [call_c_function_ptr] funptr_val={funptr_val}, dynamic_type={:?}, closure={:?}",
+        state.get_dynamic_type(funptr_val),
+        state.get_closure_proc_name(funptr_val),
     );
-    if let Some(target_pname) = state.get_closure_proc_name(funptr_val).cloned() {
+    if let Some(target_pname) =
+        crate::specialization::resolve_procname_for_value(&state, funptr_val)
+    {
         // Resolved! Dispatch as a direct call to the target procedure.
         // First check models
         if crate::models::has_model(&target_pname) {
@@ -1308,6 +1337,7 @@ mod tests {
                         kind: PrePostKind::ContinueProgram,
                         diagnostic: None,
                     }],
+                    latent_abort_diagnostics: vec![None],
                     has_dropped_disjuncts: false,
                 },
             )]
@@ -1800,6 +1830,111 @@ mod tests {
     }
 
     #[test]
+    fn test_exec_call_c_function_ptr_dynamic_type_target_without_summary_uses_direct_unknown_call()
+    {
+        let caller_pname = Procname::c_from_string("invoke");
+        let mut pdesc = Procdesc::new(
+            caller_pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        pdesc.formals = vec![
+            (
+                Mangled::from_string("f"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("i"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+        ];
+
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let f_pvar = Pvar::mk(Mangled::from_string("f"), caller_pname.clone());
+        let f_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(f_pvar)))
+            .unwrap();
+        let funptr_val = state.read_heap(f_addr, Access::Dereference);
+        state.add_dynamic_type_unsafe(
+            funptr_val,
+            Typ::mk_struct(sil::typ::TypeName::CFunction(
+                match Procname::c_from_string("recursive_target") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("c procname expected"),
+                },
+            )),
+        );
+
+        let i_pvar = Pvar::mk(Mangled::from_string("i"), caller_pname);
+        let i_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(i_pvar)))
+            .unwrap();
+        let arg_val = state.read_heap(i_addr, Access::Dereference);
+
+        let fp_id = Ident::create_normal(IdentName::from_string("fp"), 0);
+        crate::operations::write_id(&fp_id, funptr_val, &mut state);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 1);
+        crate::operations::write_id(&arg_id, arg_val, &mut state);
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 2);
+
+        let args = vec![
+            (Exp::Var(fp_id), Typ::mk_ptr(Typ::void())),
+            (Exp::Var(arg_id), Typ::int(sil::typ::IKind::IInt)),
+        ];
+        let requests = RefCell::new(Vec::new());
+        let call_flags = sil::call_flags::CallFlags::default();
+
+        let results = exec_call_c_function_ptr(
+            CallSite {
+                pdesc: &pdesc,
+                ret_id: &ret_id,
+                ret_typ: &Typ::int(sil::typ::IKind::IInt),
+                args: &args,
+                loc: &Location::dummy(),
+                call_flags: &call_flags,
+                spec_requests: Some(&requests),
+            },
+            state,
+            &HashMap::new(),
+        );
+
+        let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
+            panic!(
+                "expected dynamic-type-resolved target without summary to keep one continue state, got {results:?}"
+            );
+        };
+
+        assert!(
+            !state.need_dynamic_type_specialization.contains(&funptr_val),
+            "resolved dynamic type should satisfy specialization without a new request"
+        );
+        assert!(
+            state.get_closure_proc_name(funptr_val).is_none(),
+            "dynamic-type-driven resolution should not require a Closure attr"
+        );
+
+        let ret_val = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return id should be written");
+        assert!(
+            state.path_condition.phi().is_marked_int(ret_val),
+            "integer return type should keep the is_int fact on the fallback result"
+        );
+
+        let fn_apps: Vec<_> = state.path_condition.phi().iter_fn_app_eqs().collect();
+        assert_eq!(fn_apps.len(), 1);
+        assert_eq!(fn_apps[0].0.callee, "recursive_target");
+    }
+
+    #[test]
     fn test_exec_instr_direct_self_recursion_uses_unknown_call_fallback() {
         let pname = Procname::c_from_string("self_rec");
         let mut pdesc = Procdesc::new(
@@ -1891,6 +2026,92 @@ mod tests {
                 .iter()
                 .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
             "recursive unknown-call fallback should not mark integer leaves WrittenTo"
+        );
+    }
+
+    #[test]
+    fn test_exec_instr_direct_self_recursion_materializes_function_pointer_pointee_shape() {
+        let pname = Procname::c_from_string("self_rec_funptr");
+        let funptr_typ = Typ::mk_ptr(Typ::void());
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![
+            (
+                Mangled::from_string("f"),
+                funptr_typ.clone(),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("i"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+        ];
+
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let f_pvar = Pvar::mk(Mangled::from_string("f"), pname.clone());
+        let f_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(f_pvar)))
+            .expect("formal f should be bound");
+        let funptr_val = state.read_heap(f_root, Access::Dereference);
+        assert!(
+            state.pre.heap.get_edges(funptr_val).is_some(),
+            "loading the function pointer formal should register its pointee root in pre"
+        );
+        assert!(
+            state
+                .pre
+                .heap
+                .find_edge(funptr_val, &Access::Dereference)
+                .is_none(),
+            "the recursive function-value pointee should start unmaterialized"
+        );
+
+        let i_pvar = Pvar::mk(Mangled::from_string("i"), pname.clone());
+        let i_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(i_pvar)))
+            .expect("formal i should be bound");
+        let i_val = state.read_heap(i_root, Access::Dereference);
+
+        let fp_id = Ident::create_normal(IdentName::from_string("fp"), 0);
+        crate::operations::write_id(&fp_id, funptr_val, &mut state);
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 1);
+        crate::operations::write_id(&arg_id, i_val, &mut state);
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 2);
+
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::void()),
+            fun_exp: Exp::Const(Const::Cfun(pname)),
+            args: vec![
+                (Exp::Var(fp_id), funptr_typ),
+                (Exp::Var(arg_id), Typ::int(sil::typ::IKind::IInt)),
+            ],
+            loc: Location::dummy(),
+            flags: sil::call_flags::CallFlags::default(),
+        };
+
+        let results = exec_instr_with_summaries(&pdesc, &instr, state, &HashMap::new(), None);
+        let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
+            panic!("expected direct self recursion to keep one continue state, got {results:?}");
+        };
+
+        let pre_target = state
+            .pre
+            .heap
+            .find_edge(funptr_val, &Access::Dereference)
+            .expect("recursive unknown-call fallback should materialize a pre funptr pointee");
+        let post_target = state
+            .post
+            .heap
+            .find_edge(funptr_val, &Access::Dereference)
+            .expect("recursive unknown-call fallback should keep a post funptr pointee");
+        assert_ne!(
+            state.path_condition.get_var_repr(pre_target),
+            state.path_condition.get_var_repr(post_target),
+            "recursive unknown-call fallback should preserve the overwritten pre/post funptr shape"
         );
     }
 

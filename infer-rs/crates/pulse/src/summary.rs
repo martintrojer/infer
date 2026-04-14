@@ -65,6 +65,10 @@ pub struct PulseSummary {
 #[derive(Clone, Debug)]
 pub struct SpecializedSummary {
     pub pre_posts: Vec<PrePost>,
+    /// Specialized latent aborts stay latent in the cached summary, like
+    /// OCaml's `LatentAbortProgram {latent_issue; ...}`. Keep the issue
+    /// sideband here so callers can still reify it when applying the summary.
+    pub latent_abort_diagnostics: Vec<Option<Diagnostic>>,
     pub has_dropped_disjuncts: bool,
 }
 
@@ -325,6 +329,63 @@ impl PrePost {
             .collect()
     }
 
+    /// Cross-ref: OCaml normal evaluation records every integer literal as
+    /// `Invalid(ConstantDereference k)`. When a caller-visible summary value is
+    /// only known equal to a constant through phi (for example after
+    /// specialization or recursive summary application), recreate the same
+    /// exported attr on the final summary surface.
+    fn materialize_visible_constant_invalidations(
+        &mut self,
+        reachable: &std::collections::HashSet<AbstractValue>,
+    ) {
+        let mut materialized = Vec::new();
+
+        for addr in reachable {
+            let repr = self.post.path_condition.get_var_repr(*addr);
+            let Some(q) = self.post.path_condition.is_known_const(repr) else {
+                continue;
+            };
+            if !q.is_integer() {
+                continue;
+            }
+
+            let constant = *q.numer() / *q.denom();
+            if constant == 0 {
+                continue;
+            }
+
+            if self
+                .post
+                .post
+                .attrs
+                .get(&repr)
+                .is_some_and(|attrs| attrs.get_invalid().is_some())
+            {
+                continue;
+            }
+
+            let invalidation =
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(constant));
+            let history = self.post.history_of_value(repr).unwrap_or_default();
+            let location = history
+                .last_location()
+                .cloned()
+                .unwrap_or_else(sil::location::Location::dummy);
+            let history = history.append_event(HistoryEvent::Invalidated {
+                invalidation: invalidation.clone(),
+                location,
+            });
+            materialized.push((
+                repr,
+                crate::attribute::Attribute::Invalid(invalidation, history),
+            ));
+        }
+
+        for (addr, attr) in materialized {
+            self.post.post.attrs.add_one(addr, attr);
+        }
+    }
+
     /// Normalize the summary by discarding unreachable state.
     ///
     /// Matches OCaml's `discard_unreachable_ ~for_summary:true` which trims
@@ -446,6 +507,7 @@ impl PrePost {
         self.post
             .path_condition
             .simplify_for_summary(&precondition_vocabulary, &formula_reachable);
+        self.materialize_visible_constant_invalidations(&post_canonical_reachable);
 
         leaks
     }
@@ -749,6 +811,17 @@ impl PulseSummary {
         // itself. Keep them on the owning summary, and strip manifest abort
         // diagnostics from the cached specialized pre/posts so callers do not
         // report the same issue again for each call context.
+        let latent_abort_diagnostics: Vec<_> = summary
+            .pre_posts
+            .iter_mut()
+            .map(|pre_post| {
+                if pre_post.kind == PrePostKind::LatentAbortProgram {
+                    pre_post.diagnostic.take()
+                } else {
+                    None
+                }
+            })
+            .collect();
         let latent_keys: std::collections::HashSet<_> = summary
             .pre_posts
             .iter()
@@ -759,6 +832,7 @@ impl PulseSummary {
                 )
             })
             .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+            .chain(latent_abort_diagnostics.iter().filter_map(Option::as_ref))
             .map(Diagnostic::dedup_key)
             .collect();
         let mut seen: std::collections::HashSet<_> =
@@ -778,6 +852,7 @@ impl PulseSummary {
             spec,
             SpecializedSummary {
                 pre_posts: summary.pre_posts,
+                latent_abort_diagnostics,
                 has_dropped_disjuncts: summary.has_dropped_disjuncts,
             },
         ));
@@ -2743,6 +2818,104 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_materializes_nonzero_constant_invalid_for_visible_value() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let result = AbstractValue::of_raw(2);
+
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, result);
+        astate.initialize(return_addr);
+        astate.initialize(result);
+        assert!(astate.path_condition.and_equal_const(result, 1).is_sat());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(result),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        let attrs = pp
+            .post
+            .post
+            .attrs
+            .get(&result)
+            .expect("visible summary value should keep exported attrs");
+        assert!(
+            attrs.iter().any(|attr| matches!(
+                attr,
+                crate::attribute::Attribute::Invalid(
+                    crate::invalidation::Invalidation::ConstantDereference(value),
+                    _
+                ) if *value == IntLit::one()
+            )),
+            "summary export should recreate OCaml's constant invalidation surface for visible non-zero values"
+        );
+    }
+
+    #[test]
+    fn test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let result = AbstractValue::of_raw(2);
+
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, result);
+        astate.initialize(return_addr);
+        astate.initialize(result);
+        assert!(astate.path_condition.and_equal_const(result, 0).is_sat());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(result),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        let attrs = pp
+            .post
+            .post
+            .attrs
+            .get(&result)
+            .expect("visible summary value should keep exported attrs");
+        assert!(
+            !attrs.iter().any(|attr| matches!(
+                attr,
+                crate::attribute::Attribute::Invalid(
+                    crate::invalidation::Invalidation::ConstantDereference(_),
+                    _
+                )
+            )),
+            "summary export should leave zero-specific invalidation handling to the existing null-deref paths"
+        );
+    }
+
+    #[test]
     fn test_is_manifest_ignores_local_prune_on_formal_value() {
         let (_pdesc, mut pre_post, formal_val) = make_abort_pre_post_with_formal("x");
         let _ = pre_post
@@ -3793,6 +3966,59 @@ mod tests {
         assert!(
             summary.diagnostics.is_empty(),
             "latent specialized diagnostics should stay latent and not be published on the owner"
+        );
+    }
+
+    #[test]
+    fn test_add_specialized_summary_strips_latent_abort_diagnostic_from_cached_pre_post() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let _ = astate
+            .path_condition
+            .and_condition_direct(Atom::Equal(Term::Var(formal_val), Term::Const(4)), 1);
+
+        let diagnostic = dummy_invalid_access_diagnostic(
+            formal_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
+        let specialized = PulseSummary {
+            pre_posts: vec![PrePost {
+                pre: astate.pre.clone(),
+                post: astate,
+                formals: vec![(pvar, formal_addr)],
+                result: None,
+                kind: PrePostKind::LatentAbortProgram,
+                diagnostic: Some(diagnostic.clone()),
+            }],
+            has_dropped_disjuncts: false,
+            specialized: vec![],
+            diagnostics: vec![],
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: false,
+            formal_types: vec![],
+        };
+
+        let mut summary = PulseSummary::intra_only(vec![]);
+        let spec = PulseSpecialization::bottom();
+        summary.add_specialized_summary(spec.clone(), specialized);
+
+        let stored = summary
+            .get_specialized_data(&spec)
+            .expect("specialized summary should be stored");
+        assert_eq!(stored.pre_posts.len(), 1);
+        assert!(
+            stored.pre_posts[0].diagnostic.is_none(),
+            "cached latent abort pre/posts should export no concrete diagnostic, matching OCaml latent_issue serialization"
+        );
+        assert_eq!(
+            stored.latent_abort_diagnostics,
+            vec![Some(diagnostic)],
+            "latent abort issue should remain available for caller-side reification"
         );
     }
 

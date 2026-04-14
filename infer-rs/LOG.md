@@ -5,69 +5,156 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
-- Current dirty work (not committed yet):
-  - `crates/pulse/src/checker.rs`
-    - resolved `__call_c_function_ptr` targets with no available summary now
-      use the direct-call unknown fallback instead of the unresolved-funptr
-      fallback
-    - direct self-recursive known calls with no available summary now also use
-      the ordinary known-call unknown fallback, matching the OCaml control flow
-      after `PulseCallOperations.on_recursive_call`
-    - effect:
-      - no spurious `UnknownEffect` on integer actuals
-      - no bogus dynamic-type-specialization request once the closure target is
-        already known
-      - integer-return fallback keeps the pure-call + `is_int(...)` facts that
-        OCaml carries through these unresolved-summary edges
+- Current parity checkpoint:
+  - main summaries: `21 / 21` procedures match
+  - specialized summary harness: `Matching: 19`, `Differences: 2`
+  - remaining specialized-only diffs:
+    - `invoke_itself_bad`
+    - `two_pointers_recursion_bad`
+- Current root-cause hypotheses:
+  - `invoke_itself_bad`
+    - the old missing caller-visible
+      `Invalid(ConstantDereference(1))` gap is fixed
+    - the remaining delta is still real on the Rust side:
+      specialized recursive branch misses pre `f.* -*-> f.*.*`,
+      misses post `f.*.*:[Initialized, WrittenTo]`, and keeps extra phi
+      `atom:0 < lin(1*v2,const=2)`
+    - important negative result:
+      generic unknown-call / direct-self-recursion materialization is not the
+      root cause anymore; focused regressions now prove both the generic
+      unknown-call function-value path and the direct self-recursive fallback
+      materialize the pre/post funptr pointee shape in isolation
+  - `two_pointers_recursion_bad`
+    - the real missing specialized recursive
+      `Invalid(ConstantDereference(1))` gap is fixed
+    - remaining drift is now in `is_int(...)` comparison/canonicalization:
+      `main[1]` has extra `is_int(v1)` and
+      `specialized[alias: *x = *y][1]` is still missing
+      `is_int(return.*)`
+- Immediate next steps:
+  - remaining real summary gap:
+    - `invoke_itself_bad`
+      - specialized recursive branch still misses pre
+        `f.* -*-> f.*.*` and post attrs `f.*.*:[Initialized, WrittenTo]`
+      - current negative result:
+        - generic unknown-call / direct-self-recursion materialization is not
+          the root cause anymore
+        - fresh regressions now prove both:
+          - unknown-call function values materialize pre/post pointee shape
+          - direct self-recursive fallback with a function-pointer actual
+            materializes that shape too
+      - likely next target:
+        - specialized-path-specific state before summary export
+          (`invoke_itself_bad` after resolved `__call_c_function_ptr(id, i)`,
+          before / during recursive-call fallback)
+  - remaining semantic-comparison gap:
+    - `two_pointers_recursion_bad`
+      - current comparator delta:
+        - `main[1]` extra `is_int(v1)`
+        - `specialized[alias: *x = *y][1]` missing `is_int(return.*)`
+      - important current result:
+        - the real Rust summary/export gap on missing
+          `Invalid(ConstantDereference(1))` is fixed
+        - remaining drift is now in `is_int(...)` normalization over
+          non-unit linear equalities
+      - likely next target:
+        - extend comparator `is_int` closure reasoning through affine
+          equalities such as `x = 1/2 * return` and `return = 2 * x`
+          without reintroducing the earlier over-derived integer facts
+  - current validation set for this checkpoint:
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p test-harness test_phi_normalization_derives_is_int_from_exact_rhs_equality -- --nocapture`
+    - `cargo test -q -p pulse test_normalize_materializes_nonzero_constant_invalid_for_visible_value -- --nocapture`
+    - `cargo test -q -p pulse test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value -- --nocapture`
+    - `cargo test -q -p pulse test_unknown_call_function_value_materializes_missing_pointee_before_havoc -- --nocapture`
+    - `cargo test -q -p pulse test_exec_instr_direct_self_recursion_materializes_function_pointer_pointee_shape -- --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
+
+- Current checkpoint work:
+  - `crates/pulse/src/abductive.rs`
+    - added dynamic-type tracking on abstract values
+    - substitution now rewrites those dynamic types through equalities
     - focused regression:
+      - `test_and_equal_substitutes_heap_attrs_and_sets`
+  - `crates/pulse/src/specialization.rs`
+    - specialization apply now adds OCaml-style dynamic types instead of
+      seeding exported `Closure(...)` attrs
+    - specialization inference now reads dynamic type information from caller
+      state, falling back to direct closure attrs only for real closure/Cfun
+      values
+    - specialization requests now encode C callbacks as
+      `TypeName::CFunction(...)`, matching OCaml
+    - focused regressions:
+      - `test_apply_dynamic_type_specialization_sets_dynamic_type_without_closure_attr`
+      - `test_make_specialization_from_caller_uses_dynamic_type_without_closure_attr`
+  - `crates/pulse/src/checker.rs`
+    - `__call_c_function_ptr` now resolves through known dynamic type first,
+      then direct closure attrs
+    - propagation of `needs_specialization` now treats dynamic type as already
+      satisfying the request, not just closure attrs
+    - focused regressions:
+      - `test_exec_call_c_function_ptr_dynamic_type_target_without_summary_uses_direct_unknown_call`
       - `test_exec_call_c_function_ptr_resolved_target_without_summary_uses_direct_unknown_call`
       - `test_exec_instr_direct_self_recursion_uses_unknown_call_fallback`
-  - `crates/pulse/src/interproc.rs`
-    - `translate_formula` now imports callee `is_int` facts in addition to
-      conditions / equalities / pure-call terms
-    - this was the missing piece behind the imported integer-return parity in
-      recursive pure-call summaries
-    - focused regression:
-      - `test_apply_summary_imports_is_int_for_result_value`
+  - `crates/pulse/src/transfer.rs`
+    - unknown-call fallback now stamps
+      `ReturnedFromUnknown(actuals)` on the fresh return value, matching
+      OCaml `PulseCallOperations.add_returned_from_unknown`
+    - unknown-call havoc now materializes missing pointee cells for pointer
+      and bare function-value actuals before rewriting the post edge
+    - focused regressions:
+      - `test_unknown_call_function_value_materializes_missing_pointee_before_havoc`
+      - `test_unknown_call_return_records_returned_from_unknown_actuals`
+  - `crates/pulse/src/summary.rs`
+    - specialized latent abort pre/posts now cache diagnostics sideband and
+      reify them again on apply, matching OCaml latent-summary storage
+    - summary normalization now recreates caller-visible non-zero
+      `Invalid(ConstantDereference(k))` attrs when const-ness only survives in
+      phi
+    - focused regressions:
+      - `test_add_specialized_summary_strips_latent_abort_diagnostic_from_cached_pre_post`
+      - `test_normalize_materializes_nonzero_constant_invalid_for_visible_value`
+      - `test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value`
   - `crates/test-harness/src/summary_compare.rs`
-    - semantic comparator now also:
-      - collapses unit-affine `is_int` chains
-        (`is_int(x + k)` / `is_int(-x + k)`) onto the same canonical
-        representative
-      - normalizes function-application args and atom operands through
-        unit-affine equalities
-      - treats restricted and unrestricted pure witness ids the same when they
-        only encode the same strict/non-strict inequality witness shape
+    - exact-RHS `is_int(...)` equalities now anchor back to visible summary
+      values without widening Rust raw summaries
     - focused regression:
-      - `test_phi_normalization_collapses_unit_affine_is_int_chains`
-  - current validations on the dirty tree:
-    - `cargo test -q -p pulse test_exec_call_c_function_ptr_resolved_target_without_summary_uses_direct_unknown_call -- --nocapture`
-    - `cargo test -q -p pulse test_apply_summary_imports_is_int_for_result_value -- --nocapture`
+      - `test_phi_normalization_derives_is_int_from_exact_rhs_equality`
+  - current validations for this checkpoint:
+    - `cargo test -q -p pulse --lib`
     - `cargo test -q -p test-harness --lib`
+    - `cargo test -q -p pulse test_apply_dynamic_type_specialization_sets_dynamic_type_without_closure_attr -- --nocapture`
+    - `cargo test -q -p pulse test_make_specialization_from_caller_uses_dynamic_type_without_closure_attr -- --nocapture`
+    - `cargo test -q -p pulse test_exec_call_c_function_ptr_dynamic_type_target_without_summary_uses_direct_unknown_call -- --nocapture`
+    - `cargo test -q -p pulse test_unknown_call_function_value_materializes_missing_pointee_before_havoc -- --nocapture`
+    - `cargo test -q -p pulse test_unknown_call_return_records_returned_from_unknown_actuals -- --nocapture`
+    - `cargo test -q -p pulse test_normalize_materializes_nonzero_constant_invalid_for_visible_value -- --nocapture`
+    - `cargo test -q -p pulse test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value -- --nocapture`
+    - `cargo test -q -p test-harness test_phi_normalization_derives_is_int_from_exact_rhs_equality -- --nocapture`
     - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
   - important observed effect:
     - current verified specialization checkpoint:
       - main summaries: `21 / 21` procedures match
-      - combined per-procedure harness: `Matching: 17`, `Differences: 4`
+      - combined per-procedure harness: `Matching: 19`, `Differences: 2`
     - remaining specialized-only diff set:
-      - `invoke`
       - `invoke_itself_bad`
-      - `may_double_free_if_alias`
       - `two_pointers_recursion_bad`
-    - important root-cause note:
-      - the remaining `invoke` / `invoke_itself_bad` drift still looks like a
-        real specialization-apply mismatch, not comparator noise:
-        - OCaml `PulseSpecialization.apply` adds dynamic-type constraints via
-          `PulseArithmetic.and_dynamic_type_is_unsafe`
-        - Rust specialization currently seeds `Attribute::Closure(pname)` on
-          the specialized heap-path value
+    - fixed by the current dirty work:
+      - `invoke` now matches
+      - `may_double_free_if_alias` now matches
+      - exported `Closure(...)` noise is gone from specialized summaries
+    - current root-cause hypothesis:
+      - `invoke_itself_bad` still looks like real recursive-summary /
+        materialization drift
+      - `two_pointers_recursion_bad` is now mostly comparator normalization /
+        comparison drift over affine integer facts
   - current next target:
-    - fix specialization application first:
-      - replace/align the Rust closure-attr seeding with the OCaml
-        dynamic-type-constraint path
-    - then revisit the remaining specialized gaps:
-      - `may_double_free_if_alias` extra latent diagnostic
-      - `two_pointers_recursion_bad` recursive alias/int export mismatch
+    - inspect the remaining specialized recursive shape gap first:
+      - `invoke_itself_bad`
+    - then refine affine `is_int(...)` comparison only where the OCaml raw
+      summaries justify it:
+      - `two_pointers_recursion_bad`
 
 - Latest stable checkpoint:
   - `crates/test-harness/src/summary_compare.rs`

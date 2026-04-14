@@ -383,7 +383,7 @@ impl Formula {
         });
         let normalized_condition = self.normalize_condition_atom(&condition_atom);
         if let Some(atom) = comparison_condition_atom {
-            if self.phi.and_atom(atom).is_unsat() {
+            if self.enforce_condition_atom(&atom).is_unsat() {
                 return SatUnsat::Unsat;
             }
         }
@@ -411,6 +411,10 @@ impl Formula {
         x: &Operand,
         y: &Operand,
     ) -> SatUnsat<Vec<NewEq>> {
+        if result_of_binop_is_integer(&op, x, y, &self.phi) {
+            self.phi.mark_is_int(v);
+        }
+
         // For supported arithmetic ops, create a linear equation AND
         // propagate intervals through CItv.
         // Cross-ref: OCaml PulseFormula.ml Normalizer.and_var_binop_var
@@ -672,6 +676,32 @@ impl Formula {
             Atom::Equal(Term::Var(v1), Term::Var(v2)) => self.phi.and_var_equal(*v1, *v2),
             Atom::Equal(Term::Var(v), Term::Const(c))
             | Atom::Equal(Term::Const(c), Term::Var(v)) => self.phi.and_const_eq(*v, *c),
+            Atom::LessEqual(lhs, rhs) => {
+                if let (Some(op1), Some(op2)) =
+                    (simple_operand_of_term(lhs), simple_operand_of_term(rhs))
+                {
+                    if self
+                        .check_citv_binop(false, &sil::binop::Binop::Le, &op1, &op2)
+                        .is_unsat()
+                    {
+                        return SatUnsat::Unsat;
+                    }
+                }
+                self.phi.and_atom(atom.clone())
+            }
+            Atom::LessThan(lhs, rhs) => {
+                if let (Some(op1), Some(op2)) =
+                    (simple_operand_of_term(lhs), simple_operand_of_term(rhs))
+                {
+                    if self
+                        .check_citv_binop(false, &sil::binop::Binop::Lt, &op1, &op2)
+                        .is_unsat()
+                    {
+                        return SatUnsat::Unsat;
+                    }
+                }
+                self.phi.and_atom(atom.clone())
+            }
             _ => self.phi.and_atom(atom.clone()),
         }
     }
@@ -712,6 +742,28 @@ fn comparison_to_atom(
         Binop::Le => Some(Atom::LessEqual(lt, rt)),
         Binop::Gt => Some(Atom::LessThan(rt, lt)),
         Binop::Ge => Some(Atom::LessEqual(rt, lt)),
+        _ => None,
+    }
+}
+
+fn result_of_binop_is_integer(
+    op: &sil::binop::Binop,
+    _lhs: &Operand,
+    _rhs: &Operand,
+    _phi: &phi::Phi,
+) -> bool {
+    use sil::binop::Binop;
+
+    match op {
+        Binop::Eq | Binop::Ne | Binop::Lt | Binop::Gt | Binop::Le | Binop::Ge => true,
+        _ => false,
+    }
+}
+
+fn simple_operand_of_term(term: &Term) -> Option<Operand> {
+    match term {
+        Term::Var(v) => Some(Operand::AbstractValue(*v)),
+        Term::Const(c) => Some(Operand::ConstOperand(*c)),
         _ => None,
     }
 }
@@ -1130,6 +1182,42 @@ mod tests {
     }
 
     #[test]
+    fn test_singleton_interval_propagates_back_through_minus_linear_eq() {
+        let mut f = Formula::ttrue();
+        let i = AbstractValue::of_raw(1);
+        let i_minus_one = AbstractValue::of_raw(2);
+
+        f.and_is_int(i);
+        f.and_is_int(i_minus_one);
+        assert!(f.and_positive(i).is_sat());
+        assert!(f
+            .and_equal_binop(
+                i_minus_one,
+                sil::binop::Binop::MinusA(None),
+                &Operand::AbstractValue(i),
+                &Operand::ConstOperand(1),
+            )
+            .is_sat());
+        assert!(f
+            .and_less_equal(
+                &Operand::AbstractValue(i_minus_one),
+                &Operand::ConstOperand(0)
+            )
+            .is_sat());
+
+        assert_eq!(
+            f.is_known_const(i_minus_one),
+            Some(Q::from_integer(0)),
+            "the recursive actual should collapse to zero on the base branch"
+        );
+        assert_eq!(
+            f.is_known_const(i),
+            Some(Q::from_integer(1)),
+            "singleton intervals should feed back through x = (i - 1) so the caller-visible i becomes 1"
+        );
+    }
+
+    #[test]
     fn test_binop_comparison_with_constants() {
         let mut f = Formula::ttrue();
         let x = AbstractValue::of_raw(1);
@@ -1164,6 +1252,10 @@ mod tests {
         );
         assert!(result.is_sat(), "non-constant comparison should be Sat");
         assert_eq!(f.is_known_const(r), None, "result should be unconstrained");
+        assert!(
+            f.phi().is_marked_int(r),
+            "comparison results should stay integer-typed even before pruning"
+        );
     }
 
     #[test]
