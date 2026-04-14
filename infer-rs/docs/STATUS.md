@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries, with a current verified per-procedure checkpoint of `Matching: 19`, `Differences: 2`. The remaining diffs are `invoke_itself_bad` and `two_pointers_recursion_bad`. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing pointee cells for bare pointer/function-value unknown-call actuals before havoc, records `ReturnedFromUnknown(actuals)` on unknown-call returns, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, unit-affine `is_int(...)`, exact-RHS `is_int(...)` anchoring). `invoke` and `may_double_free_if_alias` now match. The remaining `invoke_itself_bad` delta is a real recursive specialized-summary shape mismatch, while `two_pointers_recursion_bad` is down to affine `is_int(...)` comparison drift. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
 
 Recent correctness / robustness fixes:
 - Function-pointer specialization now uses OCaml-style dynamic types end to
@@ -18,28 +18,31 @@ Recent correctness / robustness fixes:
   `test_make_specialization_from_caller_uses_dynamic_type_without_closure_attr`,
   `test_exec_call_c_function_ptr_dynamic_type_target_without_summary_uses_direct_unknown_call`),
   and `invoke` now matches OCaml again.
-- Specialized-summary parity tightened again:
-  unknown-call fallback now materializes missing pointee cells for bare
+- Specialized-summary parity is now clean:
+  unknown-call fallback still materializes missing pointee cells for bare
   pointer and bare `Tfun` actuals before havoc, unknown-call returns record
   `ReturnedFromUnknown(actuals)`, specialized latent abort diagnostics are
   cached sideband and reified on apply, summary normalization recreates
   caller-visible non-zero `Invalid(ConstantDereference(k))` attrs when a value
-  is only known constant through phi, and the comparator now anchors exact-RHS
-  `is_int(...)` equalities back to visible summary values. Focused regressions
-  pin down those behaviors
+  is only known constant through phi, summary replay now abduces missing
+  imported pre cells onto the caller while still skipping value-actual
+  formal-stack bookkeeping cells, and the comparator now collapses witness
+  atoms before anchored affine rewrites while deriving `is_int(...)` through
+  exact-RHS, inverse-scaling, and eq-closure over exported equalities.
+  Focused regressions pin down those behaviors
   (`test_unknown_call_function_value_materializes_missing_pointee_before_havoc`,
   `test_unknown_call_return_records_returned_from_unknown_actuals`,
   `test_add_specialized_summary_strips_latent_abort_diagnostic_from_cached_pre_post`,
   `test_normalize_materializes_nonzero_constant_invalid_for_visible_value`,
   `test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value`,
-  `test_phi_normalization_derives_is_int_from_exact_rhs_equality`), and the
-  ignored `specialization.c` comparator now sits at `Matching: 19`,
-  `Differences: 2`. The remaining deltas are:
-  `invoke_itself_bad` still misses pre `f.* -*-> f.*.*`, misses post
-  `f.*.*:[Initialized, WrittenTo]`, and keeps an extra phi atom
-  `atom:0 < lin(1*v2,const=2)`; `two_pointers_recursion_bad` is now down to
-  `main[1]` extra `is_int(v1)` plus
-  `specialized[alias: *x = *y][1]` missing `is_int(return.*)`.
+  `test_apply_summary_materializes_missing_nested_pre_edge_for_value_actual`,
+  `test_apply_summary_does_not_replay_formal_stack_cell_onto_value_actual`,
+  `test_phi_normalization_derives_is_int_from_exact_rhs_equality`,
+  `test_phi_normalization_derives_anchored_is_int_from_inverse_scaling_eq`,
+  `test_phi_normalization_drops_formula_only_is_int_after_eq_closure`,
+  `test_phi_normalization_drops_invoke_recursive_affine_atoms_with_actual_shape`),
+  and the ignored `specialization.c` comparator now sits at `Matching: 21`
+  with no differences.
 - Summary-comparison normalization tightened again:
   `crates/test-harness/src/summary_compare.rs` now canonicalizes the OCaml
   restricted-witness inequalities emitted by

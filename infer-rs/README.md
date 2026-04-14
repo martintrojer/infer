@@ -10,9 +10,7 @@ Exact summary-equality work now uses a semantic driver instead of raw JSON diffs
 Current verified checkpoint:
 
 - main summaries: `21 / 21` procedures match
-- combined per-procedure harness: `Matching: 19`, `Differences: 2`
-- remaining specialized-summary diffs:
-  `invoke_itself_bad`, `two_pointers_recursion_bad`
+- combined per-procedure harness: `Matching: 21`
 
 The latest OCaml-backed specialization pass now mirrors OCaml's dynamic-type path more closely:
 the abductive domain tracks known dynamic types directly, `PulseSpecialization.apply` now seeds
@@ -29,14 +27,15 @@ rehydrated on apply, and summary normalization recreates caller-visible non-zero
 these changes bring `may_double_free_if_alias` to parity and restore the missing specialized
 recursive invalidation surface in `two_pointers_recursion_bad`.
 
-The remaining two diffs are narrower. `invoke_itself_bad` still has a real analyzer gap in the
-specialized recursive branch: Rust misses pre `f.* -*-> f.*.*`, misses post
-`f.*.*:[Initialized, WrittenTo]`, and still exports an extra phi atom
-`atom:0 < lin(1*v2,const=2)`. `two_pointers_recursion_bad` is now down to integer-fact comparison
-drift: `main[1]` has extra `is_int(v1)` and `specialized[alias: *x = *y][1]` is still missing
-`is_int(return.*)`. The comparator now anchors exact-RHS equalities back to visible summary values,
-but affine `is_int` closure over non-unit equalities still needs OCaml-backed refinement; do not
-widen Rust raw summaries just to hide it.
+`specialization.c` is now fully clean in the semantic harness. The last analyzer-side fix keeps
+OCaml's summary-import behavior for missing callee pre-edges: imported pre cells are now abduced
+onto the caller with `read_heap(...)`, except for callee formal-stack bookkeeping cells for
+value-style actuals, which still must not be replayed or the old `v -*-> v` self-edge bug comes
+back. On the comparator side, `summary_compare.rs` now collapses witness atoms before anchored
+affine rewrites, derives `is_int(...)` through exact-RHS, inverse-scaling, and eq-closure over
+exported equalities, and drops redundant formula-only integer witnesses once an anchored closure is
+available. The focused regressions around `invoke_itself_bad` and `two_pointers_recursion_bad` are
+now green without widening the raw Rust summaries.
 
 Recent OCaml-backed parity work also restored `traces.c`: Rust now preserves branch-conditioned
 null provenance from both real `Prune` instructions and model-generated
@@ -80,8 +79,9 @@ skipped-call continue for selected alias-specialized latent-invalid-access summa
 `ContinueProgram`, which is the OCaml-backed shape behind
 `call_may_double_free_if_alias_bad`. Together with the newer integer-literal interning and
 post-summary attr filtering, those fixes remain part of the current
-`21 / 21` main-summary and `Matching: 19`, `Differences: 2` widened-summary checkpoint.
-`invoke`, `call_may_double_free_if_alias_bad`, `may_double_free_if_alias`, and `test_unalias`
+`21 / 21` main-summary and `Matching: 21` widened-summary checkpoint.
+`invoke`, `invoke_itself_bad`, `call_may_double_free_if_alias_bad`,
+`may_double_free_if_alias`, `test_unalias`, and `two_pointers_recursion_bad`
 now match.
 
 `memory_leak.c` is also back at parity after history-aware invalid-access provenance/dedup. The
@@ -98,7 +98,7 @@ The latest correctness pass also keeps recoverable invalid-access paths from con
 error has already been classified: transfer-side load/store recoverable errors and C-model
 recoverable errors now stop instead of exporting `ContinueProgram + AbortProgram`, with focused
 regressions for null-formal stores and double-free. That cleanup is correct and stays, but it does
-not move the current `specialization.c` comparator. A broader checker-side attempt to recover
+not explain the now-clean `specialization.c` comparator by itself. A broader checker-side attempt to recover
 non-exit latent invalid accesses when another path reaches exit was cross-checked against OCaml and
 reverted because it over-published latent summaries in `test_alias`, `test_unalias`, and wrapper /
 recursion cases. The ignored `test_normal_exit_keeps_non_exit_latent_abort` now exists only to
@@ -110,9 +110,8 @@ monotonic per-state timestamps instead of hardcoding `0`, and latent-invalid-acc
 shaping now orders direct-formal accesses by `(timestamp, location)` rather than raw `.sil`
 location alone. That removes the extra latent branch and brings the raw main summary down to the
 OCaml shape of `x == 0`, `x > 0 && y == 0`, and `x > 0 && y > 0`. After the later
-integer-literal interning and post-summary attr-filtering pass, the remaining specialization work
-is narrower: the specialized recursive pre/post shape gap in `invoke_itself_bad`, plus the
-remaining affine-`is_int` comparison drift in `two_pointers_recursion_bad`.
+integer-literal interning, summary-import fix, and eq-closure comparator pass, `specialization.c`
+is now fully matched; the remaining parity work is outside this harness.
 
 See [docs/STATUS.md](docs/STATUS.md) for detailed compliance data and
 [docs/STORE_TEXTUAL.md](docs/STORE_TEXTUAL.md) for the accepted exported-Textual limitation.

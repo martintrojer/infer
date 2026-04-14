@@ -160,6 +160,7 @@ pub(crate) fn apply_summary_with_aliasing(
         &pre_post.pre,
         &pre_post.post,
         &formal_stack_addrs,
+        &value_actual_formal_stack_addrs,
         &mut subst,
         &mut callee_heap_paths,
         &mut caller_state,
@@ -731,6 +732,7 @@ fn materialize_pre(
     callee_pre: &crate::base_domain::BaseDomain,
     callee_post: &AbductiveDomain,
     formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    value_actual_formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     callee_heap_paths: &mut HashMap<AbstractValue, Option<HeapPath>>,
     caller_state: &mut AbductiveDomain,
@@ -824,14 +826,28 @@ fn materialize_pre(
 
             for (access, callee_target) in edges.iter() {
                 let caller_access = translate_access(subst, access, caller_state);
-                let caller_target = if let Some(existing) = caller_state
-                    .post
-                    .heap
-                    .find_edge(caller_addr, &caller_access)
-                {
-                    existing
+                let caller_target = if value_actual_formal_stack_addrs.contains(&callee_addr) {
+                    // Cross-ref: OCaml `materialize_pre_from_actual` starts
+                    // from the dereferenced formal value for non-struct/value
+                    // actuals; it does not replay the callee formal stack
+                    // bookkeeping cell itself onto the caller.
+                    if let Some(existing) =
+                        caller_state.post.heap.find_edge(caller_addr, &caller_access)
+                    {
+                        existing
+                    } else {
+                        resolve_mut(subst, *callee_target)
+                    }
                 } else {
-                    resolve_mut(subst, *callee_target)
+                    // Cross-ref: OCaml `PulseInterproc.materialize_pre_from_address`
+                    // uses `Memory.eval_edge`, which abduces missing pre-edges
+                    // into the caller state while traversing the callee pre.
+                    // A bare fresh substitution target is not enough here:
+                    // callers must remember the imported pre-cell so later
+                    // summary export can distinguish the old pointee from the
+                    // refreshed post pointee in recursive/value-actual cases
+                    // such as `invoke_itself_bad(f, i - 1)`.
+                    caller_state.read_heap(caller_addr, caller_access)
                 };
 
                 subst.entry(*callee_target).or_insert(caller_target);
@@ -1947,6 +1963,101 @@ mod tests {
             state.post.heap.find_edge(ret_addr, &Access::Dereference),
             Some(caller_formal_val),
             "return cell should point to the caller actual value"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_materializes_missing_nested_pre_edge_for_value_actual() {
+        let callee_pname = Procname::c_from_string("invoke_itself_bad");
+        let fun_ptr_typ = Typ::mk_ptr(Typ::mk(sil::typ::TypeDesc::Tfun(None)));
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("f"), fun_ptr_typ, Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let formal_pvar = Pvar::mk(Mangled::from_string("f"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let old_pointee = callee_state.read_heap(formal_val, Access::Dereference);
+        let new_pointee = AbstractValue::mk_fresh();
+        callee_state.write_heap(formal_val, Access::Dereference, new_pointee);
+        callee_state.initialize(formal_val);
+        callee_state.initialize(old_pointee);
+        callee_state
+            .post
+            .attrs
+            .mark_written_to(old_pointee, 0, Location::dummy());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals =
+            vec![(Mangled::from_string("cb"), Typ::mk_ptr(Typ::void()), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("cb"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar)))
+            .unwrap();
+        let caller_fun_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_fun_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let ExecutionDomain::ContinueProgram(state) = &results[0] else {
+            panic!("expected continue result, got {results:?}");
+        };
+        let pre_target = state
+            .pre
+            .heap
+            .find_edge(caller_fun_val, &Access::Dereference)
+            .expect("summary import should abduce the missing pre-edge on the value actual");
+        let post_target = state
+            .post
+            .heap
+            .find_edge(caller_fun_val, &Access::Dereference)
+            .expect("summary import should keep the refreshed post-edge");
+        assert_ne!(
+            pre_target, post_target,
+            "callee pre/post pointees should stay distinct after summary import"
+        );
+        let post_target_attrs = state
+            .post
+            .attrs
+            .get(&pre_target)
+            .expect("old pointee should remain visible in post attrs");
+        assert!(
+            post_target_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::WrittenTo(_, _))),
+            "summary import should preserve caller-visible WrittenTo on the old pointee"
         );
     }
 

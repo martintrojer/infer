@@ -46,45 +46,14 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
 **Skipped files (3):** `infinite.c` (106 procs with infinite loops/Ackermann), `recursion.c`,
 `recursion2.c` — fixpoint exhaustion.
 
+Semantic summary-parity note: `specialization.c` is currently clean in the semantic harness
+(`21 / 21` main summaries, `Matching: 21` combined main+specialized summaries). Keep
+`test_summary_comparison_specialization_main` green as a regression guard, but it is no longer an
+active OCaml-parity gap.
+
 **Active OCaml-backed correctness focus:**
 
-3. **Specialized-summary semantic parity (`specialization.c`)**: keep driving
-   parity through `crates/test-harness/src/summary_compare.rs` and
-   `test_summary_comparison_specialization_main`. The harness now compares both
-   canonical `main.pre_post_list` state and canonical specialized summaries
-   keyed by deterministic specialization strings.
-   Verified checkpoint on the current tree:
-   - main summaries: `21 / 21` procedures match
-   - combined per-procedure harness: `Matching: 19`, `Differences: 2`
-   - remaining specialized-summary diffs:
-     `invoke_itself_bad`, `two_pointers_recursion_bad`
-   Recent correctness groundwork that should stay:
-   specialization now uses dynamic-type information from caller state and
-   `TypeName::CFunction(...)` bindings instead of seeding exported
-   `Closure(...)` attrs, `__call_c_function_ptr` resolves dynamic type first,
-   and `need_dynamic_type_specialization` propagation treats an existing known
-   dynamic type as already satisfying the request. Unknown-call fallback now
-   materializes missing pointee cells for pointer and bare `Tfun` actuals
-   before havoc, and unknown-call returns record
-   `ReturnedFromUnknown(actuals)`. Summary export/import still keeps the
-   OCaml-backed latent-invalid-access shaping, specialized latent abort
-   diagnostics are cached sideband and reified on apply, summary
-   normalization now recreates caller-visible non-zero
-   `Invalid(ConstantDereference(k))` attrs when const-ness survives only in
-   phi, and the comparator only normalizes true semantic noise
-   (deterministic specialization keys, witness inequalities, unit-affine
-   `is_int(...)`, exact-RHS `is_int(...)` anchoring, and function-application
-   args through affine equalities).
-   Remaining gaps are now narrower:
-   `invoke_itself_bad` still has a real analyzer mismatch in the specialized
-   recursive branch (missing pre `f.* -*-> f.*.*`, missing post
-   `f.*.*:[Initialized, WrittenTo]`, plus extra phi
-   `atom:0 < lin(1*v2,const=2)`), while `two_pointers_recursion_bad` is down
-   to integer-fact parity (`main[1]` extra `is_int(v1)` and
-   `specialized[alias: *x = *y][1]` missing `is_int(return.*)`). Do not hide
-   either one with comparator-only hacks or Rust-side widening.
-
-4. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
+3. **Direct-formal / by-ref / suppression regression lock-in**: keep the focused regressions green:
    `test_e2e_guarded_outparam_write_uses_matching_summary_branch`,
    `test_e2e_write_through_ptr`, `test_e2e_manifest_use_after_free_reports_only_uaf`,
    `test_e2e_access_use_after_free_keeps_manifest_npe_and_uaf`,
@@ -99,11 +68,11 @@ of which need the OCaml unnecessary-copy pipeline rather than a simple model shi
    proven wrong and must not be resurrected as a count-tuning workaround.
    These are correctness fixes, not optional count-tuning.
 
-5. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: the headline file
+4. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: the headline file
    counts are now at the expected baseline, but Rust and OCaml can still diverge on which latent
    null paths survive call chains and reify as manifest reports.
 
-6. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
+5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
    dedup and `issues.exp`-style counting, but richer OCaml-style `PulseTrace` / publication detail
    is still incomplete.
 

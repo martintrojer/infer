@@ -7,68 +7,37 @@ Keep it current when the active line of investigation changes.
 
 - Current parity checkpoint:
   - main summaries: `21 / 21` procedures match
-  - specialized summary harness: `Matching: 19`, `Differences: 2`
-  - remaining specialized-only diffs:
-    - `invoke_itself_bad`
-    - `two_pointers_recursion_bad`
-- Current root-cause hypotheses:
-  - `invoke_itself_bad`
-    - the old missing caller-visible
-      `Invalid(ConstantDereference(1))` gap is fixed
-    - the remaining delta is still real on the Rust side:
-      specialized recursive branch misses pre `f.* -*-> f.*.*`,
-      misses post `f.*.*:[Initialized, WrittenTo]`, and keeps extra phi
-      `atom:0 < lin(1*v2,const=2)`
-    - important negative result:
-      generic unknown-call / direct-self-recursion materialization is not the
-      root cause anymore; focused regressions now prove both the generic
-      unknown-call function-value path and the direct self-recursive fallback
-      materialize the pre/post funptr pointee shape in isolation
-  - `two_pointers_recursion_bad`
-    - the real missing specialized recursive
-      `Invalid(ConstantDereference(1))` gap is fixed
-    - remaining drift is now in `is_int(...)` comparison/canonicalization:
-      `main[1]` has extra `is_int(v1)` and
-      `specialized[alias: *x = *y][1]` is still missing
-      `is_int(return.*)`
+  - specialized summary harness: `Matching: 21`
+  - `specialization.c` semantic comparator is currently clean.
+- Closed this turn:
+  - `crates/pulse/src/interproc.rs`
+    - real analyzer fix:
+      imported callee pre cells with missing caller edges are now abduced onto
+      the caller via `read_heap(...)`, matching the OCaml
+      `PulseInterproc.materialize_pre_from_address` /
+      `PulseOperations.Memory.eval_edge` behavior
+    - important exception kept:
+      do not replay callee formal-stack bookkeeping cells for value actuals,
+      or the old `v -*-> v` self-edge bug comes back
+  - `crates/test-harness/src/summary_compare.rs`
+    - witness atoms now collapse before anchored affine rewrites
+    - `is_int(...)` closure now uses exported equalities too:
+      exact-RHS anchoring, inverse-scaling (`x = return / 2`), unit-affine
+      eq closure, and redundant formula-only `is_int(vN)` dropping once an
+      anchored closure exists
+    - this closed the old `invoke_itself_bad` / `two_pointers_recursion_bad`
+      diffs without widening raw Rust summaries
 - Immediate next steps:
-  - remaining real summary gap:
-    - `invoke_itself_bad`
-      - specialized recursive branch still misses pre
-        `f.* -*-> f.*.*` and post attrs `f.*.*:[Initialized, WrittenTo]`
-      - current negative result:
-        - generic unknown-call / direct-self-recursion materialization is not
-          the root cause anymore
-        - fresh regressions now prove both:
-          - unknown-call function values materialize pre/post pointee shape
-          - direct self-recursive fallback with a function-pointer actual
-            materializes that shape too
-      - likely next target:
-        - specialized-path-specific state before summary export
-          (`invoke_itself_bad` after resolved `__call_c_function_ptr(id, i)`,
-          before / during recursive-call fallback)
-  - remaining semantic-comparison gap:
-    - `two_pointers_recursion_bad`
-      - current comparator delta:
-        - `main[1]` extra `is_int(v1)`
-        - `specialized[alias: *x = *y][1]` missing `is_int(return.*)`
-      - important current result:
-        - the real Rust summary/export gap on missing
-          `Invalid(ConstantDereference(1))` is fixed
-        - remaining drift is now in `is_int(...)` normalization over
-          non-unit linear equalities
-      - likely next target:
-        - extend comparator `is_int` closure reasoning through affine
-          equalities such as `x = 1/2 * return` and `return = 2 * x`
-          without reintroducing the earlier over-derived integer facts
+  - move back to issue-set parity outside the specialization summary cluster:
+    - wrapper / cycle null-path publication such as
+      `traverse_and_crash_if_equal_to_root`
+    - richer trace/report parity (`PulseTrace`-style publication detail)
   - current validation set for this checkpoint:
-    - `cargo test -q -p pulse --lib`
-    - `cargo test -q -p test-harness test_phi_normalization_derives_is_int_from_exact_rhs_equality -- --nocapture`
-    - `cargo test -q -p pulse test_normalize_materializes_nonzero_constant_invalid_for_visible_value -- --nocapture`
-    - `cargo test -q -p pulse test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value -- --nocapture`
-    - `cargo test -q -p pulse test_unknown_call_function_value_materializes_missing_pointee_before_havoc -- --nocapture`
-    - `cargo test -q -p pulse test_exec_instr_direct_self_recursion_materializes_function_pointer_pointee_shape -- --nocapture`
-    - `cargo test -q -p pulse --test end_to_end test_debug_specialization_summary -- --nocapture`
+    - `cargo test -q -p test-harness --lib`
+    - `cargo test -q -p test-harness test_phi_normalization_derives_anchored_is_int_from_inverse_scaling_eq -- --nocapture`
+    - `cargo test -q -p test-harness test_phi_normalization_drops_formula_only_is_int_after_eq_closure -- --nocapture`
+    - `cargo test -q -p pulse test_apply_summary_materializes_missing_nested_pre_edge_for_value_actual -- --nocapture`
+    - `cargo test -q -p pulse test_apply_summary_does_not_replay_formal_stack_cell_onto_value_actual -- --nocapture`
     - `cargo test -q -p pulse --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture`
 
 - Current checkpoint work:

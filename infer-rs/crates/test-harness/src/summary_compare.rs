@@ -437,8 +437,20 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
                 normalized.insert(format!("is_int({normalized_term})"));
             }
         } else if let Some(atom) = parse_atom_item(item) {
-            let lhs = normalize_term_syntax_for_phi(&atom.lhs);
-            let rhs = normalize_term_syntax_for_phi(&atom.rhs);
+            let lhs_syntax = normalize_term_syntax_for_phi(&atom.lhs);
+            let rhs_syntax = normalize_term_syntax_for_phi(&atom.rhs);
+            if let Some(witness_atom) = collapse_witness_atom(
+                &lhs_syntax,
+                atom.operator,
+                &rhs_syntax,
+                &positive_witness_atoms,
+                &nonpositive_witness_atoms,
+            ) {
+                normalized.insert(witness_atom);
+                continue;
+            }
+            let lhs = normalize_atom_term_for_phi(&atom.lhs, &reverse_eqs, &affine_env);
+            let rhs = normalize_atom_term_for_phi(&atom.rhs, &reverse_eqs, &affine_env);
             if let Some(witness_atom) = collapse_witness_atom(
                 &lhs,
                 atom.operator,
@@ -458,43 +470,61 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
     canonicalize_is_int_closure(normalized, anchored_ids)
 }
 
+fn normalize_atom_term_for_phi(
+    term: &str,
+    reverse_eqs: &HashMap<String, Vec<String>>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
+) -> String {
+    let normalized = normalize_term_for_phi(term, affine_env);
+    reverse_eqs
+        .get(&normalized)
+        .and_then(|lhss| lhss.first())
+        .map(|lhs| normalize_term_for_phi(lhs, affine_env))
+        .unwrap_or(normalized)
+}
+
 fn canonicalize_is_int_closure(
     items: BTreeSet<String>,
     anchored_ids: &HashSet<String>,
 ) -> Vec<String> {
     let mut others = BTreeSet::new();
     let mut is_int_terms = Vec::new();
+    let mut eqs = HashMap::new();
     for item in items {
+        if let Some((lhs, rhs)) = parse_eq_item(&item) {
+            eqs.insert(lhs.to_string(), rhs.to_string());
+        }
         if let Some(term) = parse_is_int_item(&item) {
             is_int_terms.push(term.to_string());
         } else {
             others.insert(item);
         }
     }
+    let scaling_implications = build_integer_scaling_implications(&eqs);
 
     let original_plain_ints: HashSet<_> = is_int_terms
         .iter()
         .filter(|term| looks_like_term_identifier(term))
         .cloned()
         .collect();
-    let mut known_int_vars = original_plain_ints.clone();
-
-    loop {
-        let mut changed = false;
-        for term in &is_int_terms {
-            if let Some(var) = derive_is_int_var(term, &known_int_vars) {
-                if known_int_vars.insert(var) {
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let known_int_vars = close_known_int_vars(
+        original_plain_ints.clone(),
+        &is_int_terms,
+        &eqs,
+        &scaling_implications,
+    );
 
     for var in &known_int_vars {
-        if anchored_ids.contains(var) || original_plain_ints.contains(var) {
+        if anchored_ids.contains(var)
+            || (original_plain_ints.contains(var)
+                && !plain_is_int_is_redundant(
+                    var,
+                    &known_int_vars,
+                    &is_int_terms,
+                    &eqs,
+                    &scaling_implications,
+                ))
+        {
             others.insert(format!("is_int({var})"));
         }
     }
@@ -506,6 +536,105 @@ fn canonicalize_is_int_closure(
     }
 
     others.into_iter().collect()
+}
+
+fn close_known_int_vars(
+    initial_known: HashSet<String>,
+    is_int_terms: &[String],
+    eqs: &HashMap<String, String>,
+    scaling_implications: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    let mut known_int_vars = initial_known;
+
+    loop {
+        let mut changed = false;
+        for term in is_int_terms {
+            if let Some(var) = derive_is_int_var(term, &known_int_vars) {
+                if known_int_vars.insert(var) {
+                    changed = true;
+                }
+            }
+        }
+        if extend_known_int_vars_from_linear_eqs(&mut known_int_vars, eqs) {
+            changed = true;
+        }
+        if extend_known_int_vars_from_scaling_implications(&mut known_int_vars, scaling_implications)
+        {
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    known_int_vars
+}
+
+fn extend_known_int_vars_from_linear_eqs(
+    known_int_vars: &mut HashSet<String>,
+    eqs: &HashMap<String, String>,
+) -> bool {
+    let mut derived = Vec::new();
+
+    for (lhs, rhs) in eqs {
+        let Some((vars, _constant)) = parse_linear_term(rhs) else {
+            continue;
+        };
+        if vars.is_empty() {
+            continue;
+        }
+
+        if vars.iter().all(|(var, _)| known_int_vars.contains(var)) && !known_int_vars.contains(lhs)
+        {
+            derived.push(lhs.clone());
+        }
+
+        if known_int_vars.contains(lhs) {
+            let unknowns: Vec<_> = vars
+                .iter()
+                .filter(|(var, _)| !known_int_vars.contains(var))
+                .collect();
+            if unknowns.len() == 1 && matches!(unknowns[0].1, -1 | 1) {
+                derived.push(unknowns[0].0.clone());
+            }
+        }
+    }
+
+    let old_len = known_int_vars.len();
+    known_int_vars.extend(derived);
+    known_int_vars.len() != old_len
+}
+
+fn extend_known_int_vars_from_scaling_implications(
+    known_int_vars: &mut HashSet<String>,
+    scaling_implications: &HashMap<String, Vec<String>>,
+) -> bool {
+    let mut derived = Vec::new();
+    for var in known_int_vars.iter() {
+        if let Some(targets) = scaling_implications.get(var) {
+            derived.extend(targets.iter().cloned());
+        }
+    }
+    let old_len = known_int_vars.len();
+    known_int_vars.extend(derived);
+    known_int_vars.len() != old_len
+}
+
+fn plain_is_int_is_redundant(
+    var: &str,
+    known_int_vars: &HashSet<String>,
+    is_int_terms: &[String],
+    eqs: &HashMap<String, String>,
+    scaling_implications: &HashMap<String, Vec<String>>,
+) -> bool {
+    let mut seeds = known_int_vars.clone();
+    seeds.remove(var);
+    let filtered_terms: Vec<_> = is_int_terms
+        .iter()
+        .filter(|term| term.as_str() != var)
+        .cloned()
+        .collect();
+    close_known_int_vars(seeds, &filtered_terms, eqs, scaling_implications).contains(var)
 }
 
 fn derive_is_int_var(term: &str, known_int_vars: &HashSet<String>) -> Option<String> {
@@ -536,6 +665,86 @@ fn should_keep_is_int_term(term: &str, known_int_vars: &HashSet<String>) -> bool
     reducible_unknowns > 1
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RationalCoeff {
+    num: i32,
+    den: i32,
+}
+
+fn build_integer_scaling_implications(eqs: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
+    let mut result: HashMap<String, BTreeSet<String>> = HashMap::new();
+
+    for (lhs, rhs) in eqs {
+        let Some((base, coeff)) = parse_scaled_identifier_term(rhs) else {
+            continue;
+        };
+        if coeff.den == 1 {
+            result.entry(base.clone()).or_default().insert(lhs.clone());
+        }
+        if coeff.num.abs() == 1 {
+            result.entry(lhs.clone()).or_default().insert(base);
+        }
+    }
+
+    result
+        .into_iter()
+        .map(|(key, values)| (key, values.into_iter().collect()))
+        .collect()
+}
+
+fn parse_scaled_identifier_term(term: &str) -> Option<(String, RationalCoeff)> {
+    let inner = term.strip_prefix("lin(")?.strip_suffix(')')?;
+    let mut coeff = None;
+    let mut var = None;
+    let mut constant = 0;
+
+    for part in inner.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(value) = part.strip_prefix("const=") {
+            constant = value.parse().ok()?;
+            continue;
+        }
+        let (coeff_text, candidate_var) = part.split_once('*')?;
+        if var.replace(candidate_var.to_string()).is_some() {
+            return None;
+        }
+        coeff = Some(parse_rational_coeff(coeff_text)?);
+    }
+
+    (constant == 0).then_some(())?;
+    Some((var?, coeff?))
+}
+
+fn parse_rational_coeff(text: &str) -> Option<RationalCoeff> {
+    let (num, den) = if let Some((num, den)) = text.split_once('/') {
+        (num.parse::<i32>().ok()?, den.parse::<i32>().ok()?)
+    } else {
+        (text.parse::<i32>().ok()?, 1)
+    };
+    if den == 0 || num == 0 {
+        return None;
+    }
+    let gcd = gcd_i32(num.abs(), den.abs());
+    let mut num = num / gcd;
+    let mut den = den / gcd;
+    if den < 0 {
+        num = -num;
+        den = -den;
+    }
+    Some(RationalCoeff { num, den })
+}
+
+fn gcd_i32(mut lhs: i32, mut rhs: i32) -> i32 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs.abs().max(1)
+}
+
 fn parse_is_int_item(item: &str) -> Option<&str> {
     item.strip_prefix("is_int(")?.strip_suffix(')')
 }
@@ -559,15 +768,71 @@ fn collapse_witness_atom(
 }
 
 fn drop_phi_atoms_redundant_with_conditions(conditions: &[String], phi: &mut Vec<String>) {
+    let eqs: HashMap<_, _> = phi
+        .iter()
+        .filter_map(|item| {
+            let rest = item.strip_prefix("eq:")?;
+            let (lhs, rhs) = rest.split_once('=')?;
+            Some((lhs.to_string(), rhs.to_string()))
+        })
+        .collect();
+    let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
+    let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
+    let reverse_eqs = build_exact_rhs_equivalences(&eqs);
+    let affine_env = build_unit_affine_equivalences(&eqs);
+
     let condition_atoms: HashSet<_> = conditions
         .iter()
         .filter_map(|condition| condition.strip_prefix("cond:"))
-        .map(ToOwned::to_owned)
+        .map(|atom| {
+            canonicalize_redundancy_atom(
+                atom,
+                &reverse_eqs,
+                &positive_witness_atoms,
+                &nonpositive_witness_atoms,
+                &affine_env,
+            )
+        })
         .collect();
     phi.retain(|item| {
-        item.strip_prefix("atom:")
-            .is_none_or(|atom| !condition_atoms.contains(atom))
+        item.strip_prefix("atom:").is_none_or(|atom| {
+            !condition_atoms.contains(&canonicalize_redundancy_atom(
+                atom,
+                &reverse_eqs,
+                &positive_witness_atoms,
+                &nonpositive_witness_atoms,
+                &affine_env,
+            ))
+        })
     });
+}
+
+fn canonicalize_redundancy_atom(
+    atom: &str,
+    reverse_eqs: &HashMap<String, Vec<String>>,
+    positive_witness_atoms: &HashMap<String, String>,
+    nonpositive_witness_atoms: &HashMap<String, String>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
+) -> String {
+    let Some(parsed) = parse_atom_item(&format!("atom:{atom}")) else {
+        return atom.to_string();
+    };
+    let lhs = normalize_atom_term_for_phi(&parsed.lhs, reverse_eqs, affine_env);
+    let rhs = normalize_atom_term_for_phi(&parsed.rhs, reverse_eqs, affine_env);
+    if let Some(collapsed) = collapse_witness_atom(
+        &lhs,
+        parsed.operator,
+        &rhs,
+        positive_witness_atoms,
+        nonpositive_witness_atoms,
+    ) {
+        collapsed
+            .strip_prefix("atom:")
+            .unwrap_or(&collapsed)
+            .to_string()
+    } else {
+        format!("{lhs} {} {rhs}", parsed.operator)
+    }
 }
 
 fn normalize_is_int_terms(
@@ -3452,6 +3717,289 @@ mod tests {
         assert!(
             pre_post.phi.contains(&"is_int(return.*)".to_string()),
             "exact is_int term equalities should anchor back to the visible summary value"
+        );
+    }
+
+    #[test]
+    fn test_phi_normalization_derives_anchored_is_int_from_inverse_scaling_eq() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("x".to_string(), "v1".to_string())],
+                post_stack: vec![
+                    ("return".to_string(), "v20".to_string()),
+                    ("x".to_string(), "v1".to_string()),
+                ],
+                pre_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                    RawEdge {
+                        src: "v4".to_string(),
+                        access: "*".to_string(),
+                        dst: "v9".to_string(),
+                    },
+                ],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                    RawEdge {
+                        src: "v20".to_string(),
+                        access: "*".to_string(),
+                        dst: "v18".to_string(),
+                    },
+                    RawEdge {
+                        src: "v4".to_string(),
+                        access: "*".to_string(),
+                        dst: "v9".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v9=lin(1/2*v18)".to_string(),
+                    "is_int(v9)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            pre_post.phi.contains(&"is_int(return.*)".to_string()),
+            "integer closure should derive anchored return facts from inverse scaling equalities"
+        );
+        assert!(
+            !pre_post
+                .phi
+                .iter()
+                .any(|item| item.starts_with("is_int(v")),
+            "inverse scaling should not leave formula-only integer witnesses behind: {:?}",
+            pre_post.phi
+        );
+    }
+
+    #[test]
+    fn test_phi_normalization_drops_formula_only_is_int_after_eq_closure() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("x".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("return".to_string(), "v20".to_string()),
+                    ("x".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v7".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v9".to_string(),
+                    },
+                    RawEdge {
+                        src: "v7".to_string(),
+                        access: "*".to_string(),
+                        dst: "v8".to_string(),
+                    },
+                    RawEdge {
+                        src: "v9".to_string(),
+                        access: "*".to_string(),
+                        dst: "v10".to_string(),
+                    },
+                ],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v7".to_string(),
+                    },
+                    RawEdge {
+                        src: "v2".to_string(),
+                        access: "*".to_string(),
+                        dst: "v9".to_string(),
+                    },
+                    RawEdge {
+                        src: "v20".to_string(),
+                        access: "*".to_string(),
+                        dst: "v19".to_string(),
+                    },
+                    RawEdge {
+                        src: "v7".to_string(),
+                        access: "*".to_string(),
+                        dst: "v8".to_string(),
+                    },
+                    RawEdge {
+                        src: "v9".to_string(),
+                        access: "*".to_string(),
+                        dst: "v10".to_string(),
+                    },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v13=lin(-1*v18,1*v19)".to_string(),
+                    "eq:v8=lin(-1*v10,1*v18)".to_string(),
+                    "is_int(v10)".to_string(),
+                    "is_int(v13)".to_string(),
+                    "is_int(v8)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            pre_post.phi.contains(&"is_int(return.*)".to_string()),
+            "eq-based integer closure should derive visible return facts from formula-only intermediates"
+        );
+        assert!(
+            !pre_post
+                .phi
+                .iter()
+                .any(|item| item.starts_with("is_int(v")),
+            "formula-only integer witnesses should be dropped once the anchored closure is available: {:?}",
+            pre_post.phi
+        );
+    }
+
+    #[test]
+    fn test_phi_normalization_drops_atom_redundant_with_condition_via_affine_equality() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![],
+                post_stack: vec![],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v10".to_string()],
+                phi: vec![
+                    "eq:v10=lin(1*v14,const=1)".to_string(),
+                    "atom:0 < add(v14,1)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            !pre_post
+                .phi
+                .iter()
+                .any(|item| item == "atom:0 < v10" || item == "atom:0 < lin(1*v14,const=1)"),
+            "phi atom implied by an equivalent condition should be removed after affine normalization"
+        );
+    }
+
+    #[test]
+    fn test_phi_normalization_drops_recursive_affine_atoms_redundant_with_conditions() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("i".to_string(), "v2".to_string()),
+                    ("f".to_string(), "v1".to_string()),
+                ],
+                post_stack: vec![
+                    ("i".to_string(), "v2".to_string()),
+                    ("f".to_string(), "v1".to_string()),
+                ],
+                pre_heap: vec![],
+                post_heap: vec![],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v10".to_string(), "cond:0 < v4".to_string()],
+                phi: vec![
+                    "eq:v10=lin(1*v14,const=1)".to_string(),
+                    "eq:v4=lin(1*v14,const=2)".to_string(),
+                    "atom:0 < add(v14,1)".to_string(),
+                    "atom:0 < add(add(v14,1),1)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            !pre_post.phi.iter().any(|item| item.starts_with("atom:")),
+            "recursive affine atoms already covered by branch conditions should be dropped: {:?}",
+            pre_post.phi
+        );
+    }
+
+    #[test]
+    fn test_phi_normalization_drops_invoke_recursive_affine_atoms_with_actual_shape() {
+        let raw = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("f".to_string(), "v1".to_string()), ("i".to_string(), "v2".to_string())],
+                post_stack: vec![("f".to_string(), "v1".to_string()), ("i".to_string(), "v2".to_string())],
+                pre_heap: vec![
+                    RawEdge { src: "v1".to_string(), access: "*".to_string(), dst: "v3".to_string() },
+                    RawEdge { src: "v2".to_string(), access: "*".to_string(), dst: "v4".to_string() },
+                    RawEdge { src: "v3".to_string(), access: "*".to_string(), dst: "v11".to_string() },
+                ],
+                post_heap: vec![
+                    RawEdge { src: "v1".to_string(), access: "*".to_string(), dst: "v3".to_string() },
+                    RawEdge { src: "v2".to_string(), access: "*".to_string(), dst: "v4".to_string() },
+                    RawEdge { src: "v3".to_string(), access: "*".to_string(), dst: "v12".to_string() },
+                ],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v10".to_string(), "cond:0 < v4".to_string()],
+                phi: vec![
+                    "atom:0 < add(add(v14,1),1)".to_string(),
+                    "atom:0 < add(v14,1)".to_string(),
+                    "eq:v10=lin(1*v14,const=1)".to_string(),
+                    "eq:v4=lin(1*v14,const=2)".to_string(),
+                    "is_int(v10)".to_string(),
+                    "is_int(v4)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = raw.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            !pre_post.phi.iter().any(|item| item.starts_with("atom:")),
+            "invoke recursive branch should not keep redundant affine atoms after canonicalization: {:?}",
+            pre_post.phi
         );
     }
 }
