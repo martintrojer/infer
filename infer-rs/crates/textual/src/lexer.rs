@@ -175,17 +175,61 @@ fn lex_integer(lex: &mut logos::Lexer<'_, RawToken>) -> Option<BigInt> {
 
 fn lex_string(lex: &mut logos::Lexer<'_, RawToken>) -> String {
     let s = lex.slice();
-    // Strip surrounding quotes, handle basic escapes
+    // Strip surrounding quotes and unescape the same basic sequences as OCaml
+    // TextualLexer.ml, while preserving unknown backslashes literally.
     let inner = &s[1..s.len() - 1];
+    let chars: Vec<char> = inner.chars().collect();
     let mut result = String::new();
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(escaped) = chars.next() {
-                result.push(escaped);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                '\\' => {
+                    result.push('\\');
+                    i += 2;
+                }
+                '"' => {
+                    result.push('"');
+                    i += 2;
+                }
+                'n' => {
+                    result.push('\n');
+                    i += 2;
+                }
+                'r' => {
+                    result.push('\r');
+                    i += 2;
+                }
+                't' => {
+                    result.push('\t');
+                    i += 2;
+                }
+                'b' => {
+                    result.push('\u{0008}');
+                    i += 2;
+                }
+                '0'..='9' if i + 3 < chars.len() => {
+                    let digits: String = chars[i + 1..=i + 3].iter().collect();
+                    if let Ok(code) = digits.parse::<u32>() {
+                        if code < 256 {
+                            if let Some(decoded) = char::from_u32(code) {
+                                result.push(decoded);
+                                i += 4;
+                                continue;
+                            }
+                        }
+                    }
+                    result.push('\\');
+                    i += 1;
+                }
+                _ => {
+                    result.push('\\');
+                    i += 1;
+                }
             }
         } else {
-            result.push(c);
+            result.push(chars[i]);
+            i += 1;
         }
     }
     result
@@ -662,6 +706,23 @@ mod tests {
                 Tok::StringLit("world".into())
             ]
         );
+    }
+
+    #[test]
+    fn test_strings_unescape_known_sequences() {
+        let toks = tokens(r#""hello \"world\" \\ \n \t \r \b""#);
+        assert_eq!(
+            toks,
+            vec![Tok::StringLit(
+                "hello \"world\" \\ \n \t \r \u{0008}".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_strings_preserve_unknown_backslashes() {
+        let toks = tokens(r#""\HH\Lib\C""#);
+        assert_eq!(toks, vec![Tok::StringLit(r#"\HH\Lib\C"#.into())]);
     }
 
     #[test]

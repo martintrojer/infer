@@ -317,7 +317,7 @@ impl<'a> Printer<'a> {
             Exp::Const(c) => match c {
                 Const::Int(i) => self.write(&format!("{}", i)),
                 Const::Null => self.write("null"),
-                Const::Str(s) => self.write(&format!("\"{}\"", s)),
+                Const::Str(s) => self.write(&format!("\"{}\"", escape_string_literal(s))),
                 Const::Float(f) => self.write(&format!("{}", f)),
             },
             Exp::If { cond, then_, else_ } => {
@@ -417,6 +417,25 @@ impl<'a> Printer<'a> {
     }
 }
 
+fn escape_string_literal(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            c if c.is_control() && (c as u32) < 256 => {
+                out.push_str(&format!("\\{:03}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", print_module(self))
@@ -464,5 +483,57 @@ define f(x: int) : int {
                 "declaration kind mismatch"
             );
         }
+    }
+
+    #[test]
+    fn test_roundtrip_string_constants_with_escaping() {
+        let src = r#".source_language = "c"
+
+declare f(*void) : void
+
+define test() : void {
+  #b0:
+    n0 = f("hello \"world\" \\ \n end")
+    ret null
+}
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let printed = print_module(&module);
+        assert!(
+            printed.contains(r#"n0 = f("hello \"world\" \\ \n end")"#),
+            "printed module should preserve escaped string literals: {printed}"
+        );
+
+        let reparsed = parse_module(&printed, "test.sil").unwrap();
+        assert_eq!(
+            module, reparsed,
+            "string literal roundtrip should be lossless"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_string_constants_with_unknown_backslashes() {
+        let src = r#".source_language = "hack"
+
+declare f(*void) : void
+
+define test() : void {
+  #b0:
+    n0 = f("\HH\Lib\C")
+    ret null
+}
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let printed = print_module(&module);
+        assert!(
+            printed.contains(r#"n0 = f("\\HH\\Lib\\C")"#),
+            "printed module should escape literal backslashes: {printed}"
+        );
+
+        let reparsed = parse_module(&printed, "test.sil").unwrap();
+        assert_eq!(
+            module, reparsed,
+            "unknown backslash sequences should roundtrip as literal backslashes"
+        );
     }
 }
