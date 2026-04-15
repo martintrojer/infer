@@ -181,6 +181,11 @@ pub struct InferConfig {
     #[serde(rename = "trace-ondemand")]
     pub trace_ondemand: bool,
 
+    /// Regex filter for selecting procedures to analyze/debug.
+    /// OCaml: `--procedures-filter` (default none)
+    #[serde(rename = "procedures-filter")]
+    pub procedures_filter: Option<String>,
+
     // ---- Parallelism ----
     /// Number of parallel analysis jobs. None = use all available CPUs.
     /// OCaml: `-j` / `--jobs` (default: number of CPUs)
@@ -217,6 +222,7 @@ impl Default for InferConfig {
             max_widens: 10_000,
             debug_level_analysis: 0,
             trace_ondemand: false,
+            procedures_filter: None,
             jobs: None,
             quiet: false,
         }
@@ -313,6 +319,7 @@ mod tests {
         assert!(config.pulse_model_skip_pattern.is_none());
         assert!(config.pulse_model_unknown_pure.is_empty());
         assert!(!config.trace_ondemand);
+        assert!(config.procedures_filter.is_none());
         assert!(!config.quiet);
     }
 
@@ -419,6 +426,12 @@ mod tests {
     fn test_from_json_trace_ondemand() {
         let config = InferConfig::from_json(r#"{"trace-ondemand": true}"#);
         assert!(config.trace_ondemand);
+    }
+
+    #[test]
+    fn test_from_json_procedures_filter() {
+        let config = InferConfig::from_json(r#"{"procedures-filter": "foo\\.c:target"}"#);
+        assert_eq!(config.procedures_filter.as_deref(), Some("foo\\.c:target"));
     }
 
     #[test]

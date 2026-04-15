@@ -42,26 +42,23 @@ Keep it current when the active line of investigation changes.
     entering `8229` procedures across `55` logical waves with a very long
     tail; it was stopped before completion because it was not comparable to
     the single-thread OCaml baseline
-  - benchmark still points at two separate follow-ups:
-    - parser coverage gaps on store-textual files containing tokens like
-      `Local(0)` / `Wildcard`
+  - benchmark now points at two different follow-ups:
     - scheduler shape / tail latency in the Rust interproc runner
+    - exported-Textual proc identity loss for duplicate C names
   - latest fair direct-Textual `infer-rs --trace-ondemand --pulse-only -j 1`
     measurements:
     - parse/transform/to-SIL now has explicit progress and completes in about
-      `2m39s`-`2m41s` for this benchmark:
+      `3m02s` for a full clean parse of this benchmark:
       - `753` exported `.sil` files
-      - `736` parsed successfully
-      - `17` parse failures, matching the known `Local(0)` / `Wildcard` set:
-        `bn_asm`, `bn_div`, `bn_exp`, `bn_exp2`, `bn_mont`, `bn_mul`,
-        `bn_sqr`, `bntest`, `ecp_mont`, `ecp_smpl`, `ectest`, `gost89`,
-        `i_skey`, `lhash`, `o_names`, `randtest`, `ui_lib`
+      - `753` parsed successfully
+      - `0` parse failures after teaching name positions to accept textual
+        identifiers tokenized as `Local(n)` plus `_` wildcard field names
     - parse cost is non-uniform:
       - first `250` files finish in about `29s`
       - the `251-400` slice is much slower and contains many `ec_*`,
         `ecp_*`, `ectest`, `gost*`, `lhash`, `o_names`
     - merge is negligible:
-      - `736` parsed units -> merged `8229` procedures and `670` types in
+      - `753` parsed units -> merged `8395` procedures and `683` types in
         about `0.1s`
     - callgraph/schedule setup is negligible:
       - `8229` procedures, `18482` edges, `63` logical waves, all in about
@@ -94,13 +91,27 @@ Keep it current when the active line of investigation changes.
   - additional corpus caveat:
     - the exported OpenSSL textual set contains many duplicate `define`
       procnames across files (quick scan found about `3200` duplicate names)
-    - `Cfg::merge` currently lets later files win on duplicate procnames
+    - Rust merge now preserves a real body over an empty exported stub:
+      - exported empty `define { #node_0: @?; jmp @? }` bodies are now marked
+        `is_defined = false`
+      - `Cfg::merge` now keeps the existing real proc or replaces a stub with
+        a real body instead of blindly taking the later entry
     - example:
       - `ssl_set_client_disabled` is an empty stub in `ssl_lib.sil`
       - `ssl_set_client_disabled` also has a real ~`326`-line body in
         `t1_lib.sil`
-    - this is correctness-sensitive and worth comparing against how OCaml
-      capture/analysis selects duplicate C procdefs
+    - OCaml cross-check:
+      - `capture.db` keeps exactly one stored proc for this name, and it is
+        the real `t1_lib.c` body
+    - deeper exported-Textual limitation still remains:
+      - some real+real collisions are distinct OCaml proc UIDs whose hashed
+        identity is lost by `infer debug --export-textual` / `manifest.json`
+      - example: OCaml keeps
+        `tls1_sha512_final_raw{25e69bf71b156bed23a6f9e772c42969}`, but the
+        exported textual side only preserves plain
+        `tls1_sha512_final_raw`
+      - do not guess synthetic names in Rust; document this as an exported
+        Textual fidelity limit unless upstream preserves the proc UID
   - important scheduler investigation result:
     - OCaml `--scheduler callgraph` is **not** the same as the current Rust
       precomputed-wave barrier runner
@@ -121,6 +132,21 @@ Keep it current when the active line of investigation changes.
       the shared `infer-out` hit an internal restart-scheduler race even at
       `-j 1`, so proc-by-proc OCaml timing from the existing benchmark capture
       is not currently a clean baseline on this host/setup
+  - Rust-side proc filter status:
+    - `infer-rs` now has OCaml-compatible `.inferconfig` / CLI support for
+      `--procedures-filter`
+    - semantics:
+      - proc-only regex: `--procedures-filter 'ssl_set_client_disabled'`
+      - source+proc regex: `--procedures-filter 't1_lib\\.c:ssl_set_client_disabled'`
+      - filtered interproc runs retain matching roots plus transitive callees
+        so focused debugging still computes usable summaries
+    - verified benchmark spot-checks with the new flag:
+      - `t1_lib.sil` + `--procedures-filter 'ssl_set_client_disabled'`
+        retained only `2` procedures and still showed
+        `ssl_set_client_disabled` active past `50s`, confirming the hotspot is
+        local Pulse cost on the isolated slice too
+      - `s3_cbc.sil` + `--procedures-filter 'tls1_sha512_final_raw'`
+        retained `1` procedure and completed in about `6.5s`
 
 - Active parity target:
   - resume the remaining `latent.c` latent-invalid-access publication /

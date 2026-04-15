@@ -633,6 +633,11 @@ fn procdesc_to_sil(
         }
     }
 
+    // Store-textual export can emit declaration-like empty `define`s with the
+    // canonical `#node_0: @?; jmp  @?` body shape. Treat those as undefined so
+    // merged analysis does not mistake them for real bodies.
+    sil_pdesc.is_defined = !sil_pdesc.is_empty_body();
+
     if errors.is_empty() {
         Ok(sil_pdesc)
     } else {
@@ -1154,6 +1159,25 @@ define f() : *int {
             global_pvar.is_global(),
             "expected global pvar, got {global_pvar:?}"
         );
+    }
+
+    #[test]
+    fn test_empty_define_marks_proc_undefined() {
+        let src = r#".source_language = "c"
+
+define f() : void {
+  #node_0: @?
+      jmp  @?
+
+} @[1:1]
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        assert!(pdesc.is_empty_body());
+        assert!(!pdesc.is_defined);
     }
 
     #[test]

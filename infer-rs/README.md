@@ -170,6 +170,15 @@ When multiple `.sil` files are passed, `infer-rs` parses them in parallel, merge
 `Cfg`/`Tenv`, and then runs analysis once over the unified program so cross-file calls can resolve
 to in-memory summaries.
 
+For focused debugging, `--procedures-filter` mirrors OCaml's regex filter. In interprocedural mode
+the filtered run keeps matching root procedures plus their transitive callees, so narrowing to one
+hot procedure does not silently drop the summaries it depends on:
+
+```bash
+infer-rs --pulse-only --procedures-filter 'ssl_set_client_disabled' t1_lib.sil
+infer-rs --pulse-only --procedures-filter 't1_lib\\.c:ssl_set_client_disabled' *.sil
+```
+
 This direct-`.sil` mode is also the right path for apples-to-apples Rust timing
 after textual export, because it excludes capture/export overhead.
 
@@ -191,6 +200,7 @@ after textual export, because it excludes capture/export overhead.
 | `--max-widens N` | Max widenings before fixpoint gives up (default: 10000) |
 | `--debug-level-analysis N` | 0=quiet, 1=per-instruction, 2=full state dumps |
 | `--trace-ondemand` | Emit on-demand scheduler progress snapshots through the logger |
+| `--procedures-filter REGEX` | OCaml-compatible procedure filter: `proc_regex` or `source_regex:proc_regex` |
 | `--inferconfig-path FILE` | Path to .inferconfig file |
 | `--pulse-model-abort PROCNAME` | Model an exact procname as non-returning (repeatable) |
 | `--pulse-model-unreachable PROCNAME` | Model an exact procname as unreachable (repeatable) |
@@ -214,6 +224,9 @@ including the `Str.regexp` syntax used in test suites such as `\\(my\\|a\\)_mall
 `trace-ondemand` is also `.inferconfig`/CLI compatible with OCaml's flag name. Unless `RUST_LOG`
 is already set, enabling it defaults the logger to include `ondemand=info`, which emits wave
 start/end lines plus periodic scheduler snapshots with completed summaries, throughput, and ETA.
+`procedures-filter` is also `.inferconfig`/CLI compatible with OCaml's flag name and split
+syntax. A single regex filters procnames; `source_regex:proc_regex` filters both source file and
+procname.
 `pulse-model-returns-copy-pattern` is still intentionally unsupported because Rust does not yet
 implement OCaml's non-disjunctive unnecessary-copy tracking.
 

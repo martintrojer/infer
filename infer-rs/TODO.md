@@ -113,6 +113,11 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 ### Textual pipeline gaps
 
+- **Exported proc identity for duplicate C names**: direct multi-file `.sil` analysis now preserves
+  real bodies over empty exported stubs, but `infer debug --export-textual` /
+  `manifest.json` can still drop OCaml's hashed proc UIDs and collapse distinct real C functions
+  onto one plain procname. Treat this as an exported-Textual fidelity limitation unless upstream
+  preserves the proc UID at the textual boundary.
 - **DeclEnv enhancements** (`decls.rs`): Missing variadic proc tracking, generics status.
 - Language-specific (defer): FixHackWrapper, FixHackInvokeClosure, TransformClosures, verify_variadic_position, SSA restoration.
 

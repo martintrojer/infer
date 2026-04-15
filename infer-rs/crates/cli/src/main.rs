@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use diagnostics::issue::IssueLog;
 use rayon::prelude::*;
+use regex::Regex;
 use sil::procname::Procname;
+use sil::source_file::SourceFile;
 
 /// infer-rs: Rust implementation of the Infer static analyzer.
 ///
@@ -144,6 +146,11 @@ struct Cli {
     #[arg(long = "trace-ondemand")]
     trace_ondemand: bool,
 
+    /// OCaml-compatible procedure regex filter.
+    /// Either `proc_regex` or `source_regex:proc_regex`.
+    #[arg(long = "procedures-filter")]
+    procedures_filter: Option<String>,
+
     /// Path to .inferconfig file (default: search upward from CWD).
     #[arg(long = "inferconfig-path")]
     inferconfig_path: Option<PathBuf>,
@@ -233,6 +240,9 @@ impl Cli {
         if self.trace_ondemand {
             c.trace_ondemand = true;
         }
+        if let Some(v) = &self.procedures_filter {
+            c.procedures_filter = Some(v.clone());
+        }
         if self.jobs.is_some() {
             c.jobs = self.jobs;
         }
@@ -300,6 +310,73 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn filtered_cfg(cfg: &sil::cfg::Cfg, proc_names: &HashSet<Procname>) -> sil::cfg::Cfg {
+    sil::cfg::Cfg {
+        proc_descs: cfg
+            .proc_descs
+            .iter()
+            .filter(|(pname, _)| proc_names.contains(*pname))
+            .map(|(pname, pdesc)| (pname.clone(), pdesc.clone()))
+            .collect(),
+    }
+}
+
+fn retained_callee_closure(cfg: &sil::cfg::Cfg, roots: &HashSet<Procname>) -> HashSet<Procname> {
+    let call_graph = ondemand::callgraph::CallGraph::from_cfg(cfg);
+    let mut retained = roots.clone();
+    let mut worklist: Vec<_> = roots.iter().cloned().collect();
+
+    while let Some(proc_name) = worklist.pop() {
+        for callee in call_graph.callees(&proc_name) {
+            if cfg.get_proc_desc(callee).is_none() {
+                continue;
+            }
+            if retained.insert(callee.clone()) {
+                worklist.push(callee.clone());
+            }
+        }
+    }
+
+    retained
+}
+
+fn apply_procedures_filter(
+    cfg: &sil::cfg::Cfg,
+    procedures_filter: &ProceduresFilter,
+    include_transitive_callees: bool,
+) -> Result<AnalysisSelection, String> {
+    let matched_roots: HashSet<_> = cfg
+        .iter_proc_descs()
+        .filter(|pdesc| procedures_filter.matches(&pdesc.loc.file, &pdesc.proc_name))
+        .map(|pdesc| pdesc.proc_name.clone())
+        .collect();
+
+    if matched_roots.is_empty() {
+        return Err(format!(
+            "--procedures-filter `{}` matched no procedures",
+            procedures_filter.raw
+        ));
+    }
+
+    let retained = if include_transitive_callees {
+        retained_callee_closure(cfg, &matched_roots)
+    } else {
+        matched_roots.clone()
+    };
+
+    Ok(AnalysisSelection {
+        cfg: filtered_cfg(cfg, &retained),
+        matched_roots: matched_roots.len(),
+    })
+}
+
+fn count_source_files(cfg: &sil::cfg::Cfg) -> usize {
+    cfg.iter_proc_descs()
+        .map(|pdesc| pdesc.loc.file.clone())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 enum Mode {
     /// `infer-rs -- clang -c file.c` — capture then analyze
     CaptureAndAnalyze(Vec<String>),
@@ -319,6 +396,63 @@ struct AnalysisFile {
 struct ParsedAnalysisUnit {
     cfg: sil::cfg::Cfg,
     tenv: sil::tenv::Tenv,
+}
+
+/// OCaml-compatible procedure filter from `Filtering.mk_procedure_name_filter`.
+#[derive(Debug)]
+struct ProceduresFilter {
+    raw: String,
+    source_file_regex: Option<Regex>,
+    proc_name_regex: Option<Regex>,
+}
+
+impl ProceduresFilter {
+    fn compile(cfg: &config::InferConfig) -> Result<Option<Self>, String> {
+        let Some(raw) = cfg.procedures_filter.as_ref() else {
+            return Ok(None);
+        };
+
+        let (source_file_regex, proc_name_regex) = match raw.split_once(':') {
+            Some((source_file_filter, proc_name_filter)) => (
+                Some(Regex::new(source_file_filter).map_err(|e| {
+                    format!("invalid --procedures-filter source regex `{source_file_filter}`: {e}")
+                })?),
+                Some(Regex::new(proc_name_filter).map_err(|e| {
+                    format!("invalid --procedures-filter proc regex `{proc_name_filter}`: {e}")
+                })?),
+            ),
+            None => (
+                None,
+                Some(
+                    Regex::new(raw)
+                        .map_err(|e| format!("invalid --procedures-filter regex `{raw}`: {e}"))?,
+                ),
+            ),
+        };
+
+        Ok(Some(Self {
+            raw: raw.clone(),
+            source_file_regex,
+            proc_name_regex,
+        }))
+    }
+
+    fn matches(&self, source_file: &SourceFile, proc_name: &Procname) -> bool {
+        let source_matches = self
+            .source_file_regex
+            .as_ref()
+            .is_none_or(|regex| regex.is_match(&source_file.to_string()));
+        let proc_matches = self
+            .proc_name_regex
+            .as_ref()
+            .is_none_or(|regex| regex.is_match(&proc_name.to_string()));
+        source_matches && proc_matches
+    }
+}
+
+struct AnalysisSelection {
+    cfg: sil::cfg::Cfg,
+    matched_roots: usize,
 }
 
 /// Procedure metadata recovered from the original capture database.
@@ -387,6 +521,10 @@ fn main() {
     // Initialize global config from .inferconfig + CLI args
     config::init(resolved_config);
     let cfg = config::get();
+    let procedures_filter = ProceduresFilter::compile(cfg).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
 
     // Configure rayon thread pool
     if let Some(j) = cfg.jobs {
@@ -497,6 +635,7 @@ fn main() {
 
     let mut all_issues = IssueLog::new();
     let mut total_procs = 0;
+    let mut total_files = 0;
     let trace_ondemand = ondemand_trace_enabled();
 
     if !cfg.quiet {
@@ -571,10 +710,54 @@ fn main() {
         );
     }
 
-    let total_files = parsed_units.len();
-    if total_files > 0 {
+    if !parsed_units.is_empty() {
         let (merged_cfg, merged_tenv) = merge_parsed_units(parsed_units);
-        total_procs = merged_cfg.num_procs();
+        let include_transitive_callees = run_pulse && !config::get().pulse_intraprocedural_only;
+        let analysis_selection = procedures_filter
+            .as_ref()
+            .map(|filter| apply_procedures_filter(&merged_cfg, filter, include_transitive_callees))
+            .transpose()
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                process::exit(1);
+            });
+        let matched_roots = analysis_selection
+            .as_ref()
+            .map_or(0, |selection| selection.matched_roots);
+        let analysis_cfg = match analysis_selection {
+            Some(selection) => selection.cfg,
+            None => merged_cfg,
+        };
+        total_procs = analysis_cfg.num_procs();
+        total_files = count_source_files(&analysis_cfg);
+        if let Some(filter) = &procedures_filter {
+            let closure_note = if include_transitive_callees {
+                " plus transitive callees"
+            } else {
+                ""
+            };
+            if !cfg.quiet {
+                eprintln!(
+                    "Using --procedures-filter `{}`: matched {} root proc(s), retained {} proc(s) across {} file(s){}",
+                    filter.raw,
+                    matched_roots,
+                    total_procs,
+                    total_files,
+                    closure_note,
+                );
+            }
+            if trace_ondemand {
+                log::info!(
+                    target: "ondemand",
+                    "[ondemand] cli procedures filter: filter=`{}` matched_roots={} retained_procs={} files={} include_transitive_callees={}",
+                    filter.raw,
+                    matched_roots,
+                    total_procs,
+                    total_files,
+                    include_transitive_callees,
+                );
+            }
+        }
         if trace_ondemand {
             log::info!(
                 target: "ondemand",
@@ -594,7 +777,7 @@ fn main() {
                         "[ondemand] cli pulse intraprocedural start: procedures={total_procs}"
                     );
                 }
-                for pdesc in merged_cfg.iter_proc_descs() {
+                for pdesc in analysis_cfg.iter_proc_descs() {
                     let summary = pulse::checker::analyze(pdesc);
                     all_issues.merge(pulse::checker::to_issue_log_with_pdesc(&summary, pdesc));
                 }
@@ -618,9 +801,9 @@ fn main() {
                     );
                 }
                 let (store, _stats) =
-                    ondemand::runner::run_inter(&checker, &merged_cfg, &merged_tenv);
+                    ondemand::runner::run_inter(&checker, &analysis_cfg, &merged_tenv);
                 for (pname, summary) in store.to_vec() {
-                    let Some(pdesc) = merged_cfg.get_proc_desc(&pname) else {
+                    let Some(pdesc) = analysis_cfg.get_proc_desc(&pname) else {
                         continue;
                     };
                     all_issues.merge(pulse::checker::to_issue_log_with_pdesc(&summary, pdesc));
@@ -645,7 +828,7 @@ fn main() {
                     "[ondemand] cli liveness start: procedures={total_procs}"
                 );
             }
-            for pdesc in merged_cfg.iter_proc_descs() {
+            for pdesc in analysis_cfg.iter_proc_descs() {
                 all_issues.merge(analyses::liveness::report_dead_stores(pdesc));
             }
             if trace_ondemand {
@@ -1305,6 +1488,65 @@ impl ondemand::checker::InterChecker for PulseInterChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sil::call_flags::CallFlags;
+    use sil::const_val::Const;
+    use sil::exp::Exp;
+    use sil::ident::{Ident, IdentName};
+    use sil::instr::Instr;
+    use sil::location::Location;
+    use sil::procdesc::{NodeKind, StmtNodeKind};
+    use sil::typ::Typ;
+
+    fn test_loc(source_file: &str) -> Location {
+        Location {
+            file: SourceFile::new(source_file),
+            line: 1,
+            col: 1,
+            macro_file_opt: None,
+            macro_line: -1,
+        }
+    }
+
+    fn mk_proc_in_file(name: &str, source_file: &str) -> sil::procdesc::Procdesc {
+        let loc = test_loc(source_file);
+        let mut pdesc =
+            sil::procdesc::Procdesc::new(Procname::c_from_string(name), Typ::void(), loc.clone());
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::skip()],
+            loc,
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
+
+    fn mk_calling_proc_in_file(
+        name: &str,
+        callee: &str,
+        source_file: &str,
+    ) -> sil::procdesc::Procdesc {
+        let loc = test_loc(source_file);
+        let mut pdesc =
+            sil::procdesc::Procdesc::new(Procname::c_from_string(name), Typ::void(), loc.clone());
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Call {
+                ret: (
+                    Ident::create_normal(IdentName::from_string("n"), 0),
+                    Typ::void(),
+                ),
+                fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string(callee))),
+                args: vec![],
+                loc: loc.clone(),
+                flags: CallFlags::default(),
+            }],
+            loc,
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
 
     #[test]
     fn test_workspace_relative_infer_uses_sibling_repo() {
@@ -1474,5 +1716,106 @@ plain_local
             default_rust_log_filter(&cfg),
             "warn,pulse=trace,ondemand=info"
         );
+    }
+
+    #[test]
+    fn test_procedures_filter_matches_proc_only() {
+        let cfg = config::InferConfig {
+            procedures_filter: Some("target".to_string()),
+            ..config::InferConfig::default()
+        };
+        let filter = ProceduresFilter::compile(&cfg)
+            .expect("filter should compile")
+            .expect("filter should exist");
+
+        assert!(filter.matches(
+            &SourceFile::new("foo.c"),
+            &Procname::c_from_string("target_proc"),
+        ));
+        assert!(!filter.matches(
+            &SourceFile::new("foo.c"),
+            &Procname::c_from_string("other_proc"),
+        ));
+    }
+
+    #[test]
+    fn test_procedures_filter_matches_source_and_proc() {
+        let cfg = config::InferConfig {
+            procedures_filter: Some("foo\\.c:target".to_string()),
+            ..config::InferConfig::default()
+        };
+        let filter = ProceduresFilter::compile(&cfg)
+            .expect("filter should compile")
+            .expect("filter should exist");
+
+        assert!(filter.matches(
+            &SourceFile::new("/tmp/src/foo.c"),
+            &Procname::c_from_string("target_proc"),
+        ));
+        assert!(!filter.matches(
+            &SourceFile::new("/tmp/src/bar.c"),
+            &Procname::c_from_string("target_proc"),
+        ));
+        assert!(!filter.matches(
+            &SourceFile::new("/tmp/src/foo.c"),
+            &Procname::c_from_string("other_proc"),
+        ));
+    }
+
+    #[test]
+    fn test_apply_procedures_filter_keeps_transitive_callees() {
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(mk_calling_proc_in_file("caller", "callee", "foo.c"));
+        cfg.add_proc_desc(mk_proc_in_file("callee", "bar.c"));
+        cfg.add_proc_desc(mk_proc_in_file("unrelated", "baz.c"));
+
+        let filter = ProceduresFilter {
+            raw: "caller".to_string(),
+            source_file_regex: None,
+            proc_name_regex: Some(Regex::new("caller").expect("regex should compile")),
+        };
+
+        let selection =
+            apply_procedures_filter(&cfg, &filter, true).expect("filter should match caller");
+
+        assert_eq!(selection.matched_roots, 1);
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("caller"))
+            .is_some());
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("callee"))
+            .is_some());
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("unrelated"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_apply_procedures_filter_without_transitive_callees_keeps_roots_only() {
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(mk_calling_proc_in_file("caller", "callee", "foo.c"));
+        cfg.add_proc_desc(mk_proc_in_file("callee", "bar.c"));
+
+        let filter = ProceduresFilter {
+            raw: "caller".to_string(),
+            source_file_regex: None,
+            proc_name_regex: Some(Regex::new("caller").expect("regex should compile")),
+        };
+
+        let selection =
+            apply_procedures_filter(&cfg, &filter, false).expect("filter should match caller");
+
+        assert_eq!(selection.matched_roots, 1);
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("caller"))
+            .is_some());
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("callee"))
+            .is_none());
     }
 }

@@ -167,11 +167,41 @@ impl Parser {
         Ok(s)
     }
 
+    /// Name positions such as locals/fields can legitimately use `n0`/`n1`
+    /// as source-level identifiers in exported Textual. The lexer tokenizes
+    /// those as `Tok::Local(_)`, so declaration/name parsing must reinterpret
+    /// them back to their textual spelling rather than rejecting them as SSA
+    /// temporaries. Anonymous union fields also use `_`.
+    fn name_ident(&mut self) -> Result<String, ParseError> {
+        let s = match self.peek() {
+            Tok::Ident(s) => s.clone(),
+            Tok::Declare => "declare".into(),
+            Tok::Define => "define".into(),
+            Tok::Extends => "extends".into(),
+            Tok::Equals => "equals".into(),
+            Tok::Global => "global".into(),
+            Tok::Jmp => "jmp".into(),
+            Tok::Load => "load".into(),
+            Tok::LocalKw => "local".into(),
+            Tok::Prune => "prune".into(),
+            Tok::Ret => "ret".into(),
+            Tok::Store => "store".into(),
+            Tok::Throw => "throw".into(),
+            Tok::Type => "type".into(),
+            Tok::Unreachable => "unreachable".into(),
+            Tok::Local(n) => format!("n{n}"),
+            Tok::Wildcard => "_".to_string(),
+            other => return Err(self.err(format!("expected identifier, got `{other:?}`"))),
+        };
+        self.ts.advance();
+        Ok(s)
+    }
+
     // -- Names (Menhir: fname, nname, vname, tname) -------------------------
 
     fn fname(&mut self) -> Result<FieldName, ParseError> {
         let loc = self.loc();
-        let id = self.ident()?;
+        let id = self.name_ident()?;
         Ok(Name::new(id, loc))
     }
 
@@ -183,7 +213,7 @@ impl Parser {
 
     fn vname(&mut self) -> Result<VarName, ParseError> {
         let loc = self.loc();
-        let id = self.ident()?;
+        let id = self.name_ident()?;
         Ok(Name::new(id, loc))
     }
 
@@ -1288,6 +1318,52 @@ mod tests {
                 assert_eq!(p.nodes[0].instrs.len(), 1);
             }
             other => panic!("expected Proc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_local_like_param_and_field_names() {
+        let src = r#".source_language = "c"
+
+type T = { n0: int }
+
+define f(n1: int) : int {
+  #entry:
+    n0 : int = load &n1
+    ret n0
+}"#;
+        let m = parse_module(src, "t.sil").unwrap();
+
+        match &m.decls[0] {
+            Decl::Struct(s) => {
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.fields[0].qualified_name.name.value, "n0");
+            }
+            other => panic!("expected Struct, got {other:?}"),
+        }
+
+        match &m.decls[1] {
+            Decl::Proc(p) => {
+                assert_eq!(p.params.len(), 1);
+                assert_eq!(p.params[0].value, "n1");
+                assert_eq!(p.nodes[0].instrs.len(), 1);
+            }
+            other => panic!("expected Proc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wildcard_field_name() {
+        let src = r#".source_language = "c"
+
+type T = { _: int }"#;
+        let m = parse_module(src, "t.sil").unwrap();
+        match &m.decls[0] {
+            Decl::Struct(s) => {
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.fields[0].qualified_name.name.value, "_");
+            }
+            other => panic!("expected Struct, got {other:?}"),
         }
     }
 

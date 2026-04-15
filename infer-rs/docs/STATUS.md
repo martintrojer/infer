@@ -5,6 +5,23 @@
 **~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
 
 Recent correctness / robustness fixes:
+- Textual ingestion and merged direct-`.sil` robustness improved again:
+  parser name positions now accept exported identifiers tokenized as
+  `Local(n)` plus `_` wildcard field names, empty exported
+  `define { #node_0: @?; jmp @? }` stubs are now marked undefined during
+  Textual→SIL lowering, and merged multi-file analysis now keeps a real body
+  over an empty stub on duplicate procnames instead of blindly letting the
+  later entry win. On the OpenSSL benchmark this closes the old parse blockers
+  entirely (`753 / 753` exported `.sil` files now parse), while still keeping
+  the remaining real limitation explicit: exported textual can drop OCaml's
+  hashed proc UID for some duplicate C names, so real+real plain-name
+  collisions remain an accepted `--export-textual` fidelity gap rather than a
+  Rust-side renaming target.
+- CLI/debugging gained OCaml-compatible `--procedures-filter` support through
+  both CLI and `.inferconfig`. Rust mirrors OCaml's proc-only vs
+  `source_regex:proc_regex` split semantics, and filtered interprocedural runs
+  retain matching roots plus their transitive callees so focused hotspot
+  debugging can still compute usable summaries.
 - Imported arithmetic latent-summary parity is fixed again:
   `PulseFormulaPhi` condition normalization now preserves reverse-pivoted
   linear guards (for example, a stored `x = -neg_x` relation still records the

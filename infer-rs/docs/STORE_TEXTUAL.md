@@ -95,6 +95,34 @@ Relevant code paths:
 - Rust Textual → SIL lowering: `infer-rs/crates/textual/src/to_sil.rs`
 - Rust Pulse `sizeof` evaluation: `infer-rs/crates/pulse/src/operations.rs`
 
+## Accepted Fidelity Limitation: duplicate C proc identities
+
+OpenSSL exposed a second exported-Textual fidelity limit that is separate from
+`sizeof.c`.
+
+What happens today:
+
+- `capture.db` stores procedures by OCaml proc UID, not just by plain textual proc name
+- some C procedures that share the same plain name still have distinct stored proc UIDs
+- `infer debug --export-textual` writes per-source `.sil` files plus `manifest.json`, but that
+  exported surface can drop the hashed proc UID suffix and keep only the plain proc name
+- example:
+  - OCaml capture keeps `tls1_sha512_final_raw{25e69bf71b156bed23a6f9e772c42969}`
+  - exported textual side only preserves `tls1_sha512_final_raw`
+
+What infer-rs does today:
+
+- empty exported `define` stubs are now treated as undefined, so a real body correctly wins over an
+  empty `@?` stub during multi-file direct `.sil` merge
+- infer-rs does **not** invent synthetic names for real+real collisions after export
+
+Policy:
+
+- do not guess replacement proc identities in Rust just to make merged direct-Textual analysis look
+  cleaner
+- treat real+real plain-name collisions as an exported-Textual fidelity limit until the textual
+  boundary preserves the OCaml proc UID (or equivalent identity metadata)
+
 ## Other Notes
 
 - frontend coverage for `--store-textual` is moving upstream; treat old per-language support

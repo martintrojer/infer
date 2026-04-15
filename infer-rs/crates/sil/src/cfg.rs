@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,18 @@ impl Cfg {
     }
 
     pub fn merge(&mut self, other: Cfg) {
-        self.proc_descs.extend(other.proc_descs);
+        for (pname, incoming) in other.proc_descs {
+            match self.proc_descs.entry(pname) {
+                Entry::Vacant(slot) => {
+                    slot.insert(incoming);
+                }
+                Entry::Occupied(mut slot) => {
+                    if should_replace_procdesc(slot.get(), &incoming) {
+                        slot.insert(incoming);
+                    }
+                }
+            }
+        }
     }
 
     pub fn add_proc_desc(&mut self, pdesc: Procdesc) {
@@ -48,10 +59,27 @@ impl Cfg {
     }
 }
 
+fn should_replace_procdesc(current: &Procdesc, incoming: &Procdesc) -> bool {
+    // OCaml stores one procdesc per proc UID in capture.db. Exported Textual
+    // can still contain duplicate plain proc names, most often as a real body
+    // plus one or more empty `@?` stubs. Never let an empty stub overwrite a
+    // real body during merged direct-Textual analysis.
+    match (
+        current.is_defined && !current.is_empty_body(),
+        incoming.is_defined && !incoming.is_empty_body(),
+    ) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instr::Instr;
     use crate::location::Location;
+    use crate::procdesc::{NodeKind, StmtNodeKind};
     use crate::procname::Procname;
     use crate::typ::Typ;
 
@@ -61,6 +89,22 @@ mod tests {
             Typ::void(),
             Location::dummy(),
         )
+    }
+
+    fn mk_real_proc(name: &str) -> Procdesc {
+        let mut pdesc = mk_proc(name);
+        pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::skip()],
+            Location::dummy(),
+        );
+        pdesc
+    }
+
+    fn mk_stub_proc(name: &str) -> Procdesc {
+        let mut pdesc = mk_proc(name);
+        pdesc.is_defined = false;
+        pdesc
     }
 
     #[test]
@@ -83,24 +127,40 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_prefers_other_on_duplicate_procname() {
+    fn test_merge_replaces_stub_with_real_duplicate_procname() {
         let pname = Procname::c_from_string("dup");
         let mut lhs = Cfg::new();
-        let mut left = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
-        left.is_no_return = false;
-        lhs.add_proc_desc(left);
+        lhs.add_proc_desc(mk_stub_proc("dup"));
 
         let mut rhs = Cfg::new();
-        let mut right = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let mut right = mk_real_proc("dup");
         right.is_no_return = true;
         rhs.add_proc_desc(right);
 
         lhs.merge(rhs);
 
-        assert!(
-            lhs.get_proc_desc(&pname)
-                .expect("merged proc should exist")
-                .is_no_return
-        );
+        let merged = lhs.get_proc_desc(&pname).expect("merged proc should exist");
+        assert!(merged.is_defined);
+        assert!(merged.is_no_return);
+        assert!(!merged.is_empty_body());
+    }
+
+    #[test]
+    fn test_merge_keeps_existing_real_over_incoming_stub() {
+        let pname = Procname::c_from_string("dup");
+        let mut lhs = Cfg::new();
+        let mut left = mk_real_proc("dup");
+        left.is_no_return = true;
+        lhs.add_proc_desc(left);
+
+        let mut rhs = Cfg::new();
+        rhs.add_proc_desc(mk_stub_proc("dup"));
+
+        lhs.merge(rhs);
+
+        let merged = lhs.get_proc_desc(&pname).expect("merged proc should exist");
+        assert!(merged.is_defined);
+        assert!(merged.is_no_return);
+        assert!(!merged.is_empty_body());
     }
 }

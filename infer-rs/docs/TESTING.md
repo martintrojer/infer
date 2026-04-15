@@ -114,6 +114,13 @@ For the OpenSSL benchmark on this host, the fair Rust timing should be compared
 to `infer analyze --pulse-only --results-dir ../infer-out -j 1`, not to an
 OCaml run at a different `-j`.
 
+Current OpenSSL status from the latest direct-Textual spot-check:
+
+- parse coverage is now `753 / 753` exported `.sil` files with `0` parse errors after accepting
+  textual name positions tokenized as `Local(n)` plus `_` wildcard field names
+- the remaining benchmark blockers are local Pulse throughput on heavy procedures such as
+  `ssl_set_client_disabled` plus exported-Textual proc-identity loss for some duplicate C names
+
 Important macOS notes learned from the OpenSSL benchmark:
 
 - Use the repo clang through `PATH=.../facebook-clang-plugins/clang/install/bin:$PATH`
@@ -139,6 +146,9 @@ infer --pulse-only --debug -j 1 -- clang -c file.c
 
 # Rust: generate log traces
 infer-rs --debug-level-analysis 1 file.sil
+
+# Rust: narrow a large corpus to one procedure (keeps transitive callees for interproc)
+infer-rs --debug-level-analysis 1 --procedures-filter 'target_proc' *.sil
 
 # Compare side-by-side
 python3 scripts/compare_traces.py \
