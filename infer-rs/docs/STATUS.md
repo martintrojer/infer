@@ -22,6 +22,13 @@ Recent correctness / robustness fixes:
   `source_regex:proc_regex` split semantics, and filtered interprocedural runs
   retain matching roots plus their transitive callees so focused hotspot
   debugging can still compute usable summaries.
+- Long-running filtered Pulse runs now emit logger-based `pulse-progress`
+  heartbeats under `--trace-ondemand`, which exposes elapsed time,
+  transfer-step count, current node/instr, and current/max disjunct counts.
+  The first OpenSSL hotspot slice showed that
+  `ssl_set_client_disabled` is not frozen on one transfer; it crawls through
+  the CFG while staying saturated at `20` disjuncts, which points more toward
+  path churn / disjunct pressure than one isolated pathological instruction.
 - Imported arithmetic latent-summary parity is fixed again:
   `PulseFormulaPhi` condition normalization now preserves reverse-pivoted
   linear guards (for example, a stored `x = -neg_x` relation still records the

@@ -174,6 +174,8 @@ runner logs:
 - a periodic snapshot every 10s while a wave is still running
 - completed summaries vs total procedures
 - throughput and coarse ETA
+- `pulse-progress` heartbeats for long-running procedures, including elapsed
+  time, transfer-step count, current node/instr, and current/max disjuncts
 
 You can raise verbosity further with explicit logger filters, for example
 `RUST_LOG=warn,ondemand=debug infer-rs --trace-ondemand ...` to include wave

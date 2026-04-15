@@ -300,7 +300,7 @@ infer-rs/
 - **Correctness over counts**: keep semantically correct OCaml-backed behavior even when sweep totals move temporarily; accepted divergences are documented instead of hidden
 - **Test through comparison**: compare against OCaml's `issues.exp` for compliance
 - **Per-instruction tracing**: `--debug-level-analysis` + `scripts/compare_traces.py` for debugging divergences
-- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis
+- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis, and now also emits `pulse-progress` heartbeats for long-running procedures
 
 ## Documentation
 

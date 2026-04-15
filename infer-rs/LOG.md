@@ -142,9 +142,17 @@ Keep it current when the active line of investigation changes.
         so focused debugging still computes usable summaries
     - verified benchmark spot-checks with the new flag:
       - `t1_lib.sil` + `--procedures-filter 'ssl_set_client_disabled'`
-        retained only `2` procedures and still showed
-        `ssl_set_client_disabled` active past `50s`, confirming the hotspot is
-        local Pulse cost on the isolated slice too
+        retained only `2` procedures
+      - the new `pulse-progress` heartbeat under `--trace-ondemand` shows the
+        isolated hotspot is not frozen on one transfer:
+        - `ssl_set_client_disabled` finished in about `1m13s`
+        - about `173` transfer steps total
+        - it stayed saturated at `20` disjuncts the whole time
+        - heartbeat samples moved across nodes/instrs such as
+          `40:0 -> 42:0 -> 35:0 -> 46:0 -> 29:0 -> 12:2 -> 4:0`
+      - current best diagnosis:
+        - this looks more like disjunct saturation / slow path churn through
+          the CFG than a single pathological frozen instruction
       - `s3_cbc.sil` + `--procedures-filter 'tls1_sha512_final_raw'`
         retained `1` procedure and completed in about `6.5s`
 
@@ -1927,3 +1935,28 @@ If resuming after compaction:
   - if not, the fallback is to identify exactly which specialization-seeded
     `Closure(...)` artifacts are safe to erase at summary export without lying
     about behavior
+
+## 2026-04-15 Heartbeat Verification
+
+- Added logger-based long-procedure `pulse-progress` heartbeats in
+  `crates/pulse/src/checker.rs`
+  - cross-ref:
+    - OCaml `infer/src/absint/AbstractInterpreter.ml` already provides
+      per-instruction / fixpoint tracing
+    - Rust keeps that detailed trace path and adds a lower-noise progress path
+      under `--trace-ondemand`
+  - heartbeat fields:
+    - elapsed
+    - transfer-step count
+    - current node / instr
+    - current disjunct count
+    - continue count
+    - specialization request count
+    - max disjunct count seen
+  - emits a final `done` line for procedures that either logged heartbeats or
+    ran longer than the slow-proc threshold
+
+- Verification:
+  - `make check` passes cleanly after the patch
+  - an earlier `end_to_end` idle spell did not reproduce on rerun, so there is
+    no confirmed regression there right now

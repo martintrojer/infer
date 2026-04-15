@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use absint::disjunctive::DisjunctiveDomain;
 use absint::interp;
@@ -36,6 +37,105 @@ use crate::execution_domain::ExecutionDomain;
 use crate::pulse_result::PulseResult;
 use crate::summary::PulseSummary;
 use crate::transfer;
+
+/// Cross-ref: OCaml `AbstractInterpreter.ml` already emits detailed
+/// per-instruction / fixpoint debug in HTML and debug logs. Rust keeps the
+/// existing `debug_level_analysis` traces and adds a coarse heartbeat for
+/// long-running procedures when logger-based progress is enabled.
+const PROC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const PROC_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(5);
+
+fn pulse_progress_enabled() -> bool {
+    log::log_enabled!(target: "ondemand", log::Level::Info)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ProcProgress {
+    started: Instant,
+    last_log: Instant,
+    exec_steps: usize,
+    max_disjuncts: usize,
+    logged_heartbeat: bool,
+}
+
+impl ProcProgress {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_log: now,
+            exec_steps: 0,
+            max_disjuncts: 0,
+            logged_heartbeat: false,
+        }
+    }
+
+    fn note_step(
+        &mut self,
+        proc_name: &str,
+        node_id: NodeId,
+        instr_idx: usize,
+        total_disjuncts: usize,
+        continue_count: usize,
+        spec_requests: usize,
+    ) {
+        self.exec_steps += 1;
+        self.max_disjuncts = self.max_disjuncts.max(total_disjuncts);
+
+        if !pulse_progress_enabled() || self.last_log.elapsed() < PROC_PROGRESS_LOG_INTERVAL {
+            return;
+        }
+
+        self.last_log = Instant::now();
+        self.logged_heartbeat = true;
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={proc_name} elapsed={} steps={} node={node_id} instr={instr_idx} disjuncts={} continue={} spec_requests={} max_disjuncts={}",
+            format_duration(self.started.elapsed()),
+            self.exec_steps,
+            total_disjuncts,
+            continue_count,
+            spec_requests,
+            self.max_disjuncts,
+        );
+    }
+
+    fn log_done(&self, proc_name: &str, exit_disjuncts: usize, spec_requests: usize) {
+        if !pulse_progress_enabled() {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        if !self.logged_heartbeat && elapsed < PROC_SLOW_LOG_THRESHOLD {
+            return;
+        }
+
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={proc_name} done: elapsed={} steps={} exit_disjuncts={} spec_requests={} max_disjuncts={}",
+            format_duration(elapsed),
+            self.exec_steps,
+            exit_disjuncts,
+            spec_requests,
+            self.max_disjuncts,
+        );
+    }
+}
 
 /// Run Pulse analysis on a procedure (intraprocedural, default config).
 pub fn analyze(pdesc: &Procdesc) -> PulseSummary {
@@ -101,6 +201,7 @@ pub fn analyze_with_specialization_and_requests(
         pdesc,
         proc_name: format!("{}", pdesc.proc_name),
         spec_requests: RefCell::new(Vec::new()),
+        progress: RefCell::new(ProcProgress::new()),
     };
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
@@ -204,6 +305,12 @@ pub fn analyze_with_specialization_and_requests(
         is_noreturn,
         has_dropped_disjuncts,
     );
+    let spec_request_count = pulse_tf.spec_requests.borrow().len();
+    pulse_tf.progress.borrow().log_done(
+        &pulse_tf.proc_name,
+        exit_disjuncts.len(),
+        spec_request_count,
+    );
     let spec_requests = pulse_tf.spec_requests.into_inner();
     (summary, spec_requests)
 }
@@ -251,6 +358,7 @@ struct PulseTransferFunctions<'a> {
     pdesc: &'a Procdesc,
     proc_name: String,
     spec_requests: RefCell<Vec<(Procname, PulseSpecialization)>>,
+    progress: RefCell<ProcProgress>,
 }
 
 impl TransferFunctions for PulseTransferFunctions<'_> {
@@ -271,6 +379,15 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         log::debug!(
             "[{pn}] exec node={node_id} instr={instr_idx} disjuncts={} (continue={continue_count}) {instr}",
             state.disjuncts.len()
+        );
+        let spec_request_count = self.spec_requests.borrow().len();
+        self.progress.borrow_mut().note_step(
+            pn,
+            node_id,
+            instr_idx,
+            state.disjuncts.len(),
+            continue_count,
+            spec_request_count,
         );
 
         let mut new_disjuncts = Vec::new();
@@ -1552,6 +1669,7 @@ mod tests {
             pdesc: &pdesc,
             proc_name: format!("{pname}"),
             spec_requests: RefCell::new(vec![]),
+            progress: RefCell::new(ProcProgress::new()),
         };
         let state = DisjunctiveDomain {
             disjuncts: vec![ExecutionDomain::ContinueProgram(
