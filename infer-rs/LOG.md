@@ -5,6 +5,123 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active external benchmark work:
+  - compare OCaml `infer` and `infer-rs` on `~/infer/benchmarks/openssl`
+    from a copy under `/tmp`
+  - current live benchmark dir:
+    - `/tmp/infer-rs-openssl-20260414-164043-repo-clang-path`
+- Key benchmark findings so far:
+  - for this benchmark on macOS, use the repo clang via
+    `PATH=.../facebook-clang-plugins/clang/install/bin:$PATH` and `CC=clang`
+  - do not set `CC=/absolute/path/to/clang`; the build can succeed while
+    Infer captures nothing (`infer debug --source-files` empty)
+  - the repo clang needs explicit macOS SDK headers here:
+    append `-isysroot $(xcrun --show-sdk-path)` to the benchmark `CFLAG`
+  - old OpenSSL 1.0.2d on this host should not use `./config`; it picked
+    `darwin-i386-cc` and hit legacy asm capture failures inside OCaml Infer
+  - `./Configure darwin64-x86_64-cc no-asm` is the working setup
+  - the corrected shared-capture run is non-empty:
+    `infer debug --results-dir .../infer-out --source-files` shows real
+    OpenSSL translation units such as `crypto/cryptlib.c`
+- Immediate next step on the benchmark:
+  - the OCaml timing baseline we currently trust is `infer analyze -j 1`
+    only, so any Rust speed comparison must first use `infer-rs -j 1`
+  - also keep the pipeline split honest:
+    - `infer-rs --results-dir ... --infer-bin ...` includes
+      `infer debug --export-textual`, so it is **not** directly comparable to
+      OCaml `infer analyze`
+    - the apples-to-apples Rust timing should run analysis on already
+      exported `.sil` files via `--capture-textual` / direct `.sil` inputs
+    - docs now say this explicitly in `README.md`, `docs/TESTING.md`, and
+      `docs/STATUS.md` so the benchmark recipe does not mix setup time with
+      fair analysis timing
+  - the traced `infer-rs --trace-ondemand --pulse-only -j 8` rerun is now
+    classified as a separate scheduler/throughput experiment, not the fair
+    headline benchmark
+  - that `-j 8` run showed parse/export saturating ~8 cores and Pulse
+    entering `8229` procedures across `55` logical waves with a very long
+    tail; it was stopped before completion because it was not comparable to
+    the single-thread OCaml baseline
+  - benchmark still points at two separate follow-ups:
+    - parser coverage gaps on store-textual files containing tokens like
+      `Local(0)` / `Wildcard`
+    - scheduler shape / tail latency in the Rust interproc runner
+  - latest fair direct-Textual `infer-rs --trace-ondemand --pulse-only -j 1`
+    measurements:
+    - parse/transform/to-SIL now has explicit progress and completes in about
+      `2m39s`-`2m41s` for this benchmark:
+      - `753` exported `.sil` files
+      - `736` parsed successfully
+      - `17` parse failures, matching the known `Local(0)` / `Wildcard` set:
+        `bn_asm`, `bn_div`, `bn_exp`, `bn_exp2`, `bn_mont`, `bn_mul`,
+        `bn_sqr`, `bntest`, `ecp_mont`, `ecp_smpl`, `ectest`, `gost89`,
+        `i_skey`, `lhash`, `o_names`, `randtest`, `ui_lib`
+    - parse cost is non-uniform:
+      - first `250` files finish in about `29s`
+      - the `251-400` slice is much slower and contains many `ec_*`,
+        `ecp_*`, `ectest`, `gost*`, `lhash`, `o_names`
+    - merge is negligible:
+      - `736` parsed units -> merged `8229` procedures and `670` types in
+        about `0.1s`
+    - callgraph/schedule setup is negligible:
+      - `8229` procedures, `18482` edges, `63` logical waves, all in about
+        `0.0s`
+    - post-parse bottleneck is Pulse throughput on some leaf procedures under
+      the current dynamic runner:
+      - round 1 seed size `3919`
+      - only `39` procedures completed in the first `30s`
+      - only `52` procedures completed by `1m30s`
+      - active-proc tracing showed one long-running leaf monopolizing `-j 1`
+        for tens of seconds:
+        - `ssl_set_client_disabled` active for ~`23s+`
+        - `tls1_sha512_final_raw` completed in ~`6.6s`
+    - implication:
+      - the current OpenSSL gap is **not** in merge or callgraph
+        construction; it is mostly front-end parse cost plus very slow Pulse
+        on specific procedures
+    - single-file isolation confirms the heavy leaf behavior is not just
+      whole-program scheduling overhead:
+      - `t1_lib.sil` alone parses in about `6.4s`
+      - interprocedural run on just `t1_lib.sil` has `173` procedures, `6`
+        logical waves, and still stalls in round 1 on
+        `ssl_set_client_disabled`
+      - in that isolated run, only `14` procedures completed in `40s`, with
+        `ssl_set_client_disabled` still active for `40s`
+      - an intraprocedural-only run on the same `t1_lib.sil` also stayed on
+        one core for ~`1m51s` before being stopped, which strongly suggests a
+        large part of the cost is local Pulse on specific procedures, not just
+        ondemand scheduling
+  - additional corpus caveat:
+    - the exported OpenSSL textual set contains many duplicate `define`
+      procnames across files (quick scan found about `3200` duplicate names)
+    - `Cfg::merge` currently lets later files win on duplicate procnames
+    - example:
+      - `ssl_set_client_disabled` is an empty stub in `ssl_lib.sil`
+      - `ssl_set_client_disabled` also has a real ~`326`-line body in
+        `t1_lib.sil`
+    - this is correctness-sensitive and worth comparing against how OCaml
+      capture/analysis selects duplicate C procdefs
+  - important scheduler investigation result:
+    - OCaml `--scheduler callgraph` is **not** the same as the current Rust
+      precomputed-wave barrier runner
+    - OCaml `backend/CallGraphScheduler.ml` keeps a dynamic queue of current
+      leaves and, after each proc finishes, removes it from the graph so newly
+      unblocked callers can start immediately
+    - Rust `crates/ondemand/src/runner.rs` currently computes all waves up
+      front and waits for an entire wave to finish before releasing the next
+      one
+    - therefore the closest OCaml scheduler worth porting first is dynamic
+      callgraph scheduling, not OCaml's restart/locking machinery
+  - extra OCaml cross-ref from this turn:
+    - `backend/CallGraphScheduler.ml` does not sort leaves lexicographically;
+      it queues current leaves in graph iteration order and logs every `200`
+      scheduled procedures
+  - OCaml proc-filter caveat from this turn:
+    - trying `infer analyze --procedures-filter ssl_set_client_disabled` on
+      the shared `infer-out` hit an internal restart-scheduler race even at
+      `-j 1`, so proc-by-proc OCaml timing from the existing benchmark capture
+      is not currently a clean baseline on this host/setup
+
 - Active parity target:
   - resume the remaining `latent.c` latent-invalid-access publication /
     dedup cluster now that the arithmetic latent-summary regression is closed

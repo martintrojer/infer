@@ -22,6 +22,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use diagnostics::issue::IssueLog;
@@ -137,6 +139,11 @@ struct Cli {
     #[arg(long = "debug-level-analysis", default_value = "0")]
     debug_level_analysis: u8,
 
+    /// Emit scheduler progress/debug information from the on-demand runner.
+    /// Matches OCaml's --trace-ondemand.
+    #[arg(long = "trace-ondemand")]
+    trace_ondemand: bool,
+
     /// Path to .inferconfig file (default: search upward from CWD).
     #[arg(long = "inferconfig-path")]
     inferconfig_path: Option<PathBuf>,
@@ -223,6 +230,9 @@ impl Cli {
         if self.debug_level_analysis > 0 {
             c.debug_level_analysis = self.debug_level_analysis;
         }
+        if self.trace_ondemand {
+            c.trace_ondemand = true;
+        }
         if self.jobs.is_some() {
             c.jobs = self.jobs;
         }
@@ -251,6 +261,42 @@ impl Cli {
 
         // No args: analyze existing capture.db
         Mode::AnalyzeExisting
+    }
+}
+
+fn default_rust_log_filter(cfg: &config::InferConfig) -> String {
+    let mut directives = vec!["warn".to_string()];
+    match cfg.debug_level_analysis {
+        0 => {}
+        1 => directives.push("pulse=debug".to_string()),
+        _ => directives.push("pulse=trace".to_string()),
+    }
+    if cfg.trace_ondemand && !cfg.quiet {
+        directives.push("ondemand=info".to_string());
+    }
+    directives.join(",")
+}
+
+const PARSE_PROGRESS_EVERY: usize = 25;
+const MERGE_PROGRESS_EVERY: usize = 25;
+
+fn ondemand_trace_enabled() -> bool {
+    log::log_enabled!(target: "ondemand", log::Level::Info)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     }
 }
 
@@ -330,20 +376,16 @@ impl CaptureProcMetadata {
 
 fn main() {
     let cli = Cli::parse();
+    let resolved_config = cli.to_config();
 
     // Initialize logging
     if std::env::var("RUST_LOG").is_err() {
-        let level = match cli.debug_level_analysis {
-            0 => "warn",
-            1 => "pulse=debug",
-            _ => "pulse=trace",
-        };
-        std::env::set_var("RUST_LOG", level);
+        std::env::set_var("RUST_LOG", default_rust_log_filter(&resolved_config));
     }
     env_logger::init();
 
     // Initialize global config from .inferconfig + CLI args
-    config::init(cli.to_config());
+    config::init(resolved_config);
     let cfg = config::get();
 
     // Configure rayon thread pool
@@ -355,6 +397,11 @@ fn main() {
     }
 
     let mode = cli.mode();
+    let mode_label = match &mode {
+        Mode::CaptureAndAnalyze(_) => "capture-and-analyze",
+        Mode::AnalyzeExisting => "analyze-existing",
+        Mode::DirectSil(_) => "direct-sil",
+    };
     let (files, metadata_results_dir): (Vec<AnalysisFile>, Option<PathBuf>) = match mode {
         Mode::CaptureAndAnalyze(ref build_cmd) => {
             let infer_out = cli
@@ -450,6 +497,7 @@ fn main() {
 
     let mut all_issues = IssueLog::new();
     let mut total_procs = 0;
+    let trace_ondemand = ondemand_trace_enabled();
 
     if !cfg.quiet {
         for af in &files {
@@ -457,16 +505,53 @@ fn main() {
         }
     }
 
+    let parse_start = Instant::now();
+    let parse_completed = AtomicUsize::new(0);
+    let parse_ok = AtomicUsize::new(0);
+    let parse_errors = AtomicUsize::new(0);
+    let total_parse_targets = files.len();
+    if trace_ondemand {
+        log::info!(
+            target: "ondemand",
+            "[ondemand] cli parse start: mode={mode_label} files={} pulse={} liveness={} jobs={:?}",
+            files.len(),
+            run_pulse,
+            run_liveness,
+            cfg.jobs,
+        );
+    }
+
     let parse_results: Vec<_> = files
         .par_iter()
         .map(|af| {
-            (
-                af.sil_path.clone(),
-                parse_file(af, capture_proc_metadata.as_ref()),
-            )
+            let result = parse_file(af, capture_proc_metadata.as_ref());
+            match &result {
+                Ok(_) => {
+                    parse_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    parse_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let completed = parse_completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if trace_ondemand
+                && (completed == total_parse_targets
+                    || completed.is_multiple_of(PARSE_PROGRESS_EVERY))
+            {
+                log::info!(
+                    target: "ondemand",
+                    "[ondemand] cli parse progress: completed={completed}/{total_parse_targets} ok={} errors={} elapsed={}",
+                    parse_ok.load(Ordering::Relaxed),
+                    parse_errors.load(Ordering::Relaxed),
+                    format_duration(parse_start.elapsed()),
+                );
+            }
+
+            (af.sil_path.clone(), result)
         })
         .collect();
 
+    let total_parse_results = parse_results.len();
     let mut parsed_units = Vec::new();
     for (sil_path, result) in parse_results {
         match result {
@@ -474,20 +559,64 @@ fn main() {
             Err(e) => eprintln!("error: {}: {e}", sil_path.display()),
         }
     }
+    let parse_error_count = total_parse_results.saturating_sub(parsed_units.len());
+    if trace_ondemand {
+        log::info!(
+            target: "ondemand",
+            "[ondemand] cli parse done: parsed={}/{} errors={} elapsed={}",
+            parsed_units.len(),
+            total_parse_results,
+            parse_error_count,
+            format_duration(parse_start.elapsed()),
+        );
+    }
 
     let total_files = parsed_units.len();
     if total_files > 0 {
         let (merged_cfg, merged_tenv) = merge_parsed_units(parsed_units);
         total_procs = merged_cfg.num_procs();
+        if trace_ondemand {
+            log::info!(
+                target: "ondemand",
+                "[ondemand] cli analysis input ready: files={} procedures={} types={}",
+                total_files,
+                total_procs,
+                merged_tenv.len(),
+            );
+        }
 
         if run_pulse {
             if config::get().pulse_intraprocedural_only {
+                let pulse_start = Instant::now();
+                if trace_ondemand {
+                    log::info!(
+                        target: "ondemand",
+                        "[ondemand] cli pulse intraprocedural start: procedures={total_procs}"
+                    );
+                }
                 for pdesc in merged_cfg.iter_proc_descs() {
                     let summary = pulse::checker::analyze(pdesc);
                     all_issues.merge(pulse::checker::to_issue_log_with_pdesc(&summary, pdesc));
                 }
+                if trace_ondemand {
+                    log::info!(
+                        target: "ondemand",
+                        "[ondemand] cli pulse intraprocedural done: issues_so_far={} elapsed={}",
+                        all_issues.len(),
+                        format_duration(pulse_start.elapsed()),
+                    );
+                }
             } else {
                 let checker = PulseInterChecker;
+                let pulse_start = Instant::now();
+                if trace_ondemand {
+                    log::info!(
+                        target: "ondemand",
+                        "[ondemand] cli pulse interprocedural start: procedures={} types={}",
+                        total_procs,
+                        merged_tenv.len(),
+                    );
+                }
                 let (store, _stats) =
                     ondemand::runner::run_inter(&checker, &merged_cfg, &merged_tenv);
                 for (pname, summary) in store.to_vec() {
@@ -496,12 +625,36 @@ fn main() {
                     };
                     all_issues.merge(pulse::checker::to_issue_log_with_pdesc(&summary, pdesc));
                 }
+                if trace_ondemand {
+                    log::info!(
+                        target: "ondemand",
+                        "[ondemand] cli pulse interprocedural done: summaries={} issues_so_far={} elapsed={}",
+                        store.len(),
+                        all_issues.len(),
+                        format_duration(pulse_start.elapsed()),
+                    );
+                }
             }
         }
 
         if run_liveness {
+            let liveness_start = Instant::now();
+            if trace_ondemand {
+                log::info!(
+                    target: "ondemand",
+                    "[ondemand] cli liveness start: procedures={total_procs}"
+                );
+            }
             for pdesc in merged_cfg.iter_proc_descs() {
                 all_issues.merge(analyses::liveness::report_dead_stores(pdesc));
+            }
+            if trace_ondemand {
+                log::info!(
+                    target: "ondemand",
+                    "[ondemand] cli liveness done: issues_so_far={} elapsed={}",
+                    all_issues.len(),
+                    format_duration(liveness_start.elapsed()),
+                );
             }
         }
     }
@@ -785,159 +938,6 @@ fn apply_capture_proc_metadata(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_workspace_relative_infer_uses_sibling_repo() {
-        let ws_root = workspace_root().expect("workspace root should be resolvable");
-        assert_eq!(
-            workspace_relative_infer(&ws_root),
-            ws_root.join("../infer/bin/infer")
-        );
-        assert_ne!(
-            workspace_relative_infer(&ws_root),
-            ws_root.join("infer/bin/infer")
-        );
-    }
-
-    #[test]
-    fn test_parse_capture_proc_metadata_extracts_no_return() {
-        let debug_output = r#"no_ret
-  source_file: nullptr_more.c
-  defined: true
-  attributes:
-    { proc_name= no_ret
-    ; translation_unit= nullptr_more.c
-    ; formals= []
-    ; is_defined= true
-    ; loc= nullptr_more.c:137:1
-    ; locals= []
-    ; ret_type= void
-    ; proc_id= no_ret }
-
-will_not_return
-  source_file: nullptr_more.c
-  defined: false
-  attributes:
-    { proc_name= will_not_return
-    ; translation_unit= nullptr_more.c
-    ; formals= []
-    ; is_no_return= true
-    ; loc= nullptr_more.c:127:1
-    ; locals= []
-    ; ret_type= void
-    ; proc_id= will_not_return }
-"#;
-
-        let metadata = parse_capture_proc_metadata(debug_output);
-
-        assert!(metadata.is_no_return(
-            "/tmp/some/path/nullptr_more.c",
-            &Procname::c_from_string("will_not_return")
-        ));
-        assert!(!metadata.is_no_return(
-            "/tmp/some/path/nullptr_more.c",
-            &Procname::c_from_string("no_ret")
-        ));
-    }
-
-    #[test]
-    fn test_parse_capture_proc_metadata_extracts_cleanup_locals() {
-        let debug_output = r#"cleanup_malloc_ok
-  source_file: cleanup_attribute.c
-  defined: true
-  attributes:
-    { proc_name= cleanup_malloc_ok
-    ; translation_unit= cleanup_attribute.c
-    ; formals= []
-    ; is_defined= true
-    ; loc= cleanup_attribute.c:16:1
-    ; locals= [{ name= x; typ= int*; modify_in_block= false; is_declared_unused= false; is_structured_binding= false; has_cleanup_attribute= true }]
-    ; ret_type= void
-    ; proc_id= cleanup_malloc_ok }
-
-plain_local
-  source_file: cleanup_attribute.c
-  defined: true
-  attributes:
-    { proc_name= plain_local
-    ; translation_unit= cleanup_attribute.c
-    ; formals= []
-    ; is_defined= true
-    ; loc= cleanup_attribute.c:40:1
-    ; locals= [{ name= y; typ= int*; modify_in_block= false; is_declared_unused= false; is_structured_binding= false; has_cleanup_attribute= false }]
-    ; ret_type= void
-    ; proc_id= plain_local }
-"#;
-
-        let metadata = parse_capture_proc_metadata(debug_output);
-
-        assert!(metadata.local_has_cleanup_attribute(
-            "/tmp/some/path/cleanup_attribute.c",
-            &Procname::c_from_string("cleanup_malloc_ok"),
-            "x"
-        ));
-        assert!(!metadata.local_has_cleanup_attribute(
-            "/tmp/some/path/cleanup_attribute.c",
-            &Procname::c_from_string("plain_local"),
-            "y"
-        ));
-    }
-
-    #[test]
-    fn test_apply_capture_proc_metadata_marks_procdesc() {
-        let pname = Procname::c_from_string("will_not_return");
-        let mut cfg = sil::cfg::Cfg::new();
-        cfg.add_proc_desc(sil::procdesc::Procdesc::new(
-            pname.clone(),
-            sil::typ::Typ::void(),
-            sil::location::Location::dummy(),
-        ));
-
-        let mut metadata = CaptureProcMetadata::default();
-        metadata.insert_no_return("nullptr_more.c", "will_not_return");
-        apply_capture_proc_metadata(&mut cfg, "/tmp/src/nullptr_more.c", &metadata);
-
-        assert!(
-            cfg.get_proc_desc(&pname)
-                .expect("proc should exist")
-                .is_no_return
-        );
-    }
-
-    #[test]
-    fn test_apply_capture_proc_metadata_marks_cleanup_locals() {
-        let pname = Procname::c_from_string("cleanup_malloc_ok");
-        let mut pdesc = sil::procdesc::Procdesc::new(
-            pname.clone(),
-            sil::typ::Typ::void(),
-            sil::location::Location::dummy(),
-        );
-        pdesc.locals.push(sil::procdesc::VarData {
-            name: sil::mangled::Mangled::from_string("x"),
-            typ: sil::typ::Typ::int(sil::typ::IKind::IInt),
-            modify_in_block: false,
-            is_constexpr: false,
-            is_declared_unused: false,
-            is_structured_binding: false,
-            has_cleanup_attribute: false,
-        });
-
-        let mut cfg = sil::cfg::Cfg::new();
-        cfg.add_proc_desc(pdesc);
-
-        let mut metadata = CaptureProcMetadata::default();
-        metadata.insert_cleanup_local("cleanup_attribute.c", "cleanup_malloc_ok", "x");
-        apply_capture_proc_metadata(&mut cfg, "/tmp/src/cleanup_attribute.c", &metadata);
-
-        assert!(
-            cfg.get_proc_desc(&pname).expect("proc should exist").locals[0].has_cleanup_attribute
-        );
-    }
-}
-
 /// Run `infer debug --export-textual <dir> -o <infer_out>` and return analysis files.
 fn export_textual(
     infer_out: &Path,
@@ -1017,11 +1017,32 @@ fn read_manifest(manifest_path: &Path, base_dir: &Path) -> Vec<AnalysisFile> {
 // ---------------------------------------------------------------------------
 
 fn merge_parsed_units(units: Vec<ParsedAnalysisUnit>) -> (sil::cfg::Cfg, sil::tenv::Tenv) {
+    let trace_ondemand = ondemand_trace_enabled();
+    let total_units = units.len();
+    let merge_start = Instant::now();
     let mut merged_cfg = sil::cfg::Cfg::new();
     let mut merged_tenv = sil::tenv::Tenv::new();
-    for unit in units {
+    if trace_ondemand {
+        log::info!(
+            target: "ondemand",
+            "[ondemand] cli merge start: files={total_units}"
+        );
+    }
+    for (idx, unit) in units.into_iter().enumerate() {
         merged_cfg.merge(unit.cfg);
         merged_tenv.merge(unit.tenv);
+        let merged_units = idx + 1;
+        if trace_ondemand
+            && (merged_units == total_units || merged_units % MERGE_PROGRESS_EVERY == 0)
+        {
+            log::info!(
+                target: "ondemand",
+                "[ondemand] cli merge progress: merged={merged_units}/{total_units} procedures={} types={} elapsed={}",
+                merged_cfg.num_procs(),
+                merged_tenv.len(),
+                format_duration(merge_start.elapsed()),
+            );
+        }
     }
     (merged_cfg, merged_tenv)
 }
@@ -1278,5 +1299,180 @@ impl ondemand::checker::InterChecker for PulseInterChecker {
         ctx: &ondemand::checker::AnalysisContext<Self::Summary>,
     ) -> Self::Summary {
         analyze_with_spec_loop(pdesc, ctx, None, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_workspace_relative_infer_uses_sibling_repo() {
+        let ws_root = workspace_root().expect("workspace root should be resolvable");
+        assert_eq!(
+            workspace_relative_infer(&ws_root),
+            ws_root.join("../infer/bin/infer")
+        );
+        assert_ne!(
+            workspace_relative_infer(&ws_root),
+            ws_root.join("infer/bin/infer")
+        );
+    }
+
+    #[test]
+    fn test_parse_capture_proc_metadata_extracts_no_return() {
+        let debug_output = r#"no_ret
+  source_file: nullptr_more.c
+  defined: true
+  attributes:
+    { proc_name= no_ret
+    ; translation_unit= nullptr_more.c
+    ; formals= []
+    ; is_defined= true
+    ; loc= nullptr_more.c:137:1
+    ; locals= []
+    ; ret_type= void
+    ; proc_id= no_ret }
+
+will_not_return
+  source_file: nullptr_more.c
+  defined: false
+  attributes:
+    { proc_name= will_not_return
+    ; translation_unit= nullptr_more.c
+    ; formals= []
+    ; is_no_return= true
+    ; loc= nullptr_more.c:127:1
+    ; locals= []
+    ; ret_type= void
+    ; proc_id= will_not_return }
+"#;
+
+        let metadata = parse_capture_proc_metadata(debug_output);
+
+        assert!(metadata.is_no_return(
+            "/tmp/some/path/nullptr_more.c",
+            &Procname::c_from_string("will_not_return")
+        ));
+        assert!(!metadata.is_no_return(
+            "/tmp/some/path/nullptr_more.c",
+            &Procname::c_from_string("no_ret")
+        ));
+    }
+
+    #[test]
+    fn test_parse_capture_proc_metadata_extracts_cleanup_locals() {
+        let debug_output = r#"cleanup_malloc_ok
+  source_file: cleanup_attribute.c
+  defined: true
+  attributes:
+    { proc_name= cleanup_malloc_ok
+    ; translation_unit= cleanup_attribute.c
+    ; formals= []
+    ; is_defined= true
+    ; loc= cleanup_attribute.c:16:1
+    ; locals= [{ name= x; typ= int*; modify_in_block= false; is_declared_unused= false; is_structured_binding= false; has_cleanup_attribute= true }]
+    ; ret_type= void
+    ; proc_id= cleanup_malloc_ok }
+
+plain_local
+  source_file: cleanup_attribute.c
+  defined: true
+  attributes:
+    { proc_name= plain_local
+    ; translation_unit= cleanup_attribute.c
+    ; formals= []
+    ; is_defined= true
+    ; loc= cleanup_attribute.c:40:1
+    ; locals= [{ name= y; typ= int*; modify_in_block= false; is_declared_unused= false; is_structured_binding= false; has_cleanup_attribute= false }]
+    ; ret_type= void
+    ; proc_id= plain_local }
+"#;
+
+        let metadata = parse_capture_proc_metadata(debug_output);
+
+        assert!(metadata.local_has_cleanup_attribute(
+            "/tmp/some/path/cleanup_attribute.c",
+            &Procname::c_from_string("cleanup_malloc_ok"),
+            "x"
+        ));
+        assert!(!metadata.local_has_cleanup_attribute(
+            "/tmp/some/path/cleanup_attribute.c",
+            &Procname::c_from_string("plain_local"),
+            "y"
+        ));
+    }
+
+    #[test]
+    fn test_apply_capture_proc_metadata_marks_procdesc() {
+        let pname = Procname::c_from_string("will_not_return");
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(sil::procdesc::Procdesc::new(
+            pname.clone(),
+            sil::typ::Typ::void(),
+            sil::location::Location::dummy(),
+        ));
+
+        let mut metadata = CaptureProcMetadata::default();
+        metadata.insert_no_return("nullptr_more.c", "will_not_return");
+        apply_capture_proc_metadata(&mut cfg, "/tmp/src/nullptr_more.c", &metadata);
+
+        assert!(
+            cfg.get_proc_desc(&pname)
+                .expect("proc should exist")
+                .is_no_return
+        );
+    }
+
+    #[test]
+    fn test_apply_capture_proc_metadata_marks_cleanup_locals() {
+        let pname = Procname::c_from_string("cleanup_malloc_ok");
+        let mut pdesc = sil::procdesc::Procdesc::new(
+            pname.clone(),
+            sil::typ::Typ::void(),
+            sil::location::Location::dummy(),
+        );
+        pdesc.locals.push(sil::procdesc::VarData {
+            name: sil::mangled::Mangled::from_string("x"),
+            typ: sil::typ::Typ::int(sil::typ::IKind::IInt),
+            modify_in_block: false,
+            is_constexpr: false,
+            is_declared_unused: false,
+            is_structured_binding: false,
+            has_cleanup_attribute: false,
+        });
+
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(pdesc);
+
+        let mut metadata = CaptureProcMetadata::default();
+        metadata.insert_cleanup_local("cleanup_attribute.c", "cleanup_malloc_ok", "x");
+        apply_capture_proc_metadata(&mut cfg, "/tmp/src/cleanup_attribute.c", &metadata);
+
+        assert!(
+            cfg.get_proc_desc(&pname).expect("proc should exist").locals[0].has_cleanup_attribute
+        );
+    }
+
+    #[test]
+    fn test_default_rust_log_filter_adds_ondemand_info_for_trace_flag() {
+        let cfg = config::InferConfig {
+            trace_ondemand: true,
+            ..config::InferConfig::default()
+        };
+        assert_eq!(default_rust_log_filter(&cfg), "warn,ondemand=info");
+    }
+
+    #[test]
+    fn test_default_rust_log_filter_combines_pulse_and_ondemand() {
+        let cfg = config::InferConfig {
+            debug_level_analysis: 2,
+            trace_ondemand: true,
+            ..config::InferConfig::default()
+        };
+        assert_eq!(
+            default_rust_log_filter(&cfg),
+            "warn,pulse=trace,ondemand=info"
+        );
     }
 }

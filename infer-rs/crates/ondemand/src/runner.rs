@@ -9,8 +9,9 @@
 //! design using rayon for parallelism and DashMap for summary storage.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use sil::cfg::Cfg;
@@ -22,6 +23,11 @@ use crate::callgraph::CallGraph;
 use crate::checker::{AnalysisContext, FileChecker, InterChecker, IntraChecker};
 use crate::summary::SummaryStore;
 
+/// Cross-ref: OCaml `Config.trace_ondemand`.
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const ACTIVE_PROC_LOG_LIMIT: usize = 3;
+const SLOW_PROC_LOG_THRESHOLD: Duration = Duration::from_secs(5);
+
 /// Statistics from an analysis run.
 #[derive(Debug)]
 pub struct RunStats {
@@ -29,6 +35,281 @@ pub struct RunStats {
     pub analyzed_procs: usize,
     pub num_waves: usize,
     pub elapsed_ms: u128,
+}
+
+#[derive(Clone, Copy)]
+enum RoundKind {
+    Dynamic,
+    CycleCut,
+}
+
+impl RoundKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dynamic => "dynamic",
+            Self::CycleCut => "cycle-cut",
+        }
+    }
+}
+
+struct RoundProgress<'a, S> {
+    checker_id: &'a str,
+    round_num: usize,
+    logical_waves: usize,
+    kind: RoundKind,
+    seed_size: usize,
+    completed_before_round: usize,
+    total_procs: usize,
+    analyzed: &'a AtomicUsize,
+    store: &'a SummaryStore<S>,
+    remaining: &'a Mutex<HashSet<Procname>>,
+    active: &'a Mutex<HashMap<Procname, Instant>>,
+    analysis_start: Instant,
+    round_start: Instant,
+}
+
+struct DynamicSchedule {
+    callers_of: HashMap<Procname, Vec<Procname>>,
+    dependency_counts: HashMap<Procname, AtomicUsize>,
+    scheduled: HashMap<Procname, AtomicBool>,
+    remaining: Mutex<HashSet<Procname>>,
+}
+
+impl DynamicSchedule {
+    fn new(call_graph: &CallGraph, defined: &HashSet<Procname>) -> Self {
+        let callers_of = call_graph.callers_of_defined(defined);
+        let dependency_counts = call_graph
+            .defined_dependency_counts(defined)
+            .into_iter()
+            .map(|(pname, deps)| (pname, AtomicUsize::new(deps)))
+            .collect();
+        let scheduled = defined
+            .iter()
+            .cloned()
+            .map(|pname| (pname, AtomicBool::new(false)))
+            .collect();
+
+        Self {
+            callers_of,
+            dependency_counts,
+            scheduled,
+            remaining: Mutex::new(defined.clone()),
+        }
+    }
+
+    fn collect_ready_seed(&self) -> Vec<Procname> {
+        let remaining = self.remaining.lock().expect("remaining set poisoned");
+        let mut ready: Vec<_> = remaining
+            .iter()
+            .filter(|pname| {
+                self.dependency_counts
+                    .get(*pname)
+                    .is_some_and(|count| count.load(Ordering::Acquire) == 0)
+                    && self
+                        .scheduled
+                        .get(*pname)
+                        .is_some_and(|scheduled| !scheduled.load(Ordering::Acquire))
+            })
+            .cloned()
+            .collect();
+        ready.sort_by(|a, b| format!("{a}").cmp(&format!("{b}")));
+        ready
+    }
+
+    fn remaining_snapshot(&self) -> HashSet<Procname> {
+        self.remaining
+            .lock()
+            .expect("remaining set poisoned")
+            .clone()
+    }
+
+    fn remaining_count(&self) -> usize {
+        self.remaining.lock().expect("remaining set poisoned").len()
+    }
+
+    fn try_mark_scheduled(&self, pname: &Procname) -> bool {
+        self.scheduled
+            .get(pname)
+            .expect("scheduled state should exist for proc")
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn mark_completed(&self, pname: &Procname) {
+        self.remaining
+            .lock()
+            .expect("remaining set poisoned")
+            .remove(pname);
+    }
+}
+
+struct InterRunCtx<'a, C: InterChecker> {
+    checker: &'a C,
+    cfg: &'a Cfg,
+    tenv: &'a Tenv,
+    store: &'a SummaryStore<C::Summary>,
+    analyzed: &'a AtomicUsize,
+    schedule: &'a DynamicSchedule,
+    active: &'a Mutex<HashMap<Procname, Instant>>,
+}
+
+fn ondemand_progress_enabled() -> bool {
+    log::log_enabled!(log::Level::Info)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
+}
+
+fn log_round_snapshot<S>(phase: &str, progress: &RoundProgress<'_, S>)
+where
+    S: Send + Sync + 'static,
+{
+    let completed = progress.store.len();
+    let completed_since_round = completed.saturating_sub(progress.completed_before_round);
+    let analyzed_procs = progress.analyzed.load(Ordering::Relaxed);
+    let remaining = progress
+        .remaining
+        .lock()
+        .expect("remaining set poisoned")
+        .len();
+    let total_elapsed = progress.analysis_start.elapsed();
+    let total_elapsed_secs = total_elapsed.as_secs_f64();
+    let throughput = if total_elapsed_secs > 0.0 {
+        completed as f64 / total_elapsed_secs
+    } else {
+        0.0
+    };
+    let eta = if throughput > 0.0 && remaining > 0 {
+        format_duration(Duration::from_secs_f64(remaining as f64 / throughput))
+    } else {
+        "unknown".to_string()
+    };
+    let (active_count, active_top) = {
+        let active = progress.active.lock().expect("active set poisoned");
+        let mut longest_running: Vec<_> = active
+            .iter()
+            .map(|(pname, started)| (pname.to_string(), started.elapsed()))
+            .collect();
+        longest_running.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
+        longest_running.truncate(ACTIVE_PROC_LOG_LIMIT);
+        let summary = if longest_running.is_empty() {
+            "none".to_string()
+        } else {
+            longest_running
+                .into_iter()
+                .map(|(pname, elapsed)| format!("{pname}:{}", format_duration(elapsed)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        (active.len(), summary)
+    };
+
+    log::info!(
+        "[ondemand] checker={} round {} {} {phase}: \
+         seed_size={} completed_since_round_start={} \
+         completed={completed}/{} remaining={remaining} analyzed={analyzed_procs} \
+         round_elapsed={} total_elapsed={} rate={throughput:.2} proc/s eta={eta} \
+         active={active_count} active_top=[{active_top}]",
+        progress.checker_id,
+        progress.round_num,
+        progress.kind.label(),
+        progress.seed_size,
+        completed_since_round,
+        progress.total_procs,
+        format_duration(progress.round_start.elapsed()),
+        format_duration(total_elapsed),
+    );
+}
+
+fn report_round_progress<S>(progress: &RoundProgress<'_, S>, stop_rx: mpsc::Receiver<()>)
+where
+    S: Send + Sync + 'static,
+{
+    while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(PROGRESS_LOG_INTERVAL) {
+        log_round_snapshot("progress", progress);
+    }
+}
+
+fn spawn_dynamic_proc<'scope, C>(
+    scope: &rayon::Scope<'scope>,
+    ctx: &'scope InterRunCtx<'scope, C>,
+    pname: Procname,
+    propagate_ready_callers: bool,
+) where
+    C: InterChecker + 'scope,
+{
+    scope.spawn(move |scope| {
+        let pdesc = ctx
+            .cfg
+            .get_proc_desc(&pname)
+            .expect("scheduled procedure should exist in cfg");
+        let proc_start = Instant::now();
+        ctx.active
+            .lock()
+            .expect("active set poisoned")
+            .insert(pname.clone(), proc_start);
+        ctx.store.get_or_compute(&pname, || {
+            let analysis_ctx = AnalysisContext {
+                tenv: ctx.tenv,
+                summaries: ctx.store,
+                cfg: ctx.cfg,
+            };
+            ctx.analyzed.fetch_add(1, Ordering::Relaxed);
+            ctx.checker.analyze(pdesc, &analysis_ctx)
+        });
+        let proc_elapsed = proc_start.elapsed();
+        ctx.active
+            .lock()
+            .expect("active set poisoned")
+            .remove(&pname);
+        if ondemand_progress_enabled() && proc_elapsed >= SLOW_PROC_LOG_THRESHOLD {
+            log::info!(
+                "[ondemand] checker={} slow proc done: {} elapsed={}",
+                ctx.checker.id(),
+                pname,
+                format_duration(proc_elapsed),
+            );
+        }
+        ctx.schedule.mark_completed(&pname);
+
+        let mut newly_ready = Vec::new();
+        if let Some(callers) = ctx.schedule.callers_of.get(&pname) {
+            for caller in callers {
+                let previous = ctx
+                    .schedule
+                    .dependency_counts
+                    .get(caller)
+                    .expect("dependency count should exist for caller")
+                    .fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(previous > 0, "dependency count underflow for {caller}");
+                if previous == 1
+                    && propagate_ready_callers
+                    && ctx.schedule.try_mark_scheduled(caller)
+                {
+                    newly_ready.push(caller.clone());
+                }
+            }
+        }
+
+        if propagate_ready_callers {
+            for caller in newly_ready {
+                spawn_dynamic_proc(scope, ctx, caller, true);
+            }
+        }
+    });
 }
 
 /// Run an intraprocedural checker on all procedures in a Cfg.
@@ -64,15 +345,19 @@ pub fn run_intra<C: IntraChecker>(
     (store, stats)
 }
 
-/// Run an interprocedural checker on all procedures in bottom-up call graph order.
+/// Run an interprocedural checker using dynamic bottom-up call graph scheduling.
 ///
-/// Procedures are grouped into "waves" — each wave contains procedures whose
-/// callees have all been analyzed in prior waves. Procedures within a wave
-/// run in parallel.
+/// Cross-ref: OCaml `backend/CallGraphScheduler.ml`.
 ///
-/// Within a wave (especially cycle waves), blocking deduplication ensures each
-/// procedure is analyzed exactly once: if two threads discover the same callee,
-/// the first computes it while the second blocks on `OnceLock`.
+/// Ready leaves are scheduled immediately, and when a procedure finishes its
+/// callers are released as soon as their last remaining dependency completes.
+/// This avoids the full-wave barriers of the old runner while keeping cycle
+/// handling deterministic: when only cyclic SCCs remain, one SCC is cut and
+/// analyzed as a round, after which newly unblocked callers can flow again.
+///
+/// Blocking deduplication still ensures each procedure is analyzed exactly
+/// once: if two threads discover the same callee, the first computes it while
+/// the second blocks on `OnceLock`.
 pub fn run_inter<C: InterChecker>(
     checker: &C,
     cfg: &Cfg,
@@ -80,36 +365,174 @@ pub fn run_inter<C: InterChecker>(
 ) -> (SummaryStore<C::Summary>, RunStats) {
     let start = Instant::now();
     let store = SummaryStore::new();
-    let cg = CallGraph::from_cfg(cfg);
-    let defined: HashSet<Procname> = cfg.proc_descs.keys().cloned().collect();
-    let waves = cg.bottom_up_schedule(&defined);
-    let num_waves = waves.len();
+    let checker_id = checker.id().to_string();
+    let total_procs = cfg.num_procs();
     let analyzed = AtomicUsize::new(0);
+    let progress_enabled = ondemand_progress_enabled();
+    if progress_enabled {
+        log::info!("[ondemand] checker={checker_id} call graph start: procedures={total_procs}");
+    }
+    let call_graph_start = Instant::now();
+    let cg = CallGraph::from_cfg(cfg);
+    let call_graph_elapsed = call_graph_start.elapsed();
+    if progress_enabled {
+        let edge_count: usize = cg.edges.values().map(HashSet::len).sum();
+        log::info!(
+            "[ondemand] checker={checker_id} call graph done: caller_nodes={} known_procs={} edges={edge_count} elapsed={}",
+            cg.edges.len(),
+            cg.all_procs.len(),
+            format_duration(call_graph_elapsed),
+        );
+    }
+    let defined: HashSet<Procname> = cfg.proc_descs.keys().cloned().collect();
+    if progress_enabled {
+        log::info!(
+            "[ondemand] checker={checker_id} logical schedule start: defined_procs={}",
+            defined.len(),
+        );
+    }
+    let logical_schedule_start = Instant::now();
+    let logical_waves = cg.bottom_up_schedule(&defined);
+    let num_waves = logical_waves.len();
+    if progress_enabled {
+        log::info!(
+            "[ondemand] checker={checker_id} logical schedule done: waves={num_waves} elapsed={}",
+            format_duration(logical_schedule_start.elapsed()),
+        );
+    }
+    let dynamic_schedule_start = Instant::now();
+    let schedule = DynamicSchedule::new(&cg, &defined);
+    let active = Mutex::new(HashMap::new());
+    if progress_enabled {
+        log::info!(
+            "[ondemand] checker={checker_id} dependency maps done: tracked_procs={} caller_buckets={} elapsed={}",
+            schedule.remaining_count(),
+            schedule.callers_of.len(),
+            format_duration(dynamic_schedule_start.elapsed()),
+        );
+    }
+    let run_ctx = InterRunCtx {
+        checker,
+        cfg,
+        tenv,
+        store: &store,
+        analyzed: &analyzed,
+        schedule: &schedule,
+        active: &active,
+    };
 
-    for wave in &waves {
-        wave.par_iter().for_each(|pname| {
-            // Use get_or_compute for blocking dedup: if another thread in this
-            // wave is already analyzing this procedure, we wait for it.
-            if let Some(pdesc) = cfg.get_proc_desc(pname) {
-                store.get_or_compute(pname, || {
-                    let ctx = AnalysisContext {
-                        tenv,
-                        summaries: &store,
-                        cfg,
-                    };
-                    analyzed.fetch_add(1, Ordering::Relaxed);
-                    checker.analyze(pdesc, &ctx)
-                });
+    if progress_enabled {
+        let max_wave_size = logical_waves.iter().map(Vec::len).max().unwrap_or(0);
+        log::info!(
+            "[ondemand] checker={checker_id} scheduled {total_procs} procedure(s) \
+             into {num_waves} logical wave(s); executing with dynamic callgraph scheduling; \
+             max_logical_wave_size={max_wave_size}"
+        );
+    }
+
+    let mut round_num = 0usize;
+    while schedule.remaining_count() > 0 {
+        let remaining = schedule.remaining_snapshot();
+        let mut seed = schedule.collect_ready_seed();
+        let kind = if seed.is_empty() {
+            seed = cg.cycle_cut(&remaining);
+            RoundKind::CycleCut
+        } else {
+            RoundKind::Dynamic
+        };
+
+        seed.retain(|pname| schedule.try_mark_scheduled(pname));
+        if seed.is_empty() {
+            continue;
+        }
+
+        round_num += 1;
+        let completed_before_round = store.len();
+        let progress = RoundProgress {
+            checker_id: &checker_id,
+            round_num,
+            logical_waves: num_waves,
+            kind,
+            seed_size: seed.len(),
+            completed_before_round,
+            total_procs,
+            analyzed: &analyzed,
+            store: &store,
+            remaining: &schedule.remaining,
+            active: &active,
+            analysis_start: start,
+            round_start: Instant::now(),
+        };
+
+        if progress_enabled {
+            log::info!(
+                "[ondemand] checker={checker_id} round {round_num} {} start: \
+                 seed_size={} completed={completed_before_round}/{total_procs} \
+                 logical_waves={}",
+                kind.label(),
+                seed.len(),
+                progress.logical_waves,
+            );
+            if log::log_enabled!(log::Level::Debug) {
+                let members = seed.iter().map(ToString::to_string).collect::<Vec<_>>();
+                log::debug!(
+                    "[ondemand] checker={checker_id} round {round_num} {} seeds: {}",
+                    kind.label(),
+                    members.join(", ")
+                );
+            }
+        }
+
+        std::thread::scope(|thread_scope| {
+            let stop_tx = if progress_enabled {
+                let (stop_tx, stop_rx) = mpsc::channel();
+                thread_scope.spawn(|| report_round_progress(&progress, stop_rx));
+                Some(stop_tx)
+            } else {
+                None
+            };
+
+            rayon::scope(|scope| {
+                for pname in seed {
+                    spawn_dynamic_proc(scope, &run_ctx, pname, matches!(kind, RoundKind::Dynamic));
+                }
+            });
+
+            if let Some(stop_tx) = stop_tx {
+                let _ = stop_tx.send(());
             }
         });
+
+        if progress_enabled {
+            log_round_snapshot("done", &progress);
+        }
     }
 
     let stats = RunStats {
-        total_procs: cfg.num_procs(),
+        total_procs,
         analyzed_procs: analyzed.load(Ordering::Relaxed),
         num_waves,
         elapsed_ms: start.elapsed().as_millis(),
     };
+
+    if progress_enabled {
+        let total_elapsed = start.elapsed();
+        let total_elapsed_secs = total_elapsed.as_secs_f64();
+        let throughput = if total_elapsed_secs > 0.0 {
+            stats.analyzed_procs as f64 / total_elapsed_secs
+        } else {
+            0.0
+        };
+        log::info!(
+            "[ondemand] checker={checker_id} done: analyzed={}/{} logical_waves={} rounds={} elapsed={} \
+             rate={throughput:.2} proc/s",
+            stats.analyzed_procs,
+            stats.total_procs,
+            stats.num_waves,
+            round_num,
+            format_duration(total_elapsed),
+        );
+    }
 
     (store, stats)
 }
@@ -208,6 +631,10 @@ pub fn run_file_callbacks<FC: FileChecker>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
     use sil::exp::Exp;
@@ -277,11 +704,13 @@ mod tests {
         fn analyze(&self, pdesc: &Procdesc, ctx: &AnalysisContext<u32>) -> u32 {
             let mut max_callee_depth: u32 = 0;
             for (_node_id, instr) in pdesc.iter_instrs() {
-                if let Instr::Call { fun_exp, .. } = instr {
-                    if let Exp::Const(Const::Cfun(callee)) = fun_exp {
-                        if let Some(callee_depth) = ctx.summaries.get(callee) {
-                            max_callee_depth = max_callee_depth.max(callee_depth);
-                        }
+                if let Instr::Call {
+                    fun_exp: Exp::Const(Const::Cfun(callee)),
+                    ..
+                } = instr
+                {
+                    if let Some(callee_depth) = ctx.summaries.get(callee) {
+                        max_callee_depth = max_callee_depth.max(callee_depth);
                     }
                 }
             }
@@ -339,6 +768,64 @@ mod tests {
         assert!(store.contains(&Procname::c_from_string("b")));
     }
 
+    struct DynamicChainChecker {
+        slow_done: Arc<AtomicBool>,
+        top_started_before_slow_done: Arc<AtomicBool>,
+    }
+
+    impl InterChecker for DynamicChainChecker {
+        type Summary = ();
+
+        fn id(&self) -> &str {
+            "dynamic_chain"
+        }
+
+        fn analyze(&self, pdesc: &Procdesc, _ctx: &AnalysisContext<Self::Summary>) {
+            match format!("{}", pdesc.proc_name).as_str() {
+                "slow" => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    self.slow_done.store(true, AtomicOrdering::SeqCst);
+                }
+                "top" => {
+                    if !self.slow_done.load(AtomicOrdering::SeqCst) {
+                        self.top_started_before_slow_done
+                            .store(true, AtomicOrdering::SeqCst);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_inter_dynamically_releases_chain_before_unrelated_slow_leaf_finishes() {
+        let mut cfg = Cfg::new();
+        cfg.add_proc_desc(mk_simple_proc("slow"));
+        cfg.add_proc_desc(mk_simple_proc("leaf"));
+        cfg.add_proc_desc(mk_calling_proc("mid", "leaf"));
+        cfg.add_proc_desc(mk_calling_proc("top", "mid"));
+        let tenv = Tenv::new();
+
+        let slow_done = Arc::new(AtomicBool::new(false));
+        let top_started_before_slow_done = Arc::new(AtomicBool::new(false));
+        let checker = DynamicChainChecker {
+            slow_done: Arc::clone(&slow_done),
+            top_started_before_slow_done: Arc::clone(&top_started_before_slow_done),
+        };
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("local rayon pool");
+        let (_store, stats) = pool.install(|| run_inter(&checker, &cfg, &tenv));
+
+        assert_eq!(stats.analyzed_procs, 4);
+        assert!(
+            top_started_before_slow_done.load(AtomicOrdering::SeqCst),
+            "top should start before unrelated slow leaf finishes"
+        );
+    }
+
     /// Interprocedural checker that depends on both the merged call graph and
     /// the merged type environment.
     struct TenvDepthChecker;
@@ -353,11 +840,13 @@ mod tests {
         fn analyze(&self, pdesc: &Procdesc, ctx: &AnalysisContext<u32>) -> u32 {
             let mut max_callee_depth: u32 = 0;
             for (_node_id, instr) in pdesc.iter_instrs() {
-                if let Instr::Call { fun_exp, .. } = instr {
-                    if let Exp::Const(Const::Cfun(callee)) = fun_exp {
-                        if let Some(callee_depth) = ctx.summaries.get(callee) {
-                            max_callee_depth = max_callee_depth.max(callee_depth);
-                        }
+                if let Instr::Call {
+                    fun_exp: Exp::Const(Const::Cfun(callee)),
+                    ..
+                } = instr
+                {
+                    if let Some(callee_depth) = ctx.summaries.get(callee) {
+                        max_callee_depth = max_callee_depth.max(callee_depth);
                     }
                 }
             }

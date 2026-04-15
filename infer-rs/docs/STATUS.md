@@ -585,6 +585,9 @@ The current authoritative sweep covers 52 of 55 C source files through the full 
 C source → OCaml `infer --store-textual` → `infer debug --export-textual` → manifest.json →
 Rust parse → Pulse analysis.
 This is the authoritative compliance benchmark because it matches the CLI capture/export path.
+For ad-hoc performance comparisons, keep using this path for correctness, but
+time Rust analysis on already exported `.sil` files because `infer-rs --results-dir`
+includes the export step.
 
 Run with: `cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture`
 

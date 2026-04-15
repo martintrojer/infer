@@ -139,6 +139,7 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 ## Debugging tools
 
 - **Per-instruction tracing**: `--debug-level-analysis 1` (debug) or `2` (trace). Also `RUST_LOG=pulse=debug`. Log lines prefixed with `[proc_name]` for parallel-safe filtering.
+- **Scheduler tracing**: `--trace-ondemand` enables logger-based wave start/end and periodic progress snapshots (`RUST_LOG=warn,ondemand=info` by default when the flag is set).
 - **Comparison script**: `scripts/compare_traces.py` — parses OCaml `--debug` HTML and Rust log, side-by-side per-instruction with disjunct counts.
 - **Compliance recipe**: see CLAUDE.md "Step-by-step tracing for compliance debugging".
 

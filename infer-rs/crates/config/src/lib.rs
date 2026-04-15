@@ -176,6 +176,11 @@ pub struct InferConfig {
     #[serde(rename = "debug-level-analysis")]
     pub debug_level_analysis: u8,
 
+    /// Emit debug information for the on-demand analysis scheduler.
+    /// OCaml: `--trace-ondemand` (default false)
+    #[serde(rename = "trace-ondemand")]
+    pub trace_ondemand: bool,
+
     // ---- Parallelism ----
     /// Number of parallel analysis jobs. None = use all available CPUs.
     /// OCaml: `-j` / `--jobs` (default: number of CPUs)
@@ -211,6 +216,7 @@ impl Default for InferConfig {
             pulse_model_unknown_pure: Vec::new(),
             max_widens: 10_000,
             debug_level_analysis: 0,
+            trace_ondemand: false,
             jobs: None,
             quiet: false,
         }
@@ -306,6 +312,7 @@ mod tests {
         assert!(config.pulse_model_return_nullable.is_none());
         assert!(config.pulse_model_skip_pattern.is_none());
         assert!(config.pulse_model_unknown_pure.is_empty());
+        assert!(!config.trace_ondemand);
         assert!(!config.quiet);
     }
 
@@ -378,6 +385,7 @@ mod tests {
         );
         assert!(config.pulse_report_issues_for_tests);
         assert!(!config.pulse_force_continue);
+        assert!(!config.trace_ondemand);
     }
 
     #[test]
@@ -405,6 +413,12 @@ mod tests {
     fn test_from_json_empty() {
         let config = InferConfig::from_json("{}");
         assert_eq!(config.pulse_max_disjuncts, 20);
+    }
+
+    #[test]
+    fn test_from_json_trace_ondemand() {
+        let config = InferConfig::from_json(r#"{"trace-ondemand": true}"#);
+        assert!(config.trace_ondemand);
     }
 
     #[test]

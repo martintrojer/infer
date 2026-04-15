@@ -53,6 +53,71 @@ impl CallGraph {
         self.edges.get(proc).into_iter().flatten()
     }
 
+    /// Count the number of defined callees each defined procedure still depends on.
+    ///
+    /// External callees are treated as already analyzed, matching OCaml's
+    /// syntactic callgraph scheduler.
+    pub fn defined_dependency_counts(
+        &self,
+        defined: &HashSet<Procname>,
+    ) -> HashMap<Procname, usize> {
+        let mut dep_counts = HashMap::with_capacity(defined.len());
+        for proc in defined {
+            let num_defined_callees = self.callees(proc).filter(|c| defined.contains(*c)).count();
+            dep_counts.insert(proc.clone(), num_defined_callees);
+        }
+        dep_counts
+    }
+
+    /// Build the reverse defined-callgraph: callee -> sorted callers.
+    pub fn callers_of_defined(
+        &self,
+        defined: &HashSet<Procname>,
+    ) -> HashMap<Procname, Vec<Procname>> {
+        let mut callers_of: HashMap<Procname, Vec<Procname>> = HashMap::new();
+        for caller in defined {
+            for callee in self.callees(caller) {
+                if defined.contains(callee) {
+                    callers_of
+                        .entry(callee.clone())
+                        .or_default()
+                        .push(caller.clone());
+                }
+            }
+        }
+        for callers in callers_of.values_mut() {
+            callers.sort_by(|a, b| format!("{a}").cmp(&format!("{b}")));
+        }
+        callers_of
+    }
+
+    /// Pick one deterministic cycle cut from the remaining defined procedures.
+    ///
+    /// Cross-ref: OCaml `CallGraphScheduler.bottom_up` eventually reaches a
+    /// state where no more leaves are available and only cycles remain. The
+    /// Rust runner uses this helper to cut one SCC at a time while preserving
+    /// dynamic leaf-driven scheduling elsewhere.
+    pub fn cycle_cut(&self, remaining: &HashSet<Procname>) -> Vec<Procname> {
+        let successors = |proc: &Procname| {
+            self.callees(proc)
+                .filter(|c| remaining.contains(*c))
+                .cloned()
+        };
+        let mut remaining_sorted: Vec<_> = remaining.iter().cloned().collect();
+        remaining_sorted.sort_by(|a, b| format!("{a}").cmp(&format!("{b}")));
+        for start in &remaining_sorted {
+            let scc = find_one_cycle_from(start, remaining, &successors);
+            let has_self_edge = self.callees(start).any(|callee| callee == start);
+            if scc.len() > 1 || has_self_edge {
+                let mut cut = scc;
+                cut.sort_by_cached_key(|p| format!("{p}"));
+                return cut;
+            }
+        }
+
+        vec![remaining_sorted.into_iter().next().unwrap()]
+    }
+
     /// Compute a bottom-up schedule: procedures with no unanalyzed callees first.
     ///
     /// Returns a list of "waves" — each wave contains procedures that can be
@@ -81,29 +146,7 @@ impl CallGraph {
             ready.sort_by(|a, b| format!("{a}").cmp(&format!("{b}")));
 
             if ready.is_empty() {
-                // Remaining procedures have unsatisfied dependencies.
-                // Find a real SCC (size > 1) by trying different start nodes,
-                // or fall back to scheduling one procedure to make progress.
-                let successors = |proc: &Procname| {
-                    self.callees(proc)
-                        .filter(|c| remaining.contains(*c))
-                        .cloned()
-                };
-                let mut cycle = None;
-                // Sort remaining for deterministic cycle detection start order.
-                let mut remaining_sorted: Vec<_> = remaining.iter().cloned().collect();
-                remaining_sorted.sort_by(|a, b| format!("{a}").cmp(&format!("{b}")));
-                for start in &remaining_sorted {
-                    let scc = find_one_cycle_from(start, &remaining, &successors);
-                    let has_self_edge = self.callees(start).any(|callee| callee == start);
-                    if scc.len() > 1 || has_self_edge {
-                        cycle = Some(scc);
-                        break;
-                    }
-                }
-                // If no multi-node SCC found, pick the first (sorted) node to break deadlock
-                let wave_procs =
-                    cycle.unwrap_or_else(|| vec![remaining_sorted.into_iter().next().unwrap()]);
+                let wave_procs = self.cycle_cut(&remaining);
                 for proc in &wave_procs {
                     remaining.remove(proc);
                     analyzed.insert(proc.clone());

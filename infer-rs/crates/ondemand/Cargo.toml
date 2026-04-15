@@ -10,6 +10,7 @@ sil = { path = "../sil" }
 absint = { path = "../absint" }
 rayon = "1"
 dashmap = "6"
+log = { workspace = true }
 
 [dev-dependencies]
 analyses = { path = "../analyses" }

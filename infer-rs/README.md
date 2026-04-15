@@ -153,6 +153,10 @@ infer-rs --pulse-only
 infer-rs --pulse-only --results-dir /path/to/infer-out
 ```
 
+`--results-dir` is the convenient end-to-end path and includes the
+`infer debug --export-textual` step. For fair Rust-only timing, export textual
+once and run `infer-rs` directly on the `.sil` files instead.
+
 ### Direct .sil files (debugging)
 
 Analyze textual SIL files directly, bypassing capture:
@@ -165,6 +169,9 @@ infer-rs --pulse-only *.sil
 When multiple `.sil` files are passed, `infer-rs` parses them in parallel, merges the resulting
 `Cfg`/`Tenv`, and then runs analysis once over the unified program so cross-file calls can resolve
 to in-memory summaries.
+
+This direct-`.sil` mode is also the right path for apples-to-apples Rust timing
+after textual export, because it excludes capture/export overhead.
 
 ### CLI flags
 
@@ -183,6 +190,7 @@ to in-memory summaries.
 | `--pulse-intraprocedural-only` | Disable inter-procedural analysis |
 | `--max-widens N` | Max widenings before fixpoint gives up (default: 10000) |
 | `--debug-level-analysis N` | 0=quiet, 1=per-instruction, 2=full state dumps |
+| `--trace-ondemand` | Emit on-demand scheduler progress snapshots through the logger |
 | `--inferconfig-path FILE` | Path to .inferconfig file |
 | `--pulse-model-abort PROCNAME` | Model an exact procname as non-returning (repeatable) |
 | `--pulse-model-unreachable PROCNAME` | Model an exact procname as unreachable (repeatable) |
@@ -203,6 +211,9 @@ including the `Str.regexp` syntax used in test suites such as `\\(my\\|a\\)_mall
 `pulse-force-continue` is also compatible with shared `.inferconfig`; the Rust default remains
 `true` to match OCaml.
 `pulse-model-{abort,unreachable}` follow OCaml's exact-procname list semantics.
+`trace-ondemand` is also `.inferconfig`/CLI compatible with OCaml's flag name. Unless `RUST_LOG`
+is already set, enabling it defaults the logger to include `ondemand=info`, which emits wave
+start/end lines plus periodic scheduler snapshots with completed summaries, throughput, and ETA.
 `pulse-model-returns-copy-pattern` is still intentionally unsupported because Rust does not yet
 implement OCaml's non-disjunctive unnecessary-copy tracking.
 
@@ -276,6 +287,7 @@ infer-rs/
 - **Correctness over counts**: keep semantically correct OCaml-backed behavior even when sweep totals move temporarily; accepted divergences are documented instead of hidden
 - **Test through comparison**: compare against OCaml's `issues.exp` for compliance
 - **Per-instruction tracing**: `--debug-level-analysis` + `scripts/compare_traces.py` for debugging divergences
+- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis
 
 ## Documentation
 
