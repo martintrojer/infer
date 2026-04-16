@@ -11,13 +11,12 @@
 //! invalidations, path conditions) and any diagnostics found. Summaries
 //! are applied at call sites to propagate effects interprocedurally.
 
-use std::collections::HashMap;
-
 use sil::int_lit::IntLit;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
 use sil::specialization::{HeapPath, PulseSpecialization};
 use sil::var::Var;
+use std::collections::{HashMap, HashSet};
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
@@ -784,6 +783,34 @@ impl PulseSummary {
         }
         pre_posts = unique_pre_posts;
 
+        // Cross-ref: OCaml reports manifest diagnostics only after the final
+        // latent-vs-manifest classification in `PulseSummary.exec_summary_of_post_common`.
+        // If Rust still carries a manifest diagnostic for an issue whose final
+        // summary surface is latent-only, drop that stale manifest publication.
+        // Keep the manifest diagnostic when the final summary intentionally
+        // exports both variants via an `AbortProgram` twin.
+        let latent_keys: std::collections::HashSet<_> = pre_posts
+            .iter()
+            .filter(|pre_post| {
+                matches!(
+                    pre_post.kind,
+                    PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
+                )
+            })
+            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+            .map(Diagnostic::dedup_key)
+            .collect();
+        let manifest_abort_keys: std::collections::HashSet<_> = pre_posts
+            .iter()
+            .filter(|pre_post| pre_post.kind == PrePostKind::AbortProgram)
+            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+            .map(Diagnostic::dedup_key)
+            .collect();
+        diagnostics.retain(|diag| {
+            let key = diag.dedup_key();
+            !latent_keys.contains(&key) || manifest_abort_keys.contains(&key)
+        });
+
         // Deduplicate leak diagnostics: multiple disjuncts (e.g., malloc
         // null/non-null) can report the same leak from the same allocation.
         {
@@ -948,9 +975,15 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
     pre_post: &PrePost,
     existing_latent_invalid_access_keys: &std::collections::HashSet<String>,
 ) -> Vec<PrePost> {
+    // Cross-ref: OCaml only exports `LatentInvalidAccess` when summary
+    // creation has preserved a caller-reifiable `must_be_valid` obligation
+    // (`PotentialInvalidAccessSummary` in `PulseSummary.ml` /
+    // `PulseReport.ml`). A generic latent pre-heap is not enough by itself:
+    // non-manifest local aborts such as
+    // `latent.c:traverse_and_crash_if_equal_to_root` should stay
+    // `LatentAbortProgram`, not sprout extra latent invalid-access twins.
     if pre_post.kind != PrePostKind::AbortProgram
-        || (!pre_heap_has_assumptions(pre_post)
-            && !abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
+        || (!abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
             && !abort_invalid_access_is_imported_from_call(pdesc, pre_post))
     {
         return Vec::new();
@@ -1287,61 +1320,152 @@ fn latent_invalid_access_is_imported_from_call(
         })
 }
 
-fn heap_has_field_edge(
-    heap: &crate::base_memory::BaseMemory,
-    addr: AbstractValue,
-    repr_of: impl Fn(AbstractValue) -> AbstractValue,
-) -> bool {
-    heap.iter().any(|(src, edges)| {
-        repr_of(*src) == addr
-            && edges
-                .iter()
-                .any(|(access, _target)| matches!(access, Access::FieldAccess(_)))
-    })
+/// Cross-ref: OCaml summary-space traversals operate on normalized canon
+/// values (`PulseAbductiveDomain.Summary.pre_heap_has_assumptions` explicitly
+/// assumes this). Rust does not eagerly rewrite every heap cell to the current
+/// representative, so build a canonical view on demand for summary
+/// classification instead of repeatedly walking raw alias-heavy heap cells.
+#[derive(Default)]
+struct CanonicalHeapGraph {
+    non_field_outgoing: HashMap<AbstractValue, HashSet<AbstractValue>>,
+    field_outgoing: HashMap<AbstractValue, HashSet<AbstractValue>>,
+    addrs_with_field_edge: HashSet<AbstractValue>,
 }
 
-fn pre_heap_values_reachable_via_field_from_formals(
-    pdesc: &Procdesc,
-    pre_post: &PrePost,
-) -> std::collections::HashSet<AbstractValue> {
-    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
-    let seeds = pdesc.formals.iter().filter_map(|(mangled, _typ, _annot)| {
-        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
-        let var = Var::ProgramVar(Box::new(pvar));
-        pre_post.pre.stack.find(&var)
-    });
-
-    let mut reachable = std::collections::HashSet::new();
-    let mut worklist: Vec<_> = seeds.into_iter().map(|addr| (addr, false)).collect();
-
-    while let Some((addr, seen_field)) = worklist.pop() {
-        let repr = repr_of(addr);
-        if seen_field {
-            reachable.insert(repr);
+impl CanonicalHeapGraph {
+    fn from_heap(
+        heap: &crate::base_memory::BaseMemory,
+        repr_of: impl Fn(AbstractValue) -> AbstractValue,
+    ) -> Self {
+        let mut graph = Self::default();
+        for (src, edges) in heap.iter() {
+            let src = repr_of(*src);
+            for (access, target) in edges.iter() {
+                let target = repr_of(*target);
+                match access {
+                    Access::FieldAccess(_) => {
+                        graph.addrs_with_field_edge.insert(src);
+                        graph.field_outgoing.entry(src).or_default().insert(target);
+                    }
+                    Access::Dereference => {
+                        graph
+                            .non_field_outgoing
+                            .entry(src)
+                            .or_default()
+                            .insert(target);
+                    }
+                    Access::ArrayAccess(_, _) => {
+                        graph
+                            .non_field_outgoing
+                            .entry(src)
+                            .or_default()
+                            .insert(target);
+                    }
+                }
+            }
         }
-
-        let Some(edges) = pre_post.pre.heap.get_edges(addr) else {
-            continue;
-        };
-        for (access, target) in edges.iter() {
-            let next_seen_field = seen_field || matches!(access, Access::FieldAccess(_));
-            worklist.push((*target, next_seen_field));
-        }
+        graph
     }
 
-    reachable
+    fn reachable_from(
+        &self,
+        seeds: impl IntoIterator<Item = AbstractValue>,
+    ) -> HashSet<AbstractValue> {
+        let mut reachable = HashSet::new();
+        let mut worklist: Vec<_> = seeds.into_iter().collect();
+
+        while let Some(addr) = worklist.pop() {
+            if !reachable.insert(addr) {
+                continue;
+            }
+
+            if let Some(targets) = self.non_field_outgoing.get(&addr) {
+                worklist.extend(targets.iter().copied());
+            }
+            if let Some(targets) = self.field_outgoing.get(&addr) {
+                worklist.extend(targets.iter().copied());
+            }
+        }
+
+        reachable
+    }
+
+    fn reachable_via_field_from(
+        &self,
+        seeds: impl IntoIterator<Item = AbstractValue>,
+    ) -> HashSet<AbstractValue> {
+        let mut reachable = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut worklist: Vec<_> = seeds.into_iter().map(|addr| (addr, false)).collect();
+
+        while let Some((addr, seen_field)) = worklist.pop() {
+            if !visited.insert((addr, seen_field)) {
+                continue;
+            }
+
+            if seen_field {
+                reachable.insert(addr);
+            }
+
+            if let Some(targets) = self.non_field_outgoing.get(&addr) {
+                worklist.extend(targets.iter().copied().map(|target| (target, seen_field)));
+            }
+            if let Some(targets) = self.field_outgoing.get(&addr) {
+                worklist.extend(targets.iter().copied().map(|target| (target, true)));
+            }
+        }
+
+        reachable
+    }
+
+    fn has_field_edge(&self, addr: AbstractValue) -> bool {
+        self.addrs_with_field_edge.contains(&addr)
+    }
+}
+
+fn canonical_heap_graph(
+    heap: &crate::base_memory::BaseMemory,
+    pre_post: &PrePost,
+) -> CanonicalHeapGraph {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    CanonicalHeapGraph::from_heap(heap, repr_of)
+}
+
+fn formal_pre_root_reprs(pdesc: &Procdesc, pre_post: &PrePost) -> Vec<AbstractValue> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    pdesc
+        .formals
+        .iter()
+        .filter_map(|(mangled, _typ, _annot)| {
+            let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+            let var = Var::ProgramVar(Box::new(pvar));
+            pre_post.pre.stack.find(&var).map(repr_of)
+        })
+        .collect()
+}
+
+fn summary_formal_root_reprs(pre_post: &PrePost) -> Vec<AbstractValue> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    pre_post
+        .formals
+        .iter()
+        .map(|(_formal, addr)| repr_of(*addr))
+        .collect()
 }
 
 fn abort_state_has_caller_sensitive_field_write(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
-    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
-    let reachable_via_field = pre_heap_values_reachable_via_field_from_formals(pdesc, pre_post);
-    pre_heap_values_reachable_from_formals(pdesc, pre_post)
+    let pre_graph = canonical_heap_graph(&pre_post.pre.heap, pre_post);
+    let post_graph = canonical_heap_graph(&pre_post.post.post.heap, pre_post);
+    let formal_roots = formal_pre_root_reprs(pdesc, pre_post);
+    let reachable_via_field = pre_graph.reachable_via_field_from(formal_roots.iter().copied());
+    pre_graph
+        .reachable_from(formal_roots)
         .into_iter()
         .any(|addr| {
             post_addr_has_written_to(pre_post, addr)
                 && (reachable_via_field.contains(&addr)
-                    || heap_has_field_edge(&pre_post.pre.heap, addr, repr_of)
-                    || heap_has_field_edge(&pre_post.post.post.heap, addr, repr_of))
+                    || pre_graph.has_field_edge(addr)
+                    || post_graph.has_field_edge(addr))
         })
 }
 
@@ -1539,11 +1663,19 @@ fn classify_non_exit_abort_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
         return;
     }
 
-    if !proc_is_entry_point(pdesc) && pre_post_has_direct_formal_constant_deref(pdesc, pre_post) {
+    let direct_formal_constant_deref =
+        !proc_is_entry_point(pdesc) && pre_post_has_direct_formal_constant_deref(pdesc, pre_post);
+
+    if direct_formal_constant_deref {
         pre_post.kind = PrePostKind::LatentInvalidAccess;
-    } else if !pre_post_is_manifest(pdesc, pre_post)
-        && !abort_should_keep_local_manifest_twin(pdesc, pre_post)
-    {
+        return;
+    }
+
+    let is_manifest = pre_post_is_manifest(pdesc, pre_post);
+    let keep_local_manifest_twin =
+        !is_manifest && abort_should_keep_local_manifest_twin(pdesc, pre_post);
+
+    if !is_manifest && !keep_local_manifest_twin {
         pre_post.kind = PrePostKind::LatentAbortProgram;
     }
 }
@@ -1558,31 +1690,15 @@ fn pre_heap_values_reachable_from_formals(
     pdesc: &Procdesc,
     pre_post: &PrePost,
 ) -> std::collections::HashSet<AbstractValue> {
-    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
-    let seeds = pdesc.formals.iter().filter_map(|(mangled, _typ, _annot)| {
-        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
-        let var = Var::ProgramVar(Box::new(pvar));
-        pre_post.pre.stack.find(&var)
-    });
-
-    pre_post
-        .collect_reachable_from_seeds(seeds, true, false)
-        .into_iter()
-        .map(repr_of)
-        .collect()
+    let pre_graph = canonical_heap_graph(&pre_post.pre.heap, pre_post);
+    pre_graph.reachable_from(formal_pre_root_reprs(pdesc, pre_post))
 }
 
 fn pre_heap_values_reachable_from_summary_formals(
     pre_post: &PrePost,
 ) -> std::collections::HashSet<AbstractValue> {
-    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
-    let seeds = pre_post.formals.iter().map(|(_formal, addr)| *addr);
-
-    pre_post
-        .collect_reachable_from_seeds(seeds, true, false)
-        .into_iter()
-        .map(repr_of)
-        .collect()
+    let pre_graph = canonical_heap_graph(&pre_post.pre.heap, pre_post);
+    pre_graph.reachable_from(summary_formal_root_reprs(pre_post))
 }
 
 fn formal_stack_addrs(
@@ -1929,15 +2045,29 @@ fn abort_has_local_invalid_access(pdesc: &Procdesc, pre_post: &PrePost) -> bool 
     !caller_controlled.contains(&diag_addr) && !access_history_has_formal_origin
 }
 
-/// OCaml only keeps a local manifest invalid-access report when the
-/// caller-sensitive part of the summary comes from heap reachability or an
-/// imported call-side must-be-valid obligation. Pure imported arithmetic
-/// conditions should keep the local crash latent.
+/// Cross-ref: OCaml goes through `PulseLatentIssue.should_report` and
+/// `PulseArithmetic.is_manifest`, and that manifestness check already rejects
+/// summaries with `pre_heap_has_assumptions`.
+///
+/// Rust therefore keeps a local manifest twin only for narrower shapes that
+/// stay caller-sensitive for reasons other than a generic latent pre-heap:
+/// caller-sensitive field writes in the current proc, or imported call-side
+/// must-be-valid obligations. Plain latent pre-heap assumptions should keep
+/// the local crash latent, which is the OCaml behavior for
+/// `latent.c:traverse_and_crash_if_equal_to_root`.
 fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
-    abort_has_local_invalid_access(pdesc, pre_post)
-        && (pre_heap_has_assumptions(pre_post)
-            || abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
-            || abort_invalid_access_is_imported_from_call(pdesc, pre_post))
+    let has_local_invalid_access = abort_has_local_invalid_access(pdesc, pre_post);
+    if !has_local_invalid_access {
+        return false;
+    }
+
+    let has_caller_sensitive_field_write =
+        abort_state_has_caller_sensitive_field_write(pdesc, pre_post);
+    if has_caller_sensitive_field_write {
+        return true;
+    }
+
+    abort_invalid_access_is_imported_from_call(pdesc, pre_post)
 }
 
 fn abort_invalid_access_is_imported_from_call(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
@@ -2407,10 +2537,12 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
 mod tests {
     use super::*;
     use crate::attribute::Allocator;
+    use crate::checker;
     use crate::formula::atom::Atom;
     use crate::formula::lin_arith::LinArith;
     use crate::formula::term::Term;
     use crate::value_history::ValueHistory;
+    use ondemand::checker::InterChecker;
     use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
     use sil::int_lit::IntLit;
@@ -2422,6 +2554,27 @@ mod tests {
     use sil::typ::Typ;
     use sil::typ::TypeName;
     use sil::var::Var;
+    use test_harness::textual_utils;
+
+    struct TestPulseInterChecker;
+
+    impl InterChecker for TestPulseInterChecker {
+        type Summary = PulseSummary;
+
+        fn id(&self) -> &str {
+            "pulse"
+        }
+
+        fn analyze(
+            &self,
+            pdesc: &Procdesc,
+            ctx: &ondemand::checker::AnalysisContext<Self::Summary>,
+        ) -> Self::Summary {
+            let callee_summaries: std::collections::HashMap<_, _> =
+                ctx.summaries.to_vec().into_iter().collect();
+            checker::analyze_with_summaries(pdesc, &callee_summaries)
+        }
+    }
 
     fn make_pdesc_with_formals(formals: &[&str]) -> Procdesc {
         let pname = Procname::c_from_string("test_proc");
@@ -2446,6 +2599,13 @@ mod tests {
         );
         pdesc.set_succs(0, vec![load_node]);
         pdesc.set_succs(load_node, vec![1]);
+    }
+
+    fn retain_named_procs(tm: &mut textual_utils::TestModule, proc_names: &[&str]) {
+        let keep: std::collections::HashSet<_> = proc_names.iter().copied().collect();
+        tm.cfg
+            .proc_descs
+            .retain(|pname, _| keep.contains(format!("{pname}").as_str()));
     }
 
     fn make_abort_pre_post_with_formal(name: &str) -> (Procdesc, PrePost, AbstractValue) {
@@ -2554,6 +2714,50 @@ mod tests {
             x_loc,
             y_loc,
         )
+    }
+
+    #[test]
+    fn test_pre_heap_reachable_from_formals_follows_canonical_alias_edges() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let next = Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_string("list")),
+            "next",
+        );
+        let alias1 = AbstractValue::mk_fresh();
+        let alias2 = AbstractValue::mk_fresh();
+        let target = AbstractValue::mk_fresh();
+        astate
+            .pre
+            .heap
+            .add_edge(formal_val, Access::FieldAccess(next), alias1);
+        astate
+            .pre
+            .heap
+            .add_edge(alias2, Access::Dereference, target);
+        assert!(
+            astate.and_equal(alias1, alias2).is_sat(),
+            "test setup should exercise aliased pre-heap roots"
+        );
+
+        let pre_post = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        assert!(
+            pre_heap_values_reachable_from_formals(&pdesc, &pre_post)
+                .contains(&pre_post.post.path_condition.get_var_repr(target)),
+            "canonical summary-space reachability should merge alias-owned edges"
+        );
     }
 
     #[test]
@@ -3820,7 +4024,7 @@ mod tests {
     }
 
     #[test]
-    fn test_of_proc_keeps_local_invalid_access_manifest_and_latent_when_pre_heap_is_non_manifest() {
+    fn test_of_proc_keeps_local_invalid_access_latent_when_pre_heap_is_non_manifest() {
         let pdesc = make_pdesc_with_formals(&["x", "y"]);
         let mut astate = AbductiveDomain::mk_initial(&pdesc);
 
@@ -3868,21 +4072,81 @@ mod tests {
         );
 
         assert!(
-            summary.diagnostics.iter().any(|diag| diag == &diagnostic),
-            "local invalid accesses should stay manifest even when the pre heap has latent assumptions"
+            summary.diagnostics.is_empty(),
+            "local invalid accesses should stay latent when the only caller-sensitive signal is a latent pre heap assumption"
+        );
+        assert!(
+            summary.pre_posts.iter().all(|pp| {
+                pp.kind != PrePostKind::AbortProgram || pp.diagnostic.as_ref() != Some(&diagnostic)
+            }),
+            "no manifest abort summary should be exported for the local invalid access"
         );
         assert!(
             summary.pre_posts.iter().any(|pp| {
-                pp.kind == PrePostKind::AbortProgram && pp.diagnostic.as_ref() == Some(&diagnostic)
+                pp.kind == PrePostKind::LatentAbortProgram && pp.diagnostic.as_ref() == Some(&diagnostic)
             }),
-            "expected the manifest abort summary to stay exported"
+            "expected the local invalid access to remain latent under non-manifest pre-heap assumptions"
+        );
+    }
+
+    #[test]
+    fn test_of_proc_drops_stale_manifest_diag_when_final_summary_is_latent_only() {
+        let pdesc = make_pdesc_with_formals(&["x", "y"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let y_pvar = Pvar::mk(Mangled::from_string("y"), pdesc.proc_name.clone());
+        let x_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(x_pvar)))
+            .unwrap();
+        let y_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(y_pvar)))
+            .unwrap();
+        let x_val = astate.read_heap(x_addr, Access::Dereference);
+        let y_val = astate.read_heap(y_addr, Access::Dereference);
+        let shared = AbstractValue::mk_fresh();
+        astate.pre.heap.add_edge(x_val, Access::Dereference, shared);
+        astate.pre.heap.add_edge(y_val, Access::Dereference, shared);
+        astate.pre.heap.register_address(shared);
+
+        let local_root = AbstractValue::mk_fresh();
+        let local_null = AbstractValue::mk_fresh();
+        let local_var = Var::LogicalVar(Ident::create_normal(IdentName::from_string("tmp"), 0));
+        astate.post.stack.add(local_var, local_root);
+        astate.write_heap(local_root, Access::Dereference, local_null);
+        astate.mark_must_be_valid(local_null);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        astate.invalidate(
+            local_null,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+
+        let diagnostic = dummy_invalid_access_diagnostic(local_null, invalidation);
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::AbortProgram {
+                state: Box::new(astate),
+                diagnostic: Box::new(diagnostic.clone()),
+            }],
+            vec![diagnostic.clone()],
+            false,
+        );
+
+        assert!(
+            summary.diagnostics.is_empty(),
+            "stale manifest diagnostics should be dropped when the final summary keeps only the latent variant"
         );
         assert!(
             summary.pre_posts.iter().any(|pp| {
                 pp.kind == PrePostKind::LatentAbortProgram
                     && pp.diagnostic.as_ref() == Some(&diagnostic)
             }),
-            "expected a latent twin for caller-sensitive reachability, matching OCaml latent.c behavior"
+            "the latent pre/post should remain available for caller reification"
         );
     }
 
@@ -4459,5 +4723,79 @@ mod tests {
             summary.pre_posts[0].kind,
             PrePostKind::AbortProgram
         ));
+    }
+
+    #[test]
+    #[ignore = "debug parity probe against local /tmp latent.sil fixture"]
+    fn test_debug_real_latent_subset_summary_counts() {
+        let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
+        if !sil.exists() {
+            eprintln!("skip");
+            return;
+        }
+
+        let mut tm = textual_utils::parse_file_and_convert(sil);
+        let targets = [
+            "traverse_and_crash_if_equal_to_root",
+            "crash_after_one_node_bad",
+            "crash_after_two_nodes_bad",
+            "FN_crash_after_six_nodes_bad",
+        ];
+        retain_named_procs(&mut tm, &targets);
+
+        let checker = TestPulseInterChecker;
+        let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+        for target in targets {
+            let summary = store
+                .to_vec()
+                .into_iter()
+                .find(|(pname, _)| format!("{pname}") == target)
+                .map(|(_, summary)| summary)
+                .unwrap_or_else(|| panic!("summary for {target} should exist"));
+            let kinds: Vec<_> = summary
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.kind))
+                .collect();
+            eprintln!(
+                "{target}: count={} kinds={kinds:?}",
+                summary.pre_posts.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "debug parity probe against local /tmp latent.sil fixture"]
+    fn test_debug_real_traverse_summary_shape() {
+        let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
+        if !sil.exists() {
+            eprintln!("skip");
+            return;
+        }
+
+        let mut tm = textual_utils::parse_file_and_convert(sil);
+        retain_named_procs(&mut tm, &["traverse_and_crash_if_equal_to_root"]);
+        let pdesc = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "traverse_and_crash_if_equal_to_root")
+            .expect("proc should exist");
+        let summary = checker::analyze(pdesc);
+
+        let kinds: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.kind))
+            .collect();
+        let diagnostics: Vec<_> = summary
+            .diagnostics
+            .iter()
+            .map(|diag| diag.get_issue_type())
+            .collect();
+        eprintln!(
+            "traverse_and_crash_if_equal_to_root: count={} kinds={kinds:?} diagnostics={diagnostics:?}",
+            summary.pre_posts.len(),
+        );
     }
 }

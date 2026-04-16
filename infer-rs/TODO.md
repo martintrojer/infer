@@ -69,9 +69,10 @@ active OCaml-parity gap.
    proven wrong and must not be resurrected as a count-tuning workaround.
    These are correctness fixes, not optional count-tuning.
 
-4. **Wrapper/cycle null paths** such as `traverse_and_crash_if_equal_to_root`: the headline file
-   counts are now at the expected baseline, but Rust and OCaml can still diverge on which latent
-   null paths survive call chains and reify as manifest reports.
+4. **Broader wrapper/cycle null-path publication parity**: the filtered
+   `traverse_and_crash_if_equal_to_root` latent-only repro is fixed again, but
+   Rust and OCaml can still diverge on which other latent null paths survive
+   call chains and reify as manifest reports.
 
 5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
    dedup and `issues.exp`-style counting, but richer OCaml-style `PulseTrace` / publication detail
@@ -121,6 +122,18 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 - **DeclEnv enhancements** (`decls.rs`): Missing variadic proc tracking, generics status.
 - Language-specific (defer): FixHackWrapper, FixHackInvokeClosure, TransformClosures, verify_variadic_position, SSA restoration.
 
+### OpenSSL benchmark follow-ups
+
+- Get a clean full apples-to-apples OCaml-vs-Rust timing on the shared OpenSSL
+  capture using already-exported `.sil`, not the convenience `--results-dir`
+  path.
+- Profile the remaining heavy procedures after the `ssl_set_client_disabled`
+  fix. Current evidence says the next bottlenecks are still local Pulse cost,
+  not merge/callgraph setup.
+- Keep the duplicate-proc exported-Textual identity loss documented as an
+  upstream fidelity limit unless `infer debug --export-textual` preserves the
+  OCaml proc UID.
+
 ### SIL test gaps (skipped procs)
 
 - **Virtual dispatch in loads** (2 procs in static_types.sil)
@@ -138,8 +151,9 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   provenance, callee `AbortProgram` summaries now propagate again, Rust now has a caller-side
   `LatentInvalidAccess` path, imported pure-call dependencies now survive summary
   application/normalization, and `pre_heap_has_assumptions` parity is implemented. Remaining:
-  wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`, suppression/report-trace
-  presentation detail, and richer OCaml-style latent issue typing/traces.
+  broader wrapper/cycle null-path publication beyond the now-fixed filtered
+  `traverse_and_crash_if_equal_to_root` repro, suppression/report-trace presentation detail, and
+  richer OCaml-style latent issue typing/traces.
 
 ## Debugging tools
 

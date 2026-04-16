@@ -54,6 +54,17 @@ analysis cost:
 - That path shells out to `infer debug --export-textual`, so it is not a fair Rust-only timing number.
 - For apples-to-apples timing against `infer analyze`, export textual once, then time direct `.sil` analysis with the same `-j`.
 
+Current top-level OpenSSL status:
+
+- setup/capture is stable on this host with repo clang on `PATH`, `CC=clang`,
+  explicit SDK `-isysroot`, and `./Configure darwin64-x86_64-cc no-asm`
+- the exported corpus now parses completely in Rust: `753 / 753` `.sil` files
+- the first dominant hotspot, `ssl_set_client_disabled`, dropped from about
+  `1m09s` to about `5.2s` after the OCaml-style `equal_fast` split
+- the remaining benchmark gap is mostly local Pulse cost in a few heavy
+  procedures plus exported-Textual proc-identity loss for some duplicate C
+  names, not merge/callgraph setup or a one-core scheduler bug
+
 ### Shared Capture Setup
 
 ```bash
@@ -118,8 +129,11 @@ Current OpenSSL status from the latest direct-Textual spot-check:
 
 - parse coverage is now `753 / 753` exported `.sil` files with `0` parse errors after accepting
   textual name positions tokenized as `Local(n)` plus `_` wildcard field names
-- the remaining benchmark blockers are local Pulse throughput on heavy procedures such as
-  `ssl_set_client_disabled` plus exported-Textual proc-identity loss for some duplicate C names
+- restoring the OCaml-style disjunctive `equal_fast` / semantic-`leq` split cut the filtered
+  `ssl_set_client_disabled` hotspot from about `1m09s` to about `5.2s` while keeping the same
+  `173` transfer steps, `20`-disjunct cap, and hottest node `33:24`
+- the remaining benchmark blockers are front-end parse cost on some files, local Pulse throughput
+  on other heavy procedures, and exported-Textual proc-identity loss for some duplicate C names
 
 Important macOS notes learned from the OpenSSL benchmark:
 
@@ -175,7 +189,16 @@ runner logs:
 - completed summaries vs total procedures
 - throughput and coarse ETA
 - `pulse-progress` heartbeats for long-running procedures, including elapsed
-  time, transfer-step count, current node/instr, and current/max disjuncts
+  time, transfer-step count, current node/instr, current-node revisit count,
+  hottest node-so-far, and current/max disjuncts
+
+When a filtered hotspot still shows the same transfer-step count before and
+after a performance change, treat that as evidence about comparison cost vs
+semantic work. The current OpenSSL `ssl_set_client_disabled` spot-check is the
+example here: after the `equal_fast` split, the run still executes `173`
+transfer steps and saturates at `20` disjuncts, but its runtime drops from
+about `1m09s` to about `5.2s`, which points squarely at hot disjunct
+dedup/join comparison cost rather than a change in explored paths.
 
 You can raise verbosity further with explicit logger filters, for example
 `RUST_LOG=warn,ondemand=debug infer-rs --trace-ondemand ...` to include wave

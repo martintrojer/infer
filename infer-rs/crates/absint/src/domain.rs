@@ -20,6 +20,15 @@ use std::fmt;
 pub trait Comparable: Clone + fmt::Debug + PartialEq {
     /// The implication/ordering relation: `lhs <= rhs` means `lhs |- rhs`.
     fn leq(&self, rhs: &Self) -> bool;
+
+    /// Cheap equality hook for disjunctive dedup/join.
+    ///
+    /// Cross-ref: OCaml's disjunctive interpreter uses `equal_fast` when
+    /// collapsing instruction-level disjuncts, and keeps semantic `leq` for
+    /// widening and convergence checks.
+    fn equal_fast(&self, rhs: &Self) -> bool {
+        self == rhs
+    }
 }
 
 /// Abstract domain with join and widening.
@@ -79,6 +88,14 @@ impl<D: AbstractDomain> Comparable for BottomLifted<D> {
             (BottomLifted::NonBottom(a), BottomLifted::NonBottom(b)) => a.leq(b),
         }
     }
+
+    fn equal_fast(&self, rhs: &Self) -> bool {
+        match (self, rhs) {
+            (BottomLifted::Bottom, BottomLifted::Bottom) => true,
+            (BottomLifted::NonBottom(a), BottomLifted::NonBottom(b)) => a.equal_fast(b),
+            _ => false,
+        }
+    }
 }
 
 impl<D: AbstractDomain> AbstractDomain for BottomLifted<D> {
@@ -128,6 +145,14 @@ impl<D: AbstractDomain> Comparable for TopLifted<D> {
             (TopLifted::NonTop(a), TopLifted::NonTop(b)) => a.leq(b),
         }
     }
+
+    fn equal_fast(&self, rhs: &Self) -> bool {
+        match (self, rhs) {
+            (TopLifted::Top, TopLifted::Top) => true,
+            (TopLifted::NonTop(a), TopLifted::NonTop(b)) => a.equal_fast(b),
+            _ => false,
+        }
+    }
 }
 
 impl<D: AbstractDomain> AbstractDomain for TopLifted<D> {
@@ -168,6 +193,10 @@ impl<D: AbstractDomain> WithTop for TopLifted<D> {
 impl<A: AbstractDomain, B: AbstractDomain> Comparable for (A, B) {
     fn leq(&self, rhs: &Self) -> bool {
         self.0.leq(&rhs.0) && self.1.leq(&rhs.1)
+    }
+
+    fn equal_fast(&self, rhs: &Self) -> bool {
+        self.0.equal_fast(&rhs.0) && self.1.equal_fast(&rhs.1)
     }
 }
 

@@ -14,11 +14,9 @@ use crate::diagnostic::Diagnostic;
 
 /// The state of an analysis path after executing an instruction.
 ///
-/// We use structural equality here because the disjunctive abstract interpreter
-/// relies on reflexive equality for subset checks and deduplication. OCaml can
-/// get away with pointer identity (`equal_fast`) because unchanged states often
-/// keep the same heap object; in Rust we clone states freely, so pointer-style
-/// equality would make `d <= d` fail and break fixpoint convergence.
+/// `PartialEq` gives us a cheap structural approximation of OCaml's
+/// `equal_fast` for disjunctive dedup. Semantic subset/fixpoint checks still
+/// live in `Comparable::leq` below and fall back to alpha-equivalence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionDomain {
     /// Normal execution continues.
@@ -69,7 +67,55 @@ impl ExecutionDomain {
 }
 
 impl Comparable for ExecutionDomain {
+    fn equal_fast(&self, rhs: &Self) -> bool {
+        use ExecutionDomain::{
+            AbortProgram, ContinueProgram, ExceptionRaised, ExitProgram, LatentAbortProgram,
+            LatentInvalidAccess,
+        };
+
+        match (self, rhs) {
+            (ContinueProgram(lhs), ContinueProgram(rhs))
+            | (ExceptionRaised(lhs), ExceptionRaised(rhs))
+            | (ExitProgram(lhs), ExitProgram(rhs)) => lhs == rhs,
+            (
+                AbortProgram {
+                    state: lhs_state,
+                    diagnostic: lhs_diag,
+                },
+                AbortProgram {
+                    state: rhs_state,
+                    diagnostic: rhs_diag,
+                },
+            )
+            | (
+                LatentAbortProgram {
+                    state: lhs_state,
+                    diagnostic: lhs_diag,
+                },
+                LatentAbortProgram {
+                    state: rhs_state,
+                    diagnostic: rhs_diag,
+                },
+            )
+            | (
+                LatentInvalidAccess {
+                    state: lhs_state,
+                    diagnostic: lhs_diag,
+                },
+                LatentInvalidAccess {
+                    state: rhs_state,
+                    diagnostic: rhs_diag,
+                },
+            ) => lhs_state == rhs_state && diagnostics_compatible(lhs_diag, rhs_diag),
+            _ => false,
+        }
+    }
+
     fn leq(&self, rhs: &Self) -> bool {
+        if self.equal_fast(rhs) {
+            return true;
+        }
+
         use ExecutionDomain::{
             AbortProgram, ContinueProgram, ExceptionRaised, ExitProgram, LatentAbortProgram,
             LatentInvalidAccess,

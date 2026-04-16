@@ -916,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alpha_equivalent_dedups_disjuncts() {
+    fn test_alpha_equivalent_states_do_not_dedup_during_fast_join() {
         AbstractValue::reset_counters();
         let state1 = make_state(0, false);
         AbstractValue::reset_counters();
@@ -926,7 +926,21 @@ mod tests {
         let rhs = DisjunctiveDomain::singleton(ExecutionDomain::ContinueProgram(state2), 20, 3);
         let joined = lhs.join(&rhs);
 
-        assert_eq!(joined.disjuncts.len(), 1);
+        assert_eq!(joined.disjuncts.len(), 2);
+    }
+
+    #[test]
+    fn test_alpha_equivalent_states_still_collapse_during_widen() {
+        AbstractValue::reset_counters();
+        let state1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let state2 = make_state(3, false);
+
+        let lhs = DisjunctiveDomain::singleton(ExecutionDomain::ContinueProgram(state1), 20, 3);
+        let rhs = DisjunctiveDomain::singleton(ExecutionDomain::ContinueProgram(state2), 20, 3);
+        let widened = lhs.widen(&rhs, 1);
+
+        assert_eq!(widened.disjuncts.len(), 1);
     }
 
     #[test]

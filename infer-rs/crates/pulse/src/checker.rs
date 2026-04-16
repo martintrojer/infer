@@ -71,6 +71,8 @@ struct ProcProgress {
     last_log: Instant,
     exec_steps: usize,
     max_disjuncts: usize,
+    node_visits: HashMap<NodeId, usize>,
+    hottest_node: Option<(NodeId, usize)>,
     logged_heartbeat: bool,
 }
 
@@ -82,6 +84,8 @@ impl ProcProgress {
             last_log: now,
             exec_steps: 0,
             max_disjuncts: 0,
+            node_visits: HashMap::new(),
+            hottest_node: None,
             logged_heartbeat: false,
         }
     }
@@ -97,6 +101,17 @@ impl ProcProgress {
     ) {
         self.exec_steps += 1;
         self.max_disjuncts = self.max_disjuncts.max(total_disjuncts);
+        let node_visits = {
+            let visits = self.node_visits.entry(node_id).or_insert(0);
+            *visits += 1;
+            *visits
+        };
+        if self
+            .hottest_node
+            .is_none_or(|(_hot_node, hot_visits)| node_visits > hot_visits)
+        {
+            self.hottest_node = Some((node_id, node_visits));
+        }
 
         if !pulse_progress_enabled() || self.last_log.elapsed() < PROC_PROGRESS_LOG_INTERVAL {
             return;
@@ -104,11 +119,17 @@ impl ProcProgress {
 
         self.last_log = Instant::now();
         self.logged_heartbeat = true;
+        let hottest = self
+            .hottest_node
+            .map(|(hot_node, hot_visits)| format!("{hot_node}:{hot_visits}"))
+            .unwrap_or_else(|| "none".to_string());
         log::info!(
             target: "ondemand",
-            "[pulse-progress] proc={proc_name} elapsed={} steps={} node={node_id} instr={instr_idx} disjuncts={} continue={} spec_requests={} max_disjuncts={}",
+            "[pulse-progress] proc={proc_name} elapsed={} steps={} node={node_id} instr={instr_idx} node_visits={} hottest_node={} disjuncts={} continue={} spec_requests={} max_disjuncts={}",
             format_duration(self.started.elapsed()),
             self.exec_steps,
+            node_visits,
+            hottest,
             total_disjuncts,
             continue_count,
             spec_requests,
@@ -125,14 +146,19 @@ impl ProcProgress {
             return;
         }
 
+        let hottest = self
+            .hottest_node
+            .map(|(hot_node, hot_visits)| format!("{hot_node}:{hot_visits}"))
+            .unwrap_or_else(|| "none".to_string());
         log::info!(
             target: "ondemand",
-            "[pulse-progress] proc={proc_name} done: elapsed={} steps={} exit_disjuncts={} spec_requests={} max_disjuncts={}",
+            "[pulse-progress] proc={proc_name} done: elapsed={} steps={} exit_disjuncts={} spec_requests={} max_disjuncts={} hottest_node={}",
             format_duration(elapsed),
             self.exec_steps,
             exit_disjuncts,
             spec_requests,
             self.max_disjuncts,
+            hottest,
         );
     }
 }
@@ -221,19 +247,65 @@ pub fn analyze_with_specialization_and_requests(
     let mut diagnostics = Vec::new();
     let mut seen_diags = std::collections::HashSet::new();
     let mut recovered_non_exit_disjuncts = Vec::new();
+    let non_exit_scan_start = Instant::now();
+    if pulse_progress_enabled() {
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={} non-exit scan start: nodes={} exit_has_normal_path={}",
+            pulse_tf.proc_name,
+            inv_map.len(),
+            exit_has_normal_path,
+        );
+    }
     for (node_id, state) in &inv_map {
+        let node_scan_start = Instant::now();
         if *node_id == pdesc.exit_node {
             continue;
+        }
+        let continue_count = state
+            .post
+            .disjuncts
+            .iter()
+            .filter(|d| d.is_continue())
+            .count();
+        let abort_count = state
+            .post
+            .disjuncts
+            .iter()
+            .filter(|d| matches!(d, ExecutionDomain::AbortProgram { .. }))
+            .count();
+        if pulse_progress_enabled() {
+            log::info!(
+                target: "ondemand",
+                "[pulse-progress] proc={} non-exit scan node start: node={} disjuncts={} continue={} abort={}",
+                pulse_tf.proc_name,
+                node_id,
+                state.post.disjuncts.len(),
+                continue_count,
+                abort_count,
+            );
         }
         for d in &state.post.disjuncts {
             match d {
                 ExecutionDomain::AbortProgram { state, diagnostic } => {
-                    if diagnostic_originates_in_proc(pdesc, diagnostic)
+                    let classify_start = Instant::now();
+                    let is_manifest_abort = diagnostic_originates_in_proc(pdesc, diagnostic)
                         && matches!(
                             crate::summary::classify_abort_kind(pdesc, state, diagnostic),
                             crate::summary::PrePostKind::AbortProgram
-                        )
+                        );
+                    if pulse_progress_enabled()
+                        && classify_start.elapsed() >= PROC_SLOW_LOG_THRESHOLD
                     {
+                        log::info!(
+                            target: "ondemand",
+                            "[pulse-progress] proc={} non-exit slow classify: node={} elapsed={}",
+                            pulse_tf.proc_name,
+                            node_id,
+                            format_duration(classify_start.elapsed()),
+                        );
+                    }
+                    if is_manifest_abort {
                         let key = diagnostic.dedup_key();
                         if seen_diags.insert(key) {
                             diagnostics.push(diagnostic.as_ref().clone());
@@ -241,9 +313,24 @@ pub fn analyze_with_specialization_and_requests(
                     }
                 }
                 ExecutionDomain::ContinueProgram(astate) if !exit_has_normal_path => {
-                    for recovered in crate::summary::recovered_invalid_accesses_from_continue_state(
-                        pdesc, astate,
-                    ) {
+                    let recover_start = Instant::now();
+                    let recovered_candidates =
+                        crate::summary::recovered_invalid_accesses_from_continue_state(
+                            pdesc, astate,
+                        );
+                    if pulse_progress_enabled()
+                        && recover_start.elapsed() >= PROC_SLOW_LOG_THRESHOLD
+                    {
+                        log::info!(
+                            target: "ondemand",
+                            "[pulse-progress] proc={} non-exit slow recover: node={} elapsed={} recovered={}",
+                            pulse_tf.proc_name,
+                            node_id,
+                            format_duration(recover_start.elapsed()),
+                            recovered_candidates.len(),
+                        );
+                    }
+                    for recovered in recovered_candidates {
                         let diagnostic = match &recovered {
                             ExecutionDomain::AbortProgram { diagnostic, .. }
                             | ExecutionDomain::LatentInvalidAccess { diagnostic, .. } => {
@@ -263,6 +350,26 @@ pub fn analyze_with_specialization_and_requests(
                 _ => {}
             }
         }
+        if pulse_progress_enabled() && node_scan_start.elapsed() >= PROC_SLOW_LOG_THRESHOLD {
+            log::info!(
+                target: "ondemand",
+                "[pulse-progress] proc={} non-exit scan slow-node: node={} disjuncts={} elapsed={}",
+                pulse_tf.proc_name,
+                node_id,
+                state.post.disjuncts.len(),
+                format_duration(node_scan_start.elapsed()),
+            );
+        }
+    }
+    if pulse_progress_enabled() {
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={} non-exit scan done: elapsed={} diagnostics={} recovered_non_exit={}",
+            pulse_tf.proc_name,
+            format_duration(non_exit_scan_start.elapsed()),
+            diagnostics.len(),
+            recovered_non_exit_disjuncts.len(),
+        );
     }
 
     // Collect all disjuncts at exit for the summary: ContinueProgram,
@@ -283,6 +390,7 @@ pub fn analyze_with_specialization_and_requests(
             }
         }
     }
+    let recovered_non_exit_count = recovered_non_exit_disjuncts.len();
     for recovered in recovered_non_exit_disjuncts {
         if !exit_disjuncts.iter().any(|existing| existing == &recovered) {
             exit_disjuncts.push(recovered);
@@ -298,6 +406,17 @@ pub fn analyze_with_specialization_and_requests(
     let has_dropped_disjuncts = inv_map
         .values()
         .any(|domain| domain.post.had_dropped_disjuncts);
+    let summary_start = Instant::now();
+    if pulse_progress_enabled() {
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={} summary-build start: exit_disjuncts={} recovered_non_exit={} has_dropped_disjuncts={}",
+            pulse_tf.proc_name,
+            exit_disjuncts.len(),
+            recovered_non_exit_count,
+            has_dropped_disjuncts,
+        );
+    }
     let summary = PulseSummary::of_proc_with_metadata(
         pdesc,
         &exit_disjuncts,
@@ -305,6 +424,16 @@ pub fn analyze_with_specialization_and_requests(
         is_noreturn,
         has_dropped_disjuncts,
     );
+    if pulse_progress_enabled() {
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={} summary-build done: elapsed={} diagnostics={} pre_posts={}",
+            pulse_tf.proc_name,
+            format_duration(summary_start.elapsed()),
+            summary.diagnostics.len(),
+            summary.pre_posts.len(),
+        );
+    }
     let spec_request_count = pulse_tf.spec_requests.borrow().len();
     pulse_tf.progress.borrow().log_done(
         &pulse_tf.proc_name,

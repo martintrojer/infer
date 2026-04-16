@@ -2491,7 +2491,7 @@ fn test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent() {
 }
 
 #[test]
-fn test_e2e_cyclic_field_write_reifies_latent_abort_in_caller() {
+fn test_e2e_one_node_cycle_keeps_callee_latent_and_reifies_in_caller() {
     let tm = textual_utils::parse_and_convert(
         r#"
         .source_language = "C"
@@ -2537,11 +2537,8 @@ fn test_e2e_cyclic_field_write_reifies_latent_abort_in_caller() {
         .map(|(_, summary)| summary)
         .expect("traverse summary should exist");
     assert!(
-        traverse
-            .diagnostics
-            .iter()
-            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
-        "callee should keep its local null dereference manifest"
+        traverse.diagnostics.is_empty(),
+        "OCaml keeps the one-step cycle callee latent-only; the caller reifies it"
     );
     assert!(
         traverse.pre_posts.iter().any(|pp| {
@@ -2551,7 +2548,7 @@ fn test_e2e_cyclic_field_write_reifies_latent_abort_in_caller() {
                     .as_ref()
                     .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
         }),
-        "callee should also export a latent twin for caller-sensitive cycle shape"
+        "callee should export a latent abort summary matching OCaml"
     );
 
     let caller = store
@@ -3365,6 +3362,7 @@ fn test_e2e_access_use_after_free_keeps_manifest_uaf_and_suppressed_npes() {
 }
 
 #[test]
+#[ignore = "debug parity probe against local /tmp latent.sil fixture"]
 fn test_debug_latent_summary() {
     let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
     if !sil.exists() {
@@ -3451,7 +3449,55 @@ fn test_debug_latent_summary() {
     }
 }
 
+fn retain_named_procs(tm: &mut test_harness::textual_utils::TestModule, proc_names: &[&str]) {
+    let keep: std::collections::HashSet<_> = proc_names.iter().copied().collect();
+    tm.cfg
+        .proc_descs
+        .retain(|pname, _| keep.contains(format!("{pname}").as_str()));
+}
+
 #[test]
+#[ignore = "debug parity probe against local /tmp latent.sil fixture"]
+fn test_debug_latent_summary_reduced_real_counts() {
+    let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
+    if !sil.exists() {
+        eprintln!("skip");
+        return;
+    }
+
+    let mut tm = textual_utils::parse_file_and_convert(sil);
+    let targets = [
+        "traverse_and_crash_if_equal_to_root",
+        "crash_after_one_node_bad",
+        "crash_after_two_nodes_bad",
+        "FN_crash_after_six_nodes_bad",
+    ];
+    retain_named_procs(&mut tm, &targets);
+
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    for target in targets {
+        let summary = store
+            .to_vec()
+            .into_iter()
+            .find(|(pname, _)| format!("{pname}") == target)
+            .map(|(_, summary)| summary)
+            .unwrap_or_else(|| panic!("summary for {target} should exist"));
+        let kinds: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.kind))
+            .collect();
+        eprintln!(
+            "{target}: count={} kinds={kinds:?}",
+            summary.pre_posts.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "debug parity probe against local /tmp latent.sil fixture"]
 fn test_debug_specialization_summary() {
     let sil = std::path::Path::new("/tmp/interproc_debug/specialization.sil");
     if !sil.exists() {

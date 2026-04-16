@@ -5,6 +5,47 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- Active latent-summary checkpoint:
+  - the `traverse_and_crash_if_equal_to_root` post-fixpoint stall is fixed
+  - root cause:
+    Rust was recomputing caller-control reachability over raw alias-heavy
+    summary heaps inside local manifest-twin classification
+  - correctness-preserving fix:
+    `crates/pulse/src/summary.rs` now builds a canonical summary-space heap
+    graph (repr-keyed) for these reachability checks, matching the OCaml
+    assumption that summary-space values are normalized
+  - verified real repro:
+    - command:
+      `RUST_LOG=warn,ondemand=info target/debug/infer-rs --pulse-only --trace-ondemand --procedures-filter 'traverse_and_crash_if_equal_to_root' -j 1 -o /tmp/infer-rs-latent-traverse-scan10 /tmp/interproc_debug/latent.sil`
+    - now finishes in about `0.2s`
+    - now reports only `NULLPTR_DEREFERENCE_LATENT`
+    - summary-build checkpoint is back to `diagnostics=0 pre_posts=7`
+  - important OCaml cross-check from this turn:
+    - temp file:
+      `/tmp/cycle_one_step.c`
+    - command:
+      `infer --pulse-only -j 1 -o /tmp/one_step_out -- clang -c /tmp/cycle_one_step.c`
+    - OCaml reports only the caller manifest issue
+    - OCaml summary for
+      `traverse_one_step_and_crash_if_equal_to_root` is latent-only:
+      `ContinueProgram` + `LatentAbortProgram`, no callee manifest diagnostic
+  - consequence:
+    - the earlier Rust broadening for field-derived cursor rewrites was
+      incorrect and has been reverted
+    - the synthetic end-to-end expectation was wrong and is now aligned to
+      OCaml:
+      `test_e2e_one_node_cycle_keeps_callee_latent_and_reifies_in_caller`
+  - logging cleanup:
+    - removed temporary deep timing logs from
+      `crates/absint/src/disjunctive.rs`,
+      `crates/absint/src/interp.rs`, and
+      `crates/pulse/src/summary.rs`
+    - kept intentional `pulse-progress` / runner progress logging
+  - current validations:
+    - `cargo build -p infer-rs`
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end test_e2e_one_node_cycle_keeps_callee_latent_and_reifies_in_caller -- --exact`
+
 - Active external benchmark work:
   - compare OCaml `infer` and `infer-rs` on `~/infer/benchmarks/openssl`
     from a copy under `/tmp`
@@ -155,6 +196,41 @@ Keep it current when the active line of investigation changes.
           the CFG than a single pathological frozen instruction
       - `s3_cbc.sil` + `--procedures-filter 'tls1_sha512_final_raw'`
         retained `1` procedure and completed in about `6.5s`
+      - after restoring OCaml's `equal_fast` / semantic-`leq` split in the
+        Rust disjunctive domain:
+        - `Comparable` now has an explicit `equal_fast(...)` hook
+        - `DisjunctiveDomain::{join,dedup}` use `equal_fast`
+        - `DisjunctiveDomain::widen` still uses semantic `leq`
+        - the same filtered hotspot now finishes in about `5.2s` instead of
+          about `1m09s`
+        - importantly, the execution shape did **not** change:
+          - still `173` transfer steps
+          - still capped at `20` disjuncts
+          - still hottest node `33:24`
+        - conclusion:
+          - the old cost was dominated by expensive alpha-equivalence work on
+            hot disjunct join/dedup paths, not by extra transfer steps
+  - comparator follow-up after the disjunctive split:
+    - the ignored `specialization.c` summary harness briefly regressed from
+      `Matching: 21` to `Matching: 19`
+    - this was comparator-side semantic noise, not analyzer drift:
+      - OCaml exported hidden recursive actual conditions like `0 < a1`
+      - Rust exported the visible affine form like `0 < add(-1, i.*)`
+      - Rust also kept an extra exact-one upper-bound artifact
+        `add(-1, x) <= 0` when phi already said `x = 1`
+    - `crates/test-harness/src/summary_compare.rs` now canonicalizes
+      conditions through the same affine/equality closure used for phi and
+      drops that exact-one artifact
+    - result:
+      - summary harness is back to `Matching: 21`
+      - `cargo test -q -p test-harness summary_compare::tests` is green
+  - validation caveat:
+    - `RUST_TEST_THREADS=1 cargo test -p pulse --test end_to_end -- --nocapture`
+      still intermittently idles at `0%` CPU on this host after making
+      substantial progress
+    - the focused end-to-end tests used for this checkpoint are green, so
+      this still looks like the pre-existing harness stall rather than a clear
+      regression from the disjunctive change
 
 - Active parity target:
   - resume the remaining `latent.c` latent-invalid-access publication /
@@ -195,6 +271,45 @@ Keep it current when the active line of investigation changes.
   - main summaries: `21 / 21` procedures match
   - specialized summary harness: `Matching: 21`
   - `specialization.c` semantic comparator is currently clean.
+- New latent-summary checkpoint:
+  - the remaining real `latent.c` divergence was narrowed from summary-state
+    shape to summary publication:
+    - for `traverse_and_crash_if_equal_to_root`, Rust already matches the
+      OCaml total disjunct shape (`7` pre-posts with `4` continuing paths)
+    - the remaining mismatch is that Rust still publishes both manifest and
+      latent null-deref issues for the same local crash, whereas OCaml keeps
+      this callee latent-only
+  - implemented a summary-surface fix in
+    `crates/pulse/src/summary.rs`:
+    - if the final exported summary keeps only latent variants of a given
+      diagnostic key, drop any stale manifest diagnostic for that same key
+    - keep the manifest diagnostic when the final summary still exports a
+      matching `AbortProgram` twin
+    - cross-ref: this aligns Rust with OCaml's
+      `PulseSummary.exec_summary_of_post_common`, which reports after final
+      latent-vs-manifest classification
+  - added focused regression:
+    - `test_of_proc_drops_stale_manifest_diag_when_final_summary_is_latent_only`
+  - verification now green:
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end test_e2e_two_hop_field_write_keeps_null_derefs_latent -- --nocapture`
+    - `cargo test -q -p pulse --test end_to_end test_e2e_negated_actual_keeps_arithmetic_latent_summary -- --nocapture`
+    - `cargo fmt --check`
+  - important follow-up:
+    - the real filtered CLI repro for
+      `traverse_and_crash_if_equal_to_root` became unexpectedly slow again
+      during this turn (single retained proc active for `90s+` under
+      `--trace-ondemand`)
+    - this looks separate from the correctness fix, since today's code change
+      only affects summary publication after analysis completes
+    - narrowed further:
+      - temporary timing logs in `crates/pulse/src/checker.rs` showed the
+        slowdown is **before** summary construction
+      - per-instruction debug on the same one-proc repro shows the transfer
+        loop quickly climbs back to the disjunct cap (`20`) inside
+        `traverse_and_crash_if_equal_to_root`
+      - so the runtime problem is back in local loop/disjunct churn, not in
+        the new manifest-vs-latent publication filter
 - Closed this turn:
   - `crates/pulse/src/interproc.rs`
     - real analyzer fix:
@@ -1960,3 +2075,106 @@ If resuming after compaction:
   - `make check` passes cleanly after the patch
   - an earlier `end_to_end` idle spell did not reproduce on rerun, so there is
     no confirmed regression there right now
+
+## 2026-04-15 OpenSSL Runtime Sampling
+
+- Added one more semantically-neutral heartbeat detail for hotspot debugging:
+  - `pulse-progress` now also records:
+    - current-node visit count
+    - hottest node seen so far
+  - purpose:
+    - distinguish "slowly marching through many nodes" from "revisiting one
+      loop head / branch block over and over"
+
+- Verification:
+  - `cargo test -q -p pulse --lib`
+    - `271 passed`, `1 ignored`
+  - `RUST_TEST_THREADS=1 cargo test -p pulse --test end_to_end -- --nocapture`
+    - `49 passed`, `5 ignored`
+  - `make check`
+    - `cargo fmt --check` and `cargo clippy -- -D warnings` passed
+    - `cargo test` hit the old intermittent idle spell in `end_to_end`
+      once again, but the direct serial `end_to_end` rerun passed, so there is
+      still no confirmed regression from this patch
+
+- Full OpenSSL sample (`753` exported `.sil` files, `-j 8`,
+  `--trace-ondemand`):
+  - parse finished in about `43.6s`
+  - merged input:
+    - `8395` procedures
+    - `683` types
+  - callgraph / schedule:
+    - `26180` edges
+    - `175` logical waves
+    - `2600` procs in the largest logical wave
+  - runtime signal:
+    - round 1 kept `active=8`
+    - top active procs after 10s and 20s included
+      `AES_encrypt`, `AES_decrypt`, and `ASN1_PRINTABLE_type`
+  - conclusion:
+    - the full benchmark is **not** stuck on one core because of broken
+      `-j` plumbing or a collapsed scheduler
+    - current performance risk is dominated by procedure-local Pulse cost in
+      selected hot procedures
+
+- Filtered hotspot rerun:
+  - command:
+    - `--procedures-filter 'ssl_set_client_disabled' -j 1`
+  - retained only `2` procedures, so single-core execution there is expected
+  - result:
+    - finished in about `1m09s`
+    - `173` transfer steps
+    - stayed saturated at `20` disjuncts
+    - hottest node ended at `33:24`
+  - SIL cross-ref:
+    - `t1_lib.sil` node `33` is the `have_ecdsa <- 1` block inside the
+      `sigalgs` loop/branch nest around nodes `39 -> 34 -> 24/27/29/33 -> 32`
+  - updated diagnosis:
+    - this hotspot is at least partly loop revisit churn through the
+      `sigalgs` scan, not just one frozen instruction
+    - next realistic investigation is whether the OCaml run shows comparable
+      revisit / runtime shape for this proc, and if not, whether our
+      disjunct-domain/state-comparison behavior is missing a principled join or
+      widening opportunity
+
+- Follow-up comparator experiment:
+  - added a safe structural fast path to `ExecutionDomain::leq`
+    - if two execution states are exactly equal, return `true` before the full
+      `alpha_equivalent(...)` canonicalization
+    - cross-ref:
+      - OCaml `PulseExecutionDomain.equal_fast`
+      - Rust still clones states much more eagerly, so this is only a partial
+        analogue of the OCaml physical-equality fast path
+  - verification:
+    - `cargo test -q -p pulse --lib`
+      - `271 passed`, `1 ignored`
+    - `RUST_TEST_THREADS=1 cargo test -p pulse --test end_to_end -- --nocapture`
+      - `49 passed`, `5 ignored`
+  - benchmark result:
+    - filtered `ssl_set_client_disabled` rerun still finished in about
+      `1m10s` / `173` steps / `20` exit disjuncts
+    - conclusion:
+      - exact-clone short-circuiting is correct but is **not** the main cost in
+        this hotspot
+
+- Stronger OCaml cross-ref from `AbstractInterpreter.MakeDisjunctive`:
+  - instruction-level `join_up_to` uses `T.DisjDomain.equal_fast`
+  - loop widening uses `T.DisjDomain.leq`
+  - for Pulse, OCaml `equal_fast` is essentially physical equality on the
+    abductive state / diagnostic surface
+  - implication for Rust:
+    - our current hot-path comparisons still lean on the full semantic order
+      more than OCaml does
+    - a more faithful performance story probably needs state-sharing /
+      sharing-aware fast equality, not just another exact-structural shortcut
+
+- OCaml timing comparison caveat from the current benchmark tree:
+  - the copied OpenSSL tree still has object files / `infer-out`, but not the
+    original `t1_lib.c` source text needed for a fresh single-file capture
+  - `infer analyze --results-dir <copied infer-out> --procedures-filter ...`
+    still walks all `753` captured source files at file-scheduler level, so it
+    is **not** an apples-to-apples comparison with the Rust single-file
+    filtered textual run
+  - trying two such OCaml analyze runs in parallel hit the restart-scheduler
+    lock race immediately, confirming the copied `infer-out` must be isolated
+    per run

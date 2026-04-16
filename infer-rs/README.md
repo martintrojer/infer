@@ -12,6 +12,34 @@ Current verified checkpoint:
 - main summaries: `21 / 21` procedures match
 - combined per-procedure harness: `Matching: 21`
 
+OpenSSL benchmark status on this host:
+
+- shared capture/export setup is now stable: repo clang on `PATH`, `CC=clang`,
+  explicit macOS SDK `-isysroot`, and `./Configure darwin64-x86_64-cc no-asm`
+- Rust now parses the full exported corpus: `753 / 753` `.sil` files, `0`
+  parse errors
+- the first dominant hotspot, `ssl_set_client_disabled`, dropped from about
+  `1m09s` to about `5.2s` after restoring the OCaml-style
+  `equal_fast` / semantic-`leq` split
+- there is still no final apples-to-apples whole-program timing claim: the
+  remaining gap is local Pulse cost in a few heavy procedures plus
+  exported-Textual proc-identity loss for some duplicate C names, not
+  merge/callgraph setup
+- the wider benchmark is not stuck on one-core scheduling anymore: `-j 8`
+  traces showed `active=8` workers on the full corpus, so the remaining
+  bottleneck is mostly per-procedure analysis cost
+
+On the performance side, Rust now mirrors the OCaml split between cheap
+disjunct equality and semantic subsumption more closely. `Comparable` has an
+explicit `equal_fast(...)` hook, `DisjunctiveDomain::{join,dedup}` use that
+cheap equality (the Rust analogue of OCaml
+`PulseExecutionDomain.equal_fast` / `AbstractInterpreter.MakeDisjunctiveTransferFunctions.join_up_to`),
+and loop widening still uses semantic `leq`. On the filtered OpenSSL hotspot
+`ssl_set_client_disabled`, that keeps the exact same execution shape
+(`173` transfer steps, `20` disjunct cap, hottest node `33:24`) while cutting
+runtime from about `1m09s` to about `5.2s`, which shows the old cost was in hot
+disjunct dedup/join comparisons rather than extra transfer work.
+
 A newer OCaml-backed latent-summary fix also preserves imported arithmetic guards through summary
 recording and export, including reverse-pivoted linear equalities such as `neg_x = -x` that the
 solver stores as `x = -neg_x`. Summary condition recording now keeps the caller-visible `-x`
@@ -46,6 +74,15 @@ affine rewrites, derives `is_int(...)` through exact-RHS, inverse-scaling, and e
 exported equalities, and drops redundant formula-only integer witnesses once an anchored closure is
 available. The focused regressions around `invoke_itself_bad` and `two_pointers_recursion_bad` are
 now green without widening the raw Rust summaries.
+
+The comparator now also canonicalizes summary conditions through the same
+affine/equality closure it already used for phi. That keeps OCaml's hidden
+recursive actual conditions like `0 < a1` aligned with Rust's visible affine
+form like `0 < add(-1, i.*)`, and drops the redundant exact-one upper-bound
+artifact `add(-1, x) <= 0` when phi already fixes `x = 1`. This restored the
+specialized-summary harness back to `Matching: 21` immediately after the
+disjunctive `equal_fast` split, confirming the speedup did not come from
+semantic drift.
 
 Recent OCaml-backed parity work also restored `traces.c`: Rust now preserves branch-conditioned
 null provenance from both real `Prune` instructions and model-generated
@@ -300,7 +337,7 @@ infer-rs/
 - **Correctness over counts**: keep semantically correct OCaml-backed behavior even when sweep totals move temporarily; accepted divergences are documented instead of hidden
 - **Test through comparison**: compare against OCaml's `issues.exp` for compliance
 - **Per-instruction tracing**: `--debug-level-analysis` + `scripts/compare_traces.py` for debugging divergences
-- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis, and now also emits `pulse-progress` heartbeats for long-running procedures
+- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis, and now also emits `pulse-progress` heartbeats for long-running procedures, including node-visit counts and the hottest node seen so far
 
 ## Documentation
 

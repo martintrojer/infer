@@ -362,7 +362,8 @@ where
         };
 
         // Check convergence: new_pre ≤ old_pre
-        if new_pre.leq(&old_state.pre) {
+        let reached_fixpoint = new_pre.leq(&old_state.pre);
+        if reached_fixpoint {
             return Convergence::ReachedFixPoint;
         }
 
@@ -462,7 +463,6 @@ where
     TF::Domain: WithBottom,
 {
     let entry = Dir::entry_node(pdesc);
-
     // Compute WTO using the analysis direction's successor function
     let wto = wto::compute_wto(entry, |node_id| Dir::succs(pdesc, node_id));
 

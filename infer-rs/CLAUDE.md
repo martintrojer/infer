@@ -21,6 +21,27 @@ Key OCaml files to cross-reference:
 - Do not add workarounds, special cases, or heuristic hacks whose main purpose is to make the sweep numbers look better without fixing the underlying behavior.
 - When a correct fix regresses totals, keep the correct fix and investigate the newly exposed gaps separately.
 
+## LOG.md Purpose
+
+`LOG.md` exists to preserve the minimum active debugging context needed to
+resume quickly after chat compaction or interruption without reconstructing the
+whole investigation from scratch.
+
+## LOG.md Hygiene
+
+`LOG.md` is for short-lived debugging context that must survive chat
+compaction, not for storing the full project history.
+
+- Keep it current with the active line of investigation: current hypothesis,
+  OCaml cross-checks, repro commands, blockers, and latest validated
+  checkpoint.
+- Keep it clean of finished items. When work is done, move the durable result
+  to the right long-lived place such as `README.md`, `docs/STATUS.md`,
+  `TODO.md`, focused tests, or the commit history, then trim it out of
+  `LOG.md`.
+- Do not let `LOG.md` become a changelog or archive of closed work; stale
+  finished sections should be removed or summarized elsewhere.
+
 ## Function Pointer Specialization Gotcha
 
 When debugging `__call_c_function_ptr` / specialization parity, remember that
@@ -68,6 +89,19 @@ caller-visible arithmetic structure in recorded summary conditions.
 - Local invalid accesses should only keep the Rust manifest+latent twin on non-manifest paths when
   the caller-sensitive signal comes from heap shape or imported call-side validity, not pure
   imported arithmetic.
+
+## Cycle / cursor-rewrite latent-summary gotcha
+
+When debugging wrapper/cycle null publication, do not assume that a field-derived cursor rewrite
+should turn a callee-local latent null path into a manifest callee report.
+
+- Cross-reference `PulseSummary.ml` / `PulseLatentIssue.ml` and validate against dumped OCaml
+  summaries, not just issue counts.
+- In the one-step cycle shape (`traverse_one_step_and_crash_if_equal_to_root`-style), OCaml keeps
+  the callee summary latent-only and reifies the manifest null-deref only in the caller.
+- Do not broaden Rust manifest-twin heuristics for field-derived cursor rewrites unless the
+  caller-control / reachability check is done over canonical summary-space values and OCaml proves
+  the broader behavior.
 
 ## Compliance debugging recipe
 

@@ -191,19 +191,19 @@ impl RawPrePost {
         let pre_attrs = canonicalize_attrs(&pruned.pre_attrs, &id_canonicalizer);
         let post_attrs = canonicalize_attrs(&pruned.post_attrs, &id_canonicalizer);
 
-        let mut conditions: Vec<_> = pruned
+        let replaced_conditions: Vec<_> = pruned
             .conditions
             .iter()
             .map(|condition| id_canonicalizer.replace_ids(condition))
             .collect();
-        conditions.sort();
 
-        let mut phi: Vec<_> = pruned
+        let replaced_phi: Vec<_> = pruned
             .phi
             .iter()
             .map(|item| id_canonicalizer.replace_ids(item))
             .collect();
-        phi = canonicalize_phi_items(&phi, &anchored_ids);
+        let mut conditions = canonicalize_condition_items(&replaced_conditions, &replaced_phi);
+        let mut phi = canonicalize_phi_items(&replaced_phi, &anchored_ids);
         let mut diagnostic = pruned
             .diagnostic
             .as_ref()
@@ -470,6 +470,70 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
     canonicalize_is_int_closure(normalized, anchored_ids)
 }
 
+fn canonicalize_condition_items(conditions: &[String], phi: &[String]) -> Vec<String> {
+    let eqs: HashMap<_, _> = phi
+        .iter()
+        .filter_map(|item| {
+            let rest = item.strip_prefix("eq:")?;
+            let (lhs, rhs) = rest.split_once('=')?;
+            Some((lhs.to_string(), rhs.to_string()))
+        })
+        .collect();
+    let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
+    let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
+    let reverse_eqs = build_exact_rhs_equivalences(&eqs);
+    let affine_env = build_unit_affine_equivalences(&eqs);
+    let exact_one_vars = build_exact_constant_lhs_set(&eqs, "1");
+
+    let mut normalized = BTreeSet::new();
+    for condition in conditions {
+        let Some(parsed) = parse_condition_item(condition) else {
+            normalized.insert(condition.clone());
+            continue;
+        };
+
+        let lhs_syntax = normalize_term_syntax_for_phi(&parsed.lhs);
+        let rhs_syntax = normalize_term_syntax_for_phi(&parsed.rhs);
+        let atom = if let Some(witness_atom) = collapse_witness_atom(
+            &lhs_syntax,
+            parsed.operator,
+            &rhs_syntax,
+            &positive_witness_atoms,
+            &nonpositive_witness_atoms,
+        ) {
+            witness_atom
+                .strip_prefix("atom:")
+                .unwrap_or(&witness_atom)
+                .to_string()
+        } else {
+            let lhs = normalize_atom_term_for_condition(&parsed.lhs, &reverse_eqs, &affine_env);
+            let rhs = normalize_atom_term_for_condition(&parsed.rhs, &reverse_eqs, &affine_env);
+            if let Some(witness_atom) = collapse_witness_atom(
+                &lhs,
+                parsed.operator,
+                &rhs,
+                &positive_witness_atoms,
+                &nonpositive_witness_atoms,
+            ) {
+                witness_atom
+                    .strip_prefix("atom:")
+                    .unwrap_or(&witness_atom)
+                    .to_string()
+            } else {
+                format!("{lhs} {} {rhs}", parsed.operator)
+            }
+        };
+
+        if should_drop_condition_atom(&atom, &exact_one_vars) {
+            continue;
+        }
+
+        normalized.insert(format!("cond:{atom}"));
+    }
+
+    normalized.into_iter().collect()
+}
+
 fn normalize_atom_term_for_phi(
     term: &str,
     reverse_eqs: &HashMap<String, Vec<String>>,
@@ -481,6 +545,103 @@ fn normalize_atom_term_for_phi(
         .and_then(|lhss| lhss.first())
         .map(|lhs| normalize_term_for_phi(lhs, affine_env))
         .unwrap_or(normalized)
+}
+
+fn normalize_atom_term_for_condition(
+    term: &str,
+    reverse_eqs: &HashMap<String, Vec<String>>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
+) -> String {
+    let normalized = normalize_term_syntax_for_phi(term);
+    let mut candidates = BTreeSet::from([normalized.clone()]);
+
+    for equivalent in collect_affine_equivalent_terms(term, affine_env) {
+        candidates.insert(equivalent.clone());
+        if let Some(lhss) = reverse_eqs.get(&equivalent) {
+            candidates.extend(lhss.iter().cloned());
+        }
+    }
+
+    if let Some(lhss) = reverse_eqs.get(&normalized) {
+        candidates.extend(lhss.iter().cloned());
+    }
+
+    candidates
+        .into_iter()
+        .min_by_key(|term| condition_term_sort_key(term))
+        .unwrap_or(normalized)
+}
+
+fn collect_affine_equivalent_terms(
+    term: &str,
+    env: &HashMap<String, Vec<AffineExpr>>,
+) -> BTreeSet<String> {
+    let Some(start) = parse_affine_expr(term) else {
+        return BTreeSet::new();
+    };
+
+    let mut result = BTreeSet::new();
+    let mut worklist = vec![start];
+    let mut visited = BTreeSet::new();
+
+    while let Some(expr) = worklist.pop() {
+        let key = format_affine_expr(&expr);
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        result.insert(key);
+
+        let Some(next_exprs) = env.get(&expr.base) else {
+            continue;
+        };
+        for next in next_exprs {
+            let coeff = expr.coeff * next.coeff;
+            if !matches!(coeff, -1 | 1) {
+                continue;
+            }
+            worklist.push(AffineExpr {
+                coeff,
+                base: next.base.clone(),
+                constant: expr.coeff * next.constant + expr.constant,
+            });
+        }
+    }
+
+    result
+}
+
+fn condition_term_sort_key(term: &str) -> (bool, bool, bool, usize, String) {
+    (
+        term.contains('('),
+        term.starts_with('a'),
+        looks_like_abstract_id(term),
+        term.len(),
+        term.to_string(),
+    )
+}
+
+fn build_exact_constant_lhs_set(eqs: &HashMap<String, String>, constant: &str) -> HashSet<String> {
+    eqs.iter()
+        .filter_map(|(lhs, rhs)| {
+            (normalize_term_syntax_for_phi(rhs) == constant).then_some(lhs.clone())
+        })
+        .collect()
+}
+
+fn should_drop_condition_atom(atom: &str, exact_one_vars: &HashSet<String>) -> bool {
+    let Some(parsed) = parse_atom_item(&format!("atom:{atom}")) else {
+        return false;
+    };
+
+    if parsed.operator != "<=" || normalize_term_syntax_for_phi(&parsed.rhs) != "0" {
+        return false;
+    }
+
+    let Some(expr) = parse_affine_expr(&normalize_term_syntax_for_phi(&parsed.lhs)) else {
+        return false;
+    };
+
+    expr.coeff == 1 && expr.constant == -1 && exact_one_vars.contains(&expr.base)
 }
 
 fn canonicalize_is_int_closure(
@@ -1096,6 +1257,10 @@ fn parse_atom_item(item: &str) -> Option<ParsedAtom> {
         }
     }
     None
+}
+
+fn parse_condition_item(item: &str) -> Option<ParsedAtom> {
+    parse_atom_item(&format!("atom:{}", item.strip_prefix("cond:")?))
 }
 
 fn parse_fn_app(term: &str) -> Option<(String, Vec<String>)> {
@@ -4029,5 +4194,143 @@ mod tests {
             "invoke recursive branch should not keep redundant affine atoms after canonicalization: {:?}",
             pre_post.phi
         );
+    }
+
+    #[test]
+    fn test_condition_normalization_matches_recursive_hidden_actual_and_visible_affine_actual() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("f".to_string(), "v1".to_string()),
+                    ("i".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("f".to_string(), "v1".to_string()),
+                    ("i".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v2".to_string(),
+                    access: "*".to_string(),
+                    dst: "v4".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v2".to_string(),
+                    access: "*".to_string(),
+                    dst: "v4".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < a1".to_string(), "cond:0 < v4".to_string()],
+                phi: vec!["eq:v10=lin(1*a1,const=1)".to_string()],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("f".to_string(), "v10".to_string()),
+                    ("i".to_string(), "v20".to_string()),
+                ],
+                post_stack: vec![
+                    ("f".to_string(), "v10".to_string()),
+                    ("i".to_string(), "v20".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v20".to_string(),
+                    access: "*".to_string(),
+                    dst: "v40".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v20".to_string(),
+                    access: "*".to_string(),
+                    dst: "v40".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![
+                    "cond:0 < add(-1, v40)".to_string(),
+                    "cond:0 < v40".to_string(),
+                ],
+                phi: vec![
+                    "eq:v50=lin(1*v60,const=1)".to_string(),
+                    "eq:v40=lin(1*v60,const=2)".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let left_canonical = left.canonicalize();
+        let right_canonical = right.canonicalize();
+        let [left_pre_post] = left_canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        let [right_pre_post] = right_canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+
+        assert_eq!(left_pre_post.conditions, right_pre_post.conditions);
+        assert_eq!(
+            left_pre_post.conditions,
+            vec!["cond:0 < i.*".to_string(), "cond:0 < v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_condition_normalization_drops_exact_one_upper_bound_artifact() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v1".to_string())],
+                post_stack: vec![("i".to_string(), "v1".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v4".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v4".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:0 < v4".to_string()],
+                phi: vec!["eq:v4=1".to_string()],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("i".to_string(), "v10".to_string())],
+                post_stack: vec![("i".to_string(), "v10".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v10".to_string(),
+                    access: "*".to_string(),
+                    dst: "v40".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v10".to_string(),
+                    access: "*".to_string(),
+                    dst: "v40".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![
+                    "cond:0 < v40".to_string(),
+                    "cond:add(-1, v40) <= 0".to_string(),
+                ],
+                phi: vec!["eq:v40=1".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
     }
 }

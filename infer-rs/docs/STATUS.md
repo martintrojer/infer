@@ -2,9 +2,49 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster remains concentrated in wrapper/cycle null-path publication such as `traverse_and_crash_if_equal_to_root` plus richer trace/report parity.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster is now concentrated in broader wrapper/cycle null-path publication and richer trace/report parity; the filtered `traverse_and_crash_if_equal_to_root` latent-only repro is fixed again.**
+
+## OpenSSL Benchmark
+
+- The benchmark setup is now understood and repeatable on this host:
+  use the repo clang on `PATH`, set `CC=clang`, append
+  `-isysroot $(xcrun --show-sdk-path)`, and configure OpenSSL with
+  `./Configure darwin64-x86_64-cc no-asm`.
+- Rust now parses the full exported Textual corpus from this benchmark:
+  `753 / 753` `.sil` files with `0` parse failures.
+- The first dominant hotspot, `ssl_set_client_disabled`, improved from about
+  `1m09s` to about `5.2s` after restoring the OCaml-style disjunctive
+  `equal_fast` / semantic-`leq` split, with the same `173` transfer steps,
+  `20`-disjunct cap, and hottest node `33:24`.
+- This benchmark is no longer pointing at merge or callgraph setup as the main
+  problem. Merge is negligible, and `-j 8` traces showed `active=8` workers on
+  the full corpus, so the remaining slowdown is mainly local Pulse cost in a
+  few heavy procedures.
+- We still do not claim a clean full-program apples-to-apples OCaml-vs-Rust
+  timing number. The remaining blockers are heavy local Pulse procedures plus
+  exported-Textual proc-identity loss for some duplicate C names.
 
 Recent correctness / robustness fixes:
+- Disjunctive Pulse execution now mirrors the OCaml split between cheap
+  disjunct equality and semantic subsumption more closely. `absint` gained an
+  explicit `Comparable::equal_fast(...)` hook, `DisjunctiveDomain::{join,dedup}`
+  now use `equal_fast`, and loop widening still uses semantic `leq`
+  (cross-ref: OCaml `PulseExecutionDomain.equal_fast` and
+  `AbstractInterpreter.MakeDisjunctiveTransferFunctions.join_up_to` / widen).
+  On the filtered OpenSSL hotspot `ssl_set_client_disabled`, this keeps the
+  exact same execution shape (`173` transfer steps, `20` disjunct cap, hottest
+  node `33:24`) while cutting runtime from about `1m09s` to about `5.2s`,
+  which is strong evidence that the old cost was dominated by hot
+  alpha-equivalence dedup/join comparisons rather than extra transfer work.
+- Summary-comparison normalization now canonicalizes conditions through the
+  same affine/equality closure already used for phi, and drops the redundant
+  exact-one upper-bound artifact `add(-1, x) <= 0` when exported phi already
+  fixes `x = 1`. That keeps OCaml's hidden recursive actual conditions like
+  `0 < a1` aligned with Rust's visible affine form like `0 < add(-1, i.*)`,
+  and restores the ignored `specialization.c` harness to `Matching: 21`
+  immediately after the disjunctive `equal_fast` split. The current summary
+  checkpoint therefore stays semantically clean while the performance fix
+  remains in place.
 - Textual ingestion and merged direct-`.sil` robustness improved again:
   parser name positions now accept exported identifiers tokenized as
   `Local(n)` plus `_` wildcard field names, empty exported
@@ -24,11 +64,19 @@ Recent correctness / robustness fixes:
   debugging can still compute usable summaries.
 - Long-running filtered Pulse runs now emit logger-based `pulse-progress`
   heartbeats under `--trace-ondemand`, which exposes elapsed time,
-  transfer-step count, current node/instr, and current/max disjunct counts.
-  The first OpenSSL hotspot slice showed that
+  transfer-step count, current node/instr, current-node revisit count, hottest
+  node-so-far, and current/max disjunct counts. The first OpenSSL hotspot
+  slice showed that
   `ssl_set_client_disabled` is not frozen on one transfer; it crawls through
-  the CFG while staying saturated at `20` disjuncts, which points more toward
-  path churn / disjunct pressure than one isolated pathological instruction.
+  the CFG while staying saturated at `20` disjuncts. After restoring the
+  OCaml-style `equal_fast` split, the same filtered run still takes the same
+  `173` transfer steps and reaches the same hottest node, but now finishes in
+  about `5.2s` instead of about `1m09s`. A wider OpenSSL sample with `-j 8`
+  also confirmed that the Rust runner does use parallelism on the full
+  benchmark (`active=8` in round 1 over a call graph with `8395` procedures /
+  `175` logical waves / max logical wave size `2600`), so the remaining
+  bottleneck is procedure-local Pulse cost in specific hot functions rather
+  than a broken scheduler or thread-pool setup.
 - Imported arithmetic latent-summary parity is fixed again:
   `PulseFormulaPhi` condition normalization now preserves reverse-pivoted
   linear guards (for example, a stored `x = -neg_x` relation still records the
@@ -655,8 +703,9 @@ Current interpretation of these deltas:
 - `sizeof.c` is no longer considered an active Pulse parity task: the exported Textual path drops
   `Sizeof.nbytes` / array extents and emits `<int[]>`, so Rust receives too little information to
   fold those branches without adding a workaround. See `docs/STORE_TEXTUAL.md`.
-- The remaining active work is concentrated in exact issue-set / reporting parity for wrapper/cycle
-  null paths such as `traverse_and_crash_if_equal_to_root`, plus richer trace reconstruction.
+- The remaining active work is concentrated in exact issue-set / reporting parity for broader
+  wrapper/cycle null-path publication beyond the now-fixed filtered
+  `traverse_and_crash_if_equal_to_root` repro, plus richer trace reconstruction.
 
 **MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
 
@@ -696,8 +745,9 @@ using any exact disjunct/null-attr mismatch counts.
    - Latent invalid access now exists for caller-derived invalid addresses, imported pure-call
      dependencies survive summary application, and `pre_heap_has_assumptions` is included in
      manifestness. The remaining active mismatch is narrower: exact publication/reporting parity
-     on wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`, plus richer
-     suppression / trace presentation detail.
+     on broader wrapper/cycle null-path publication beyond the now-fixed filtered
+     `traverse_and_crash_if_equal_to_root` repro, plus richer suppression / trace presentation
+     detail.
    - Minimal `ValueHistory` threading now exists for invalid-access provenance and dedup, but full
      OCaml `PulseValueHistory` / `PulseTrace` parity is still missing
    - No global variable handling in summary application
@@ -713,7 +763,8 @@ using any exact disjunct/null-attr mismatch counts.
 ### 1. Finish exact invalid-access publication parity
 The remaining correctness work is now mostly issue-set, not headline-count, work. Match OCaml on:
 
-- wrapper/cycle null paths such as `traverse_and_crash_if_equal_to_root`
+- broader wrapper/cycle null-path publication beyond the now-fixed filtered
+  `traverse_and_crash_if_equal_to_root` repro
 - latent-vs-manifest publication details that count-only sweeps can hide
 - report/tracing presentation details around suppressed issues and caller reification
 
