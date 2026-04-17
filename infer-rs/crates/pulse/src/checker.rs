@@ -289,7 +289,8 @@ pub fn analyze_with_specialization_and_requests(
             match d {
                 ExecutionDomain::AbortProgram { state, diagnostic } => {
                     let classify_start = Instant::now();
-                    let classified_kind = crate::summary::classify_abort_kind(pdesc, state, diagnostic);
+                    let classified_kind =
+                        crate::summary::classify_abort_kind(pdesc, state, diagnostic);
                     let is_manifest_abort = diagnostic_originates_in_proc(pdesc, diagnostic)
                         && matches!(classified_kind, crate::summary::PrePostKind::AbortProgram);
                     if pulse_progress_enabled()
@@ -517,9 +518,7 @@ fn diagnostic_originates_in_proc(pdesc: &Procdesc, diagnostic: &Diagnostic) -> b
 fn stopped_summary_key(exec: &ExecutionDomain) -> Option<(u8, String)> {
     match exec {
         ExecutionDomain::AbortProgram { diagnostic, .. } => Some((0, diagnostic.dedup_key())),
-        ExecutionDomain::LatentAbortProgram { diagnostic, .. } => {
-            Some((1, diagnostic.dedup_key()))
-        }
+        ExecutionDomain::LatentAbortProgram { diagnostic, .. } => Some((1, diagnostic.dedup_key())),
         ExecutionDomain::LatentInvalidAccess { diagnostic, .. } => {
             Some((2, diagnostic.dedup_key()))
         }
@@ -3060,7 +3059,10 @@ mod tests {
             .find(|pdesc| format!("{}", pdesc.proc_name) == "conditional_free2")
             .expect("conditional_free2 proc should exist")
             .clone();
-        callee_summaries.insert(conditional_free.proc_name.clone(), analyze(&conditional_free));
+        callee_summaries.insert(
+            conditional_free.proc_name.clone(),
+            analyze(&conditional_free),
+        );
 
         let cfg = config::get();
         let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
@@ -3086,15 +3088,11 @@ mod tests {
                     if let ExecutionDomain::AbortProgram { state, diagnostic } = disjunct {
                         let kind = crate::summary::classify_abort_kind(&pdesc, state, diagnostic);
                         let manifest = crate::summary::abort_is_manifest(&pdesc, state);
-                        eprintln!(
-                            "      classify={kind:?} manifest={}",
-                            manifest,
-                        );
+                        eprintln!("      classify={kind:?} manifest={}", manifest,);
                     }
                 }
             }
         }
-
     }
 
     #[test]

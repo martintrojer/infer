@@ -1110,7 +1110,8 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
     if classified_abort.kind != PrePostKind::AbortProgram {
         return Vec::new();
     }
-    let Some(Diagnostic::AccessToInvalidAddress { invalidation, .. }) = pre_post.diagnostic.as_ref()
+    let Some(Diagnostic::AccessToInvalidAddress { invalidation, .. }) =
+        pre_post.diagnostic.as_ref()
     else {
         return Vec::new();
     };
@@ -2276,7 +2277,8 @@ fn abort_has_local_invalid_access(pdesc: &Procdesc, pre_post: &PrePost) -> bool 
 /// the local crash latent, which is the OCaml behavior for
 /// `latent.c:traverse_and_crash_if_equal_to_root`.
 fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
-    let Some(Diagnostic::AccessToInvalidAddress { invalidation, .. }) = pre_post.diagnostic.as_ref()
+    let Some(Diagnostic::AccessToInvalidAddress { invalidation, .. }) =
+        pre_post.diagnostic.as_ref()
     else {
         return false;
     };
@@ -2530,10 +2532,9 @@ fn atom_is_benign_manifest_constraint(
     use crate::formula::atom::Atom;
     use crate::formula::term::Term;
 
-    let is_allocatedish =
-        |v: AbstractValue| {
-            let repr = pre_post.post.path_condition.get_var_repr(v);
-            pre_post
+    let is_allocatedish = |v: AbstractValue| {
+        let repr = pre_post.post.path_condition.get_var_repr(v);
+        pre_post
                 .post
                 .post
                 .attrs
@@ -2544,7 +2545,7 @@ fn atom_is_benign_manifest_constraint(
                 // / `0 < x` guards, even if the summarized state later
                 // invalidates the same address.
                 || pre_post.post.must_be_valid.contains(&repr)
-        };
+    };
 
     let var_neq_zero = match atom {
         Atom::NotEqual(Term::Var(v), Term::Const(0))
