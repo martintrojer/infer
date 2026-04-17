@@ -100,6 +100,15 @@ impl VarUF {
         self.find_immut(v)
     }
 
+    /// Number of parent links tracked by the union-find.
+    pub fn len(&self) -> usize {
+        self.parent.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.parent.is_empty()
+    }
+
     /// Iterate over all non-trivial equivalence classes.
     pub fn iter_equalities(&self) -> impl Iterator<Item = (AbstractValue, AbstractValue)> + '_ {
         self.parent

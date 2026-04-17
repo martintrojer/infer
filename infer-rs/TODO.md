@@ -43,6 +43,12 @@ root/build-system `pulse-model-returns-copy-pattern` and C++ `pulse-model-cheap-
 of which need the OCaml unnecessary-copy pipeline rather than a simple model shim. Language-specific
 `pulse-model-{release,deep-release}-pattern` remain out of the current C null/UAF/leak scope.
 
+Separate recency note: `pulse-recency-limit` is now available through CLI and
+`.inferconfig` for OCaml-style experiments, but it is intentionally not the
+default path. Matching OCaml's default `32` cap by default would reintroduce
+the real `nullptr.c` `FN_nullptr_deref_old_bad` false negative, and the
+focused `whirlpool_block` probe stayed essentially unchanged with the cap on.
+
 **Skipped files (3):** `infinite.c` (106 procs with infinite loops/Ackermann), `recursion.c`,
 `recursion2.c` — fixpoint exhaustion.
 
@@ -133,12 +139,28 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 ### OpenSSL benchmark follow-ups
 
-- Get a clean full apples-to-apples OCaml-vs-Rust timing on the shared OpenSSL
-  capture using already-exported `.sil`, not the convenience `--results-dir`
-  path.
-- Profile the remaining heavy procedures after the `ssl_set_client_disabled`
-  fix. Current evidence says the next bottlenecks are still local Pulse cost,
-  not merge/callgraph setup.
+- First stabilize whole-program merged direct-`.sil` OpenSSL runs. Re-run the
+  latest shared corpus without `/usr/bin/time` so we can capture the real exit
+  status and determine whether the current `-j 4` / `-j 8` failures are an
+  external kill or some other runtime termination path.
+- Measure the same shared exported corpus at `-j 1`, `-j 2`, `-j 4`, and
+  `-j 8` once the exit cause is clearer, and treat `-j 1` as the only current
+  publishable apples-to-apples Rust timing until merged `-j > 1` runs are
+  stable.
+- Compare OCaml logical per-node retained state against Rust on
+  `whirlpool_block` and another hot OpenSSL procedure using the new
+  `live-fixpoint` heartbeat plus OCaml traces / summary dumps.
+- If the logical shape is similar, focus on Rust invariant-map storage /
+  sharing cost rather than new semantic caps:
+  persistent sharing across heap / attrs / formula, cheaper retained summary
+  snapshots, and less cloning around stored node states.
+- If the logical shape is larger in Rust, investigate semantic redundancy in
+  the retained node snapshots before trying any new cap or workaround.
+- Keep the new `pulse-recency-limit` flag experimental only. It is useful for
+  OCaml cross-checks, but it is not the current fix direction for OpenSSL.
+- Keep profiling the remaining heavy procedures after the
+  `ssl_set_client_disabled` fix. That hotspot improvement is real, but it is
+  no longer the only thing blocking OpenSSL usability.
 - Keep the duplicate-proc exported-Textual identity loss documented as an
   upstream fidelity limit unless `infer debug --export-textual` preserves the
   OCaml proc UID.
@@ -168,6 +190,7 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 - **Per-instruction tracing**: `--debug-level-analysis 1` (debug) or `2` (trace). Also `RUST_LOG=pulse=debug`. Log lines prefixed with `[proc_name]` for parallel-safe filtering.
 - **Scheduler tracing**: `--trace-ondemand` enables logger-based wave start/end and periodic progress snapshots (`RUST_LOG=warn,ondemand=info` by default when the flag is set).
+- **Retained-state tracing**: `--trace-ondemand` now also emits `live-fixpoint` heartbeats so OpenSSL debugging can separate active frontier cost from retained invariant-map cost.
 - **Comparison script**: `scripts/compare_traces.py` — parses OCaml `--debug` HTML and Rust log, side-by-side per-instruction with disjunct counts.
 - **Compliance recipe**: see CLAUDE.md "Step-by-step tracing for compliance debugging".
 

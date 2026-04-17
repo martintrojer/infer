@@ -8,6 +8,7 @@
 //! Mirrors OCaml's `TransferFunctions.mli`.
 
 use crate::domain::AbstractDomain;
+use crate::interp::InvariantMap;
 use sil::instr::Instr;
 use sil::procdesc::NodeId;
 
@@ -39,4 +40,10 @@ pub trait TransferFunctions {
         instr_idx: usize,
         instr: &Instr,
     ) -> Self::Domain;
+
+    /// Observe the current fixpoint invariant map after a node update.
+    ///
+    /// Default: no-op. Checkers can override this to emit coarse progress
+    /// snapshots for long-running procedures.
+    fn observe_fixpoint(&self, _node_id: NodeId, _inv_map: &InvariantMap<Self::Domain>) {}
 }

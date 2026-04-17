@@ -58,7 +58,8 @@ pub fn get() -> &'static InferConfig {
 /// All analysis configuration.
 ///
 /// Fields match OCaml's `Config.ml` flags where applicable.
-/// All fields have sane defaults matching OCaml's behavior.
+/// Defaults follow OCaml unless a field documents an intentional Rust-side
+/// divergence.
 /// NOTE: The `#[serde(rename = "...")]` attributes are the single source
 /// of truth for flag names. CLI flags in `cli/main.rs` must use the same
 /// names in their `#[arg(long = "...")]` attributes. The names match
@@ -81,6 +82,14 @@ pub struct InferConfig {
     /// OCaml: `--pulse-intraprocedural-only` (default false)
     #[serde(rename = "pulse-intraprocedural-only")]
     pub pulse_intraprocedural_only: bool,
+
+    /// Maximum number of recently modified heap edges retained per address.
+    /// OCaml flag: `--pulse-recency-limit` (default 32).
+    /// Rust leaves this unset by default to preserve the current
+    /// correctness-positive behavior until that precision tradeoff is chosen
+    /// explicitly.
+    #[serde(rename = "pulse-recency-limit")]
+    pub pulse_recency_limit: Option<usize>,
 
     /// Run only the Pulse checker.
     /// OCaml: `--pulse-only` (default false)
@@ -204,6 +213,7 @@ impl Default for InferConfig {
             pulse_max_disjuncts: 20,
             pulse_widen_threshold: 3,
             pulse_intraprocedural_only: false,
+            pulse_recency_limit: None,
             pulse_only: false,
             liveness_only: false,
             pulse_report_issues_for_tests: false,
@@ -303,6 +313,7 @@ mod tests {
         assert_eq!(config.pulse_widen_threshold, 3);
         assert_eq!(config.max_widens, 10_000);
         assert!(!config.pulse_intraprocedural_only);
+        assert_eq!(config.pulse_recency_limit, None);
         assert!(!config.pulse_only);
         assert!(!config.liveness_only);
         assert!(!config.pulse_report_issues_for_tests);
@@ -325,9 +336,10 @@ mod tests {
 
     #[test]
     fn test_from_json_known_fields() {
-        let json = r#"{"pulse-max-disjuncts": 50, "quiet": true, "pulse-force-continue": false}"#;
+        let json = r#"{"pulse-max-disjuncts": 50, "pulse-recency-limit": 17, "quiet": true, "pulse-force-continue": false}"#;
         let config = InferConfig::from_json(json);
         assert_eq!(config.pulse_max_disjuncts, 50);
+        assert_eq!(config.pulse_recency_limit, Some(17));
         assert!(config.quiet);
         assert!(!config.pulse_force_continue);
         // Other fields should be defaults

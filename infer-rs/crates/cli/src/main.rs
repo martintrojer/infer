@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -128,6 +129,10 @@ struct Cli {
     #[arg(long = "pulse-intraprocedural-only")]
     pulse_intraprocedural_only: bool,
 
+    /// Maximum number of recently modified heap edges retained per address.
+    #[arg(long = "pulse-recency-limit")]
+    pulse_recency_limit: Option<usize>,
+
     /// Maximum widenings before fixpoint gives up (default: 10000).
     #[arg(long = "max-widens")]
     max_widens: Option<usize>,
@@ -227,6 +232,9 @@ impl Cli {
         }
         if self.pulse_intraprocedural_only {
             c.pulse_intraprocedural_only = true;
+        }
+        if let Some(v) = self.pulse_recency_limit {
+            c.pulse_recency_limit = Some(v);
         }
         if let Some(v) = self.pulse_max_disjuncts {
             c.pulse_max_disjuncts = v;
@@ -1283,7 +1291,7 @@ fn collect_cfun_summaries(
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
     summaries: &mut std::collections::HashMap<
         sil::procname::Procname,
-        pulse::summary::PulseSummary,
+        Arc<pulse::summary::PulseSummary>,
     >,
 ) {
     use sil::const_val::Const;
@@ -1295,12 +1303,12 @@ fn collect_cfun_summaries(
         ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
         summaries: &mut std::collections::HashMap<
             sil::procname::Procname,
-            pulse::summary::PulseSummary,
+            Arc<pulse::summary::PulseSummary>,
         >,
     ) {
         match exp {
             Exp::Const(Const::Cfun(pname)) => {
-                if let Some(summary) = ctx.summaries.get(pname) {
+                if let Some(summary) = ctx.summaries.get_arc(pname) {
                     summaries.entry(pname.clone()).or_insert(summary);
                 }
             }
@@ -1365,12 +1373,12 @@ fn is_pointer_to_function_typ(typ: &sil::typ::Typ) -> bool {
 fn collect_summary_closure_summaries(
     summary: &pulse::summary::PulseSummary,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
-    out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
+    out: &mut std::collections::HashMap<sil::procname::Procname, Arc<pulse::summary::PulseSummary>>,
 ) {
     for pre_post in &summary.pre_posts {
         for (_addr, attrs) in pre_post.post.post.attrs.iter() {
             if let Some(pname) = attrs.get_closure_proc_name() {
-                if let Some(summary) = ctx.summaries.get(pname) {
+                if let Some(summary) = ctx.summaries.get_arc(pname) {
                     out.entry(pname.clone()).or_insert(summary);
                 }
             }
@@ -1394,7 +1402,10 @@ fn analyze_with_spec_loop(
 ) -> pulse::summary::PulseSummary {
     const MAX_SPEC_DEPTH: usize = 5;
 
-    let mut callee_summaries = std::collections::HashMap::new();
+    let mut callee_summaries: std::collections::HashMap<
+        sil::procname::Procname,
+        Arc<pulse::summary::PulseSummary>,
+    > = std::collections::HashMap::new();
     let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
         collect_cfun_summaries(instr, ctx, &mut callee_summaries);
@@ -1404,16 +1415,16 @@ fn analyze_with_spec_loop(
         let Some(init_pdesc) = ctx.cfg.get_proc_desc(&init_pname) else {
             continue;
         };
-        let summary = ctx.summaries.get_or_compute(&init_pname, || {
+        let summary = ctx.summaries.get_or_compute_arc(&init_pname, || {
             analyze_with_spec_loop(init_pdesc, ctx, None, depth + 1)
         });
-        collect_summary_closure_summaries(&summary, ctx, &mut callee_summaries);
+        collect_summary_closure_summaries(summary.as_ref(), ctx, &mut callee_summaries);
         callee_summaries.entry(init_pname).or_insert(summary);
     }
     if let Some(spec) = specialization {
         for type_name in spec.dynamic_types.values() {
             let pname = sil::procname::Procname::c_from_string(&format!("{type_name}"));
-            if let Some(s) = ctx.summaries.get(&pname) {
+            if let Some(s) = ctx.summaries.get_arc(&pname) {
                 callee_summaries.insert(pname, s);
             }
         }
@@ -1442,7 +1453,7 @@ fn analyze_with_spec_loop(
                 let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
                 let spec_summary_for_store = spec_summary.clone();
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
-                    existing.add_specialized_summary(spec.clone(), spec_summary);
+                    Arc::make_mut(existing).add_specialized_summary(spec.clone(), spec_summary);
                     let _ = ctx.summaries.update(callee_pname, |stored| {
                         if stored.get_specialized(spec).is_none() {
                             stored.add_specialized_summary(spec.clone(), spec_summary_for_store);

@@ -20,14 +20,73 @@ use crate::value_history::{ValueHistory, ValueWithHistory};
 
 /// Edges from a single heap address: maps accesses to target addresses.
 ///
-/// OCaml uses `RecencyMap` (bounded map). We use `BTreeMap` (unbounded)
-/// for simplicity; can add recency eviction later if needed.
+/// Mirrors OCaml's `RecencyMap`: keep the most recently modified batch plus
+/// the previous batch, each bounded by `pulse-recency-limit`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Edges(BTreeMap<Access, ValueWithHistory>);
+pub struct Edges {
+    new_keys: Vec<Access>,
+    old_keys: Vec<Access>,
+    values: BTreeMap<Access, ValueWithHistory>,
+}
 
 impl Edges {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    fn configured_limit() -> Option<usize> {
+        config::get().pulse_recency_limit.map(|limit| limit.max(1))
+    }
+
+    fn remove_key(keys: &mut Vec<Access>, access: &Access) -> bool {
+        let Some(index) = keys.iter().position(|existing| existing == access) else {
+            return false;
+        };
+        keys.remove(index);
+        true
+    }
+
+    fn retain_tracked_values(&mut self) {
+        let tracked_new = self.new_keys.clone();
+        let tracked_old = self.old_keys.clone();
+        self.values
+            .retain(|access, _| tracked_new.contains(access) || tracked_old.contains(access));
+    }
+
+    fn recency_bindings_cloned(&self) -> Vec<(Access, ValueWithHistory)> {
+        if self.new_keys.is_empty() && self.old_keys.is_empty() {
+            return self
+                .values
+                .iter()
+                .map(|(access, value)| (access.clone(), value.clone()))
+                .collect();
+        }
+        let mut bindings = Vec::with_capacity(self.values.len());
+        for access in &self.new_keys {
+            if let Some(value) = self.values.get(access) {
+                bindings.push((access.clone(), value.clone()));
+            }
+        }
+        for access in &self.old_keys {
+            if self.new_keys.contains(access) {
+                continue;
+            }
+            if let Some(value) = self.values.get(access) {
+                bindings.push((access.clone(), value.clone()));
+            }
+        }
+        bindings
+    }
+
+    fn from_recency_bindings_limited(
+        bindings_in_recency_order: Vec<(Access, ValueWithHistory)>,
+        limit: usize,
+    ) -> Self {
+        let mut edges = Self::empty();
+        for (access, value) in bindings_in_recency_order.into_iter().rev() {
+            edges.add_with_history_limited(access, value, limit);
+        }
+        edges
     }
 
     pub fn add(&mut self, access: Access, target: AbstractValue) {
@@ -35,11 +94,33 @@ impl Edges {
     }
 
     pub fn add_with_history(&mut self, access: Access, value: ValueWithHistory) {
-        self.0.insert(access, value);
+        let Some(limit) = Self::configured_limit() else {
+            self.values.insert(access, value);
+            return;
+        };
+        self.add_with_history_limited(access, value, limit);
+    }
+
+    fn add_with_history_limited(&mut self, access: Access, value: ValueWithHistory, limit: usize) {
+        let limit = limit.max(1);
+        Self::remove_key(&mut self.old_keys, &access);
+        Self::remove_key(&mut self.new_keys, &access);
+        self.values.insert(access.clone(), value);
+
+        let next_count_new = self.new_keys.len() + 1;
+        if next_count_new > limit {
+            self.old_keys = std::mem::take(&mut self.new_keys);
+            self.new_keys = vec![access];
+            self.retain_tracked_values();
+        } else {
+            self.new_keys.insert(0, access);
+        }
     }
 
     pub fn remove(&mut self, access: &Access) {
-        self.0.remove(access);
+        self.values.remove(access);
+        Self::remove_key(&mut self.new_keys, access);
+        Self::remove_key(&mut self.old_keys, access);
     }
 
     pub fn find(&self, access: &Access) -> Option<AbstractValue> {
@@ -47,36 +128,48 @@ impl Edges {
     }
 
     pub fn find_with_history(&self, access: &Access) -> Option<&ValueWithHistory> {
-        self.0.get(access)
+        self.values.get(access)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.values.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Access, &AbstractValue)> {
-        self.0.iter().map(|(access, value)| (access, &value.addr))
+        self.values
+            .iter()
+            .map(|(access, value)| (access, &value.addr))
     }
 
     pub fn iter_with_history(&self) -> impl Iterator<Item = (&Access, &ValueWithHistory)> {
-        self.0.iter()
+        self.values.iter()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.values.len()
     }
 
     /// Substitute abstract values in edge targets.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
-        let mut updated = BTreeMap::new();
-        for (access, mut value) in std::mem::take(&mut self.0) {
-            let access = access.canonicalize(|v| if v == old { new } else { v });
-            if value.addr == old {
-                value.addr = new;
-            }
-            updated.insert(access, value);
-        }
-        self.0 = updated;
+        let rewritten = self
+            .recency_bindings_cloned()
+            .into_iter()
+            .map(|(access, mut value)| {
+                let access = access.canonicalize(|v| if v == old { new } else { v });
+                if value.addr == old {
+                    value.addr = new;
+                }
+                (access, value)
+            })
+            .collect();
+        *self = match Self::configured_limit() {
+            Some(limit) => Self::from_recency_bindings_limited(rewritten, limit),
+            None => Self {
+                new_keys: Vec::new(),
+                old_keys: Vec::new(),
+                values: rewritten.into_iter().collect(),
+            },
+        };
     }
 }
 
@@ -219,6 +312,96 @@ impl fmt::Display for BaseMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sil::fieldname::Fieldname;
+    use sil::qualified_cpp_name::QualifiedCppName;
+    use sil::typ::TypeName;
+
+    fn field_access(name: &str) -> Access {
+        Access::FieldAccess(Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_string("S")),
+            name,
+        ))
+    }
+
+    #[test]
+    fn test_edges_recency_spills_old_batch() {
+        let mut edges = Edges::empty();
+        let v1 = AbstractValue::of_raw(1);
+        let v2 = AbstractValue::of_raw(2);
+        let v3 = AbstractValue::of_raw(3);
+        let v4 = AbstractValue::of_raw(4);
+        let v5 = AbstractValue::of_raw(5);
+
+        edges.add_with_history_limited(
+            field_access("a"),
+            ValueWithHistory::new(v1, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            field_access("b"),
+            ValueWithHistory::new(v2, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            field_access("c"),
+            ValueWithHistory::new(v3, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            field_access("d"),
+            ValueWithHistory::new(v4, ValueHistory::epoch()),
+            2,
+        );
+        assert_eq!(edges.len(), 4);
+
+        edges.add_with_history_limited(
+            field_access("e"),
+            ValueWithHistory::new(v5, ValueHistory::epoch()),
+            2,
+        );
+
+        assert_eq!(edges.len(), 3);
+        assert_eq!(edges.find(&field_access("a")), None);
+        assert_eq!(edges.find(&field_access("b")), None);
+        assert_eq!(edges.find(&field_access("c")), Some(v3));
+        assert_eq!(edges.find(&field_access("d")), Some(v4));
+        assert_eq!(edges.find(&field_access("e")), Some(v5));
+    }
+
+    #[test]
+    fn test_edges_recency_update_from_old_promotes_binding() {
+        let mut edges = Edges::empty();
+        let v1 = AbstractValue::of_raw(1);
+        let v2 = AbstractValue::of_raw(2);
+        let v3 = AbstractValue::of_raw(3);
+        let v4 = AbstractValue::of_raw(4);
+
+        edges.add_with_history_limited(
+            field_access("a"),
+            ValueWithHistory::new(v1, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            field_access("b"),
+            ValueWithHistory::new(v2, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            field_access("c"),
+            ValueWithHistory::new(v3, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            field_access("a"),
+            ValueWithHistory::new(v4, ValueHistory::epoch()),
+            2,
+        );
+
+        assert_eq!(edges.len(), 3);
+        assert_eq!(edges.find(&field_access("a")), Some(v4));
+        assert_eq!(edges.find(&field_access("b")), Some(v2));
+        assert_eq!(edges.find(&field_access("c")), Some(v3));
+    }
 
     #[test]
     fn test_add_and_find_edge() {

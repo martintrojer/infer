@@ -86,6 +86,197 @@ pub enum ImportedFormulaEffect {
     PotentialInvalidAccess(AbstractValue),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BaseDomainSizeStats {
+    stack_bindings: usize,
+    heap_nodes: usize,
+    heap_edges: usize,
+    attr_addrs: usize,
+    attr_entries: usize,
+}
+
+impl BaseDomainSizeStats {
+    fn of(domain: &BaseDomain) -> Self {
+        Self {
+            stack_bindings: domain.stack.len(),
+            heap_nodes: domain.heap.len(),
+            heap_edges: domain.heap.iter().map(|(_addr, edges)| edges.len()).sum(),
+            attr_addrs: domain.attrs.len(),
+            attr_entries: domain
+                .attrs
+                .iter()
+                .map(|(_addr, attrs)| attrs.iter().count())
+                .sum(),
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.stack_bindings += other.stack_bindings;
+        self.heap_nodes += other.heap_nodes;
+        self.heap_edges += other.heap_edges;
+        self.attr_addrs += other.attr_addrs;
+        self.attr_entries += other.attr_entries;
+    }
+
+    fn max_assign(&mut self, other: Self) {
+        self.stack_bindings = self.stack_bindings.max(other.stack_bindings);
+        self.heap_nodes = self.heap_nodes.max(other.heap_nodes);
+        self.heap_edges = self.heap_edges.max(other.heap_edges);
+        self.attr_addrs = self.attr_addrs.max(other.attr_addrs);
+        self.attr_entries = self.attr_entries.max(other.attr_entries);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReachabilitySizeStats {
+    roots: usize,
+    heap_nodes: usize,
+    heap_edges: usize,
+    attr_addrs: usize,
+    attr_entries: usize,
+}
+
+impl ReachabilitySizeStats {
+    fn add_assign(&mut self, other: Self) {
+        self.roots += other.roots;
+        self.heap_nodes += other.heap_nodes;
+        self.heap_edges += other.heap_edges;
+        self.attr_addrs += other.attr_addrs;
+        self.attr_entries += other.attr_entries;
+    }
+
+    fn max_assign(&mut self, other: Self) {
+        self.roots = self.roots.max(other.roots);
+        self.heap_nodes = self.heap_nodes.max(other.heap_nodes);
+        self.heap_edges = self.heap_edges.max(other.heap_edges);
+        self.attr_addrs = self.attr_addrs.max(other.attr_addrs);
+        self.attr_entries = self.attr_entries.max(other.attr_entries);
+    }
+}
+
+/// Cheap state-size counters for long-running progress logs.
+///
+/// Cross-ref: OCaml emits full HTML / debug traces when requested. These
+/// counters are intentionally coarse so they can stay enabled on large runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AstateSizeStats {
+    pre: BaseDomainSizeStats,
+    post: BaseDomainSizeStats,
+    post_reachable: ReachabilitySizeStats,
+    formula_conditions: usize,
+    formula_atoms: usize,
+    formula_linear_eqs: usize,
+    formula_term_eqs: usize,
+    formula_intervals: usize,
+    formula_is_int_vars: usize,
+    formula_equalities: usize,
+    must_be_valid: usize,
+    dynamic_types: usize,
+    need_dynamic_type_specialization: usize,
+    const_cache: usize,
+}
+
+impl AstateSizeStats {
+    pub fn of(astate: &AbductiveDomain) -> Self {
+        let phi = astate.path_condition.phi();
+        Self {
+            pre: BaseDomainSizeStats::of(&astate.pre),
+            post: BaseDomainSizeStats::of(&astate.post),
+            post_reachable: astate.post_reachability_stats(),
+            formula_conditions: astate.path_condition.conditions().len(),
+            formula_atoms: phi.atoms.len(),
+            formula_linear_eqs: phi.linear_eqs.len(),
+            formula_term_eqs: phi.term_eqs.len(),
+            formula_intervals: phi.intervals.len(),
+            formula_is_int_vars: phi.is_int_vars.len(),
+            formula_equalities: phi.var_eqs.len(),
+            must_be_valid: astate.must_be_valid.len(),
+            dynamic_types: astate.dynamic_types.len(),
+            need_dynamic_type_specialization: astate.need_dynamic_type_specialization.len(),
+            const_cache: astate.const_cache.len(),
+        }
+    }
+
+    pub fn add_assign(&mut self, other: Self) {
+        self.pre.add_assign(other.pre);
+        self.post.add_assign(other.post);
+        self.post_reachable.add_assign(other.post_reachable);
+        self.formula_conditions += other.formula_conditions;
+        self.formula_atoms += other.formula_atoms;
+        self.formula_linear_eqs += other.formula_linear_eqs;
+        self.formula_term_eqs += other.formula_term_eqs;
+        self.formula_intervals += other.formula_intervals;
+        self.formula_is_int_vars += other.formula_is_int_vars;
+        self.formula_equalities += other.formula_equalities;
+        self.must_be_valid += other.must_be_valid;
+        self.dynamic_types += other.dynamic_types;
+        self.need_dynamic_type_specialization += other.need_dynamic_type_specialization;
+        self.const_cache += other.const_cache;
+    }
+
+    pub fn max_assign(&mut self, other: Self) {
+        self.pre.max_assign(other.pre);
+        self.post.max_assign(other.post);
+        self.post_reachable.max_assign(other.post_reachable);
+        self.formula_conditions = self.formula_conditions.max(other.formula_conditions);
+        self.formula_atoms = self.formula_atoms.max(other.formula_atoms);
+        self.formula_linear_eqs = self.formula_linear_eqs.max(other.formula_linear_eqs);
+        self.formula_term_eqs = self.formula_term_eqs.max(other.formula_term_eqs);
+        self.formula_intervals = self.formula_intervals.max(other.formula_intervals);
+        self.formula_is_int_vars = self.formula_is_int_vars.max(other.formula_is_int_vars);
+        self.formula_equalities = self.formula_equalities.max(other.formula_equalities);
+        self.must_be_valid = self.must_be_valid.max(other.must_be_valid);
+        self.dynamic_types = self.dynamic_types.max(other.dynamic_types);
+        self.need_dynamic_type_specialization = self
+            .need_dynamic_type_specialization
+            .max(other.need_dynamic_type_specialization);
+        self.const_cache = self.const_cache.max(other.const_cache);
+    }
+}
+
+impl std::fmt::Display for AstateSizeStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pre[s={} hn={} he={} aa={} at={}] \
+             post[s={} hn={} he={} aa={} at={} live_hn={} dead_hn={} live_he={} dead_he={} live_aa={} dead_aa={} live_at={} dead_at={}] \
+             formula[c={} a={} lin={} term={} itv={} int={} eq={}] \
+             sets[must={} dyn={} spec={} const={}]",
+            self.pre.stack_bindings,
+            self.pre.heap_nodes,
+            self.pre.heap_edges,
+            self.pre.attr_addrs,
+            self.pre.attr_entries,
+            self.post.stack_bindings,
+            self.post.heap_nodes,
+            self.post.heap_edges,
+            self.post.attr_addrs,
+            self.post.attr_entries,
+            self.post_reachable.heap_nodes,
+            self.post.heap_nodes.saturating_sub(self.post_reachable.heap_nodes),
+            self.post_reachable.heap_edges,
+            self.post.heap_edges.saturating_sub(self.post_reachable.heap_edges),
+            self.post_reachable.attr_addrs,
+            self.post.attr_addrs.saturating_sub(self.post_reachable.attr_addrs),
+            self.post_reachable.attr_entries,
+            self.post
+                .attr_entries
+                .saturating_sub(self.post_reachable.attr_entries),
+            self.formula_conditions,
+            self.formula_atoms,
+            self.formula_linear_eqs,
+            self.formula_term_eqs,
+            self.formula_intervals,
+            self.formula_is_int_vars,
+            self.formula_equalities,
+            self.must_be_valid,
+            self.dynamic_types,
+            self.need_dynamic_type_specialization,
+            self.const_cache,
+        )
+    }
+}
+
 impl AbductiveDomain {
     /// Create the initial state for analyzing a procedure.
     ///
@@ -121,6 +312,66 @@ impl AbductiveDomain {
         }
 
         state
+    }
+
+    pub fn size_stats(&self) -> AstateSizeStats {
+        AstateSizeStats::of(self)
+    }
+
+    fn post_reachability_stats(&self) -> ReachabilitySizeStats {
+        let mut roots = std::collections::HashSet::new();
+        for (_var, value) in self.post.stack.iter_with_history() {
+            roots.insert(value.addr);
+        }
+        for (addr, attrs) in self.post.attrs.iter() {
+            if attrs.is_always_reachable() {
+                roots.insert(*addr);
+            }
+        }
+
+        let mut reachable = std::collections::HashSet::new();
+        let mut worklist: Vec<_> = roots.iter().copied().collect();
+        while let Some(addr) = worklist.pop() {
+            if !reachable.insert(addr) {
+                continue;
+            }
+            if let Some(edges) = self.post.heap.get_edges(addr) {
+                for (_access, target) in edges.iter() {
+                    worklist.push(*target);
+                }
+            }
+        }
+
+        let heap_edges = reachable
+            .iter()
+            .filter_map(|addr| self.post.heap.get_edges(*addr))
+            .map(|edges| edges.len())
+            .sum();
+        let heap_nodes = reachable
+            .iter()
+            .filter(|addr| self.post.heap.get_edges(**addr).is_some())
+            .count();
+        let attr_addrs = self
+            .post
+            .attrs
+            .iter()
+            .filter(|(addr, _attrs)| reachable.contains(addr))
+            .count();
+        let attr_entries = self
+            .post
+            .attrs
+            .iter()
+            .filter(|(addr, _attrs)| reachable.contains(addr))
+            .map(|(_addr, attrs)| attrs.iter().count())
+            .sum();
+
+        ReachabilitySizeStats {
+            roots: roots.len(),
+            heap_nodes,
+            heap_edges,
+            attr_addrs,
+            attr_entries,
+        }
     }
 
     /// Look up a variable's abstract address in the stack.
@@ -1133,6 +1384,45 @@ mod tests {
             state.check_valid(formal_val).is_ok(),
             "summary import should report the potential invalid access without persisting a synthetic invalid attr"
         );
+    }
+
+    #[test]
+    fn test_size_stats_counts_key_state_surfaces() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
+            Mangled::from_string("p"),
+            Procname::c_from_string("test"),
+        )));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+        let formal_val = state.read_heap(formal_addr, Access::Dereference);
+        let leaf = state.read_heap(formal_val, Access::Dereference);
+
+        state.add_attr(formal_val, Attribute::Initialized);
+        state.add_attr(formal_val, Attribute::WrittenTo(1, Location::dummy()));
+        state.mark_must_be_valid(formal_val);
+        state.need_dynamic_type_specialization.insert(formal_val);
+        state.add_dynamic_type_unsafe(
+            formal_val,
+            Typ::mk_struct(sil::typ::TypeName::CStruct(
+                sil::qualified_cpp_name::QualifiedCppName::from_string("Callback"),
+            )),
+        );
+        assert!(state.and_equal_const(leaf, 0).is_sat());
+
+        let stats = state.size_stats();
+        assert_eq!(stats.post.heap_edges, 2);
+        assert_eq!(stats.post.attr_addrs, 1);
+        assert_eq!(stats.post.attr_entries, 2);
+        assert_eq!(stats.post_reachable.heap_nodes, 2);
+        assert_eq!(stats.post_reachable.heap_edges, 2);
+        assert_eq!(stats.post_reachable.attr_addrs, 1);
+        assert_eq!(stats.post_reachable.attr_entries, 2);
+        assert_eq!(stats.formula_linear_eqs, 1);
+        assert_eq!(stats.formula_intervals, 1);
+        assert_eq!(stats.must_be_valid, 1);
+        assert_eq!(stats.dynamic_types, 1);
+        assert_eq!(stats.need_dynamic_type_specialization, 1);
     }
 
     #[test]

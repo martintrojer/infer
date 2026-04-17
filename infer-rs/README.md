@@ -18,16 +18,36 @@ OpenSSL benchmark status on this host:
   explicit macOS SDK `-isysroot`, and `./Configure darwin64-x86_64-cc no-asm`
 - Rust now parses the full exported corpus: `753 / 753` `.sil` files, `0`
   parse errors
+- on the latest fresh shared capture
+  (`/tmp/infer-rs-openssl-20260417-095315-rebase-j`), OCaml
+  `infer analyze --pulse-only --results-dir infer-out -j 1` completed in
+  `589.76s` with about `2.55 GB` max RSS
+- the rebased macOS parallel path is no longer stuck in the old immediate
+  `-j > 1` startup failure: direct `.sil` Rust runs reached about `793%` CPU at
+  `-j 8` and about `375%` CPU at `-j 4`
+- but whole-program Rust timing is still blocked by memory growth in merged
+  interprocedural runs on this benchmark:
+  `-j 8` terminated abnormally after `190.81s` at about `24.5 GB` max RSS, and
+  `-j 4` terminated abnormally after `690.77s` at about `33.2 GB` max RSS
+- focused `whirlpool_block` tracing shows the dominant multiplier is retained
+  fixpoint state, not just the current frontier: at `36.1s` the live frontier
+  still held only about `9837` summed post heap nodes, while the retained
+  invariant map already held `2995` disjunct snapshots and about `975641`
+  post heap nodes, `1313138` edges, and `2464294` attr entries across CFG
+  nodes
+- `--pulse-recency-limit 32` is now available as an opt-in OCaml-style
+  experiment, but it is intentionally not the default: default-enabling it
+  reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad` false
+  negative, and on `whirlpool_block` it left the state shape essentially
+  unchanged
 - the first dominant hotspot, `ssl_set_client_disabled`, dropped from about
   `1m09s` to about `5.2s` after restoring the OCaml-style
   `equal_fast` / semantic-`leq` split
 - there is still no final apples-to-apples whole-program timing claim: the
-  remaining gap is local Pulse cost in a few heavy procedures plus
+  remaining gap is retained invariant-map storage across hot procedures,
+  remaining local Pulse cost, abnormal termination in merged runs, and
   exported-Textual proc-identity loss for some duplicate C names, not
   merge/callgraph setup
-- the wider benchmark is not stuck on one-core scheduling anymore: `-j 8`
-  traces showed `active=8` workers on the full corpus, so the remaining
-  bottleneck is mostly per-procedure analysis cost
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an
@@ -39,6 +59,12 @@ and loop widening still uses semantic `leq`. On the filtered OpenSSL hotspot
 (`173` transfer steps, `20` disjunct cap, hottest node `33:24`) while cutting
 runtime from about `1m09s` to about `5.2s`, which shows the old cost was in hot
 disjunct dedup/join comparisons rather than extra transfer work.
+
+The ondemand summary store now also shares cached summaries through `Arc`
+handles instead of cloning large summaries per caller. That helps avoid some
+copy cost, but the new `live-fixpoint` heartbeat shows it is not the main
+OpenSSL memory fix: on `whirlpool_block`, retained per-node invariant-map state
+is still the dominant multiplier.
 
 A newer OCaml-backed latent-summary fix also preserves imported arithmetic guards through summary
 recording and export, including reverse-pivoted linear equalities such as `neg_x = -x` that the
@@ -235,6 +261,7 @@ after textual export, because it excludes capture/export overhead.
 | `--infer-bin PATH` | Path to infer binary (default: auto-detect) |
 | `-q` / `--quiet` | Suppress progress output |
 | `--pulse-max-disjuncts N` | Max disjuncts per program point (default: 20) |
+| `--pulse-recency-limit N` | OCaml-style heap-edge recency cap experiment (unset by default in Rust) |
 | `--pulse-intraprocedural-only` | Disable inter-procedural analysis |
 | `--max-widens N` | Max widenings before fixpoint gives up (default: 10000) |
 | `--debug-level-analysis N` | 0=quiet, 1=per-instruction, 2=full state dumps |
@@ -259,10 +286,19 @@ after textual export, because it excludes capture/export overhead.
 including the `Str.regexp` syntax used in test suites such as `\\(my\\|a\\)_malloc`.
 `pulse-force-continue` is also compatible with shared `.inferconfig`; the Rust default remains
 `true` to match OCaml.
+`pulse-recency-limit` is also compatible with shared `.inferconfig`, but Rust
+intentionally leaves it unset by default. OCaml defaults that flag to `32`;
+enabling the same cap by default in Rust reintroduces the real
+`FN_nullptr_deref_old_bad` false negative, so the cap is kept as an explicit
+experiment knob rather than baseline behavior.
 `pulse-model-{abort,unreachable}` follow OCaml's exact-procname list semantics.
 `trace-ondemand` is also `.inferconfig`/CLI compatible with OCaml's flag name. Unless `RUST_LOG`
 is already set, enabling it defaults the logger to include `ondemand=info`, which emits wave
-start/end lines plus periodic scheduler snapshots with completed summaries, throughput, and ETA.
+start/end lines plus periodic scheduler snapshots with completed summaries,
+throughput, and ETA. Long-running Pulse procedures also emit `pulse-progress`
+heartbeats for the active frontier and `live-fixpoint` heartbeats for retained
+invariant-map state, which is the main debugging surface for the current
+OpenSSL memory investigation.
 `procedures-filter` is also `.inferconfig`/CLI compatible with OCaml's flag name and split
 syntax. A single regex filters procnames; `source_regex:proc_regex` filters both source file and
 procname.
@@ -339,7 +375,7 @@ infer-rs/
 - **Correctness over counts**: keep semantically correct OCaml-backed behavior even when sweep totals move temporarily; accepted divergences are documented instead of hidden
 - **Test through comparison**: compare against OCaml's `issues.exp` for compliance
 - **Per-instruction tracing**: `--debug-level-analysis` + `scripts/compare_traces.py` for debugging divergences
-- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis, and now also emits `pulse-progress` heartbeats for long-running procedures, including node-visit counts and the hottest node seen so far
+- **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis, and now also emits `pulse-progress` frontier heartbeats plus `live-fixpoint` retained-state heartbeats for long-running procedures
 
 ## Documentation
 

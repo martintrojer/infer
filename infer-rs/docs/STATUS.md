@@ -10,19 +10,49 @@
   use the repo clang on `PATH`, set `CC=clang`, append
   `-isysroot $(xcrun --show-sdk-path)`, and configure OpenSSL with
   `./Configure darwin64-x86_64-cc no-asm`.
+- On the latest fresh shared capture
+  (`/tmp/infer-rs-openssl-20260417-095315-rebase-j`), capture completed in
+  `371.32s`, textual export completed in `0.35s`, and the exported corpus is
+  `753` `.sil` files.
 - Rust now parses the full exported Textual corpus from this benchmark:
-  `753 / 753` `.sil` files with `0` parse failures.
-- The first dominant hotspot, `ssl_set_client_disabled`, improved from about
-  `1m09s` to about `5.2s` after restoring the OCaml-style disjunctive
+  `753 / 753` `.sil` files with `0` parse failures. The traced `-j 8`
+  direct-`.sil` run parsed them in `43.1s`, merged them into `8395`
+  procedures / `683` types, and reached a real parallel round with
+  `active=8`, so the old immediate macOS `-j > 1` startup failure is no
+  longer the main story here.
+- The OCaml baseline on the same shared capture completed with
+  `infer analyze --pulse-only --results-dir infer-out -j 1` in `589.76s`
+  with about `2.55 GB` max RSS.
+- Whole-program Rust direct-`.sil` merged runs are still not stable on this
+  benchmark: `-j 8` terminated abnormally after `190.81s` at about
+  `24.5 GB` max RSS, and `-j 4` terminated abnormally after `690.77s` at
+  about `33.2 GB` max RSS. Under `/usr/bin/time`, both runs ended as
+  `command terminated abnormally` plus `signal: Invalid argument`, so the
+  exact kill mechanism still needs a rerun without `time`.
+- Focused traced `whirlpool_block` runs now show the main memory multiplier
+  directly. At `10.3s`, the live frontier still held only `20` disjuncts and
+  about `7820` summed post heap nodes, but the new `live-fixpoint` heartbeat
+  already showed `164` retained CFG nodes, `2180` disjunct snapshots, and
+  about `545860` summed post heap nodes across the invariant map. At `36.1s`,
+  the frontier was still only about `9837` summed post heap nodes while the
+  invariant map had grown to `2995` retained snapshots, about `975641` post
+  heap nodes, `1313138` post heap edges, and `2464294` post attr entries.
+- `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
+  OCaml-style experiments, but Rust intentionally leaves it unset by default.
+  Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`
+  `FN_nullptr_deref_old_bad` false negative, and the focused
+  `whirlpool_block --pulse-recency-limit 32` probe stayed essentially
+  identical to the unbounded run.
+- The first dominant hotspot, `ssl_set_client_disabled`, still improved from
+  about `1m09s` to about `5.2s` after restoring the OCaml-style disjunctive
   `equal_fast` / semantic-`leq` split, with the same `173` transfer steps,
-  `20`-disjunct cap, and hottest node `33:24`.
-- This benchmark is no longer pointing at merge or callgraph setup as the main
-  problem. Merge is negligible, and `-j 8` traces showed `active=8` workers on
-  the full corpus, so the remaining slowdown is mainly local Pulse cost in a
-  few heavy procedures.
+  `20`-disjunct cap, and hottest node `33:24`. That fix is real, but it is no
+  longer enough to make the whole benchmark usable.
 - We still do not claim a clean full-program apples-to-apples OCaml-vs-Rust
-  timing number. The remaining blockers are heavy local Pulse procedures plus
-  exported-Textual proc-identity loss for some duplicate C names.
+  timing number. The current blockers are retained invariant-map storage /
+  sharing cost in hot procedures, merged-run abnormal termination, remaining
+  heavy local Pulse procedures, and the exported-Textual proc-identity loss
+  for some duplicate C names.
 
 Recent correctness / robustness fixes:
 - Latent UAF summary parity tightened again:
@@ -95,6 +125,20 @@ Recent correctness / robustness fixes:
   `175` logical waves / max logical wave size `2600`), so the remaining
   bottleneck is procedure-local Pulse cost in specific hot functions rather
   than a broken scheduler or thread-pool setup.
+- `pulse-recency-limit` is now wired through config/CLI and `BaseMemory::Edges`
+  mirrors OCaml `RecencyMap` batching when that flag is set. Rust keeps the
+  default unset, though: matching OCaml's default `32` cap by default would
+  regress the real `nullptr.c` `FN_nullptr_deref_old_bad` report, and the
+  focused `whirlpool_block` probe showed that recency alone does not change
+  the problematic state shape materially.
+- `absint` and Pulse now expose a low-frequency `live-fixpoint` heartbeat via
+  `TransferFunctions::observe_fixpoint(...)`. On `whirlpool_block`, that made
+  the real storage picture obvious: the current frontier state is large, but
+  retained invariant-map state across CFG nodes is the dominant multiplier.
+- The ondemand summary store now shares cached summaries through `Arc` handles
+  instead of cloning large summaries per caller. That is still useful
+  overhead reduction, but the new fixpoint heartbeat shows it is not the main
+  OpenSSL memory fix.
 - Imported arithmetic latent-summary parity is fixed again:
   `PulseFormulaPhi` condition normalization now preserves reverse-pivoted
   linear guards (for example, a stored `x = -neg_x` relation still records the

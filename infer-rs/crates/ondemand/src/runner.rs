@@ -261,7 +261,7 @@ fn spawn_dynamic_proc<'scope, C>(
             .lock()
             .expect("active set poisoned")
             .insert(pname.clone(), proc_start);
-        ctx.store.get_or_compute(&pname, || {
+        let _summary = ctx.store.get_or_compute_arc(&pname, || {
             let analysis_ctx = AnalysisContext {
                 tenv: ctx.tenv,
                 summaries: ctx.store,

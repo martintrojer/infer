@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use absint::disjunctive::DisjunctiveDomain;
@@ -31,7 +32,7 @@ use sil::procdesc::{NodeId, Procdesc};
 use sil::procname::Procname;
 use sil::specialization::PulseSpecialization;
 
-use crate::abductive::AbductiveDomain;
+use crate::abductive::{AbductiveDomain, AstateSizeStats};
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::pulse_result::PulseResult;
@@ -65,10 +66,137 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Read-only view over already-computed callee summaries.
+///
+/// The CLI specialization driver keeps shared `Arc<PulseSummary>` handles
+/// locally to avoid cloning large summaries per caller, while many focused
+/// tests still use plain owned `HashMap<Procname, PulseSummary>` fixtures.
+/// This trait lets the analysis code read either representation.
+pub trait SummaryLookup {
+    fn get(&self, pname: &Procname) -> Option<&PulseSummary>;
+
+    fn contains_key(&self, pname: &Procname) -> bool {
+        self.get(pname).is_some()
+    }
+}
+
+impl SummaryLookup for HashMap<Procname, PulseSummary> {
+    fn get(&self, pname: &Procname) -> Option<&PulseSummary> {
+        HashMap::get(self, pname)
+    }
+}
+
+impl SummaryLookup for HashMap<Procname, Arc<PulseSummary>> {
+    fn get(&self, pname: &Procname) -> Option<&PulseSummary> {
+        HashMap::get(self, pname).map(Arc::as_ref)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DisjunctiveStateStats {
+    disjuncts: usize,
+    continue_count: usize,
+    exit_count: usize,
+    abort_count: usize,
+    latent_abort_count: usize,
+    latent_invalid_count: usize,
+    exception_count: usize,
+    sum: AstateSizeStats,
+    max: AstateSizeStats,
+}
+
+impl DisjunctiveStateStats {
+    fn from_domain(domain: &DisjunctiveDomain<ExecutionDomain>) -> Self {
+        let mut stats = Self {
+            disjuncts: domain.disjuncts.len(),
+            ..Self::default()
+        };
+
+        for disjunct in &domain.disjuncts {
+            match disjunct {
+                ExecutionDomain::ContinueProgram(_) => stats.continue_count += 1,
+                ExecutionDomain::ExitProgram(_) => stats.exit_count += 1,
+                ExecutionDomain::AbortProgram { .. } => stats.abort_count += 1,
+                ExecutionDomain::LatentAbortProgram { .. } => stats.latent_abort_count += 1,
+                ExecutionDomain::LatentInvalidAccess { .. } => stats.latent_invalid_count += 1,
+                ExecutionDomain::ExceptionRaised(_) => stats.exception_count += 1,
+            }
+
+            let astate_stats = disjunct.get_astate().size_stats();
+            stats.sum.add_assign(astate_stats);
+            stats.max.max_assign(astate_stats);
+        }
+
+        stats
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.disjuncts += other.disjuncts;
+        self.continue_count += other.continue_count;
+        self.exit_count += other.exit_count;
+        self.abort_count += other.abort_count;
+        self.latent_abort_count += other.latent_abort_count;
+        self.latent_invalid_count += other.latent_invalid_count;
+        self.exception_count += other.exception_count;
+        self.sum.add_assign(other.sum);
+        self.max.max_assign(other.max);
+    }
+}
+
+impl std::fmt::Display for DisjunctiveStateStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "disj={} kinds[c={} x={} a={} la={} li={} exn={}] sum{{{}}} max{{{}}}",
+            self.disjuncts,
+            self.continue_count,
+            self.exit_count,
+            self.abort_count,
+            self.latent_abort_count,
+            self.latent_invalid_count,
+            self.exception_count,
+            self.sum,
+            self.max,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FixpointStats {
+    nodes: usize,
+    revisited_nodes: usize,
+    max_visit_count: usize,
+    max_node_disjuncts: usize,
+    states: DisjunctiveStateStats,
+}
+
+impl FixpointStats {
+    fn from_inv_map(inv_map: &interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>) -> Self {
+        let mut stats = Self {
+            nodes: inv_map.len(),
+            ..Self::default()
+        };
+
+        for state in inv_map.values() {
+            if state.visit_count > 1 {
+                stats.revisited_nodes += 1;
+            }
+            stats.max_visit_count = stats.max_visit_count.max(state.visit_count);
+            stats.max_node_disjuncts = stats.max_node_disjuncts.max(state.post.disjuncts.len());
+            stats
+                .states
+                .add_assign(DisjunctiveStateStats::from_domain(&state.post));
+        }
+
+        stats
+    }
+}
+
 #[derive(Debug)]
 struct ProcProgress {
     started: Instant,
     last_log: Instant,
+    last_fixpoint_log: Instant,
     exec_steps: usize,
     max_disjuncts: usize,
     node_visits: HashMap<NodeId, usize>,
@@ -82,6 +210,7 @@ impl ProcProgress {
         Self {
             started: now,
             last_log: now,
+            last_fixpoint_log: now,
             exec_steps: 0,
             max_disjuncts: 0,
             node_visits: HashMap::new(),
@@ -95,10 +224,10 @@ impl ProcProgress {
         proc_name: &str,
         node_id: NodeId,
         instr_idx: usize,
-        total_disjuncts: usize,
-        continue_count: usize,
+        state: &DisjunctiveDomain<ExecutionDomain>,
         spec_requests: usize,
     ) {
+        let total_disjuncts = state.disjuncts.len();
         self.exec_steps += 1;
         self.max_disjuncts = self.max_disjuncts.max(total_disjuncts);
         let node_visits = {
@@ -119,25 +248,61 @@ impl ProcProgress {
 
         self.last_log = Instant::now();
         self.logged_heartbeat = true;
+        let state_stats = DisjunctiveStateStats::from_domain(state);
         let hottest = self
             .hottest_node
             .map(|(hot_node, hot_visits)| format!("{hot_node}:{hot_visits}"))
             .unwrap_or_else(|| "none".to_string());
         log::info!(
             target: "ondemand",
-            "[pulse-progress] proc={proc_name} elapsed={} steps={} node={node_id} instr={instr_idx} node_visits={} hottest_node={} disjuncts={} continue={} spec_requests={} max_disjuncts={}",
+            "[pulse-progress] proc={proc_name} elapsed={} steps={} node={node_id} instr={instr_idx} node_visits={} hottest_node={} disjuncts={} continue={} spec_requests={} max_disjuncts={} state={}",
             format_duration(self.started.elapsed()),
             self.exec_steps,
             node_visits,
             hottest,
             total_disjuncts,
-            continue_count,
+            state_stats.continue_count,
             spec_requests,
             self.max_disjuncts,
+            state_stats,
         );
     }
 
-    fn log_done(&self, proc_name: &str, exit_disjuncts: usize, spec_requests: usize) {
+    fn note_fixpoint_snapshot(
+        &mut self,
+        proc_name: &str,
+        updated_node: NodeId,
+        inv_map: &interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>,
+    ) {
+        if !pulse_progress_enabled()
+            || self.last_fixpoint_log.elapsed() < PROC_PROGRESS_LOG_INTERVAL
+        {
+            return;
+        }
+
+        self.last_fixpoint_log = Instant::now();
+        self.logged_heartbeat = true;
+        let fixpoint_stats = FixpointStats::from_inv_map(inv_map);
+        log::info!(
+            target: "ondemand",
+            "[pulse-progress] proc={proc_name} live-fixpoint: elapsed={} updated_node={} nodes={} revisited_nodes={} max_visit_count={} max_node_disjuncts={} states={}",
+            format_duration(self.started.elapsed()),
+            updated_node,
+            fixpoint_stats.nodes,
+            fixpoint_stats.revisited_nodes,
+            fixpoint_stats.max_visit_count,
+            fixpoint_stats.max_node_disjuncts,
+            fixpoint_stats.states,
+        );
+    }
+
+    fn log_done(
+        &self,
+        proc_name: &str,
+        exit_disjuncts: usize,
+        spec_requests: usize,
+        fixpoint_stats: Option<&FixpointStats>,
+    ) {
         if !pulse_progress_enabled() {
             return;
         }
@@ -160,12 +325,23 @@ impl ProcProgress {
             self.max_disjuncts,
             hottest,
         );
+        if let Some(fixpoint_stats) = fixpoint_stats {
+            log::info!(
+                target: "ondemand",
+                "[pulse-progress] proc={proc_name} fixpoint-shape: nodes={} revisited_nodes={} max_visit_count={} max_node_disjuncts={} states={}",
+                fixpoint_stats.nodes,
+                fixpoint_stats.revisited_nodes,
+                fixpoint_stats.max_visit_count,
+                fixpoint_stats.max_node_disjuncts,
+                fixpoint_stats.states,
+            );
+        }
     }
 }
 
 /// Run Pulse analysis on a procedure (intraprocedural, default config).
 pub fn analyze(pdesc: &Procdesc) -> PulseSummary {
-    analyze_with_summaries(pdesc, &HashMap::new())
+    analyze_with_summaries(pdesc, &HashMap::<Procname, PulseSummary>::new())
 }
 
 /// Run Pulse analysis on a procedure with access to callee summaries.
@@ -174,7 +350,7 @@ pub fn analyze(pdesc: &Procdesc) -> PulseSummary {
 /// OCaml's `MakeDisjunctive(PulseTransferFunctions)`.
 pub fn analyze_with_summaries(
     pdesc: &Procdesc,
-    callee_summaries: &HashMap<Procname, PulseSummary>,
+    callee_summaries: &dyn SummaryLookup,
 ) -> PulseSummary {
     analyze_with_specialization(pdesc, callee_summaries, None)
 }
@@ -186,7 +362,7 @@ pub fn analyze_with_summaries(
 /// Cross-ref: OCaml Pulse.ml analyze with specialization parameter.
 pub fn analyze_with_specialization(
     pdesc: &Procdesc,
-    callee_summaries: &HashMap<Procname, PulseSummary>,
+    callee_summaries: &dyn SummaryLookup,
     specialization: Option<&sil::specialization::PulseSpecialization>,
 ) -> PulseSummary {
     analyze_with_specialization_and_requests(pdesc, callee_summaries, specialization).0
@@ -200,7 +376,7 @@ pub fn analyze_with_specialization(
 /// loads, and branch pruning in the caller.
 pub fn analyze_with_specialization_and_requests(
     pdesc: &Procdesc,
-    callee_summaries: &HashMap<Procname, PulseSummary>,
+    callee_summaries: &dyn SummaryLookup,
     specialization: Option<&sil::specialization::PulseSpecialization>,
 ) -> (PulseSummary, Vec<(Procname, PulseSpecialization)>) {
     // Reset per-thread counters so each procedure gets deterministic IDs.
@@ -231,6 +407,7 @@ pub fn analyze_with_specialization_and_requests(
     };
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
+    let fixpoint_stats = pulse_progress_enabled().then(|| FixpointStats::from_inv_map(&inv_map));
     let exit_has_normal_path = inv_map.get(&pdesc.exit_node).is_some_and(|exit_state| {
         exit_state.post.disjuncts.iter().any(|d| {
             matches!(
@@ -476,6 +653,7 @@ pub fn analyze_with_specialization_and_requests(
         &pulse_tf.proc_name,
         exit_disjuncts.len(),
         spec_request_count,
+        fixpoint_stats.as_ref(),
     );
     let spec_requests = pulse_tf.spec_requests.into_inner();
     (summary, spec_requests)
@@ -531,7 +709,7 @@ fn stopped_summary_key(exec: &ExecutionDomain) -> Option<(u8, String)> {
 /// Wraps `transfer::exec_instr` to operate on `DisjunctiveDomain<ExecutionDomain>`.
 /// Each instruction is executed on each ContinueProgram disjunct independently.
 struct PulseTransferFunctions<'a> {
-    callee_summaries: &'a HashMap<Procname, PulseSummary>,
+    callee_summaries: &'a dyn SummaryLookup,
     pdesc: &'a Procdesc,
     proc_name: String,
     spec_requests: RefCell<Vec<(Procname, PulseSpecialization)>>,
@@ -558,14 +736,9 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             state.disjuncts.len()
         );
         let spec_request_count = self.spec_requests.borrow().len();
-        self.progress.borrow_mut().note_step(
-            pn,
-            node_id,
-            instr_idx,
-            state.disjuncts.len(),
-            continue_count,
-            spec_request_count,
-        );
+        self.progress
+            .borrow_mut()
+            .note_step(pn, node_id, instr_idx, state, spec_request_count);
 
         let mut new_disjuncts = Vec::new();
 
@@ -617,6 +790,12 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
 
         result
     }
+
+    fn observe_fixpoint(&self, node_id: NodeId, inv_map: &interp::InvariantMap<Self::Domain>) {
+        self.progress
+            .borrow_mut()
+            .note_fixpoint_snapshot(&self.proc_name, node_id, inv_map);
+    }
 }
 
 /// Execute an instruction, checking for interprocedural summary application.
@@ -626,7 +805,7 @@ fn exec_instr_with_summaries(
     pdesc: &Procdesc,
     instr: &Instr,
     state: AbductiveDomain,
-    callee_summaries: &HashMap<Procname, PulseSummary>,
+    callee_summaries: &dyn SummaryLookup,
     spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
 ) -> Vec<ExecutionDomain> {
     if let Some(results) =
@@ -706,7 +885,7 @@ fn maybe_inline_global_initializer_load(
     pdesc: &Procdesc,
     instr: &Instr,
     state: AbductiveDomain,
-    callee_summaries: &HashMap<Procname, PulseSummary>,
+    callee_summaries: &dyn SummaryLookup,
 ) -> Option<Vec<ExecutionDomain>> {
     let Instr::Load {
         e: Exp::Lvar(pvar),
@@ -1334,7 +1513,7 @@ fn maybe_force_continue_after_known_call(
 fn exec_call_c_function_ptr(
     callsite: CallSite<'_>,
     mut state: crate::abductive::AbductiveDomain,
-    callee_summaries: &HashMap<Procname, PulseSummary>,
+    callee_summaries: &dyn SummaryLookup,
 ) -> Vec<ExecutionDomain> {
     let CallSite {
         pdesc,
@@ -1899,7 +2078,7 @@ mod tests {
     fn test_exec_instr_preserves_dropped_disjuncts_metadata() {
         let pname = Procname::c_from_string("preserve_drop_flag");
         let pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
-        let callee_summaries = HashMap::new();
+        let callee_summaries: HashMap<Procname, PulseSummary> = HashMap::new();
         let tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
@@ -2137,7 +2316,7 @@ mod tests {
                 spec_requests: Some(&requests),
             },
             state,
-            &HashMap::new(),
+            &HashMap::<Procname, PulseSummary>::new(),
         );
 
         let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
@@ -2274,7 +2453,7 @@ mod tests {
                 spec_requests: Some(&requests),
             },
             state,
-            &HashMap::new(),
+            &HashMap::<Procname, PulseSummary>::new(),
         );
 
         let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
@@ -2393,7 +2572,7 @@ mod tests {
                 spec_requests: Some(&requests),
             },
             state,
-            &HashMap::new(),
+            &HashMap::<Procname, PulseSummary>::new(),
         );
 
         let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
@@ -2466,7 +2645,13 @@ mod tests {
             flags: sil::call_flags::CallFlags::default(),
         };
 
-        let results = exec_instr_with_summaries(&pdesc, &instr, state, &HashMap::new(), None);
+        let results = exec_instr_with_summaries(
+            &pdesc,
+            &instr,
+            state,
+            &HashMap::<Procname, PulseSummary>::new(),
+            None,
+        );
 
         let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
             panic!("expected direct self recursion to keep one continue state, got {results:?}");
@@ -2585,7 +2770,13 @@ mod tests {
             flags: sil::call_flags::CallFlags::default(),
         };
 
-        let results = exec_instr_with_summaries(&pdesc, &instr, state, &HashMap::new(), None);
+        let results = exec_instr_with_summaries(
+            &pdesc,
+            &instr,
+            state,
+            &HashMap::<Procname, PulseSummary>::new(),
+            None,
+        );
         let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
             panic!("expected direct self recursion to keep one continue state, got {results:?}");
         };

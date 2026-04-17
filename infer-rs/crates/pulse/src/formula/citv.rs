@@ -386,7 +386,7 @@ mod tests {
     fn test_equal_to() {
         let i = CItv::equal_to(5);
         assert_eq!(i.to_singleton(), Some(5));
-        assert!(i.is_equal_to_zero() == false);
+        assert!(!i.is_equal_to_zero());
         assert!(CItv::equal_to(0).is_equal_to_zero());
     }
 

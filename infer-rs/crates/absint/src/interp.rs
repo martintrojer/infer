@@ -201,6 +201,7 @@ where
                     visit_count,
                 },
             );
+            tf.observe_fixpoint(node_id, &inv_map);
             changed = true;
         }
     }
@@ -384,6 +385,7 @@ where
                 visit_count,
             },
         );
+        tf.observe_fixpoint(node_id, inv_map);
         Convergence::DidNotReachFixPoint
     } else {
         // First visit
@@ -396,6 +398,7 @@ where
                 visit_count: 1,
             },
         );
+        tf.observe_fixpoint(node_id, inv_map);
         Convergence::DidNotReachFixPoint
     }
 }

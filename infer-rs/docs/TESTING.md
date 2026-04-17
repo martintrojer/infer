@@ -58,12 +58,28 @@ Current top-level OpenSSL status:
 
 - setup/capture is stable on this host with repo clang on `PATH`, `CC=clang`,
   explicit SDK `-isysroot`, and `./Configure darwin64-x86_64-cc no-asm`
-- the exported corpus now parses completely in Rust: `753 / 753` `.sil` files
-- the first dominant hotspot, `ssl_set_client_disabled`, dropped from about
-  `1m09s` to about `5.2s` after the OCaml-style `equal_fast` split
-- the remaining benchmark gap is mostly local Pulse cost in a few heavy
-  procedures plus exported-Textual proc-identity loss for some duplicate C
-  names, not merge/callgraph setup or a one-core scheduler bug
+- the latest fresh shared-capture snapshot
+  (`/tmp/infer-rs-openssl-20260417-095315-rebase-j`) captured in `371.32s`,
+  exported in `0.35s`, and produced `753` `.sil` files
+- the OCaml baseline on that shared capture completed in `589.76s` with about
+  `2.55 GB` max RSS
+- Rust now parses the full exported corpus (`753 / 753`), and the rebased
+  macOS `-j > 1` path now really starts parallel analysis (`active=8` in the
+  traced `-j 8` run), so the old immediate startup failure is no longer the
+  main blocker
+- focused `whirlpool_block` tracing now separates active frontier cost from
+  retained invariant-map cost, and the dominant multiplier is the retained
+  fixpoint map rather than the live frontier alone
+- whole-program Rust merged direct-`.sil` runs are still unstable on this
+  benchmark: `-j 8` died at `190.81s` / `24.5 GB` RSS and `-j 4` died at
+  `690.77s` / `33.2 GB` RSS
+- the filtered hotspot fix for `ssl_set_client_disabled` remains real
+  (`1m09s` -> `5.2s`), but the current benchmark blocker is merged parallel
+  memory growth plus a few remaining heavy local Pulse procedures, not
+  merge/callgraph setup or a one-core scheduler bug
+- `--pulse-recency-limit 32` is available as an experiment knob, but it is
+  intentionally not the default because it reintroduces the real `nullptr.c`
+  false negative and does not materially change the `whirlpool_block` shape
 
 ### Shared Capture Setup
 
@@ -123,17 +139,42 @@ For timing, reuse the already exported `.sil` files and bypass `--results-dir`:
 
 For the OpenSSL benchmark on this host, the fair Rust timing should be compared
 to `infer analyze --pulse-only --results-dir ../infer-out -j 1`, not to an
-OCaml run at a different `-j`.
+OCaml run at a different `-j`. Until whole-program merged `-j > 1`
+direct-`.sil` runs are stable, use `-j 1` as the publishable apples-to-apples
+baseline.
 
 Current OpenSSL status from the latest direct-Textual spot-check:
 
-- parse coverage is now `753 / 753` exported `.sil` files with `0` parse errors after accepting
-  textual name positions tokenized as `Local(n)` plus `_` wildcard field names
-- restoring the OCaml-style disjunctive `equal_fast` / semantic-`leq` split cut the filtered
-  `ssl_set_client_disabled` hotspot from about `1m09s` to about `5.2s` while keeping the same
-  `173` transfer steps, `20`-disjunct cap, and hottest node `33:24`
-- the remaining benchmark blockers are front-end parse cost on some files, local Pulse throughput
-  on other heavy procedures, and exported-Textual proc-identity loss for some duplicate C names
+- shared capture and export on the fresh benchmark dir completed in `371.32s`
+  and `0.35s`, respectively, and produced `753` exported `.sil` files
+- parse coverage is now `753 / 753` exported `.sil` files with `0` parse
+  errors after accepting textual name positions tokenized as `Local(n)` plus
+  `_` wildcard field names
+- the OCaml baseline on the same shared capture completed in `589.76s` with
+  about `2.55 GB` max RSS
+- the traced Rust direct `-j 8` run parsed the corpus in `43.1s`, merged it to
+  `8395` procedures / `683` types, entered round 1 with `active=8`, then
+  terminated abnormally at `190.81s` with about `24.5 GB` max RSS
+- a Rust direct `-j 4` run also terminated abnormally, later, at `690.77s`
+  with about `33.2 GB` max RSS
+- the new `live-fixpoint` heartbeat shows why the benchmark is still hard:
+  on isolated `whirlpool_block`, the frontier at `36.1s` still held only about
+  `9837` summed post heap nodes, but the retained invariant map already held
+  `2995` disjunct snapshots with about `975641` post heap nodes,
+  `1313138` edges, and `2464294` attr entries
+- the OCaml-style recency experiment is available for direct probes
+  (`--pulse-recency-limit 32`), but the focused `whirlpool_block` run stayed
+  essentially identical and default-enabling that cap would reintroduce the
+  real `nullptr.c` `FN_nullptr_deref_old_bad` false negative
+- restoring the OCaml-style disjunctive `equal_fast` / semantic-`leq` split
+  still cut the filtered `ssl_set_client_disabled` hotspot from about `1m09s`
+  to about `5.2s` while keeping the same `173` transfer steps, `20`-disjunct
+  cap, and hottest node `33:24`
+- current interpretation: the old immediate macOS `-j > 1` startup failure is
+  no longer the main issue; the blocker is retained invariant-map growth plus
+  abnormal termination in whole-program runs, the remaining heavy local Pulse
+  procedures, and exported-Textual proc-identity loss for some duplicate C
+  names
 
 Important macOS notes learned from the OpenSSL benchmark:
 
@@ -191,6 +232,9 @@ runner logs:
 - `pulse-progress` heartbeats for long-running procedures, including elapsed
   time, transfer-step count, current node/instr, current-node revisit count,
   hottest node-so-far, and current/max disjuncts
+- `live-fixpoint` heartbeats for retained invariant-map state, including
+  retained CFG-node count, retained disjunct-snapshot count, and aggregate
+  heap / attr / formula size counters
 
 When a filtered hotspot still shows the same transfer-step count before and
 after a performance change, treat that as evidence about comparison cost vs
@@ -199,6 +243,12 @@ example here: after the `equal_fast` split, the run still executes `173`
 transfer steps and saturates at `20` disjuncts, but its runtime drops from
 about `1m09s` to about `5.2s`, which points squarely at hot disjunct
 dedup/join comparison cost rather than a change in explored paths.
+
+Use `pulse-progress` and `live-fixpoint` together. On the current
+`whirlpool_block` probe, the active frontier stays around `10k` summed post
+heap nodes while the retained fixpoint map grows toward `1M`, which is why the
+next OpenSSL work is on invariant-map retention / storage, not just frontier
+caps.
 
 You can raise verbosity further with explicit logger filters, for example
 `RUST_LOG=warn,ondemand=debug infer-rs --trace-ondemand ...` to include wave

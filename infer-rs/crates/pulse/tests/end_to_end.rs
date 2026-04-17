@@ -53,7 +53,7 @@ fn analyze_with_spec_loop(
     let mut callee_summaries = std::collections::HashMap::new();
     let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
-        collect_cfun_refs(instr, &ctx.summaries, &mut callee_summaries);
+        collect_cfun_refs(instr, ctx.summaries, &mut callee_summaries);
         collect_global_initializer_refs(instr, &mut global_initializers);
     }
     for init_pname in global_initializers {
@@ -576,13 +576,12 @@ fn assert_pulse_file(path: &std::path::Path, skip: &[&str]) {
                     "{proc_name}: expected NULL_DEREFERENCE, got {issues:?}"
                 ));
             }
-        } else if proc_name.contains("_ok")
+        } else if (proc_name.contains("_ok")
             || proc_name.contains("Ok")
-            || proc_name.contains("_good")
+            || proc_name.contains("_good"))
+            && !issues.is_empty()
         {
-            if !issues.is_empty() {
-                failures.push(format!("{proc_name}: expected no issues, got {issues:?}"));
-            }
+            failures.push(format!("{proc_name}: expected no issues, got {issues:?}"));
         }
     }
 
@@ -806,7 +805,7 @@ fn test_c_dump_textual_sweep() {
     let mut entries: Vec<_> = std::fs::read_dir(&c_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "c"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "c"))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -814,7 +813,7 @@ fn test_c_dump_textual_sweep() {
         let path = entry.path();
         let name = path.file_name().unwrap().to_str().unwrap();
 
-        if skip_files.iter().any(|s| *s == name) {
+        if skip_files.contains(&name) {
             eprintln!("  SKIP {name} (known hang)");
             continue;
         }
@@ -3890,7 +3889,7 @@ fn test_store_textual_sweep() {
             .to_str()
             .unwrap_or("");
 
-        if skip_files.iter().any(|s| *s == source_name) {
+        if skip_files.contains(&source_name) {
             eprintln!("  SKIP {source_name} (known hang)");
             continue;
         }

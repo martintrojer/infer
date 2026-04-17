@@ -23,7 +23,7 @@ use sil::procname::Procname;
 /// - Concurrent threads requesting the same procedure block until computation completes
 /// - No procedure is analyzed more than once (even within cycle waves)
 pub struct SummaryStore<S> {
-    store: DashMap<Procname, Arc<OnceLock<S>>>,
+    store: DashMap<Procname, Arc<OnceLock<Arc<S>>>>,
     completed: AtomicUsize,
 }
 
@@ -38,11 +38,22 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
     /// Store a summary for a procedure. Overwrites any existing summary.
     pub fn insert(&self, proc_name: Procname, summary: S) {
         let cell = Arc::new(OnceLock::new());
-        let _ = cell.set(summary);
+        let _ = cell.set(Arc::new(summary));
         let replaced = self.store.insert(proc_name, cell);
         if replaced.is_none() {
             self.completed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Get a shared handle to a procedure's summary, if it has been computed.
+    ///
+    /// This avoids cloning large summaries at lookup time. Cross-ref: OCaml's
+    /// summary cache also shares cached summaries rather than copying them per
+    /// caller.
+    pub fn get_arc(&self, proc_name: &Procname) -> Option<Arc<S>> {
+        self.store
+            .get(proc_name)
+            .and_then(|cell| cell.get().cloned())
     }
 
     /// Get a clone of a procedure's summary, if it has been computed.
@@ -53,9 +64,32 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
     where
         S: Clone,
     {
-        self.store
-            .get(proc_name)
-            .and_then(|cell| cell.get().cloned())
+        self.get_arc(proc_name)
+            .map(|summary| summary.as_ref().clone())
+    }
+
+    /// Get or compute a summary, returning a shared handle to the cached value.
+    ///
+    /// This is the allocation-friendly variant of `get_or_compute`: the
+    /// underlying summary is computed once and then shared across callers.
+    pub fn get_or_compute_arc(&self, proc_name: &Procname, compute: impl FnOnce() -> S) -> Arc<S> {
+        let cell = self
+            .store
+            .entry(proc_name.clone())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone();
+
+        let mut computed_here = false;
+        let result = cell
+            .get_or_init(|| {
+                computed_here = true;
+                Arc::new(compute())
+            })
+            .clone();
+        if computed_here {
+            self.completed.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Get or compute a summary, blocking if another thread is already computing it.
@@ -71,20 +105,7 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
     where
         S: Clone,
     {
-        // Get or create the slot. The DashMap shard lock is held only briefly.
-        let cell = self
-            .store
-            .entry(proc_name.clone())
-            .or_insert_with(|| Arc::new(OnceLock::new()))
-            .clone();
-
-        // OnceLock::get_or_init blocks if another thread is initializing.
-        let was_empty = cell.get().is_none();
-        let result = cell.get_or_init(compute).clone();
-        if was_empty && cell.get().is_some() {
-            self.completed.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        self.get_or_compute_arc(proc_name, compute).as_ref().clone()
     }
 
     /// Update an already computed summary in place.
@@ -103,11 +124,11 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
             return false;
         };
 
-        let mut updated = current;
+        let mut updated = current.as_ref().clone();
         f(&mut updated);
 
         let cell = Arc::new(OnceLock::new());
-        let _ = cell.set(updated);
+        let _ = cell.set(Arc::new(updated));
         *entry.value_mut() = cell;
         true
     }
@@ -127,14 +148,14 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
             .iter()
             .find(|entry| format!("{}", entry.key()) == name)
         {
-            return entry.value().get().cloned();
+            return entry.value().get().map(|summary| summary.as_ref().clone());
         }
         // Suffix match (e.g. "leaf" matches "$TOPLEVEL$CLASS$.leaf")
         let suffix = format!(".{name}");
         self.store
             .iter()
             .find(|entry| format!("{}", entry.key()).ends_with(&suffix))
-            .and_then(|entry| entry.value().get().cloned())
+            .and_then(|entry| entry.value().get().map(|summary| summary.as_ref().clone()))
     }
 
     /// Check if a summary has been computed for a procedure.
@@ -158,7 +179,7 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
     pub fn for_each(&self, f: impl Fn(&Procname, &S)) {
         self.store.iter().for_each(|entry| {
             if let Some(summary) = entry.value().get() {
-                f(entry.key(), summary);
+                f(entry.key(), summary.as_ref());
             }
         });
     }
@@ -174,7 +195,7 @@ impl<S: Send + Sync + 'static> SummaryStore<S> {
                 entry
                     .value()
                     .get()
-                    .map(|s| (entry.key().clone(), s.clone()))
+                    .map(|summary| (entry.key().clone(), summary.as_ref().clone()))
             })
             .collect()
     }
@@ -220,6 +241,18 @@ mod tests {
         // Second call returns cached value, doesn't call compute
         let v = store.get_or_compute(&pname, || panic!("should not be called"));
         assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn test_get_arc_shares_cached_summary() {
+        let store = SummaryStore::new();
+        let pname = Procname::c_from_string("foo");
+        store.insert(pname.clone(), vec![1u8, 2, 3]);
+
+        let first = store.get_arc(&pname).expect("summary should exist");
+        let second = store.get_arc(&pname).expect("summary should exist");
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
