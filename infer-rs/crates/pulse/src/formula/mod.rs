@@ -92,6 +92,37 @@ impl Formula {
         self.phi.is_known_zero(v)
     }
 
+    /// Check whether summary-space simplification proves a visible value is
+    /// equal to zero, even if the proof currently goes through dead alias /
+    /// arithmetic temps that `simplify_for_summary` is about to erase.
+    ///
+    /// Cross-ref: OCaml `PulseFormula.simplify` returns `new_eqs`, and
+    /// `PulseAbductiveDomain.incorporate_new_eqs` uses `EqZero` to surface
+    /// `PotentialInvalidAccessSummary` on caller-visible values.
+    pub fn is_known_zero_for_summary(
+        &self,
+        v: AbstractValue,
+        precondition_vocabulary: &HashSet<AbstractValue>,
+        keep: &HashSet<AbstractValue>,
+    ) -> bool {
+        let atom = self.phi.simplify_condition_atom_for_summary(
+            &Atom::Equal(Term::Var(v), Term::Const(0)),
+            precondition_vocabulary,
+            keep,
+        );
+
+        if atom.is_trivially_true() == Some(true) {
+            return true;
+        }
+
+        matches!(
+            atom,
+            Atom::Equal(Term::Var(w), Term::Const(0))
+                | Atom::Equal(Term::Const(0), Term::Var(w))
+                if self.phi.get_repr(w) == self.phi.get_repr(v)
+        )
+    }
+
     /// Check if a variable is known to be non-zero (positive or has NotEqual(v, 0)).
     pub fn is_known_nonzero(&self, v: AbstractValue) -> bool {
         let repr = self.phi.get_repr(v);

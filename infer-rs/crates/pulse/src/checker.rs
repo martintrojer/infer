@@ -289,11 +289,9 @@ pub fn analyze_with_specialization_and_requests(
             match d {
                 ExecutionDomain::AbortProgram { state, diagnostic } => {
                     let classify_start = Instant::now();
+                    let classified_kind = crate::summary::classify_abort_kind(pdesc, state, diagnostic);
                     let is_manifest_abort = diagnostic_originates_in_proc(pdesc, diagnostic)
-                        && matches!(
-                            crate::summary::classify_abort_kind(pdesc, state, diagnostic),
-                            crate::summary::PrePostKind::AbortProgram
-                        );
+                        && matches!(classified_kind, crate::summary::PrePostKind::AbortProgram);
                     if pulse_progress_enabled()
                         && classify_start.elapsed() >= PROC_SLOW_LOG_THRESHOLD
                     {
@@ -310,6 +308,39 @@ pub fn analyze_with_specialization_and_requests(
                         if seen_diags.insert(key) {
                             diagnostics.push(diagnostic.as_ref().clone());
                         }
+                    }
+                    let recovered = match classified_kind {
+                        crate::summary::PrePostKind::LatentAbortProgram => {
+                            Some(ExecutionDomain::LatentAbortProgram {
+                                state: state.clone(),
+                                diagnostic: diagnostic.clone(),
+                            })
+                        }
+                        crate::summary::PrePostKind::LatentInvalidAccess => {
+                            Some(ExecutionDomain::LatentInvalidAccess {
+                                state: state.clone(),
+                                diagnostic: diagnostic.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(recovered) = recovered {
+                        let recovered_key = stopped_summary_key(&recovered);
+                        if !recovered_non_exit_disjuncts.iter().any(|existing| {
+                            stopped_summary_key(existing).as_ref() == recovered_key.as_ref()
+                        }) {
+                            recovered_non_exit_disjuncts.push(recovered);
+                        }
+                    }
+                }
+                ExecutionDomain::LatentAbortProgram { .. }
+                | ExecutionDomain::LatentInvalidAccess { .. } => {
+                    let key = stopped_summary_key(d);
+                    if !recovered_non_exit_disjuncts
+                        .iter()
+                        .any(|existing| stopped_summary_key(existing).as_ref() == key.as_ref())
+                    {
+                        recovered_non_exit_disjuncts.push(d.clone());
                     }
                 }
                 ExecutionDomain::ContinueProgram(astate) if !exit_has_normal_path => {
@@ -392,7 +423,12 @@ pub fn analyze_with_specialization_and_requests(
     }
     let recovered_non_exit_count = recovered_non_exit_disjuncts.len();
     for recovered in recovered_non_exit_disjuncts {
-        if !exit_disjuncts.iter().any(|existing| existing == &recovered) {
+        let recovered_key = stopped_summary_key(&recovered);
+        let already_present = exit_disjuncts.iter().any(|existing| {
+            stopped_summary_key(existing).as_ref() == recovered_key.as_ref()
+                || existing == &recovered
+        });
+        if !already_present {
             exit_disjuncts.push(recovered);
         }
     }
@@ -476,6 +512,19 @@ fn diagnostic_originates_in_proc(pdesc: &Procdesc, diagnostic: &Diagnostic) -> b
     };
 
     loc.file == proc_file && proc_start <= loc.line && loc.line <= proc_end
+}
+
+fn stopped_summary_key(exec: &ExecutionDomain) -> Option<(u8, String)> {
+    match exec {
+        ExecutionDomain::AbortProgram { diagnostic, .. } => Some((0, diagnostic.dedup_key())),
+        ExecutionDomain::LatentAbortProgram { diagnostic, .. } => {
+            Some((1, diagnostic.dedup_key()))
+        }
+        ExecutionDomain::LatentInvalidAccess { diagnostic, .. } => {
+            Some((2, diagnostic.dedup_key()))
+        }
+        _ => None,
+    }
 }
 
 /// Pulse transfer functions for the disjunctive abstract interpreter.
@@ -1589,6 +1638,13 @@ fn diagnostic_dedup_key(diagnostic: &Diagnostic, latent: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use absint::disjunctive::DisjunctiveDomain;
+    use absint::interp;
+    use test_harness::textual_utils;
+
     use super::*;
     use crate::abstract_value::AbstractValue;
     use crate::access::Access;
@@ -1613,6 +1669,58 @@ mod tests {
 
     fn formal_value_heap_path(formal_pvar: &Pvar) -> HeapPath {
         HeapPath::Dereference(Box::new(HeapPath::Pvar(formal_pvar.clone())))
+    }
+
+    fn retain_named_procs(tm: &mut textual_utils::TestModule, proc_names: &[&str]) {
+        let keep: std::collections::HashSet<_> = proc_names.iter().copied().collect();
+        tm.cfg
+            .proc_descs
+            .retain(|pname, _| keep.contains(format!("{pname}").as_str()));
+    }
+
+    fn summarize_exec_domain(exec: &ExecutionDomain) -> String {
+        match exec {
+            ExecutionDomain::ContinueProgram(state) => {
+                format!(
+                    "ContinueProgram conditions={:?}",
+                    state.path_condition.conditions()
+                )
+            }
+            ExecutionDomain::ExitProgram(state) => {
+                format!(
+                    "ExitProgram conditions={:?}",
+                    state.path_condition.conditions()
+                )
+            }
+            ExecutionDomain::ExceptionRaised(state) => {
+                format!(
+                    "ExceptionRaised conditions={:?}",
+                    state.path_condition.conditions()
+                )
+            }
+            ExecutionDomain::AbortProgram { state, diagnostic }
+            | ExecutionDomain::LatentAbortProgram { state, diagnostic }
+            | ExecutionDomain::LatentInvalidAccess { state, diagnostic } => {
+                let diag = match diagnostic.as_ref() {
+                    crate::diagnostic::Diagnostic::AccessToInvalidAddress {
+                        addr,
+                        access_location,
+                        ..
+                    } => format!("invalid@{access_location} addr={addr}"),
+                    other => format!("{other:?}"),
+                };
+                format!(
+                    "{} {diag} conditions={:?}",
+                    match exec {
+                        ExecutionDomain::AbortProgram { .. } => "AbortProgram",
+                        ExecutionDomain::LatentAbortProgram { .. } => "LatentAbortProgram",
+                        ExecutionDomain::LatentInvalidAccess { .. } => "LatentInvalidAccess",
+                        _ => unreachable!(),
+                    },
+                    state.path_condition.conditions()
+                )
+            }
+        }
     }
 
     fn make_alias_specialization_summary(
@@ -2902,8 +3010,95 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "documents pending non-exit latent-read recovery when another path reaches exit"]
-    fn test_normal_exit_keeps_non_exit_latent_abort() {
+    #[ignore = "debug latent UAF node states"]
+    fn test_debug_latent_uaf_node_states() {
+        let tm = textual_utils::parse_and_convert(
+            r#"
+            .source_language = "C"
+
+            define conditional_free2(b: int, x: *int) : void {
+              #entry:
+                n0:int = load &b
+                n1:*int = load &x
+                jmp do_free, skip_free
+              #do_free:
+                prune __sil_eq(n0, 1)
+                _ = free(n1)
+                ret null
+              #skip_free:
+                prune __sil_lnot(__sil_eq(n0, 1))
+                ret null
+            }
+
+            define latent_use_after_free(b: int, x: *int) : void {
+              #entry:
+                n0:int = load &b
+                n1:*int = load &x
+                _ = conditional_free2(n0, n1)
+                store n1 <- 42:int
+                jmp clean_up, done
+              #clean_up:
+                prune __sil_eq(n0, 0)
+                _ = free(n1)
+                ret null
+              #done:
+                prune __sil_lnot(__sil_eq(n0, 0))
+                ret null
+            }
+        "#,
+        );
+        let pdesc = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "latent_use_after_free")
+            .expect("latent_use_after_free proc should exist")
+            .clone();
+        let mut callee_summaries = HashMap::new();
+        let conditional_free = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "conditional_free2")
+            .expect("conditional_free2 proc should exist")
+            .clone();
+        callee_summaries.insert(conditional_free.proc_name.clone(), analyze(&conditional_free));
+
+        let cfg = config::get();
+        let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
+        let initial_domain = DisjunctiveDomain::singleton(
+            initial_exec,
+            cfg.pulse_max_disjuncts,
+            cfg.pulse_widen_threshold,
+        );
+        let pulse_tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            proc_name: format!("{}", pdesc.proc_name),
+            spec_requests: RefCell::new(Vec::new()),
+            progress: RefCell::new(ProcProgress::new()),
+        };
+        let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
+        for node in &pdesc.nodes {
+            if let Some(state) = inv_map.get(&node.id) {
+                eprintln!("node {}", node.id);
+                for (i, disjunct) in state.post.disjuncts.iter().enumerate() {
+                    eprintln!("  [{i}] {}", summarize_exec_domain(disjunct));
+                    if let ExecutionDomain::AbortProgram { state, diagnostic } = disjunct {
+                        let kind = crate::summary::classify_abort_kind(&pdesc, state, diagnostic);
+                        let manifest = crate::summary::abort_is_manifest(&pdesc, state);
+                        eprintln!(
+                            "      classify={kind:?} manifest={}",
+                            manifest,
+                        );
+                    }
+                }
+            }
+        }
+
+    }
+
+    #[test]
+    fn test_formal_load_then_exit_stays_continue_only() {
         let pdesc = make_formal_load_then_exit_proc();
         let summary = analyze(&pdesc);
 
@@ -2924,14 +3119,10 @@ mod tests {
             })
             .count();
 
-        assert_eq!(
-            continue_paths, 1,
-            "expected the non-null path to keep a normal continue summary, summary={summary:?}"
-        );
-        assert_eq!(
-            latent_null_derefs, 1,
-            "expected the null path to stay latent even when the procedure also has a normal exit, summary={summary:?}"
-        );
+        // Cross-ref: OCaml `infer --pulse-only` on the matching tiny C repro
+        // exports a single `ContinueProgram` summary for this shape.
+        assert_eq!(continue_paths, 1, "summary={summary:?}");
+        assert_eq!(latent_null_derefs, 0, "summary={summary:?}");
     }
 
     #[test]
@@ -3331,5 +3522,211 @@ mod tests {
             !summary.diagnostics.is_empty(),
             "should find null deref diagnostics"
         );
+    }
+
+    #[test]
+    #[ignore = "debug parity probe against local /tmp latent.sil fixture"]
+    fn test_debug_latent_exit_disjuncts_before_summary_export() {
+        let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
+        if !sil.exists() {
+            eprintln!("skip");
+            return;
+        }
+
+        let mut tm = textual_utils::parse_file_and_convert(sil);
+        retain_named_procs(
+            &mut tm,
+            &[
+                "traverse_and_crash_if_equal_to_root",
+                "crash_after_two_nodes_bad",
+                "FN_crash_after_six_nodes_bad",
+            ],
+        );
+
+        let traverse = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "traverse_and_crash_if_equal_to_root")
+            .expect("callee procdesc should exist")
+            .clone();
+        let traverse_summary = analyze(&traverse);
+        eprintln!(
+            "CALLEE summary {:?}",
+            traverse_summary
+                .pre_posts
+                .iter()
+                .map(|pp| {
+                    format!(
+                        "{:?}:{:?}",
+                        pp.kind,
+                        crate::summary::latent_invalid_access_report_key(pp)
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let mut callee_summaries = HashMap::new();
+        callee_summaries.insert(traverse.proc_name.clone(), traverse_summary);
+
+        for caller_name in ["crash_after_two_nodes_bad", "FN_crash_after_six_nodes_bad"] {
+            let caller = tm
+                .cfg
+                .iter_proc_descs()
+                .find(|pdesc| format!("{}", pdesc.proc_name) == caller_name)
+                .expect("caller procdesc should exist")
+                .clone();
+
+            AbstractValue::reset_counters();
+            let cfg = config::get();
+            let initial_state = crate::abductive::AbductiveDomain::mk_initial(&caller);
+            let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
+            let initial_domain = DisjunctiveDomain::singleton(
+                initial_exec,
+                cfg.pulse_max_disjuncts,
+                cfg.pulse_widen_threshold,
+            );
+            let pulse_tf = PulseTransferFunctions {
+                callee_summaries: &callee_summaries,
+                pdesc: &caller,
+                proc_name: format!("{}", caller.proc_name),
+                spec_requests: RefCell::new(Vec::new()),
+                progress: RefCell::new(ProcProgress::new()),
+            };
+            let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &caller, initial_domain);
+            let exit_state = inv_map
+                .get(&caller.exit_node)
+                .expect("caller exit state should exist");
+
+            let local_node = caller
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.instrs
+                        .iter()
+                        .any(|instr| matches!(instr, Instr::Store { .. }))
+                        && node
+                            .instrs
+                            .iter()
+                            .any(|instr| matches!(instr, Instr::Load { .. }))
+                })
+                .expect("local field-write node should exist");
+            let mut local_domain = DisjunctiveDomain::singleton(
+                ExecutionDomain::ContinueProgram(crate::abductive::AbductiveDomain::mk_initial(
+                    &caller,
+                )),
+                cfg.pulse_max_disjuncts,
+                cfg.pulse_widen_threshold,
+            );
+            eprintln!("{caller_name} local replay node={}", local_node.id);
+            for (instr_idx, instr) in local_node.instrs.iter().enumerate() {
+                let mut replayed = Vec::new();
+                for disjunct in &local_domain.disjuncts {
+                    match disjunct {
+                        ExecutionDomain::ContinueProgram(state) => {
+                            replayed.extend(crate::transfer::exec_instr_with_pdesc(
+                                Some(&caller),
+                                instr,
+                                state.clone(),
+                            ))
+                        }
+                        other => replayed.push(other.clone()),
+                    }
+                }
+                local_domain = DisjunctiveDomain {
+                    disjuncts: replayed,
+                    max_disjuncts: cfg.pulse_max_disjuncts,
+                    max_widen_iters: cfg.pulse_widen_threshold,
+                    had_dropped_disjuncts: false,
+                };
+                local_domain.dedup();
+                local_domain.bound();
+                eprintln!("  after instr[{instr_idx}] {instr}");
+                for (disj_idx, disjunct) in local_domain.disjuncts.iter().enumerate() {
+                    eprintln!("    replay[{disj_idx}] {}", summarize_exec_domain(disjunct));
+                }
+            }
+
+            let caller_state_after_store = match local_domain.disjuncts.as_slice() {
+                [ExecutionDomain::ContinueProgram(state)] => state.clone(),
+                other => panic!("expected one continue state after local replay, got {other:?}"),
+            };
+            let call_node = caller
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.instrs
+                        .iter()
+                        .any(|instr| matches!(instr, Instr::Call { .. }))
+                })
+                .expect("call node should exist");
+            let (ret_id, actuals, call_loc) = call_node
+                .instrs
+                .iter()
+                .find_map(|instr| match instr {
+                    Instr::Call {
+                        ret: (ret_id, _ret_typ),
+                        args,
+                        loc,
+                        ..
+                    } => Some((ret_id.clone(), args.clone(), loc.clone())),
+                    _ => None,
+                })
+                .expect("call instruction should exist");
+
+            eprintln!("{caller_name} per-pre-post apply:");
+            for (pp_idx, pre_post) in callee_summaries
+                .get(&traverse.proc_name)
+                .expect("callee summary should exist")
+                .pre_posts
+                .iter()
+                .enumerate()
+            {
+                let outcome = crate::interproc::apply_summary_with_aliasing(
+                    &caller,
+                    pre_post,
+                    &ret_id,
+                    &actuals,
+                    &call_loc,
+                    caller_state_after_store.clone(),
+                );
+                let rendered = outcome
+                    .results
+                    .iter()
+                    .map(summarize_exec_domain)
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "  pp[{pp_idx}] kind={:?} report_key={:?} -> {rendered:?}",
+                    pre_post.kind,
+                    crate::summary::latent_invalid_access_report_key(pre_post)
+                );
+            }
+
+            eprintln!(
+                "{caller_name} EXIT disjunct count={}",
+                exit_state.post.disjuncts.len()
+            );
+            for (i, disjunct) in exit_state.post.disjuncts.iter().enumerate() {
+                let isolated = PulseSummary::of_proc_with_metadata(
+                    &caller,
+                    std::slice::from_ref(disjunct),
+                    Vec::new(),
+                    caller.is_no_return,
+                    false,
+                );
+                let isolated_shape = isolated
+                    .pre_posts
+                    .iter()
+                    .map(|pp| {
+                        format!(
+                            "{:?}:{:?}",
+                            pp.kind,
+                            crate::summary::latent_invalid_access_report_key(pp)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!("  exit[{i}] {}", summarize_exec_domain(disjunct));
+                eprintln!("  exit[{i}] isolated={isolated_shape:?}");
+            }
+        }
     }
 }

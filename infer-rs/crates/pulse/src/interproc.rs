@@ -371,6 +371,40 @@ pub(crate) fn apply_summary_with_aliasing(
         };
     }
 
+    let stopped_summary = (!matches!(pre_post.kind, crate::summary::PrePostKind::ContinueProgram))
+        .then(|| crate::summary::summarize_stopped_state(caller_pdesc, &caller_state));
+
+    if let Some(summary) = stopped_summary.as_ref() {
+        if let Some(diag) = summary.potential_invalid_access.as_ref() {
+            let mut caller_summary_state = summary.state.clone();
+            let diag = rebase_diagnostic_to_state(diag.clone(), &caller_summary_state);
+            mark_diagnostic_addr_must_be_valid(&mut caller_summary_state, &diag);
+            return if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_summary_state)
+            {
+                let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_summary_state);
+                ApplySummaryOutcome {
+                    results: vec![ExecutionDomain::AbortProgram {
+                        state: Box::new(caller_summary_state),
+                        diagnostic: Box::new(manifest_diag),
+                    }],
+                    alias_specialization: None,
+                }
+            } else {
+                ApplySummaryOutcome {
+                    results: vec![ExecutionDomain::LatentInvalidAccess {
+                        state: Box::new(caller_summary_state),
+                        diagnostic: Box::new(diag),
+                    }],
+                    alias_specialization: None,
+                }
+            };
+        }
+    }
+
+    let caller_state = stopped_summary
+        .map(|summary| summary.state)
+        .unwrap_or(caller_state);
+
     // Return the same execution domain kind as the callee's pre_post.
     // Cross-ref: OCaml PulseCallOperations.ml apply_callee dispatches
     // on the callee's execution state to determine the caller's state.
@@ -402,8 +436,10 @@ pub(crate) fn apply_summary_with_aliasing(
             // in the caller's summarized state before deciding whether it is
             // still latent or has become manifest here.
             if let Some(diag) = &pre_post.diagnostic {
-                let diag =
-                    translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories, loc);
+                let diag = rebase_diagnostic_to_state(
+                    translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories, loc),
+                    &caller_state,
+                );
                 if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
                     vec![ExecutionDomain::AbortProgram {
                         state: Box::new(caller_state),
@@ -423,8 +459,11 @@ pub(crate) fn apply_summary_with_aliasing(
             if let Some(diag) = pre_post.diagnostic.clone().or_else(|| {
                 crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
             }) {
-                let diag =
-                    translate_diagnostic(&diag, &mut subst, &caller_state, &formal_histories, loc);
+                let mut caller_state = caller_state;
+                let diag = rebase_diagnostic_to_state(
+                    translate_diagnostic(&diag, &mut subst, &caller_state, &formal_histories, loc),
+                    &caller_state,
+                );
                 mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
                 if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
@@ -477,6 +516,25 @@ fn translate_diagnostic(
             }
         }
         _ => diagnostic.clone(),
+    }
+}
+
+fn rebase_diagnostic_to_state(diagnostic: Diagnostic, state: &AbductiveDomain) -> Diagnostic {
+    match diagnostic {
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            invalidation,
+            access_location,
+            access_history,
+            invalidation_history,
+        } => Diagnostic::AccessToInvalidAddress {
+            addr: state.path_condition.get_var_repr(addr),
+            invalidation,
+            access_location,
+            access_history,
+            invalidation_history,
+        },
+        _ => diagnostic,
     }
 }
 

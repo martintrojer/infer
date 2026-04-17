@@ -145,11 +145,13 @@ The latest correctness pass also keeps recoverable invalid-access paths from con
 error has already been classified: transfer-side load/store recoverable errors and C-model
 recoverable errors now stop instead of exporting `ContinueProgram + AbortProgram`, with focused
 regressions for null-formal stores and double-free. That cleanup is correct and stays, but it does
-not explain the now-clean `specialization.c` comparator by itself. A broader checker-side attempt to recover
-non-exit latent invalid accesses when another path reaches exit was cross-checked against OCaml and
-reverted because it over-published latent summaries in `test_alias`, `test_unalias`, and wrapper /
-recursion cases. The ignored `test_normal_exit_keeps_non_exit_latent_abort` now exists only to
-document that still-missing direct-formal-read case.
+not explain the now-clean `specialization.c` comparator by itself. A broader checker-side attempt
+to recover non-exit latent invalid accesses when another path reaches exit was cross-checked
+against OCaml and reverted because it over-published latent summaries in `test_alias`,
+`test_unalias`, and wrapper / recursion cases. A separate direct-formal-load synthetic repro was
+also cross-checked against OCaml: `formal_load_then_exit` exports a single `ContinueProgram`, so
+Rust now locks that down with `checker::tests::test_formal_load_then_exit_stays_continue_only`
+instead of keeping the old ignored test alive as a target.
 
 The latest direct-formal ordering fix closes the main `may_double_free_if_alias` shape bug without
 cheating the counts: Rust now stamps `MustBeValid` / `MustBeInitialized` summary attrs with real

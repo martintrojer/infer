@@ -5,6 +5,54 @@ Keep it current when the active line of investigation changes.
 
 ## Current Focus
 
+- 2026-04-17 latent UAF parity checkpoint:
+  - fixed focused regressions:
+    - `test_e2e_latent_error_only_summary_is_not_noreturn`
+    - `test_e2e_manifest_use_after_free_reports_only_uaf`
+  - root causes:
+    - summary dedup was keying all invalid-access-shaped pre/posts as
+      `NULLPTR_DEREFERENCE`, so a `LatentAbortProgram` carrying
+      `USE_AFTER_FREE` could collapse into a sibling `LatentInvalidAccess`
+      at the same access site / heap path
+    - benign manifestness for imported `x != 0` / `0 < x` guards had drifted
+      from OCaml: Rust stopped treating `must_be_valid` values as
+      "allocated-ish" once the same address later carried a non-null
+      invalidation, which kept caller-side UAF paths latent
+  - correctness-preserving fixes:
+    - `crates/pulse/src/summary.rs:latent_invalid_access_report_key(...)`
+      now keys on the actual diagnostic issue type instead of hard-coding NPE
+    - `crates/pulse/src/summary.rs:atom_is_benign_manifest_constraint(...)`
+      now matches OCaml `PulseArithmetic.is_manifest` for `must_be_valid`
+      values
+  - verification:
+    - `cargo test -q -p pulse --lib`
+    - `cargo test -q -p pulse --test end_to_end`
+    - focused guards:
+      - `test_e2e_latent_cycle_summary_shapes_match_ocaml_subset`
+      - `test_e2e_deref_then_free_then_deref_keeps_npe_latent`
+      - `test_e2e_local_zero_proof_on_formal_keeps_null_deref_manifest`
+      - `checker::tests::test_same_block_local_abort_keeps_earlier_null_derefs_latent`
+  - extra OCaml cross-check from this turn:
+    - temp file:
+      `/tmp/formal_load_then_exit.c`
+    - command:
+      `infer -j 1 --pulse-only -o /tmp/formal_load_then_exit_out -- clang -c /tmp/formal_load_then_exit.c`
+      then
+      `infer debug -j 1 --dump-json-summaries -o /tmp/formal_load_then_exit_out`
+    - OCaml summary shape:
+      - `formal_load_then_exit` exports exactly one `ContinueProgram`
+    - consequence:
+      - the old ignored Rust test was pointing at the wrong target
+      - Rust now matches OCaml on this direct-formal-load shape via
+        `checker::tests::test_formal_load_then_exit_stays_continue_only`
+      - the direct-formal false positive fix is intentionally narrow:
+        `summary_eq_zero` recovery no longer invents latent invalid-access
+        summaries for bare direct-formal values unless there is an actual zero
+        proof
+  - current next target:
+    - go back to the broader wrapper/cycle null-path publication gap; the
+      direct-formal-load synthetic repro is no longer the right driver
+
 - Active latent-summary checkpoint:
   - the `traverse_and_crash_if_equal_to_root` post-fixpoint stall is fixed
   - root cause:

@@ -25,6 +25,24 @@
   exported-Textual proc-identity loss for some duplicate C names.
 
 Recent correctness / robustness fixes:
+- Latent UAF summary parity tightened again:
+  summary pre/post dedup now keys invalid-access-shaped entries by the real
+  diagnostic issue type instead of hard-coding NPE, which preserves
+  `LatentAbortProgram(USE_AFTER_FREE)` alongside sibling null-style
+  `LatentInvalidAccess` summaries at the same access site / heap path.
+  Rust also now matches OCaml `PulseArithmetic.is_manifest` for benign
+  imported `x != 0` / `0 < x` guards on `must_be_valid` values, so
+  `latent_use_after_free` keeps its latent UAF path and
+  `manifest_use_after_free` reifies only `USE_AFTER_FREE`. Verified with
+  `cargo test -q -p pulse --lib` and `cargo test -q -p pulse --test end_to_end`.
+- Direct-formal-load summary parity tightened too:
+  Rust was inventing a latent invalid-access summary for the synthetic
+  `formal_load_then_exit` shape via broad `summary_eq_zero` recovery on bare
+  direct-formal values. A matching OCaml `infer --pulse-only` summary dump for
+  `/tmp/formal_load_then_exit.c` shows one `ContinueProgram` only, and Rust
+  now matches that behavior with the narrow
+  `checker::tests::test_formal_load_then_exit_stays_continue_only` guard
+  instead of changing the wider summary-formula simplification rules.
 - Disjunctive Pulse execution now mirrors the OCaml split between cheap
   disjunct equality and semantic subsumption more closely. `absint` gained an
   explicit `Comparable::equal_fast(...)` hook, `DisjunctiveDomain::{join,dedup}`
@@ -229,9 +247,12 @@ Recent correctness / robustness fixes:
   dumps for `may_double_free_if_alias`, `test_alias`, and `test_unalias`
   showed that the broad recovery was wrong: it reproduced the missing
   direct-formal-read shape, but also surfaced bogus latent summaries in
-  alias/wrapper/recursion cases. The ignored
-  `checker::tests::test_normal_exit_keeps_non_exit_latent_abort` remains only
-  as a documentation repro for the still-missing case.
+  alias/wrapper/recursion cases. A later OCaml cross-check for the tiny
+  `formal_load_then_exit` repro showed that this synthetic direct-formal-load
+  shape should actually export a single `ContinueProgram`, and Rust now locks
+  that down with
+  `checker::tests::test_formal_load_then_exit_stays_continue_only` instead of
+  keeping the old ignored test as a target.
 - Exact summary-equality work now has a semantic driver instead of raw JSON diffs:
   `crates/test-harness/src/summary_compare.rs` canonicalizes OCaml and Rust
   `main.pre_post_list` state (stack / heap / attrs / conditions / phi /

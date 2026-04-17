@@ -781,6 +781,46 @@ mod tests {
     }
 
     #[test]
+    fn test_store_through_freed_formal_is_not_latent_invalid_access() {
+        let pname = Procname::c_from_string("formal_uaf_store");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal = Pvar::mk(Mangled::from_string("x"), pname);
+        let formal_var = Var::ProgramVar(Box::new(formal.clone()));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+        let formal_val = state.read_heap(formal_addr, Access::Dereference);
+        let loaded = Ident::create_normal(IdentName::from_string("n"), 0);
+        state
+            .post
+            .stack
+            .add(Var::LogicalVar(loaded.clone()), formal_val);
+        state.invalidate(
+            formal_val,
+            crate::invalidation::Invalidation::CFree,
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
+        );
+
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Var(loaded)),
+            typ: Typ::void(),
+            e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(42)))),
+            loc: Location::dummy(),
+        };
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+
+        assert!(
+            !matches!(results.as_slice(), [ExecutionDomain::LatentInvalidAccess { .. }]),
+            "use-after-free on a direct formal should not be classified as LatentInvalidAccess: {results:?}"
+        );
+    }
+
+    #[test]
     fn test_store_to_formula_known_zero_detects_error() {
         let mut state = mk_state();
         let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));

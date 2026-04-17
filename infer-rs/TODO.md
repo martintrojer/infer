@@ -62,12 +62,12 @@ active OCaml-parity gap.
    `test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent`,
    `test_e2e_latent_chain_stays_latent_until_manifest_callsite`,
    `test_e2e_callee_local_abort_is_not_republished_on_caller`, and
-   `test_to_issue_log_filters_suppressed_null_deref_by_default`. Also keep
-   the ignored documentation repro
-   `checker::tests::test_normal_exit_keeps_non_exit_latent_abort`: it marks a
-   still-missing OCaml behavior, but the obvious broad checker-side fix was
-   proven wrong and must not be resurrected as a count-tuning workaround.
-   These are correctness fixes, not optional count-tuning.
+   `test_to_issue_log_filters_suppressed_null_deref_by_default`, and
+   `checker::tests::test_formal_load_then_exit_stays_continue_only`.
+   OCaml exports the direct-formal-load synthetic repro as a pure
+   `ContinueProgram`, so Rust must not resurrect the old broad
+   `summary_eq_zero` latent-invalid-access workaround there. These are
+   correctness fixes, not optional count-tuning.
 
 4. **Broader wrapper/cycle null-path publication parity**: the filtered
    `traverse_and_crash_if_equal_to_root` latent-only repro is fixed again, but
@@ -92,6 +92,15 @@ Recent groundwork that should stay in place even though the current NPE total mo
 - caller-side latent invalid-access rechecks now mark translated diagnostic addresses
   `must_be_valid` and reuse summary classification, which fixes
   `manifest_use_after_free` without regressing `access_use_after_free_bad`
+- latent UAF summary export/import now keeps `USE_AFTER_FREE`
+  `LatentAbortProgram` paths distinct from null-style `LatentInvalidAccess`
+  siblings by deduping on the real issue type, and benign imported `x != 0` /
+  `0 < x` guards on `must_be_valid` values now follow OCaml manifestness
+  again; keep `latent_use_after_free` / `manifest_use_after_free` green
+- bare direct-formal load/exit summaries no longer synthesize latent
+  invalid-access pre/posts from `summary_eq_zero` alone; OCaml exports the
+  matching `formal_load_then_exit` repro as one `ContinueProgram`, and Rust
+  now locks that down with `checker::tests::test_formal_load_then_exit_stays_continue_only`
 - direct-formal constant-deref latentification now refuses to fire when the summary already has a
   local depth-0 `addr == 0` proof, matching the OCaml `create_null_path2_bad_FN` shape
 - default reporting now suppresses OCaml-style constant/compared-to-null dereferences without a

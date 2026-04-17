@@ -54,10 +54,31 @@ struct CanonicalState {
 
 /// Compare two states modulo abstract-value renaming.
 pub fn alpha_equivalent(lhs: &AbductiveDomain, rhs: &AbductiveDomain) -> bool {
-    canonicalize(lhs) == canonicalize(rhs)
+    canonicalize(lhs).state == canonicalize(rhs).state
 }
 
-fn canonicalize(state: &AbductiveDomain) -> CanonicalState {
+/// Compare two state values modulo the same alpha-renaming used by
+/// [`alpha_equivalent`].
+///
+/// This is stricter than raw [`AbstractValue`] equality: the states must be
+/// semantically equivalent, and the designated values must land on the same
+/// canonical value within that equivalence.
+pub fn alpha_equivalent_value(
+    lhs: &AbductiveDomain,
+    lhs_value: AbstractValue,
+    rhs: &AbductiveDomain,
+    rhs_value: AbstractValue,
+) -> bool {
+    let lhs = canonicalize(lhs);
+    let rhs = canonicalize(rhs);
+    lhs.state == rhs.state
+        && matches!(
+            (lhs.value_label(lhs_value), rhs.value_label(rhs_value)),
+            (Some(lhs_label), Some(rhs_label)) if lhs_label == rhs_label
+        )
+}
+
+fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
     let mut canon = Canonicalizer::default();
     canon.seed_from_stack(&state.pre.stack);
     canon.seed_from_stack(&state.post.stack);
@@ -76,20 +97,34 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalState {
 
     canon.assign_remaining(state);
 
-    CanonicalState {
-        pre_stack: canonical_stack(&state.pre.stack, &canon),
-        post_stack: canonical_stack(&state.post.stack, &canon),
-        pre_heap: canonical_heap(&state.pre.heap, &canon),
-        post_heap: canonical_heap(&state.post.heap, &canon),
-        pre_attrs: canonical_attrs(&state.pre.attrs, &canon),
-        post_attrs: canonical_attrs(&state.post.attrs, &canon),
-        formula: canonical_formula(state, &canon),
-        must_be_valid: canonical_value_set(&state.must_be_valid, &canon, "must_be_valid"),
-        need_specialization: canonical_value_set(
-            &state.need_dynamic_type_specialization,
-            &canon,
-            "need_specialization",
-        ),
+    CanonicalizedState {
+        state: CanonicalState {
+            pre_stack: canonical_stack(&state.pre.stack, &canon),
+            post_stack: canonical_stack(&state.post.stack, &canon),
+            pre_heap: canonical_heap(&state.pre.heap, &canon),
+            post_heap: canonical_heap(&state.post.heap, &canon),
+            pre_attrs: canonical_attrs(&state.pre.attrs, &canon),
+            post_attrs: canonical_attrs(&state.post.attrs, &canon),
+            formula: canonical_formula(state, &canon),
+            must_be_valid: canonical_value_set(&state.must_be_valid, &canon, "must_be_valid"),
+            need_specialization: canonical_value_set(
+                &state.need_dynamic_type_specialization,
+                &canon,
+                "need_specialization",
+            ),
+        },
+        canon,
+    }
+}
+
+struct CanonicalizedState {
+    state: CanonicalState,
+    canon: Canonicalizer,
+}
+
+impl CanonicalizedState {
+    fn value_label(&self, value: AbstractValue) -> Option<CanonValue> {
+        self.canon.get(value)
     }
 }
 

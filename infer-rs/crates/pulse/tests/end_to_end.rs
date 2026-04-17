@@ -1706,6 +1706,177 @@ fn test_e2e_interproc_path_condition() {
 }
 
 #[test]
+fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        type node = {data: int; next: *node}
+
+        define traverse_and_crash_if_equal_to_root(p: *node) : void {
+          local crash: *int, old_p: *node
+          #node_0:
+              jmp node_1
+          #node_11:
+              jmp
+          #node_2:
+              jmp node_13
+          #node_13:
+              n0:*node = load &p
+              jmp node_12, node_10
+          #node_12:
+              prune __sil_ne(n0, 0)
+              jmp node_3
+          #node_10:
+              prune __sil_lnot(__sil_ne(n0, 0))
+              jmp node_11
+          #node_7:
+              jmp node_2
+          #node_4:
+              n1:*node = load &old_p
+              n2:*node = load &p
+              jmp node_9, node_8
+          #node_9:
+              prune __sil_eq(n1, n2)
+              jmp node_5
+          #node_8:
+              prune __sil_lnot(__sil_eq(n1, n2))
+              jmp node_7
+          #node_6:
+              n3:*int = load &crash
+              store n3 <- 42:int
+              jmp node_7
+          #node_5:
+              _ = __sil_metadata_variable_lifetime_begins(&crash, <*int>)
+              store &crash <- 0:*int
+              jmp node_6
+          #node_3:
+              n6:*node = load &p
+              n7:*node = load n6.node.next
+              store &p <- n7:*node
+              jmp node_4
+          #node_1:
+              _ = __sil_metadata_variable_lifetime_begins(&old_p, <*node>)
+              n9:*node = load &p
+              store &old_p <- n9:*node
+              jmp node_2
+        }
+
+        define crash_after_one_node_bad(q: *node) : void {
+          #node_0:
+              jmp node_1
+          #node_3:
+              jmp
+          #node_2:
+              n0:*node = load &q
+              n1 = traverse_and_crash_if_equal_to_root(n0)
+              jmp node_3
+          #node_1:
+              n3:*node = load &q
+              n2:*node = load &q
+              store n2.node.next <- n3:*node
+              jmp node_2
+        }
+
+        define crash_after_two_nodes_bad(q: *node) : void {
+          #node_0:
+              jmp node_1
+          #node_3:
+              jmp
+          #node_2:
+              n0:*node = load &q
+              n1 = traverse_and_crash_if_equal_to_root(n0)
+              jmp node_3
+          #node_1:
+              n4:*node = load &q
+              n2:*node = load &q
+              n3:*node = load n2.node.next
+              store n3.node.next <- n4:*node
+              jmp node_2
+        }
+
+        define FN_crash_after_six_nodes_bad(q: *node) : void {
+          #node_0:
+              jmp node_1
+          #node_3:
+              jmp
+          #node_2:
+              n0:*node = load &q
+              n1 = traverse_and_crash_if_equal_to_root(n0)
+              jmp node_3
+          #node_1:
+              n8:*node = load &q
+              n2:*node = load &q
+              n3:*node = load n2.node.next
+              n4:*node = load n3.node.next
+              n5:*node = load n4.node.next
+              n6:*node = load n5.node.next
+              n7:*node = load n6.node.next
+              store n7.node.next <- n8:*node
+              jmp node_2
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+
+    let expected = [
+        (
+            "traverse_and_crash_if_equal_to_root",
+            vec![
+                "ContinueProgram",
+                "ContinueProgram",
+                "LatentAbortProgram",
+                "ContinueProgram",
+                "LatentAbortProgram",
+                "ContinueProgram",
+                "LatentAbortProgram",
+            ],
+        ),
+        (
+            "crash_after_one_node_bad",
+            vec!["ContinueProgram", "LatentInvalidAccess", "AbortProgram"],
+        ),
+        (
+            "crash_after_two_nodes_bad",
+            vec![
+                "ContinueProgram",
+                "LatentInvalidAccess",
+                "LatentInvalidAccess",
+                "AbortProgram",
+            ],
+        ),
+        (
+            "FN_crash_after_six_nodes_bad",
+            vec![
+                "ContinueProgram",
+                "LatentInvalidAccess",
+                "LatentInvalidAccess",
+                "LatentInvalidAccess",
+                "LatentInvalidAccess",
+            ],
+        ),
+    ];
+
+    for (proc_name, expected_kinds) in expected {
+        let summary = store
+            .to_vec()
+            .into_iter()
+            .find(|(pname, _)| format!("{pname}") == proc_name)
+            .map(|(_, summary)| summary)
+            .unwrap_or_else(|| panic!("summary for {proc_name} should exist"));
+        let actual_kinds: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.kind))
+            .collect();
+        assert_eq!(
+            actual_kinds, expected_kinds,
+            "{proc_name} summary kinds diverged"
+        );
+    }
+}
+
+#[test]
 fn test_e2e_negated_actual_keeps_arithmetic_latent_summary() {
     let tm = textual_utils::parse_and_convert(
         r#"
@@ -3296,6 +3467,86 @@ fn test_e2e_latent_error_only_summary_is_not_noreturn() {
             .any(|pp| matches!(pp.kind, pulse::summary::PrePostKind::LatentAbortProgram)),
         "latent_use_after_free should keep its latent UAF summary path"
     );
+}
+
+#[test]
+#[ignore = "debug UAF summary shapes"]
+fn test_debug_uaf_summary_shapes() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define conditional_free2(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            jmp do_free, skip_free
+          #do_free:
+            prune __sil_eq(n0, 1)
+            _ = free(n1)
+            ret null
+          #skip_free:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define latent_use_after_free(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = conditional_free2(n0, n1)
+            store n1 <- 42:int
+            jmp clean_up, done
+          #clean_up:
+            prune __sil_eq(n0, 0)
+            _ = free(n1)
+            ret null
+          #done:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            ret null
+        }
+
+        define manifest_use_after_free(x: *int) : void {
+          #entry:
+            n0:*int = load &x
+            _ = latent_use_after_free(1, n0)
+            ret null
+        }
+    "#,
+    );
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    for name in [
+        "conditional_free2",
+        "latent_use_after_free",
+        "manifest_use_after_free",
+    ] {
+        let summary = store
+            .to_vec()
+            .into_iter()
+            .find(|(pname, _)| format!("{pname}") == name)
+            .map(|(_, summary)| summary)
+            .unwrap_or_else(|| panic!("summary for {name} should exist"));
+        let issues: Vec<_> = summary
+            .diagnostics
+            .iter()
+            .map(|diag| diag.get_issue_type_id())
+            .collect();
+        let kinds: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.kind))
+            .collect();
+        let conditions: Vec<_> = summary
+            .pre_posts
+            .iter()
+            .map(|pp| format!("{:?}", pp.post.path_condition.conditions()))
+            .collect();
+        eprintln!(
+            "{name}: issues={issues:?} kinds={kinds:?} conditions={conditions:?} noreturn={}",
+            summary.is_noreturn,
+        );
+    }
 }
 
 #[test]
