@@ -162,6 +162,11 @@ Current OpenSSL status from the latest direct-Textual spot-check:
   `9837` summed post heap nodes, but the retained invariant map already held
   `2995` disjunct snapshots with about `975641` post heap nodes,
   `1313138` edges, and `2464294` attr entries
+- the matching narrowed OCaml debug run on the same shared capture completed
+  in `1m31s` and ended with only `152` retained post snapshots across
+  `178` CFG nodes, about `98727` post heap nodes, `53889` post heap edges,
+  and `39663` post attr entries; no final OCaml node retained more than
+  `1` disjunct
 - the OCaml-style recency experiment is available for direct probes
   (`--pulse-recency-limit 32`), but the focused `whirlpool_block` run stayed
   essentially identical and default-enabling that cap would reintroduce the
@@ -172,7 +177,8 @@ Current OpenSSL status from the latest direct-Textual spot-check:
   cap, and hottest node `33:24`
 - current interpretation: the old immediate macOS `-j > 1` startup failure is
   no longer the main issue; the blocker is retained invariant-map growth plus
-  abnormal termination in whole-program runs, the remaining heavy local Pulse
+  semantic-convergence gaps in retained loop-head states, abnormal
+  termination in whole-program runs, the remaining heavy local Pulse
   procedures, and exported-Textual proc-identity loss for some duplicate C
   names
 

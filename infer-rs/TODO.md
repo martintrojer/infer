@@ -147,15 +147,19 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   `-j 8` once the exit cause is clearer, and treat `-j 1` as the only current
   publishable apples-to-apples Rust timing until merged `-j > 1` runs are
   stable.
-- Compare OCaml logical per-node retained state against Rust on
-  `whirlpool_block` and another hot OpenSSL procedure using the new
-  `live-fixpoint` heartbeat plus OCaml traces / summary dumps.
-- If the logical shape is similar, focus on Rust invariant-map storage /
-  sharing cost rather than new semantic caps:
-  persistent sharing across heap / attrs / formula, cheaper retained summary
-  snapshots, and less cloning around stored node states.
-- If the logical shape is larger in Rust, investigate semantic redundancy in
-  the retained node snapshots before trying any new cap or workaround.
+- Deepen the new retained-state OCaml comparison on `whirlpool_block`.
+  We now know the logical shape is larger in Rust, not just more expensive to
+  store: the narrowed OCaml run finishes with `152` final post snapshots
+  (`98727` post heap nodes / `53889` edges / `39663` attr entries) while Rust
+  reaches `2995` retained snapshots (`975641` post heap nodes /
+  `1313138` edges / `2464294` attr entries) on the same hotspot.
+- Next semantic probe: inspect loop heads `3` and `17` on `whirlpool_block`
+  and compare Rust `ExecutionDomain::leq` / `state_cmp::alpha_equivalent`
+  against OCaml `PulseExecutionDomain.leq` / `PulseAbductiveDomain.leq`,
+  especially attribute normalization and history-sensitive equality.
+- Only after the retained logical shape is closer to OCaml should we spend
+  more time on storage-sharing work such as cheaper invariant-map snapshots or
+  more persistent sharing across heap / attrs / formula state.
 - Keep the new `pulse-recency-limit` flag experimental only. It is useful for
   OCaml cross-checks, but it is not the current fix direction for OpenSSL.
 - Keep profiling the remaining heavy procedures after the

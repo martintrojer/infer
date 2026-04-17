@@ -37,6 +37,13 @@
   the frontier was still only about `9837` summed post heap nodes while the
   invariant map had grown to `2995` retained snapshots, about `975641` post
   heap nodes, `1313138` post heap edges, and `2464294` post attr entries.
+- The matching OCaml `whirlpool_block` debug run on the same shared capture
+  completed in `1m31s` and retained far less final state:
+  `152` post snapshots across `178` CFG nodes, about `98727` post heap nodes,
+  `53889` post heap edges, `13698` attr addresses, and `39663` attr entries.
+  No final OCaml node retained more than `1` disjunct. That means the
+  remaining Rust-vs-OCaml OpenSSL gap is not just retained-state copy cost:
+  Rust is still keeping far more logical post states on this hotspot.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`
@@ -50,9 +57,10 @@
   longer enough to make the whole benchmark usable.
 - We still do not claim a clean full-program apples-to-apples OCaml-vs-Rust
   timing number. The current blockers are retained invariant-map storage /
-  sharing cost in hot procedures, merged-run abnormal termination, remaining
-  heavy local Pulse procedures, and the exported-Textual proc-identity loss
-  for some duplicate C names.
+  sharing cost in hot procedures, semantic-convergence gaps in retained
+  loop-head states, merged-run abnormal termination, remaining heavy local
+  Pulse procedures, and the exported-Textual proc-identity loss for some
+  duplicate C names.
 
 Recent correctness / robustness fixes:
 - Latent UAF summary parity tightened again:

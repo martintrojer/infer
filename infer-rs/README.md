@@ -35,6 +35,11 @@ OpenSSL benchmark status on this host:
   invariant map already held `2995` disjunct snapshots and about `975641`
   post heap nodes, `1313138` edges, and `2464294` attr entries across CFG
   nodes
+- the matching OCaml `whirlpool_block` debug run on the same shared capture
+  finished in `1m31s` and retained far less final post state:
+  `152` post snapshots across `178` CFG nodes, about `98727` post heap nodes,
+  `53889` edges, and `39663` attr entries, with no final node retaining more
+  than `1` disjunct
 - `--pulse-recency-limit 32` is now available as an opt-in OCaml-style
   experiment, but it is intentionally not the default: default-enabling it
   reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad` false
@@ -45,9 +50,9 @@ OpenSSL benchmark status on this host:
   `equal_fast` / semantic-`leq` split
 - there is still no final apples-to-apples whole-program timing claim: the
   remaining gap is retained invariant-map storage across hot procedures,
-  remaining local Pulse cost, abnormal termination in merged runs, and
-  exported-Textual proc-identity loss for some duplicate C names, not
-  merge/callgraph setup
+  remaining local Pulse cost, abnormal termination in merged runs,
+  semantic-convergence gaps in retained loop-head states, and exported-Textual
+  proc-identity loss for some duplicate C names, not merge/callgraph setup
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an
@@ -65,6 +70,14 @@ handles instead of cloning large summaries per caller. That helps avoid some
 copy cost, but the new `live-fixpoint` heartbeat shows it is not the main
 OpenSSL memory fix: on `whirlpool_block`, retained per-node invariant-map state
 is still the dominant multiplier.
+
+The OCaml `whirlpool_block` comparison sharpens that further: the remaining
+OpenSSL gap is not just physical storage overhead. OCaml's final retained node
+states collapse to at most one disjunct per node on this hotspot, while Rust is
+still retaining thousands of post snapshots during the same procedure. The next
+fix direction is therefore semantic convergence in retained loop-head states
+(`leq` / alpha-equivalence / attribute normalization) before any new cap or
+storage workaround.
 
 A newer OCaml-backed latent-summary fix also preserves imported arithmetic guards through summary
 recording and export, including reverse-pivoted linear equalities such as `neg_x = -x` that the
@@ -261,6 +274,7 @@ after textual export, because it excludes capture/export overhead.
 | `--infer-bin PATH` | Path to infer binary (default: auto-detect) |
 | `-q` / `--quiet` | Suppress progress output |
 | `--pulse-max-disjuncts N` | Max disjuncts per program point (default: 20) |
+| `--pulse-widen-threshold N` | Loop-head visit threshold before widening (default: 3) |
 | `--pulse-recency-limit N` | OCaml-style heap-edge recency cap experiment (unset by default in Rust) |
 | `--pulse-intraprocedural-only` | Disable inter-procedural analysis |
 | `--max-widens N` | Max widenings before fixpoint gives up (default: 10000) |
@@ -284,6 +298,8 @@ after textual export, because it excludes capture/export overhead.
 `pulse-model-return-{nonnull,this,first-arg,nullable}`, `pulse-model-skip-pattern`, and
 `pulse-model-unknown-pure` are compatible with OCaml Infer's shared `.inferconfig` files,
 including the `Str.regexp` syntax used in test suites such as `\\(my\\|a\\)_malloc`.
+`pulse-max-disjuncts`, `pulse-widen-threshold`, and `max-widens` are also
+compatible with shared `.inferconfig` and the matching CLI flags.
 `pulse-force-continue` is also compatible with shared `.inferconfig`; the Rust default remains
 `true` to match OCaml.
 `pulse-recency-limit` is also compatible with shared `.inferconfig`, but Rust
