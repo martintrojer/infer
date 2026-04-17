@@ -163,12 +163,20 @@ impl std::fmt::Display for DisjunctiveStateStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FixpointTopNode {
+    node: NodeId,
+    disjuncts: usize,
+    visit_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FixpointStats {
     nodes: usize,
     revisited_nodes: usize,
     max_visit_count: usize,
     max_node_disjuncts: usize,
     states: DisjunctiveStateStats,
+    top_nodes: Vec<FixpointTopNode>,
 }
 
 impl FixpointStats {
@@ -178,18 +186,44 @@ impl FixpointStats {
             ..Self::default()
         };
 
-        for state in inv_map.values() {
+        for (node_id, state) in inv_map {
             if state.visit_count > 1 {
                 stats.revisited_nodes += 1;
             }
             stats.max_visit_count = stats.max_visit_count.max(state.visit_count);
-            stats.max_node_disjuncts = stats.max_node_disjuncts.max(state.post.disjuncts.len());
+            let disjuncts = state.post.disjuncts.len();
+            stats.max_node_disjuncts = stats.max_node_disjuncts.max(disjuncts);
             stats
                 .states
                 .add_assign(DisjunctiveStateStats::from_domain(&state.post));
+            if disjuncts > 1 {
+                stats.top_nodes.push(FixpointTopNode {
+                    node: *node_id,
+                    disjuncts,
+                    visit_count: state.visit_count,
+                });
+            }
         }
+        stats.top_nodes.sort_by(|lhs, rhs| {
+            rhs.disjuncts
+                .cmp(&lhs.disjuncts)
+                .then_with(|| rhs.visit_count.cmp(&lhs.visit_count))
+                .then_with(|| lhs.node.cmp(&rhs.node))
+        });
+        stats.top_nodes.truncate(8);
 
         stats
+    }
+
+    fn top_nodes_summary(&self) -> String {
+        if self.top_nodes.is_empty() {
+            return "none".to_string();
+        }
+        self.top_nodes
+            .iter()
+            .map(|node| format!("{}:{}d:{}v", node.node, node.disjuncts, node.visit_count))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -335,6 +369,11 @@ impl ProcProgress {
                 fixpoint_stats.max_visit_count,
                 fixpoint_stats.max_node_disjuncts,
                 fixpoint_stats.states,
+            );
+            log::info!(
+                target: "ondemand",
+                "[pulse-progress] proc={proc_name} fixpoint-top-nodes: {}",
+                fixpoint_stats.top_nodes_summary(),
             );
         }
     }
@@ -2207,6 +2246,79 @@ mod tests {
             0,
             "revisiting a node with no new pre disjuncts should not re-execute its instructions"
         );
+    }
+
+    #[test]
+    fn test_fixpoint_stats_reports_top_nodes_by_disjuncts_then_visits() {
+        let pname = Procname::c_from_string("fixpoint_top_nodes");
+        let pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        let exec =
+            ExecutionDomain::ContinueProgram(crate::abductive::AbductiveDomain::mk_initial(&pdesc));
+        let mk_domain = |count| DisjunctiveDomain {
+            disjuncts: vec![exec.clone(); count],
+            max_disjuncts: 20,
+            max_widen_iters: 3,
+            had_dropped_disjuncts: false,
+        };
+
+        let mut inv_map = interp::InvariantMap::new();
+        inv_map.insert(
+            10,
+            interp::State {
+                pre: mk_domain(1),
+                post: mk_domain(4),
+                visit_count: 2,
+            },
+        );
+        inv_map.insert(
+            3,
+            interp::State {
+                pre: mk_domain(1),
+                post: mk_domain(4),
+                visit_count: 4,
+            },
+        );
+        inv_map.insert(
+            7,
+            interp::State {
+                pre: mk_domain(1),
+                post: mk_domain(3),
+                visit_count: 3,
+            },
+        );
+        inv_map.insert(
+            1,
+            interp::State {
+                pre: mk_domain(1),
+                post: mk_domain(1),
+                visit_count: 5,
+            },
+        );
+
+        let stats = FixpointStats::from_inv_map(&inv_map);
+
+        assert_eq!(stats.max_node_disjuncts, 4);
+        assert_eq!(
+            stats.top_nodes,
+            vec![
+                FixpointTopNode {
+                    node: 3,
+                    disjuncts: 4,
+                    visit_count: 4,
+                },
+                FixpointTopNode {
+                    node: 10,
+                    disjuncts: 4,
+                    visit_count: 2,
+                },
+                FixpointTopNode {
+                    node: 7,
+                    disjuncts: 3,
+                    visit_count: 3,
+                },
+            ]
+        );
+        assert_eq!(stats.top_nodes_summary(), "3:4d:4v, 10:4d:2v, 7:3d:3v");
     }
 
     /// Build: void f() { int *p = NULL; *p = 42; }

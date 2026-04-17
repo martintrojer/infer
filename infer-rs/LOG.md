@@ -43,7 +43,18 @@ changes, and move finished results to durable docs/tests/commits.
     at `40.6s`, retained `495` snapshots;
     at `50.8s`, retained `520` snapshots;
     at `61.0s`, retained `544` snapshots;
-    at `71.1s`, retained `566` snapshots
+    at `71.1s`, retained `566` snapshots;
+    final current run completes in `1m52s` with `611` retained snapshots
+    across `180` nodes, `max_visit_count=4`, `max_node_disjuncts=4`,
+    `exit_disjuncts=2`, and `pre_posts=2`
+  - new debug-only fixpoint tail logger points at the retained hot block:
+    `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v,
+    26:4d:4v, 27:4d:4v`
+  - OCaml HTML on the same node IDs shows the remaining gap is not incoming
+    frontier width alone:
+    node `18` last `PRE STATE=1`, last `Got 1`;
+    nodes `20/21/24/25/26/27` last `PRE STATE=7`, last `Got 1`;
+    node `22` last `PRE STATE=7`, last `Got 0`
 - Active conclusion:
   - the dominant OpenSSL gap was not just storage sharing and not just
     `state_cmp`; Rust was re-executing already-known pre disjuncts on hot WTO
@@ -54,6 +65,11 @@ changes, and move finished results to durable docs/tests/commits.
   - Rust is now much closer to OCaml on `whirlpool_block`, but the remaining
     semantic gap is the smaller set of loop-head states that still retain up
     to `4` disjuncts instead of OCaml's final `0/1`
+  - the new node scrape sharpens that further: OCaml reaches the same hot
+    block with up to `7` incoming disjuncts, but collapses those nodes back to
+    `1` or `0`; Rust still keeps `4`-way retained posts there, so the next
+    probe is post-node collapse / dedup on that block rather than frontier
+    breadth or recency
 - Useful paths / commands:
   - Rust hotspot file:
     `/tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
@@ -87,13 +103,12 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Next Probes
 
-- Run the isolated `whirlpool_block` probe longer to completion after the WTO
-  `exec_node` fix and record the final retained shape against OCaml's `152`
-  snapshots.
-- Compare the remaining retained loop-head states that still reach
-  `max_node_disjuncts=4` (likely nodes `3` and `17`) against the OCaml HTML
-  and Rust traces to identify the first semantic difference that still
-  prevents collapse.
+- Compare the retained Rust post states on nodes
+  `18, 20, 21, 22, 24, 25, 26, 27` against the OCaml HTML / Rust debug trace
+  and identify the first post-node semantic difference that prevents collapse
+  from `4` to OCaml's `1/0`.
+- Use the new debug-only `fixpoint-top-nodes` logger as the entry point before
+  adding any broader instrumentation or revisiting storage work.
 - After that narrower comparison is understood, rerun the shared OpenSSL
   corpus at `-j 1` before spending more time on whole-program `-j 4` / `-j 8`
   runs or storage/persistence work.
