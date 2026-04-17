@@ -8,33 +8,52 @@ changes, and move finished results to durable docs/tests/commits.
 
 - Active benchmark / repro dir:
   `/tmp/infer-rs-openssl-20260417-095315-rebase-j`
-- Key result from the latest OpenSSL work:
+- Latest validated OpenSSL finding:
+  - `state_cmp` now mirrors OCaml `PulseAbductiveDomain.leq` more closely:
+    compare only the stack-reachable heap / attr graph, ignore disconnected
+    retained garbage, and ignore Rust-only helper caches such as
+    `must_be_valid` and `need_dynamic_type_specialization`
+  - that comparator cleanup was semantically correct but did not materially
+    move the `whirlpool_block` hotspot by itself
+  - the large reduction came from a new `TransferFunctions::exec_node(...)`
+    hook plus a Pulse override mirroring OCaml
+    `AbstractInterpreter.MakeDisjunctiveTransferFunctions.exec_node_instrs`:
+    on WTO revisits, re-execute only pre disjuncts that are new w.r.t. the
+    retained node pre-state and join those results into the retained post
   - the old immediate macOS `-j > 1` startup failure is no longer the main
-    blocker
-  - whole-program direct-`.sil` runs still die from memory growth /
+    blocker; whole-program direct-`.sil` runs still die from memory growth /
     abnormal termination before we have a publishable Rust timing
-  - `ssl_set_client_disabled` still proves the `equal_fast` split was real:
-    about `1m09s` -> about `5.2s`, same `173` transfer steps / `20`
+  - `ssl_set_client_disabled` still proves the earlier `equal_fast` split was
+    real: about `1m09s` -> about `5.2s`, same `173` transfer steps / `20`
     disjuncts / hottest node `33:24`
 - Current strongest hotspot evidence on `whirlpool_block`:
-  - Rust frontier at `36.1s`: `20` live disjuncts, about `9837` summed post
-    heap nodes
-  - Rust retained invariant map at `36.1s`: `2995` post snapshots,
-    about `975641` post heap nodes, `1313138` post heap edges,
-    `2464294` post attr entries
-  - OCaml final retained state on the same narrowed proc:
+  - OCaml final retained state on the narrowed proc:
     `152` post snapshots across `178` CFG nodes, about `98727` post heap
     nodes, `53889` post heap edges, `13698` attr addrs, `39663` attr entries,
     and no final node with more than `1` disjunct
+  - old Rust baseline before the WTO `exec_node` fix:
+    at `36.1s`, frontier `20` disjuncts and retained invariant map
+    `2995` post snapshots, about `975641` post heap nodes,
+    `1313138` post heap edges, `2464294` post attr entries
+  - current Rust after the WTO `exec_node` fix:
+    at `10.1s`, frontier `1` disjunct, retained `366` snapshots,
+    `max_node_disjuncts=3`;
+    at `30.3s`, retained `466` snapshots, `max_visit_count=4`,
+    `max_node_disjuncts=4`;
+    at `40.6s`, retained `495` snapshots;
+    at `50.8s`, retained `520` snapshots;
+    at `61.0s`, retained `544` snapshots;
+    at `71.1s`, retained `566` snapshots
 - Active conclusion:
-  - this is not just a storage-sharing problem; Rust is retaining many more
-    logical post states than OCaml on `whirlpool_block`
-  - recency is not the dominant answer: `--pulse-recency-limit 32` stayed
-    essentially unchanged on `whirlpool_block`, and default-enabling it
+  - the dominant OpenSSL gap was not just storage sharing and not just
+    `state_cmp`; Rust was re-executing already-known pre disjuncts on hot WTO
+    revisits
+  - recency is still not the dominant answer: `--pulse-recency-limit 32`
+    stayed essentially unchanged on `whirlpool_block`, and default-enabling it
     reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad`
-  - current suspect is semantic convergence at loop heads:
-    `ExecutionDomain::leq` / `state_cmp::alpha_equivalent` and attribute /
-    history normalization are likely still stricter than OCaml
+  - Rust is now much closer to OCaml on `whirlpool_block`, but the remaining
+    semantic gap is the smaller set of loop-head states that still retain up
+    to `4` disjuncts instead of OCaml's final `0/1`
 - Useful paths / commands:
   - Rust hotspot file:
     `/tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
@@ -43,13 +62,14 @@ changes, and move finished results to durable docs/tests/commits.
   - narrowed OCaml repro:
     `printf 'openssl-1.0.2d/crypto/whrlpool/wp_block.c\n' > /tmp/infer-rs-openssl-wp_block.changed`
     `infer analyze --pulse-only --debug --results-dir infer-out -j 1 --changed-files-index /tmp/infer-rs-openssl-wp_block.changed --procedures-filter whirlpool_block`
-- Last validated code checkpoint:
-  - commit `7536cda6e8` (`perf(pulse): trace fixpoint retention`)
-  - validated with:
-    `make check` (earlier clean checkpoint),
-    `cargo test -p pulse test_size_stats_counts_key_state_surfaces`,
-    `cargo test -p ondemand test_get_arc_shares_cached_summary`,
-    `cargo build -p infer-rs --release`
+  - current narrowed Rust repro:
+    `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block /tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
+- Current validated working-tree checkpoint:
+  - `cargo test -p pulse exec_node_skips_reexecuting_old_pre_disjuncts -- --nocapture`
+  - `cargo test -p pulse state_cmp -- --nocapture`
+  - `cargo test -p absint --lib -- --nocapture`
+  - `cargo build -p infer-rs --release`
+  - `cargo fmt --check`
 
 ## Current Correctness Checkpoint
 
@@ -67,12 +87,13 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Next Probes
 
-- Compare Rust-retained states at loop heads `3` and `17` against the OCaml
-  HTML and identify the first canonicalized difference that prevents collapse.
-- Audit `crates/pulse/src/state_cmp.rs` against OCaml
-  `PulseAbductiveDomain.leq` / graph isomorphism, with special attention to:
-  `WrittenTo`, `MustBeValid`, `MustBeInitialized`, invalidation history, and
-  any other iteration-sensitive attrs.
-- Only after semantic retention is closer to OCaml should we spend more time
-  on storage/persistence work or new whole-program `-j 4` / `-j 8` benchmark
-  runs.
+- Run the isolated `whirlpool_block` probe longer to completion after the WTO
+  `exec_node` fix and record the final retained shape against OCaml's `152`
+  snapshots.
+- Compare the remaining retained loop-head states that still reach
+  `max_node_disjuncts=4` (likely nodes `3` and `17`) against the OCaml HTML
+  and Rust traces to identify the first semantic difference that still
+  prevents collapse.
+- After that narrower comparison is understood, rerun the shared OpenSSL
+  corpus at `-j 1` before spending more time on whole-program `-j 4` / `-j 8`
+  runs or storage/persistence work.

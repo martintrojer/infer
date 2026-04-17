@@ -29,12 +29,25 @@ OpenSSL benchmark status on this host:
   interprocedural runs on this benchmark:
   `-j 8` terminated abnormally after `190.81s` at about `24.5 GB` max RSS, and
   `-j 4` terminated abnormally after `690.77s` at about `33.2 GB` max RSS
-- focused `whirlpool_block` tracing shows the dominant multiplier is retained
-  fixpoint state, not just the current frontier: at `36.1s` the live frontier
-  still held only about `9837` summed post heap nodes, while the retained
-  invariant map already held `2995` disjunct snapshots and about `975641`
-  post heap nodes, `1313138` edges, and `2464294` attr entries across CFG
-  nodes
+- focused `whirlpool_block` tracing first showed that the dominant multiplier
+  is retained fixpoint state, not just the current frontier: the old Rust
+  baseline reached `2995` retained post snapshots at `36.1s` while the live
+  frontier still held only `20` disjuncts
+- `state_cmp` now mirrors OCaml `PulseAbductiveDomain.leq` more closely by
+  comparing only the stack-reachable heap / attr graph and ignoring Rust-only
+  helper caches such as `must_be_valid`, with focused regression tests for the
+  reachable-vs-disconnected split
+- that `state_cmp` cleanup was semantically correct but did not materially move
+  the `whirlpool_block` hotspot by itself
+- the large OpenSSL reduction came from matching OCaml's WTO revisit
+  semantics: a new `TransferFunctions::exec_node(...)` hook lets Pulse mirror
+  `AbstractInterpreter.MakeDisjunctiveTransferFunctions.exec_node_instrs`, so
+  revisits re-execute only pre disjuncts that are new versus the retained node
+  pre and join those results into the retained post
+- on `whirlpool_block`, the new WTO parity path cut the traced Rust retained
+  state from `2995` snapshots at `36.1s` to `366` at `10.1s`, `466` at
+  `30.3s`, and `566` at `71.1s`; at `10.1s` the live frontier was already down
+  to `1` disjunct and the retained max per node was `3`
 - the matching OCaml `whirlpool_block` debug run on the same shared capture
   finished in `1m31s` and retained far less final post state:
   `152` post snapshots across `178` CFG nodes, about `98727` post heap nodes,
@@ -49,10 +62,11 @@ OpenSSL benchmark status on this host:
   `1m09s` to about `5.2s` after restoring the OCaml-style
   `equal_fast` / semantic-`leq` split
 - there is still no final apples-to-apples whole-program timing claim: the
-  remaining gap is retained invariant-map storage across hot procedures,
-  remaining local Pulse cost, abnormal termination in merged runs,
-  semantic-convergence gaps in retained loop-head states, and exported-Textual
-  proc-identity loss for some duplicate C names, not merge/callgraph setup
+  remaining gap is the smaller residual loop-head convergence difference on
+  `whirlpool_block` (Rust still above OCaml's `152`-snapshot final shape),
+  retained invariant-map storage across hot procedures, remaining local Pulse
+  cost, abnormal termination in merged runs, and exported-Textual proc-identity
+  loss for some duplicate C names, not merge/callgraph setup
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an
@@ -71,13 +85,15 @@ copy cost, but the new `live-fixpoint` heartbeat shows it is not the main
 OpenSSL memory fix: on `whirlpool_block`, retained per-node invariant-map state
 is still the dominant multiplier.
 
-The OCaml `whirlpool_block` comparison sharpens that further: the remaining
-OpenSSL gap is not just physical storage overhead. OCaml's final retained node
-states collapse to at most one disjunct per node on this hotspot, while Rust is
-still retaining thousands of post snapshots during the same procedure. The next
-fix direction is therefore semantic convergence in retained loop-head states
-(`leq` / alpha-equivalence / attribute normalization) before any new cap or
-storage workaround.
+The newer `state_cmp` / WTO revisit work sharpens that further. `state_cmp`
+now aligns with OCaml on stack-reachable graph comparison, but the main OpenSSL
+win came from the new `exec_node(...)` hook: Pulse now mirrors OCaml
+`exec_node_instrs` and stops re-executing already-known pre disjuncts on WTO
+revisits. On `whirlpool_block`, that drops retained snapshots from `2995` at
+`36.1s` in the old Rust trace to `366` at `10.1s` and `566` at `71.1s` in the
+new trace. Rust is still above OCaml's final `152`, so the next fix direction
+is the smaller residual loop-head convergence gap on the nodes that still
+retain up to `4` disjuncts, not a new workaround cap.
 
 A newer OCaml-backed latent-summary fix also preserves imported arithmetic guards through summary
 recording and export, including reverse-pivoted linear equalities such as `neg_x = -x` that the
@@ -347,6 +363,11 @@ cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ig
 ```
 
 `make check-full` exercises the older `capture --dump-textual` path as a secondary regression check.
+`make check` / `make check-full` intentionally run the cargo test phase with
+`RUST_TEST_THREADS=1`: the Pulse `end_to_end` integration binary still shares
+global analysis state, and cargo's default parallel test scheduling can
+interleave whole end-to-end runs and deadlock that harness even though the
+analysis logic itself is green.
 The published compliance numbers in [docs/STATUS.md](docs/STATUS.md) come from the
 `--store-textual` + `--export-textual` sweep because that matches the CLI pipeline.
 That ignored sweep now invokes `infer-rs` once per exported `.sil` from the originating source

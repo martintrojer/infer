@@ -194,8 +194,13 @@ Equivalently, the three steps individually:
 ```bash
 cargo fmt --check        # formatting
 cargo clippy -- -D warnings  # lints (warnings are errors)
-cargo test               # unit + integration tests (no external deps)
+RUST_TEST_THREADS=1 cargo test  # unit + integration tests (no external deps)
 ```
+
+`make check` / `make check-full` intentionally run cargo tests with
+`RUST_TEST_THREADS=1`: the Pulse `end_to_end` integration binary still shares
+global analysis state, and cargo's default parallel test scheduling can
+interleave whole end-to-end runs and deadlock the harness.
 
 Fix clippy warnings before committing -- do not suppress them with `#[allow(...)]` unless there is a clear justification documented in a comment.
 
@@ -299,7 +304,8 @@ placeholder behavior.
 ## Commits
 
 - Keep commits focused: one logical change per commit.
-- Run `cargo fmt && cargo clippy -- -D warnings && cargo test` before every commit.
+- Run `cargo fmt && cargo clippy -- -D warnings && RUST_TEST_THREADS=1 cargo test`
+  before every commit.
 - Use the `infer-rs` branch for all work.
 
 ## Rebasing onto updated main
@@ -340,7 +346,8 @@ Before rebasing, make adaptation commits on the `infer-rs` branch:
 - Update Rust types to match changed OCaml types
 - Update tests if OCaml test files we reference have changed
 - Add new test coverage for new OCaml test files if applicable
-- Ensure `cargo fmt --check && cargo clippy -- -D warnings && cargo test` passes
+- Ensure `cargo fmt --check && cargo clippy -- -D warnings && RUST_TEST_THREADS=1 cargo test`
+  passes
 
 Commit these changes with a message like: `Adapt to main changes: <summary of what changed>`
 
@@ -354,5 +361,6 @@ If conflicts arise:
 - Conflicts in `infer/` (OCaml files): accept theirs — main is the source of truth for OCaml
 - Conflicts in `infer-rs/` (Rust files): resolve manually, keeping our adaptations
 - After resolving each conflict: `git add <files> && git rebase --continue`
-- Run `cargo fmt && cargo clippy -- -D warnings && cargo test` after rebase completes
+- Run `cargo fmt && cargo clippy -- -D warnings && RUST_TEST_THREADS=1 cargo test`
+  after rebase completes
 - If tests fail post-rebase, fix and amend the relevant commit or add a fixup commit

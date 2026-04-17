@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use absint::disjunctive::DisjunctiveDomain;
+use absint::domain::{AbstractDomain, Comparable};
 use absint::interp;
 use absint::transfer::TransferFunctions;
 use diagnostics::issue::IssueLog;
@@ -789,6 +790,59 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         );
 
         result
+    }
+
+    fn exec_node(
+        &self,
+        old_state: Option<&interp::State<Self::Domain>>,
+        pre: &Self::Domain,
+        data: &Self::AnalysisData,
+        node_id: NodeId,
+        pdesc: &Procdesc,
+        reverse_instrs: bool,
+    ) -> Self::Domain {
+        let node = match pdesc.get_node(node_id) {
+            Some(node) => node,
+            None => return pre.clone(),
+        };
+
+        // Cross-ref: OCaml
+        // `AbstractInterpreter.MakeDisjunctiveTransferFunctions.exec_node_instrs`
+        // re-executes only the pre disjuncts that are new w.r.t. the retained
+        // node pre-state, then joins those results into the retained post.
+        // Re-executing the whole `new_pre` on every WTO revisit can keep
+        // regenerating fresh-but-equivalent post disjuncts on hot loop heads.
+        let mut current_post = old_state
+            .map(|state| state.post.clone())
+            .unwrap_or_else(|| DisjunctiveDomain::empty(pre.max_disjuncts, pre.max_widen_iters));
+        current_post.had_dropped_disjuncts |= pre.had_dropped_disjuncts;
+
+        let mut input = pre.clone();
+        if let Some(old_state) = old_state {
+            input.disjuncts.retain(|disjunct| {
+                !old_state
+                    .pre
+                    .disjuncts
+                    .iter()
+                    .any(|old| disjunct.equal_fast(old))
+            });
+            if input.disjuncts.is_empty() {
+                return current_post;
+            }
+        }
+
+        let mut state = input;
+        if reverse_instrs {
+            for (idx, instr) in node.instrs.iter().enumerate().rev() {
+                state = self.exec_instr(&state, data, node_id, idx, instr);
+            }
+        } else {
+            for (idx, instr) in node.instrs.iter().enumerate() {
+                state = self.exec_instr(&state, data, node_id, idx, instr);
+            }
+        }
+
+        current_post.join(&state)
     }
 
     fn observe_fixpoint(&self, node_id: NodeId, inv_map: &interp::InvariantMap<Self::Domain>) {
@@ -2106,6 +2160,52 @@ mod tests {
         assert!(
             result.had_dropped_disjuncts,
             "instruction execution should preserve earlier dropped-disjunct metadata"
+        );
+    }
+
+    #[test]
+    fn test_exec_node_skips_reexecuting_old_pre_disjuncts() {
+        let pname = Procname::c_from_string("skip_old_pre_disjuncts");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Load {
+                id: Ident::create_normal(IdentName::from_string("n"), 0),
+                e: Exp::Const(Const::Cint(IntLit::zero())),
+                typ: Typ::void(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        let callee_summaries: HashMap<Procname, PulseSummary> = HashMap::new();
+        let tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            proc_name: format!("{pname}"),
+            spec_requests: RefCell::new(vec![]),
+            progress: RefCell::new(ProcProgress::new()),
+        };
+        let state = DisjunctiveDomain {
+            disjuncts: vec![ExecutionDomain::ContinueProgram(
+                crate::abductive::AbductiveDomain::mk_initial(&pdesc),
+            )],
+            max_disjuncts: 20,
+            max_widen_iters: 3,
+            had_dropped_disjuncts: false,
+        };
+        let old_state = interp::State {
+            pre: state.clone(),
+            post: state.clone(),
+            visit_count: 1,
+        };
+
+        let result = tf.exec_node(Some(&old_state), &state, &(), node, &pdesc, false);
+
+        assert_eq!(result, old_state.post);
+        assert_eq!(
+            tf.progress.borrow().exec_steps,
+            0,
+            "revisiting a node with no new pre disjuncts should not re-execute its instructions"
         );
     }
 

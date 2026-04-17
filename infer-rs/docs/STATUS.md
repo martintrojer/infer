@@ -29,21 +29,22 @@
   about `33.2 GB` max RSS. Under `/usr/bin/time`, both runs ended as
   `command terminated abnormally` plus `signal: Invalid argument`, so the
   exact kill mechanism still needs a rerun without `time`.
-- Focused traced `whirlpool_block` runs now show the main memory multiplier
-  directly. At `10.3s`, the live frontier still held only `20` disjuncts and
-  about `7820` summed post heap nodes, but the new `live-fixpoint` heartbeat
-  already showed `164` retained CFG nodes, `2180` disjunct snapshots, and
-  about `545860` summed post heap nodes across the invariant map. At `36.1s`,
-  the frontier was still only about `9837` summed post heap nodes while the
-  invariant map had grown to `2995` retained snapshots, about `975641` post
-  heap nodes, `1313138` post heap edges, and `2464294` post attr entries.
+- Focused traced `whirlpool_block` runs still show retained fixpoint state as
+  the main memory multiplier, but the story is now narrower. The old Rust
+  baseline reached `2995` retained post snapshots at `36.1s` while the live
+  frontier still held only `20` disjuncts. After the latest OCaml-backed WTO
+  revisit fix, the same narrowed probe reached `366` retained snapshots at
+  `10.1s`, `466` at `30.3s`, `495` at `40.6s`, `520` at `50.8s`, `544` at
+  `61.0s`, and `566` at `71.1s`; the live frontier was already down to `1`
+  disjunct at `10.1s`, and the retained max per node was `3` then `4`.
 - The matching OCaml `whirlpool_block` debug run on the same shared capture
   completed in `1m31s` and retained far less final state:
   `152` post snapshots across `178` CFG nodes, about `98727` post heap nodes,
   `53889` post heap edges, `13698` attr addresses, and `39663` attr entries.
-  No final OCaml node retained more than `1` disjunct. That means the
-  remaining Rust-vs-OCaml OpenSSL gap is not just retained-state copy cost:
-  Rust is still keeping far more logical post states on this hotspot.
+  No final OCaml node retained more than `1` disjunct. Rust is now much
+  closer than before, but it is still above the OCaml final shape and the
+  remaining gap is the smaller set of loop heads that still keep up to `4`
+  disjuncts.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`
@@ -57,12 +58,22 @@
   longer enough to make the whole benchmark usable.
 - We still do not claim a clean full-program apples-to-apples OCaml-vs-Rust
   timing number. The current blockers are retained invariant-map storage /
-  sharing cost in hot procedures, semantic-convergence gaps in retained
-  loop-head states, merged-run abnormal termination, remaining heavy local
-  Pulse procedures, and the exported-Textual proc-identity loss for some
-  duplicate C names.
+  sharing cost in hot procedures, the remaining residual loop-head
+  convergence gap on `whirlpool_block`, merged-run abnormal termination,
+  remaining heavy local Pulse procedures, and the exported-Textual
+  proc-identity loss for some duplicate C names.
 
 Recent correctness / robustness fixes:
+- Loop-head convergence now mirrors OCaml more closely on two fronts.
+  `state_cmp` / `PulseAbductiveDomain.leq` parity now compares only the
+  stack-reachable heap / attr graph and ignores Rust-only helper caches, and
+  `absint::TransferFunctions` gained `exec_node(...)` so Pulse can mirror
+  OCaml `AbstractInterpreter.MakeDisjunctiveTransferFunctions.exec_node_instrs`
+  on WTO revisits. Focused tests cover both surfaces. On `whirlpool_block`,
+  the comparator cleanup was correct but not the main movement; the large
+  retained-state drop came from the revisit fix that stops re-executing
+  already-known pre disjuncts and joins only genuinely new post states into
+  the retained node post.
 - Latent UAF summary parity tightened again:
   summary pre/post dedup now keys invalid-access-shaped entries by the real
   diagnostic issue type instead of hard-coding NPE, which preserves

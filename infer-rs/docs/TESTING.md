@@ -8,6 +8,12 @@
 | `make check-full` | + C dump-textual sweep + #[ignore] tests | ~60s |
 | `cargo test -p pulse --release --test end_to_end test_store_textual_sweep -- --ignored --nocapture` | authoritative Pulse compliance sweep via `--store-textual` + export | ~10s plus build |
 
+`make check` and `make check-full` intentionally run the cargo test phase with
+`RUST_TEST_THREADS=1`. The Pulse `end_to_end` integration binary still shares
+global analysis state, and cargo's default parallel test scheduling can
+interleave whole end-to-end runs and deadlock that harness even when the
+underlying analyzer logic is fine.
+
 ## Test Levels
 
 **Unit tests** -- inline `#[cfg(test)]` modules in each crate. Run with `cargo test`.
@@ -68,8 +74,17 @@ Current top-level OpenSSL status:
   traced `-j 8` run), so the old immediate startup failure is no longer the
   main blocker
 - focused `whirlpool_block` tracing now separates active frontier cost from
-  retained invariant-map cost, and the dominant multiplier is the retained
-  fixpoint map rather than the live frontier alone
+  retained invariant-map cost, and the dominant multiplier is still the
+  retained fixpoint map rather than the live frontier alone
+- the latest OCaml-backed loop-convergence pass did two separate things:
+  `state_cmp` now compares only stack-reachable heap / attr state and ignores
+  Rust-only helper caches, but the large movement came from WTO revisit parity
+  in `exec_node(...)`: revisits now re-execute only new pre disjuncts and join
+  them into the retained post
+- on isolated `whirlpool_block`, the old Rust probe reached `2995` retained
+  snapshots at `36.1s`; the current traced probe reaches `366` at `10.1s`,
+  `466` at `30.3s`, and `566` at `71.1s`, while the matching OCaml narrowed
+  run still finishes at `152`
 - whole-program Rust merged direct-`.sil` runs are still unstable on this
   benchmark: `-j 8` died at `190.81s` / `24.5 GB` RSS and `-j 4` died at
   `690.77s` / `33.2 GB` RSS
@@ -157,11 +172,11 @@ Current OpenSSL status from the latest direct-Textual spot-check:
   terminated abnormally at `190.81s` with about `24.5 GB` max RSS
 - a Rust direct `-j 4` run also terminated abnormally, later, at `690.77s`
   with about `33.2 GB` max RSS
-- the new `live-fixpoint` heartbeat shows why the benchmark is still hard:
-  on isolated `whirlpool_block`, the frontier at `36.1s` still held only about
-  `9837` summed post heap nodes, but the retained invariant map already held
-  `2995` disjunct snapshots with about `975641` post heap nodes,
-  `1313138` edges, and `2464294` attr entries
+- the current isolated `whirlpool_block` probe is the right narrow regression
+  slice: the old Rust baseline reached `2995` retained snapshots at `36.1s`,
+  while the current WTO-parity build reaches `366` at `10.1s`, `466` at
+  `30.3s`, `495` at `40.6s`, `520` at `50.8s`, `544` at `61.0s`, and `566`
+  at `71.1s`
 - the matching narrowed OCaml debug run on the same shared capture completed
   in `1m31s` and ended with only `152` retained post snapshots across
   `178` CFG nodes, about `98727` post heap nodes, `53889` post heap edges,
@@ -176,11 +191,20 @@ Current OpenSSL status from the latest direct-Textual spot-check:
   to about `5.2s` while keeping the same `173` transfer steps, `20`-disjunct
   cap, and hottest node `33:24`
 - current interpretation: the old immediate macOS `-j > 1` startup failure is
-  no longer the main issue; the blocker is retained invariant-map growth plus
-  semantic-convergence gaps in retained loop-head states, abnormal
+  no longer the main issue; the blocker is the remaining residual retained
+  loop-head convergence gap plus retained invariant-map growth, abnormal
   termination in whole-program runs, the remaining heavy local Pulse
   procedures, and exported-Textual proc-identity loss for some duplicate C
   names
+
+Useful narrowed probe command for the current hotspot:
+
+```bash
+RUST_LOG=warn,ondemand=info /Users/mtrojer/infer-rs/infer-rs/target/release/infer-rs \
+  --pulse-only --trace-ondemand -j 1 \
+  --procedures-filter whirlpool_block \
+  /tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil
+```
 
 Important macOS notes learned from the OpenSSL benchmark:
 

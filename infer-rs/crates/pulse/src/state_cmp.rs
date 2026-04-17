@@ -48,8 +48,6 @@ struct CanonicalState {
     pre_attrs: Vec<String>,
     post_attrs: Vec<String>,
     formula: Vec<String>,
-    must_be_valid: Vec<String>,
-    need_specialization: Vec<String>,
 }
 
 /// Compare two states modulo abstract-value renaming.
@@ -79,6 +77,12 @@ pub fn alpha_equivalent_value(
 }
 
 fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
+    // Cross-ref: OCaml `PulseAbductiveDomain.leq` compares the full formula
+    // plus the stack-reachable pre/post graph. It does not compare Rust-only
+    // helper caches such as `must_be_valid`, and it ignores disconnected
+    // retained heap/attr garbage.
+    let pre_reachable = reachable_from_stack(&state.pre.stack, &state.pre.heap);
+    let post_reachable = reachable_from_stack(&state.post.stack, &state.post.heap);
     let mut canon = Canonicalizer::default();
     canon.seed_from_stack(&state.pre.stack);
     canon.seed_from_stack(&state.post.stack);
@@ -95,23 +99,17 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
         }
     }
 
-    canon.assign_remaining(state);
+    canon.assign_remaining(state, &pre_reachable, &post_reachable);
 
     CanonicalizedState {
         state: CanonicalState {
             pre_stack: canonical_stack(&state.pre.stack, &canon),
             post_stack: canonical_stack(&state.post.stack, &canon),
-            pre_heap: canonical_heap(&state.pre.heap, &canon),
-            post_heap: canonical_heap(&state.post.heap, &canon),
-            pre_attrs: canonical_attrs(&state.pre.attrs, &canon),
-            post_attrs: canonical_attrs(&state.post.attrs, &canon),
+            pre_heap: canonical_heap(&state.pre.heap, &pre_reachable, &canon),
+            post_heap: canonical_heap(&state.post.heap, &post_reachable, &canon),
+            pre_attrs: canonical_attrs(&state.pre.attrs, &pre_reachable, &canon),
+            post_attrs: canonical_attrs(&state.post.attrs, &post_reachable, &canon),
             formula: canonical_formula(state, &canon),
-            must_be_valid: canonical_value_set(&state.must_be_valid, &canon, "must_be_valid"),
-            need_specialization: canonical_value_set(
-                &state.need_dynamic_type_specialization,
-                &canon,
-                "need_specialization",
-            ),
         },
         canon,
     }
@@ -314,16 +312,19 @@ impl Canonicalizer {
         }
     }
 
-    fn assign_remaining(&mut self, state: &AbductiveDomain) {
+    fn assign_remaining(
+        &mut self,
+        state: &AbductiveDomain,
+        pre_reachable: &std::collections::HashSet<AbstractValue>,
+        post_reachable: &std::collections::HashSet<AbstractValue>,
+    ) {
         self.assign_remaining_stack(&state.pre.stack);
         self.assign_remaining_stack(&state.post.stack);
-        self.assign_remaining_memory(&state.pre.heap);
-        self.assign_remaining_memory(&state.post.heap);
-        self.assign_remaining_attrs(&state.pre.attrs);
-        self.assign_remaining_attrs(&state.post.attrs);
+        self.assign_remaining_memory(&state.pre.heap, pre_reachable);
+        self.assign_remaining_memory(&state.post.heap, post_reachable);
+        self.assign_remaining_attrs(&state.pre.attrs, pre_reachable);
+        self.assign_remaining_attrs(&state.post.attrs, post_reachable);
         self.assign_remaining_formula(state);
-        self.assign_remaining_value_set(&state.must_be_valid);
-        self.assign_remaining_value_set(&state.need_dynamic_type_specialization);
     }
 
     fn assign_remaining_stack(&mut self, stack: &BaseStack) {
@@ -337,10 +338,17 @@ impl Canonicalizer {
         }
     }
 
-    fn assign_remaining_memory(&mut self, memory: &BaseMemory) {
+    fn assign_remaining_memory(
+        &mut self,
+        memory: &BaseMemory,
+        reachable: &std::collections::HashSet<AbstractValue>,
+    ) {
         let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
         entries.sort_by_key(|(src, _)| self.partial_value_label(*src));
         for (src, edges) in entries {
+            if !reachable.contains(&src) {
+                continue;
+            }
             self.map_value(src);
             let mut edge_entries: Vec<_> = edges
                 .iter()
@@ -356,10 +364,17 @@ impl Canonicalizer {
         }
     }
 
-    fn assign_remaining_attrs(&mut self, attrs: &BaseAddressAttributes) {
+    fn assign_remaining_attrs(
+        &mut self,
+        attrs: &BaseAddressAttributes,
+        reachable: &std::collections::HashSet<AbstractValue>,
+    ) {
         let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
         entries.sort_by_key(|(addr, _)| self.partial_value_label(*addr));
         for (addr, attrs) in entries {
+            if !reachable.contains(&addr) {
+                continue;
+            }
             self.map_value(addr);
             for attr in attrs.iter() {
                 if let Attribute::ReturnedFromUnknown(values) = attr {
@@ -438,14 +453,6 @@ impl Canonicalizer {
                 }
             }
             self.map_value(*ret);
-        }
-    }
-
-    fn assign_remaining_value_set(&mut self, values: &std::collections::HashSet<AbstractValue>) {
-        let mut ordered: Vec<_> = values.iter().copied().collect();
-        ordered.sort_by_key(|value| self.partial_value_label(*value));
-        for value in ordered {
-            self.map_value(value);
         }
     }
 
@@ -620,9 +627,16 @@ fn canonical_stack(stack: &BaseStack, canon: &Canonicalizer) -> Vec<String> {
     entries
 }
 
-fn canonical_heap(memory: &BaseMemory, canon: &Canonicalizer) -> Vec<String> {
+fn canonical_heap(
+    memory: &BaseMemory,
+    reachable: &std::collections::HashSet<AbstractValue>,
+    canon: &Canonicalizer,
+) -> Vec<String> {
     let mut edges = Vec::new();
     for (src, accesses) in memory.iter() {
+        if !reachable.contains(src) {
+            continue;
+        }
         for (access, target) in accesses.iter() {
             edges.push(format!(
                 "{}:{}->{}",
@@ -636,9 +650,16 @@ fn canonical_heap(memory: &BaseMemory, canon: &Canonicalizer) -> Vec<String> {
     edges
 }
 
-fn canonical_attrs(attrs: &BaseAddressAttributes, canon: &Canonicalizer) -> Vec<String> {
+fn canonical_attrs(
+    attrs: &BaseAddressAttributes,
+    reachable: &std::collections::HashSet<AbstractValue>,
+    canon: &Canonicalizer,
+) -> Vec<String> {
     let mut entries = Vec::new();
     for (addr, attrs) in attrs.iter() {
+        if !reachable.contains(addr) {
+            continue;
+        }
         for attr in attrs.iter() {
             entries.push(format!(
                 "{}:{}",
@@ -737,17 +758,26 @@ fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<Stri
     parts
 }
 
-fn canonical_value_set(
-    values: &std::collections::HashSet<AbstractValue>,
-    canon: &Canonicalizer,
-    prefix: &str,
-) -> Vec<String> {
-    let mut entries: Vec<_> = values
-        .iter()
-        .map(|value| format!("{prefix}:{}", canon.get(*value).unwrap()))
-        .collect();
-    entries.sort();
-    entries
+fn reachable_from_stack(
+    stack: &BaseStack,
+    heap: &BaseMemory,
+) -> std::collections::HashSet<AbstractValue> {
+    // Cross-ref: OCaml `PulseAbductiveDomain.GraphComparison.isograph_map_from_stack`.
+    // The OCaml `leq` relation compares only stack-reachable heap/attr state
+    // and ignores disconnected retained garbage at fixpoint nodes.
+    let mut reachable = std::collections::HashSet::new();
+    let mut worklist: Vec<_> = stack.iter().map(|(_var, addr)| *addr).collect();
+    while let Some(addr) = worklist.pop() {
+        if !reachable.insert(addr) {
+            continue;
+        }
+        if let Some(edges) = heap.get_edges(addr) {
+            for (_access, target) in edges.iter() {
+                worklist.push(*target);
+            }
+        }
+    }
+    reachable
 }
 
 fn canonical_access(access: &Access, canon: &Canonicalizer) -> String {
@@ -936,6 +966,26 @@ mod tests {
         state
     }
 
+    fn add_extra_reachable_edge(state: &mut AbductiveDomain) {
+        let formal_addr = state
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+        let pointee = state.read_heap(formal_addr, Access::Dereference);
+        let extra = AbstractValue::mk_fresh();
+        let field = Access::FieldAccess(sil::fieldname::Fieldname::make(
+            sil::typ::TypeName::CStruct(sil::qualified_cpp_name::QualifiedCppName::from_string(
+                "Node",
+            )),
+            "prev",
+        ));
+        state.write_heap(pointee, field, extra);
+        state.allocate(extra, Allocator::CMalloc, Location::dummy());
+    }
+
     #[test]
     fn test_alpha_equivalent_states_ignore_raw_value_renaming() {
         AbstractValue::reset_counters();
@@ -979,11 +1029,50 @@ mod tests {
     }
 
     #[test]
-    fn test_disconnected_leak_state_is_not_considered_equivalent() {
+    fn test_disconnected_state_is_ignored_by_alpha_equivalence_like_ocaml_leq() {
         AbstractValue::reset_counters();
         let state1 = make_state(0, false);
         AbstractValue::reset_counters();
         let state2 = make_state(2, true);
+
+        let exec1 = ExecutionDomain::ContinueProgram(state1);
+        let exec2 = ExecutionDomain::ContinueProgram(state2);
+
+        assert!(exec1.leq(&exec2));
+        assert!(exec2.leq(&exec1));
+    }
+
+    #[test]
+    fn test_helper_sets_do_not_affect_alpha_equivalence() {
+        AbstractValue::reset_counters();
+        let state1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(2, false);
+
+        let formal_addr = state2
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+        state2.mark_must_be_valid(formal_addr);
+        state2.add_need_dynamic_type_specialization(formal_addr);
+
+        let exec1 = ExecutionDomain::ContinueProgram(state1);
+        let exec2 = ExecutionDomain::ContinueProgram(state2);
+
+        assert!(exec1.leq(&exec2));
+        assert!(exec2.leq(&exec1));
+    }
+
+    #[test]
+    fn test_reachable_heap_difference_is_not_considered_equivalent() {
+        AbstractValue::reset_counters();
+        let state1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(2, false);
+        add_extra_reachable_edge(&mut state2);
 
         let exec1 = ExecutionDomain::ContinueProgram(state1);
         let exec2 = ExecutionDomain::ContinueProgram(state2);

@@ -175,7 +175,7 @@ where
             }
 
             // Compute the post-state by executing all instructions.
-            let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &pre);
+            let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &pre, inv_map.get(&node_id));
 
             let visit_count = inv_map
                 .get(&node_id)
@@ -239,22 +239,9 @@ fn exec_node<Dir: CfgDirection, TF: TransferFunctions>(
     node_id: NodeId,
     pdesc: &Procdesc,
     pre: &TF::Domain,
+    old_state: Option<&State<TF::Domain>>,
 ) -> TF::Domain {
-    let node = match pdesc.get_node(node_id) {
-        Some(n) => n,
-        None => return pre.clone(),
-    };
-    let mut state = pre.clone();
-    if Dir::reverse_instrs() {
-        for (idx, instr) in node.instrs.iter().enumerate().rev() {
-            state = tf.exec_instr(&state, data, node_id, idx, instr);
-        }
-    } else {
-        for (idx, instr) in node.instrs.iter().enumerate() {
-            state = tf.exec_instr(&state, data, node_id, idx, instr);
-        }
-    }
-    state
+    tf.exec_node(old_state, pre, data, node_id, pdesc, Dir::reverse_instrs())
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +356,7 @@ where
         }
 
         // Not converged: execute instructions and update
-        let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &new_pre);
+        let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &new_pre, Some(old_state));
         // Cross-ref: OCaml `AbstractInterpreter.exec_node_instrs` keeps the
         // existing node post and joins newly produced disjuncts into it.
         // Replacing the post outright loses duplicate/drop information that was
@@ -389,7 +376,7 @@ where
         Convergence::DidNotReachFixPoint
     } else {
         // First visit
-        let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &pre);
+        let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &pre, None);
         inv_map.insert(
             node_id,
             State {

@@ -15,11 +15,11 @@ lint:
 	cargo clippy -- -D warnings
 
 test-fast:
-	cargo test
+	RUST_TEST_THREADS=1 cargo test
 
 # Includes #[ignore] tests (C sweep spawns infer binary — needs infer built)
 test-full:
-	cargo test -- --include-ignored
+	RUST_TEST_THREADS=1 cargo test -- --include-ignored
 
 # Build optimized release binary → bin/infer-rs
 build: release

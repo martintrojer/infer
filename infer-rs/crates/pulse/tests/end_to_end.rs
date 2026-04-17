@@ -15,6 +15,7 @@ use test_harness::textual_utils;
 // Running its per-procedure analyzers concurrently across unrelated tests is
 // currently flaky, so serialize analysis inside this integration binary.
 static ANALYZE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static TEST_RUN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Adapter for running Pulse through the ondemand interprocedural runner.
 struct PulseInterChecker;
@@ -34,6 +35,22 @@ impl ondemand::checker::InterChecker for PulseInterChecker {
             .expect("end-to-end analyze lock poisoned");
         analyze_with_spec_loop(pdesc, ctx, None, 0)
     }
+}
+
+fn run_pulse_inter(
+    cfg: &sil::cfg::Cfg,
+    tenv: &sil::tenv::Tenv,
+) -> ondemand::summary::SummaryStore<pulse::summary::PulseSummary> {
+    // Serializing only `InterChecker::analyze` is not enough when cargo runs
+    // multiple end-to-end tests in parallel: unrelated tests can still
+    // interleave separate ondemand runs and recreate the harness deadlock this
+    // file is already trying to avoid. Serialize whole runner invocations too.
+    let _guard = TEST_RUN_LOCK
+        .lock()
+        .expect("end-to-end test-run lock poisoned");
+    let checker = PulseInterChecker;
+    let (store, _) = ondemand::runner::run_inter(&checker, cfg, tenv);
+    store
 }
 
 /// Analyze a procedure with the specialization loop, recursively specializing
@@ -462,8 +479,7 @@ fn test_e2e_npe_branching_fixture() {
     let tm = textual_utils::parse_file_and_convert(&fixture);
 
     // Use interprocedural analysis via ondemand runner (bottom-up call graph order)
-    let checker = PulseInterChecker;
-    let (store, _stats) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let mut results: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -548,8 +564,7 @@ fn assert_pulse_file(path: &std::path::Path, skip: &[&str]) {
     assert!(path.exists(), "fixture missing: {}", path.display());
 
     let tm = textual_utils::parse_file_and_convert(path);
-    let checker = PulseInterChecker;
-    let (store, _stats) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let mut results: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -836,12 +851,7 @@ fn test_c_dump_textual_sweep() {
                         let (tx, rx) = std::sync::mpsc::channel();
                         let tm_clone = tm;
                         let handle = std::thread::spawn(move || {
-                            let checker = PulseInterChecker;
-                            let (store, _) = ondemand::runner::run_inter(
-                                &checker,
-                                &tm_clone.cfg,
-                                &tm_clone.tenv,
-                            );
+                            let store = run_pulse_inter(&tm_clone.cfg, &tm_clone.tenv);
                             let mut n_procs = 0;
                             let mut issues = Vec::new();
                             for (_pname, summary) in store.to_vec() {
@@ -989,8 +999,7 @@ fn test_e2e_exit_noreturn() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     for name in ["direct_exit_ok", "indirect_exit_ok"] {
         let found = store
@@ -1045,8 +1054,7 @@ fn test_e2e_capture_metadata_noreturn_stub() {
         .expect("no_return proc should exist")
         .is_no_return = true;
 
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     for name in ["direct_no_return_ok", "indirect_no_return_ok"] {
         let found = store
@@ -1084,8 +1092,7 @@ fn test_e2e_fopen_null_deref() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for (pname, summary) in store.to_vec() {
         let issues: Vec<_> = summary
             .diagnostics
@@ -1143,8 +1150,7 @@ fn test_summary_comparison_specialization_main() {
         .dump_textual_for_c(&c_path)
         .expect("dump-textual should succeed for specialization.c");
     let tm = textual_utils::parse_file_and_convert(&sil_path);
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let mut rust_summaries = std::collections::HashMap::new();
     for (pname, summary) in store.to_vec() {
@@ -1537,8 +1543,7 @@ fn test_e2e_null_attrs_propagation() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for (pname, summary) in store.to_vec() {
         let issues: Vec<_> = summary
             .diagnostics
@@ -1600,8 +1605,7 @@ fn test_e2e_callee_local_abort_is_not_republished_on_caller() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let bake = store
         .to_vec()
@@ -1680,8 +1684,7 @@ fn test_e2e_interproc_path_condition() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for (pname, summary) in store.to_vec() {
         let issues: Vec<_> = summary
             .diagnostics
@@ -1815,8 +1818,7 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let expected = [
         (
@@ -1915,8 +1917,7 @@ fn test_e2e_negated_actual_keeps_arithmetic_latent_summary() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summaries = store.to_vec();
 
     let latent_summary = summaries
@@ -1986,8 +1987,7 @@ fn test_e2e_infer_fail_stub_does_not_force_noreturn_summary() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summaries = store.to_vec();
 
     let assert_summary = summaries
@@ -2044,8 +2044,7 @@ fn test_e2e_empty_body_pure_int_call_preserves_integer_reasoning() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summary = store
         .to_vec()
         .into_iter()
@@ -2097,8 +2096,7 @@ fn test_e2e_looped_empty_body_pure_int_call_preserves_integer_reasoning() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summary = store
         .to_vec()
         .into_iter()
@@ -2150,8 +2148,7 @@ fn test_e2e_offsetof_shaped_pure_int_loop_preserves_integer_reasoning() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summary = store
         .to_vec()
         .into_iter()
@@ -2206,8 +2203,7 @@ fn test_e2e_funptr_dispatch() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let bad = store
         .to_vec()
         .into_iter()
@@ -2266,8 +2262,7 @@ fn test_e2e_funptr_multilevel() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let bad = store
         .to_vec()
         .into_iter()
@@ -2319,8 +2314,7 @@ fn test_e2e_funptr_multilevel_formal_write_stays_manifest() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let bad = store
         .to_vec()
         .into_iter()
@@ -2381,8 +2375,7 @@ fn test_e2e_guarded_outparam_write_uses_matching_summary_branch() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let bad = store
         .to_vec()
@@ -2432,8 +2425,7 @@ fn test_e2e_write_through_ptr() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let bad = store
         .to_vec()
         .into_iter()
@@ -2526,8 +2518,7 @@ fn test_e2e_unknown_call_havoc() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for (pname, summary) in store.to_vec() {
         let name = format!("{pname}");
         let has_npe = summary
@@ -2579,8 +2570,7 @@ fn test_e2e_unknown_call_havoc_on_by_ref_formal_slot() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let caller_ok = store
         .to_vec()
@@ -2635,8 +2625,7 @@ fn test_e2e_imported_pure_call_condition_keeps_precondition_violation_latent() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summary = store
         .to_vec()
         .into_iter()
@@ -2697,8 +2686,7 @@ fn test_e2e_one_node_cycle_keeps_callee_latent_and_reifies_in_caller() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let traverse = store
         .to_vec()
@@ -2762,8 +2750,7 @@ fn test_e2e_two_hop_field_write_keeps_null_derefs_latent() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let summary = store
         .to_vec()
@@ -2839,8 +2826,7 @@ fn test_e2e_latent_chain_stays_latent_until_manifest_callsite() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summaries = store.to_vec();
 
     let direct = summaries
@@ -3106,8 +3092,7 @@ fn test_e2e_global_function_pointer_initializer_is_inlined() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let bad = store
         .to_vec()
         .into_iter()
@@ -3130,8 +3115,7 @@ fn test_debug_follow_ret() {
         return;
     }
     let tm = textual_utils::parse_file_and_convert(sil);
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     // Dump selected summaries for local debugging of latent/reporting parity.
     for (pname, summary) in store.to_vec() {
         let name = format!("{pname}");
@@ -3214,8 +3198,7 @@ fn test_e2e_manifest_use_after_free_reports_only_uaf() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let summary = store
         .to_vec()
@@ -3302,8 +3285,7 @@ fn test_e2e_local_zero_proof_on_formal_keeps_null_deref_manifest() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     let summaries = store.to_vec();
 
     for proc_name in [
@@ -3374,8 +3356,7 @@ fn test_e2e_deref_then_free_then_deref_keeps_npe_latent() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let summary = store
         .to_vec()
@@ -3445,8 +3426,7 @@ fn test_e2e_latent_error_only_summary_is_not_noreturn() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let summary = store
         .to_vec()
@@ -3513,8 +3493,7 @@ fn test_debug_uaf_summary_shapes() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for name in [
         "conditional_free2",
         "latent_use_after_free",
@@ -3567,8 +3546,7 @@ fn test_e2e_access_use_after_free_keeps_manifest_uaf_and_suppressed_npes() {
         }
     "#,
     );
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let summary = store
         .to_vec()
@@ -3620,8 +3598,7 @@ fn test_debug_latent_summary() {
         return;
     }
     let tm = textual_utils::parse_file_and_convert(sil);
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for (pname, summary) in store.to_vec() {
         let name = format!("{pname}");
         if name.contains("latent")
@@ -3724,8 +3701,7 @@ fn test_debug_latent_summary_reduced_real_counts() {
     ];
     retain_named_procs(&mut tm, &targets);
 
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     for target in targets {
         let summary = store
@@ -3755,8 +3731,7 @@ fn test_debug_specialization_summary() {
         return;
     }
     let tm = textual_utils::parse_file_and_convert(sil);
-    let checker = PulseInterChecker;
-    let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
     for (pname, summary) in store.to_vec() {
         let name = format!("{pname}");
         if name.contains("test_alias")

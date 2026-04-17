@@ -8,9 +8,9 @@
 //! Mirrors OCaml's `TransferFunctions.mli`.
 
 use crate::domain::AbstractDomain;
-use crate::interp::InvariantMap;
+use crate::interp::{InvariantMap, State};
 use sil::instr::Instr;
-use sil::procdesc::NodeId;
+use sil::procdesc::{NodeId, Procdesc};
 
 /// Transfer functions that push abstract states across instructions.
 ///
@@ -40,6 +40,40 @@ pub trait TransferFunctions {
         instr_idx: usize,
         instr: &Instr,
     ) -> Self::Domain;
+
+    /// Execute all instructions in a node.
+    ///
+    /// Default: thread the whole input state through the node instruction list.
+    /// Disjunctive analyses can override this to mirror OCaml's
+    /// `exec_node_instrs` behavior, for example by re-executing only the new
+    /// pre disjuncts and joining them into the retained node post.
+    fn exec_node(
+        &self,
+        old_state: Option<&State<Self::Domain>>,
+        pre: &Self::Domain,
+        data: &Self::AnalysisData,
+        node_id: NodeId,
+        pdesc: &Procdesc,
+        reverse_instrs: bool,
+    ) -> Self::Domain {
+        let _ = old_state;
+        let node = match pdesc.get_node(node_id) {
+            Some(node) => node,
+            None => return pre.clone(),
+        };
+
+        let mut state = pre.clone();
+        if reverse_instrs {
+            for (idx, instr) in node.instrs.iter().enumerate().rev() {
+                state = self.exec_instr(&state, data, node_id, idx, instr);
+            }
+        } else {
+            for (idx, instr) in node.instrs.iter().enumerate() {
+                state = self.exec_instr(&state, data, node_id, idx, instr);
+            }
+        }
+        state
+    }
 
     /// Observe the current fixpoint invariant map after a node update.
     ///

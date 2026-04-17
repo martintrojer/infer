@@ -139,24 +139,21 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 ### OpenSSL benchmark follow-ups
 
-- First stabilize whole-program merged direct-`.sil` OpenSSL runs. Re-run the
-  latest shared corpus without `/usr/bin/time` so we can capture the real exit
-  status and determine whether the current `-j 4` / `-j 8` failures are an
-  external kill or some other runtime termination path.
-- Measure the same shared exported corpus at `-j 1`, `-j 2`, `-j 4`, and
-  `-j 8` once the exit cause is clearer, and treat `-j 1` as the only current
-  publishable apples-to-apples Rust timing until merged `-j > 1` runs are
-  stable.
-- Deepen the new retained-state OCaml comparison on `whirlpool_block`.
-  We now know the logical shape is larger in Rust, not just more expensive to
-  store: the narrowed OCaml run finishes with `152` final post snapshots
-  (`98727` post heap nodes / `53889` edges / `39663` attr entries) while Rust
-  reaches `2995` retained snapshots (`975641` post heap nodes /
-  `1313138` edges / `2464294` attr entries) on the same hotspot.
-- Next semantic probe: inspect loop heads `3` and `17` on `whirlpool_block`
-  and compare Rust `ExecutionDomain::leq` / `state_cmp::alpha_equivalent`
-  against OCaml `PulseExecutionDomain.leq` / `PulseAbductiveDomain.leq`,
-  especially attribute normalization and history-sensitive equality.
+- Finish the isolated `whirlpool_block` probe after the WTO `exec_node`
+  parity fix and record its final retained-state shape against OCaml's
+  `152`-snapshot final state. The old `2995`-snapshot Rust baseline is no
+  longer the current checkpoint.
+- Compare the remaining retained loop-head states that still reach
+  `max_node_disjuncts=4` (currently likely nodes `3` and `17`) against the
+  OCaml HTML / Rust traces. `state_cmp` itself is no longer the main story;
+  the active question is the smaller residual semantic difference in those
+  states after the WTO revisit fix.
+- First rerun the shared exported corpus at `-j 1` after the narrowed hotspot
+  comparison is understood, and treat that as the only current publishable
+  apples-to-apples Rust timing until merged `-j > 1` runs are stable.
+- Then re-run the same shared corpus without `/usr/bin/time` at `-j 4` and
+  `-j 8` so we can capture the real exit status and determine whether the
+  current failures are external kills or some other runtime termination path.
 - Only after the retained logical shape is closer to OCaml should we spend
   more time on storage-sharing work such as cheaper invariant-map snapshots or
   more persistent sharing across heap / attrs / formula state.
