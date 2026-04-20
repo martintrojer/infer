@@ -65,14 +65,19 @@
   `Pulse.ml` `Metadata (ExitScope ...)` and
   `PulseAbductiveDomain.Stack.remove_vars`. Focused tests now cover both
   surfaces: dead post-stack temp removal and preserved pre-rooted formals.
-- That `ExitScope` fix materially improves the richer single-file hotspot but
-  does not finish it. A fresh rerun on the same `wp_block.c` export was
-  interrupted at `2m05s` with `1022` retained states after earlier checkpoints
-  of `668 / max_node_disjuncts=6` at `10.3s`, `768 / 6` at `31.0s`, and
-  `922 / 6` at `1m12s`; later revisits still climbed back to
-  `max_node_disjuncts=8` by `1m23s` and stayed there through the interrupted
-  run. This is real progress on retained-state volume, not yet final OCaml
-  parity on the hot block.
+- That `ExitScope` fix materially improves the richer single-file hotspot's
+  early retained-state curve but not its final fixpoint shape. A completed
+  selected-node rerun on the same `wp_block.c` export now finishes in `4m58s`
+  with `204` CFG nodes, `173` revisited nodes, `1222` retained states,
+  `max_visit_count=4`, `max_node_disjuncts=8`, `pre_posts=2`, and the same
+  top retained nodes `29,31,32,33,35,36,37,38`.
+- The selected-node dump pins that remaining block to line `540`
+  (`r++` / load / prune) and lines `752-755` (`S.q[...] = L*`). Matching
+  OCaml HTML on those lines ends with `Got 1 disjunct back`, and the last
+  visible OCaml PRE widths there stay smaller (`2` at node `29`, `4` at
+  nodes `31/32`, `2` at nodes `35-38`). The remaining gap is therefore
+  Rust-side retained-state convergence on that loop block, not exporter
+  fidelity and not missing `ExitScope` semantics.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`

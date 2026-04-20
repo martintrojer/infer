@@ -147,18 +147,26 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 ### OpenSSL benchmark follow-ups
 
 - Keep the narrowed `whirlpool_block` checkpoint current on the regenerated
-  export too: the fresh single-file `wp_block.c` run now finishes in `4m52s`
-  with `1222` retained states, `max_node_disjuncts=8`, and top retained nodes
-  `29,31,32,33,35,36,37,38`, versus OCaml's `152` final snapshots on the
-  shared capture.
+  export too: after the `ExitScope` fix, the completed selected-node rerun on
+  the fresh single-file `wp_block.c` export still converges to
+  `1222` retained states in `4m58s`, with `204` CFG nodes,
+  `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
+  `29,31,32,33,35,36,37,38`.
 - Rust now executes exported `Metadata::ExitScope` semantically instead of as
   a no-op, with focused regressions for dead temp removal and preserved
-  pre-rooted formals. A fresh rerun on the same richer export was interrupted
-  at `2m05s` with `1022` retained states: this is materially better than the
-  old `1222`, but later revisits still climb back to `max_node_disjuncts=8`.
-- Next narrowed hotspot step: finish a selected-node retained dump on the
-  richer export after the `ExitScope` fix and compare the later `8`-way split
-  to OCaml, rather than revisiting metadata import/export.
+  pre-rooted formals. Keep that correctness fix even though the full final
+  selected-node run still reaches the same `1222` / `8` final shape; it
+  improved the early trajectory, not the eventual convergence point.
+- Next narrowed hotspot step: rerun the richer export with
+  `--debug-level-analysis 2 --debug-fixpoint-nodes 29,31,32,33,35,36,37,38`
+  and compare Rust's retained PRE/POST states to the OCaml line `540` /
+  `752-755` block using location/instruction mapping rather than assuming raw
+  node-id parity across frontends.
+- Keep the current OCaml comparison in view while doing that dump: the
+  corresponding OCaml HTML nodes end with `Got 1 disjunct back`, and their
+  last visible PRE widths are smaller (`2` at node `29`, `4` at `31/32`,
+  `2` at `35-38`), so the remaining bug is before any exporter workaround
+  discussion.
 - Do not chase a Rust/Pulse workaround that tries to restore the old smaller
   state numbers by regressing export fidelity. The correct input now includes
   the cleanup metadata.

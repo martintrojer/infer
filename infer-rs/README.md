@@ -70,13 +70,17 @@ OpenSSL benchmark status on this host:
   instead of treating all metadata as a no-op: dead post-stack temps/locals
   are removed while pre-rooted formals stay available for summary
   construction, matching the OCaml `ExitScope` intent
-- that `ExitScope` fix materially improves the same richer single-file hotspot:
-  a fresh rerun was interrupted at `2m05s` with `1022` retained states after
-  earlier checkpoints of `668 / max_node_disjuncts=6` at `10.3s`,
-  `768 / 6` at `31.0s`, and `922 / 6` at `1m12s`
-- the remaining gap is therefore narrower and more explicit: later revisits on
-  the richer export still climb back to `max_node_disjuncts=8`, so the next
-  work stays on retained-state convergence rather than exporter fidelity
+- that `ExitScope` fix materially improves the transient curve on the same
+  richer single-file hotspot, but not its final fixpoint shape: a completed
+  selected-node rerun now finishes in `4m58s` with `1222` retained states
+  across `204` CFG nodes, `max_visit_count=4`, `max_node_disjuncts=8`,
+  `pre_posts=2`, and the same top retained nodes
+  `29,31,32,33,35,36,37,38`
+- the remaining gap is therefore sharper: the selected nodes map to the line
+  `540` `r++` / load / prune block and the line `752-755`
+  `S.q[...] = L*` stores, while matching OCaml HTML on those lines ends with
+  `Got 1 disjunct back` and smaller final PRE widths there, so the next work
+  stays on retained-state convergence rather than exporter fidelity
 - `--pulse-recency-limit 32` is now available as an opt-in OCaml-style
   experiment, but it is intentionally not the default: default-enabling it
   reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad` false

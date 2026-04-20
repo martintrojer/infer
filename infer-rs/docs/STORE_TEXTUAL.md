@@ -154,12 +154,15 @@ What the current OpenSSL probe shows after that exporter fix:
 - Rust Pulse now also executes exported `Metadata::ExitScope` semantically
   instead of treating metadata as a no-op. Cross-ref: OCaml `Pulse.ml`
   `Metadata (ExitScope ...)` and `PulseAbductiveDomain.Stack.remove_vars`.
-- with that Rust-side fix in place, a fresh rerun on the same richer export
-  was interrupted at `2m05s` with `1022` retained states after earlier
-  checkpoints of `668 / max_node_disjuncts=6` at `10.3s`,
-  `768 / 6` at `31.0s`, and `922 / 6` at `1m12s`
-- that is a real retained-state improvement, but not the whole remaining
-  answer: later revisits still climb back to `max_node_disjuncts=8`, so the
+- with that Rust-side fix in place, the transient curve really does improve
+  early (`668 / max_node_disjuncts=6` at `10.3s`, `768 / 6` at `31.0s`,
+  `922 / 6` at `1m12s`), but a completed selected-node rerun still finishes
+  in `4m58s` with `1222` retained states, `204` CFG nodes,
+  `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
+  `29,31,32,33,35,36,37,38`
+- the selected-node dump maps that residual split to the line `540`
+  `r++` / load / prune block and the line `752-755` `S.q[...] = L*` stores;
+  matching OCaml HTML on those lines ends with `Got 1 disjunct back`, so the
   current hotspot is narrower Rust-side retained-state convergence work, not
   an exporter/importer metadata gap
 
