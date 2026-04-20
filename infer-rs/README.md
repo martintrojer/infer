@@ -76,11 +76,24 @@ OpenSSL benchmark status on this host:
   across `204` CFG nodes, `max_visit_count=4`, `max_node_disjuncts=8`,
   `pre_posts=2`, and the same top retained nodes
   `29,31,32,33,35,36,37,38`
+- Rust Pulse now also executes exported `Metadata::VariableLifetimeBegins`
+  semantically for non-global locals, mirroring OCaml
+  `PulseOperations.realloc_pvar`: rebind the local to a fresh slot and mark
+  ordinary scalar/pointer locals uninitialized unless it is a structured
+  binding
+- that `VariableLifetimeBegins` fix is also correctness-first and also leaves
+  the final hotspot endpoint unchanged: a completed selected-node rerun now
+  finishes in `4m56s` with the same `1222` retained states,
+  `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
+  `29,31,32,33,35,36,37,38`
 - the remaining gap is therefore sharper: the selected nodes map to the line
   `540` `r++` / load / prune block and the line `752-755`
   `S.q[...] = L*` stores, while matching OCaml HTML on those lines ends with
   `Got 1 disjunct back` and smaller final PRE widths there, so the next work
   stays on retained-state convergence rather than exporter fidelity
+- OCaml Pulse also keeps `Nullify` and `Abstract` as no-op metadata, so the
+  next step is retained-state comparison on that block, not more metadata
+  plumbing
 - `--pulse-recency-limit 32` is now available as an opt-in OCaml-style
   experiment, but it is intentionally not the default: default-enabling it
   reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad` false

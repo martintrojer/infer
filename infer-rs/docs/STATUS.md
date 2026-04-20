@@ -71,6 +71,17 @@
   with `204` CFG nodes, `173` revisited nodes, `1222` retained states,
   `max_visit_count=4`, `max_node_disjuncts=8`, `pre_posts=2`, and the same
   top retained nodes `29,31,32,33,35,36,37,38`.
+- Rust Pulse now also executes exported `Metadata::VariableLifetimeBegins`
+  semantically for non-global locals, matching the OCaml
+  `PulseOperations.realloc_pvar` intent: rebind the local to a fresh stack
+  slot and mark ordinary scalar/pointer locals uninitialized, while C++
+  structured bindings skip that mark. Focused tests cover both surfaces.
+- That `VariableLifetimeBegins` fix is also correctness-first and also leaves
+  the final hotspot shape unchanged. A completed selected-node rerun on the
+  same richer `wp_block.c` export now finishes in `4m56s` with
+  `1222` retained states, `204` CFG nodes, `173` revisited nodes,
+  `max_visit_count=4`, `max_node_disjuncts=8`, `pre_posts=2`, and the same
+  top retained nodes `29,31,32,33,35,36,37,38`.
 - The selected-node dump pins that remaining block to line `540`
   (`r++` / load / prune) and lines `752-755` (`S.q[...] = L*`). Matching
   OCaml HTML on those lines ends with `Got 1 disjunct back`, and the last
@@ -78,6 +89,9 @@
   nodes `31/32`, `2` at nodes `35-38`). The remaining gap is therefore
   Rust-side retained-state convergence on that loop block, not exporter
   fidelity and not missing `ExitScope` semantics.
+- OCaml cross-check: `Pulse.ml` also keeps `Nullify` and `Abstract` as no-op
+  metadata, so the next narrowed step remains retained PRE/POST comparison on
+  the hot block, not more metadata plumbing.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`

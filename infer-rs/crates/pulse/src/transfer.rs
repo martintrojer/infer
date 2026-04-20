@@ -14,9 +14,11 @@ use sil::exp::Exp;
 use sil::instr::{Instr, InstrMetadata};
 use sil::location::Location;
 use sil::procdesc::Procdesc;
+use sil::var::Var;
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
+use crate::attribute::Attribute;
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
@@ -57,8 +59,50 @@ pub fn exec_instr_with_pdesc(
             state.remove_vars(vars);
             vec![ExecutionDomain::ContinueProgram(state)]
         }
+        Instr::Metadata(InstrMetadata::VariableLifetimeBegins {
+            pvar,
+            typ,
+            loc,
+            is_cpp_structured_binding,
+        }) if !pvar.is_global() => {
+            exec_variable_lifetime_begins(pvar, typ, loc, *is_cpp_structured_binding, state)
+        }
         Instr::Metadata(_) => vec![ExecutionDomain::ContinueProgram(state)],
     }
+}
+
+fn exec_variable_lifetime_begins(
+    pvar: &sil::pvar::Pvar,
+    typ: &sil::typ::Typ,
+    loc: &Location,
+    is_cpp_structured_binding: bool,
+    mut state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    // Cross-ref: OCaml `Pulse.ml` routes this metadata to
+    // `PulseOperations.realloc_pvar`, which rebinds the local to a fresh stack
+    // slot and marks scalar/pointer locals uninitialized. Rust does not thread
+    // Tenv through transfer yet, so we mirror the root local-slot behavior
+    // here and keep the uninitialized marking to types we can model locally.
+    let addr = AbstractValue::mk_fresh();
+    let history = ValueHistory::assignment(loc.clone());
+    state.post.stack.add_with_history(
+        Var::ProgramVar(Box::new(pvar.clone())),
+        ValueWithHistory::new(addr, history),
+    );
+    state.post.heap.register_address(addr);
+
+    let should_mark_uninitialized = !is_cpp_structured_binding
+        && matches!(
+            &*typ.desc,
+            sil::typ::TypeDesc::Tint(_)
+                | sil::typ::TypeDesc::Tfloat(_)
+                | sil::typ::TypeDesc::Tptr(..)
+        );
+    if should_mark_uninitialized {
+        state.add_attr(addr, Attribute::Uninitialized);
+    }
+
+    vec![ExecutionDomain::ContinueProgram(state)]
 }
 
 /// Load: `id = *rhs_exp`
@@ -732,6 +776,78 @@ mod tests {
             state.post.stack.find(&formal_var),
             Some(formal_addr),
             "ExitScope should not drop pre-rooted formal vars needed for summaries"
+        );
+    }
+
+    #[test]
+    fn test_variable_lifetime_begins_rebinds_local_and_marks_scalar_uninitialized() {
+        let mut state = mk_state();
+        let local = Pvar::mk(Mangled::from_string("x"), Procname::c_from_string("test"));
+        let old_addr = AbstractValue::mk_fresh();
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(local.clone())), old_addr);
+
+        let instr = Instr::Metadata(InstrMetadata::VariableLifetimeBegins {
+            pvar: local.clone(),
+            typ: Typ::int(sil::typ::IKind::IInt),
+            loc: Location::dummy(),
+            is_cpp_structured_binding: false,
+        });
+        let results = exec_instr(&instr, state);
+        let state = results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("variable lifetime begins should continue");
+
+        let var = Var::ProgramVar(Box::new(local));
+        let addr = state
+            .post
+            .stack
+            .find(&var)
+            .expect("local should be rebound to a fresh slot");
+        assert_ne!(
+            addr, old_addr,
+            "VariableLifetimeBegins should behave like realloc_pvar and replace the old slot"
+        );
+        assert!(
+            state.check_initialized(addr).is_err(),
+            "scalar locals declared by VariableLifetimeBegins should start uninitialized"
+        );
+    }
+
+    #[test]
+    fn test_variable_lifetime_begins_structured_binding_skips_uninitialized_mark() {
+        let state = mk_state();
+        let local = Pvar::mk(Mangled::from_string("x"), Procname::c_from_string("test"));
+
+        let instr = Instr::Metadata(InstrMetadata::VariableLifetimeBegins {
+            pvar: local.clone(),
+            typ: Typ::int(sil::typ::IKind::IInt),
+            loc: Location::dummy(),
+            is_cpp_structured_binding: true,
+        });
+        let results = exec_instr(&instr, state);
+        let state = results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("variable lifetime begins should continue");
+
+        let addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(local)))
+            .expect("structured binding local should be bound");
+        assert!(
+            state.check_initialized(addr).is_ok(),
+            "structured bindings should skip the uninitialized mark like OCaml"
         );
     }
 

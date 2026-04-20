@@ -160,6 +160,18 @@ What the current OpenSSL probe shows after that exporter fix:
   in `4m58s` with `1222` retained states, `204` CFG nodes,
   `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
   `29,31,32,33,35,36,37,38`
+- Rust Pulse now also executes exported `Metadata::VariableLifetimeBegins`
+  semantically for non-global locals, matching the OCaml
+  `PulseOperations.realloc_pvar` intent at the Rust level: rebind the local to
+  a fresh stack slot and mark ordinary scalar/pointer locals uninitialized,
+  while structured bindings skip that mark
+- a completed selected-node rerun after that Rust-side fix still finishes in
+  `4m56s` with the same `1222` retained states, `204` CFG nodes,
+  `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
+  `29,31,32,33,35,36,37,38`
+- OCaml cross-check: `Pulse.ml` also keeps `Nullify` and `Abstract` as no-op
+  metadata, so the remaining hotspot is not another metadata-family
+  importer/executor gap
 - the selected-node dump maps that residual split to the line `540`
   `r++` / load / prune block and the line `752-755` `S.q[...] = L*` stores;
   matching OCaml HTML on those lines ends with `Got 1 disjunct back`, so the

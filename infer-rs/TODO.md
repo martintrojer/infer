@@ -157,11 +157,18 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   pre-rooted formals. Keep that correctness fix even though the full final
   selected-node run still reaches the same `1222` / `8` final shape; it
   improved the early trajectory, not the eventual convergence point.
+- Rust now also executes exported `Metadata::VariableLifetimeBegins`
+  semantically for non-global locals, with focused regressions for fresh-slot
+  rebinding and structured-binding skip behavior. Keep that correctness fix
+  too: the completed selected-node rerun still finishes at the same
+  `1222` / `8` final shape in `4m56s`.
 - Next narrowed hotspot step: rerun the richer export with
   `--debug-level-analysis 2 --debug-fixpoint-nodes 29,31,32,33,35,36,37,38`
   and compare Rust's retained PRE/POST states to the OCaml line `540` /
   `752-755` block using location/instruction mapping rather than assuming raw
   node-id parity across frontends.
+- Do not spend time on `Nullify` / `Abstract` metadata here unless new
+  evidence appears: OCaml Pulse keeps them as no-op too.
 - Keep the current OCaml comparison in view while doing that dump: the
   corresponding OCaml HTML nodes end with `Got 1 disjunct back`, and their
   last visible PRE widths are smaller (`2` at node `29`, `4` at `31/32`,

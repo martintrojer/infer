@@ -6,8 +6,11 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Current Focus
 
-- Active benchmark / repro dir:
-  `/tmp/infer-rs-openssl-20260417-095315-rebase-j`
+- Active benchmark / repro dirs:
+  - shared exported corpus:
+    `/tmp/infer-rs-openssl-20260417-095315-rebase-j`
+  - richer single-file hotspot repro:
+    `/tmp/wpblock-export.CAfXIo/openssl-1.0.2d`
 - Latest validated OpenSSL finding:
   - `state_cmp` now mirrors OCaml `PulseAbductiveDomain.leq` more closely:
     compare only the stack-reachable heap / attr graph, ignore disconnected
@@ -97,6 +100,21 @@ changes, and move finished results to durable docs/tests/commits.
     `pre_posts=2`, same top retained nodes
     `29:8d:4v, 31:8d:4v, 32:8d:4v, 33:8d:4v, 35:8d:4v, 36:8d:4v,
     37:8d:4v, 38:8d:4v`
+  - Rust Pulse now also mirrors OCaml `Pulse.ml` /
+    `PulseOperations.realloc_pvar` for
+    `Metadata::VariableLifetimeBegins`: non-global locals are rebound to a
+    fresh stack slot, and ordinary scalar/pointer locals are marked
+    uninitialized unless `is_cpp_structured_binding=true`
+  - focused Rust regressions:
+    `transfer::tests::test_variable_lifetime_begins_rebinds_local_and_marks_scalar_uninitialized`
+    and
+    `transfer::tests::test_variable_lifetime_begins_structured_binding_skips_uninitialized_mark`
+  - completed selected-node rerun after that fix:
+    `4m56s`, `204` CFG nodes, `173` revisited nodes,
+    `1222` retained states, `max_visit_count=4`, `max_node_disjuncts=8`,
+    `pre_posts=2`, same top retained nodes
+    `29:8d:4v, 31:8d:4v, 32:8d:4v, 33:8d:4v, 35:8d:4v, 36:8d:4v,
+    37:8d:4v, 38:8d:4v`
   - selected-node mapping from the Rust dump:
     node `29` is the empty join block at line `540`,
     nodes `31/32/33` are the `r++` / load / prune chain at line `540`,
@@ -104,10 +122,13 @@ changes, and move finished results to durable docs/tests/commits.
   - matching OCaml HTML on those source lines ends with `Got 1 disjunct back`
     and smaller last visible PRE widths:
     node `29` -> `2`, nodes `31/32` -> `4`, nodes `35/36/37/38` -> `2`
-  - conclusion from the completed rerun: missing `ExitScope` handling was a
-    real Rust correctness/performance hole, but it does not change the final
-    fixpoint shape on this hotspot; the remaining problem is later
-    retained-state convergence on the line `540` / `752-755` block
+  - OCaml cross-check: `Pulse.ml` keeps `Nullify` and `Abstract` as no-op
+    metadata too, so the remaining gap is not "implement more metadata"
+  - conclusion from the completed reruns: missing `ExitScope` and
+    `VariableLifetimeBegins` handling were real Rust correctness gaps, but
+    neither changes the final fixpoint shape on this hotspot; the remaining
+    problem is later retained-state convergence on the line `540` /
+    `752-755` block
 - Active conclusion:
   - the dominant OpenSSL gap was not just storage sharing and not just
     `state_cmp`; Rust was re-executing already-known pre disjuncts on hot WTO
@@ -134,6 +155,7 @@ changes, and move finished results to durable docs/tests/commits.
     `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil"`
 - Current validated working-tree checkpoint:
   - `cargo test -p pulse test_exit_scope_ -- --nocapture`
+  - `cargo test -p pulse test_variable_lifetime_begins_ -- --nocapture`
   - `cargo test -p pulse exec_node_skips_reexecuting_old_pre_disjuncts -- --nocapture`
   - `cargo test -p pulse state_cmp -- --nocapture`
   - `cargo test -p absint --lib -- --nocapture`
@@ -162,6 +184,8 @@ changes, and move finished results to durable docs/tests/commits.
   `--debug-level-analysis 2 --debug-fixpoint-nodes 29,31,32,33,35,36,37,38`
   and compare the exact retained PRE/POST states against the OCaml line
   `540` / `752-755` block.
+- Do not chase `Nullify` / `Abstract` metadata work here: OCaml Pulse keeps
+  them as no-op too.
 - Re-export the shared OpenSSL corpus with the patched OCaml exporter and use
   that as the next apples-to-apples Rust checkpoint.
 - Use the current importer support as the floor: do not add a Pulse workaround
