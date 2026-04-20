@@ -127,6 +127,20 @@ changes, and move finished results to durable docs/tests/commits.
     node `29` is the empty join block at line `540`,
     nodes `31/32/33` are the `r++` / load / prune chain at line `540`,
     nodes `35/36/37/38` are the `S.q[...] = L*` stores at lines `752-755`
+  - richer-export OCaml cross-map is now tighter too:
+    OCaml node `30` ~= Rust node `31` (`r++`),
+    OCaml node `31` ~= Rust node `32` (load),
+    OCaml node `32` ~= Rust node `33` (prune / exit-scope),
+    and OCaml nodes `34/35/36/37` ~= Rust nodes `35/36/37/38`
+    for the `S.q[7/6/5/4]` stores; Rust node `29`'s empty join block does
+    not have a clean same-number OCaml partner
+  - latest OCaml HTML clue on that block:
+    the store-chain PRE states at OCaml nodes `34-37` visibly keep
+    `r -> { line 540, column 21 -> { 80, 90 }, line 602, column 22 -> { 115, 125 } }`
+    with no visible `line 540, column 33` increment history, while nearby
+    OCaml nodes such as `28/30` still show the `line 540, column 33`
+    history component; likely next Rust check is whether the retained
+    `r` / temp histories are being collapsed later than OCaml
   - matching OCaml HTML on those source lines ends with `Got 1 disjunct back`
     and smaller last visible PRE widths:
     node `29` -> `2`, nodes `31/32` -> `4`, nodes `35/36/37/38` -> `2`
