@@ -45,6 +45,18 @@
   closer than before, but it is still above the OCaml final shape and the
   remaining gap is the smaller set of loop heads that still keep up to `4`
   disjuncts.
+- Rust Textual→SIL now lowers OCaml-exported `__sil_metadata_*` helper calls
+  back to `Instr::Metadata`, matching
+  `infer/src/textual/TextualOfSil.ml` `InstrBridge.of_sil_metadata`, and
+  focused `to_sil` tests cover the supported metadata families.
+- That importer support does not change the current `whirlpool_block` hotspot
+  shape by itself. The exported `wp_block.sil` keeps
+  `__sil_metadata_variable_lifetime_begins`, but it still lacks the
+  `abstract` / `nullify` / `exit_scope` / `loop_*` metadata visible in the
+  corresponding OCaml SIL/HTML hot loop. A post-importer narrowed rerun still
+  ends at `1m46s`, `611` retained disjunct states, and top retained nodes
+  `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v, 26:4d:4v,
+  27:4d:4v`.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`
@@ -124,6 +136,13 @@ Recent correctness / robustness fixes:
   hashed proc UID for some duplicate C names, so real+real plain-name
   collisions remain an accepted `--export-textual` fidelity gap rather than a
   Rust-side renaming target.
+- Textual metadata lowering now also mirrors OCaml's export surface for
+  `Instr::Metadata`: `to_sil.rs` converts exported
+  `__sil_metadata_{abstract,catch_entry,exit_scope,nullify,loop_*,skip,try_*,variable_lifetime_begins}`
+  helper calls back into SIL metadata instructions instead of treating them as
+  ordinary calls. The current OpenSSL `whirlpool_block` gap remains because
+  the exported file itself still lacks the cleanup metadata seen in OCaml on
+  the hot loop path, not because Rust is missing the importer support anymore.
 - CLI/debugging gained OCaml-compatible `--procedures-filter` support through
   both CLI and `.inferconfig`. Rust mirrors OCaml's proc-only vs
   `source_regex:proc_regex` split semantics, and filtered interprocedural runs
@@ -144,6 +163,12 @@ Recent correctness / robustness fixes:
   `175` logical waves / max logical wave size `2600`), so the remaining
   bottleneck is procedure-local Pulse cost in specific hot functions rather
   than a broken scheduler or thread-pool setup.
+- Debugging now has a narrower retained-state dump surface too:
+  `debug-fixpoint-nodes` is available through CLI/config for Rust-only hotspot
+  work. With `RUST_LOG=pulse=debug` it logs final retained disjunct / visit
+  counts for selected CFG nodes, and `--debug-level-analysis 2` upgrades that
+  to full retained PRE/POST dumps. This is the surface that pinned the
+  remaining `whirlpool_block` hotspot to nodes `18,20,21,22,24,25,26,27`.
 - `pulse-recency-limit` is now wired through config/CLI and `BaseMemory::Edges`
   mirrors OCaml `RecencyMap` batching when that flag is set. Rust keeps the
   default unset, though: matching OCaml's default `32` cap by default would

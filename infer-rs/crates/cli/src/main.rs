@@ -156,6 +156,11 @@ struct Cli {
     #[arg(long = "procedures-filter")]
     procedures_filter: Option<String>,
 
+    /// Dump final retained fixpoint pre/post states for selected CFG node IDs.
+    /// Accepts a comma-separated list, e.g. `--debug-fixpoint-nodes 18,20,22`.
+    #[arg(long = "debug-fixpoint-nodes", value_delimiter = ',')]
+    debug_fixpoint_nodes: Vec<u32>,
+
     /// Path to .inferconfig file (default: search upward from CWD).
     #[arg(long = "inferconfig-path")]
     inferconfig_path: Option<PathBuf>,
@@ -250,6 +255,9 @@ impl Cli {
         }
         if let Some(v) = &self.procedures_filter {
             c.procedures_filter = Some(v.clone());
+        }
+        if !self.debug_fixpoint_nodes.is_empty() {
+            c.debug_fixpoint_nodes = self.debug_fixpoint_nodes.clone();
         }
         if self.jobs.is_some() {
             c.jobs = self.jobs;

@@ -123,6 +123,36 @@ Policy:
 - treat real+real plain-name collisions as an exported-Textual fidelity limit until the textual
   boundary preserves the OCaml proc UID (or equivalent identity metadata)
 
+## Accepted Fidelity Limitation: exported cleanup metadata on hot loops
+
+Rust now lowers OCaml-exported `__sil_metadata_*` helper calls back to SIL
+metadata instructions during Textual→SIL conversion. This matches
+`infer/src/textual/TextualOfSil.ml` `InstrBridge.of_sil_metadata`, and the
+Rust side has focused unit tests for the supported metadata families.
+
+What the current OpenSSL probe shows:
+
+- the exported `wp_block.sil` does already contain
+  `__sil_metadata_variable_lifetime_begins`
+- the hot loop path around line `540` still contains no
+  `__sil_metadata_abstract`, `__sil_metadata_nullify`,
+  `__sil_metadata_exit_scope`, or `__sil_metadata_loop_*` calls
+- the corresponding OCaml SIL/HTML view for the same hotspot does show the
+  cleanup/abstraction metadata on those nodes
+- after importer support landed, the narrowed `whirlpool_block` rerun still
+  finished at `1m46s` with `611` retained disjunct states and the same top
+  retained nodes `18,20,21,22,24,25,26,27`
+
+Policy:
+
+- do not add a Rust-side Pulse workaround for this specific gap just to make
+  the OpenSSL numbers look better
+- treat the missing cleanup metadata on this exported path as an
+  `--export-textual` fidelity limitation until the textual boundary preserves
+  it
+- if upstream export starts emitting those metadata calls, rerun the narrowed
+  `whirlpool_block` probe immediately before changing Pulse again
+
 ## Other Notes
 
 - frontend coverage for `--store-textual` is moving upstream; treat old per-language support

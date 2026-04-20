@@ -55,6 +55,20 @@ changes, and move finished results to durable docs/tests/commits.
     node `18` last `PRE STATE=1`, last `Got 1`;
     nodes `20/21/24/25/26/27` last `PRE STATE=7`, last `Got 1`;
     node `22` last `PRE STATE=7`, last `Got 0`
+  - Rust Textual→SIL now lowers OCaml-exported `__sil_metadata_*` helper
+    calls back to `Instr::Metadata` (cross-ref:
+    `infer/src/textual/TextualOfSil.ml` `InstrBridge.of_sil_metadata` and
+    `infer-rs/crates/textual/src/to_sil.rs`), with focused unit tests
+  - current `wp_block.sil` export does contain
+    `__sil_metadata_variable_lifetime_begins`, but it still contains no
+    `__sil_metadata_abstract`, `__sil_metadata_nullify`,
+    `__sil_metadata_exit_scope`, or `__sil_metadata_loop_*` calls on the hot
+    loop path around line `540`
+  - after landing metadata import support, the narrowed traced rerun stayed on
+    the same final shape: `1m46s`, `611` retained disjunct states,
+    `max_node_disjuncts=4`, and top retained nodes
+    `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v,
+    26:4d:4v, 27:4d:4v`
 - Active conclusion:
   - the dominant OpenSSL gap was not just storage sharing and not just
     `state_cmp`; Rust was re-executing already-known pre disjuncts on hot WTO
@@ -65,11 +79,10 @@ changes, and move finished results to durable docs/tests/commits.
   - Rust is now much closer to OCaml on `whirlpool_block`, but the remaining
     semantic gap is the smaller set of loop-head states that still retain up
     to `4` disjuncts instead of OCaml's final `0/1`
-  - the new node scrape sharpens that further: OCaml reaches the same hot
-    block with up to `7` incoming disjuncts, but collapses those nodes back to
-    `1` or `0`; Rust still keeps `4`-way retained posts there, so the next
-    probe is post-node collapse / dedup on that block rather than frontier
-    breadth or recency
+  - the remaining `whirlpool_block` gap is no longer a Rust-side Textual
+    metadata import miss: importer support is in place and tested, but the
+    current export surface still drops the cleanup/abstraction metadata that
+    OCaml carries on the hot loop path
 - Useful paths / commands:
   - Rust hotspot file:
     `/tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
@@ -80,10 +93,14 @@ changes, and move finished results to durable docs/tests/commits.
     `infer analyze --pulse-only --debug --results-dir infer-out -j 1 --changed-files-index /tmp/infer-rs-openssl-wp_block.changed --procedures-filter whirlpool_block`
   - current narrowed Rust repro:
     `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block /tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
+  - narrowed post-importer metadata check:
+    `rg -n "__sil_metadata_(abstract|nullify|exit_scope|loop_back_edge|loop_entry|loop_exit|try_entry|try_exit|catch_entry|skip|variable_lifetime_begins)" /tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
 - Current validated working-tree checkpoint:
   - `cargo test -p pulse exec_node_skips_reexecuting_old_pre_disjuncts -- --nocapture`
   - `cargo test -p pulse state_cmp -- --nocapture`
   - `cargo test -p absint --lib -- --nocapture`
+  - `cargo test -p textual -- --nocapture`
+  - `cargo test -p analyses test_liveness_on_c_fixture -- --nocapture`
   - `cargo build -p infer-rs --release`
   - `cargo fmt --check`
 
@@ -103,12 +120,13 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Next Probes
 
-- Compare the retained Rust post states on nodes
-  `18, 20, 21, 22, 24, 25, 26, 27` against the OCaml HTML / Rust debug trace
-  and identify the first post-node semantic difference that prevents collapse
-  from `4` to OCaml's `1/0`.
-- Use the new debug-only `fixpoint-top-nodes` logger as the entry point before
-  adding any broader instrumentation or revisiting storage work.
-- After that narrower comparison is understood, rerun the shared OpenSSL
-  corpus at `-j 1` before spending more time on whole-program `-j 4` / `-j 8`
-  runs or storage/persistence work.
+- Keep the missing exported cleanup metadata documented as an upstream/export
+  fidelity limit. If `--export-textual` starts emitting the corresponding
+  `__sil_metadata_{abstract,nullify,exit_scope,loop_*}` calls on this proc,
+  rerun `whirlpool_block` immediately.
+- Use the current importer support as the floor: do not add a Pulse workaround
+  for this specific `whirlpool_block` gap just to move the retained-state
+  numbers.
+- Continue whole-program OpenSSL work on the publishable surfaces that remain:
+  merged-run abnormal termination / memory growth and then a clean `-j 1`
+  rerun on the shared exported corpus.

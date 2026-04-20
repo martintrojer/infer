@@ -134,20 +134,30 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   `manifest.json` can still drop OCaml's hashed proc UIDs and collapse distinct real C functions
   onto one plain procname. Treat this as an exported-Textual fidelity limitation unless upstream
   preserves the proc UID at the textual boundary.
+- **Exported cleanup metadata fidelity**: Rust now lowers OCaml-exported
+  `__sil_metadata_*` helper calls back to SIL metadata, but the current
+  OpenSSL `wp_block.sil` still only contains
+  `__sil_metadata_variable_lifetime_begins` and lacks the
+  `abstract` / `nullify` / `exit_scope` / `loop_*` metadata present in the
+  corresponding OCaml SIL/HTML view. Treat this remaining `whirlpool_block`
+  gap as an exported-Textual fidelity limit unless the boundary preserves that
+  cleanup metadata too.
 - **DeclEnv enhancements** (`decls.rs`): Missing variadic proc tracking, generics status.
 - Language-specific (defer): FixHackWrapper, FixHackInvokeClosure, TransformClosures, verify_variadic_position, SSA restoration.
 
 ### OpenSSL benchmark follow-ups
 
-- Finish the isolated `whirlpool_block` probe after the WTO `exec_node`
-  parity fix and record its final retained-state shape against OCaml's
-  `152`-snapshot final state. The old `2995`-snapshot Rust baseline is no
-  longer the current checkpoint.
-- Compare the remaining retained loop-head states that still reach
-  `max_node_disjuncts=4` (currently likely nodes `3` and `17`) against the
-  OCaml HTML / Rust traces. `state_cmp` itself is no longer the main story;
-  the active question is the smaller residual semantic difference in those
-  states after the WTO revisit fix.
+- Keep the narrowed `whirlpool_block` checkpoint current:
+  post-importer-support rerun still finishes at `1m46s` with
+  `611` retained disjunct states and the same top retained nodes
+  `18,20,21,22,24,25,26,27`, versus OCaml's `152` final snapshots.
+- Do not chase a Rust/Pulse workaround for that remaining `whirlpool_block`
+  gap. The importer now handles exported `__sil_metadata_*` helpers correctly;
+  the current blocker is that the exported file still lacks the cleanup /
+  abstraction metadata visible in OCaml on the hot loop path.
+- If upstream `--export-textual` starts emitting the missing cleanup metadata
+  on `whirlpool_block`, rerun the narrowed probe before doing any new local
+  Pulse surgery.
 - First rerun the shared exported corpus at `-j 1` after the narrowed hotspot
   comparison is understood, and treat that as the only current publishable
   apples-to-apples Rust timing until merged `-j > 1` runs are stable.
@@ -192,6 +202,7 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 - **Per-instruction tracing**: `--debug-level-analysis 1` (debug) or `2` (trace). Also `RUST_LOG=pulse=debug`. Log lines prefixed with `[proc_name]` for parallel-safe filtering.
 - **Scheduler tracing**: `--trace-ondemand` enables logger-based wave start/end and periodic progress snapshots (`RUST_LOG=warn,ondemand=info` by default when the flag is set).
 - **Retained-state tracing**: `--trace-ondemand` now also emits `live-fixpoint` heartbeats so OpenSSL debugging can separate active frontier cost from retained invariant-map cost.
+- **Selected-node retained dumps**: `--debug-fixpoint-nodes 18,20,22` (with `RUST_LOG=pulse=debug`) logs final retained disjunct / visit counts for chosen CFG nodes; add `--debug-level-analysis 2` to dump retained PRE/POST states too.
 - **Comparison script**: `scripts/compare_traces.py` — parses OCaml `--debug` HTML and Rust log, side-by-side per-instruction with disjunct counts.
 - **Compliance recipe**: see CLAUDE.md "Step-by-step tracing for compliance debugging".
 

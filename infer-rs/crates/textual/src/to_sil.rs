@@ -276,6 +276,19 @@ fn field_to_sil(lang: Lang, field: &ast::FieldDecl) -> strukt::Field {
     }
 }
 
+fn lvar_to_sil_pvar(
+    decls: &DeclEnv,
+    pname: &procname::Procname,
+    name: &ast::VarName,
+) -> pvar::Pvar {
+    let mangled = Mangled::from_string(&name.value);
+    if decls.get_global(&name.value).is_some() {
+        pvar::Pvar::mk_global(mangled)
+    } else {
+        pvar::Pvar::mk(mangled, pname.clone())
+    }
+}
+
 /// Mirrors `ExpBridge.to_sil` (simplified — handles the common cases).
 // `lang` and `source_file` are threaded through for recursive calls where
 // deeper expression kinds (Closure, Lfield) need them, even though the
@@ -381,12 +394,7 @@ fn exp_to_sil(
         ast::Exp::Var(id) => Ok(exp::Exp::Var(ident_to_sil(*id))),
         ast::Exp::Const(c) => Ok(exp::Exp::Const(const_to_sil(c))),
         ast::Exp::Lvar(name) => {
-            let mangled = Mangled::from_string(&name.value);
-            let pv = if decls.get_global(&name.value).is_some() {
-                pvar::Pvar::mk_global(mangled)
-            } else {
-                pvar::Pvar::mk(mangled, pname.clone())
-            };
+            let pv = lvar_to_sil_pvar(decls, pname, name);
             Ok(exp::Exp::Lvar(pv))
         }
         ast::Exp::Load { exp, typ: _ } => {
@@ -833,6 +841,236 @@ fn sil_builtin_to_unop(name: &str) -> Option<unop::Unop> {
     }
 }
 
+fn metadata_builtin_error(
+    textual_loc: &ast::Location,
+    name: &str,
+    message: impl Into<String>,
+) -> ConvError {
+    ConvError {
+        loc: textual_loc.clone(),
+        message: format!("invalid `{name}` metadata builtin: {}", message.into()),
+    }
+}
+
+fn metadata_i32_arg(
+    name: &str,
+    arg_name: &str,
+    exp: &ast::Exp,
+    textual_loc: &ast::Location,
+) -> Result<i32, ConvError> {
+    match exp {
+        ast::Exp::Const(ast::Const::Int(value)) => value.to_string().parse::<i32>().map_err(|_| {
+            metadata_builtin_error(textual_loc, name, format!("{arg_name} must fit in i32"))
+        }),
+        _ => Err(metadata_builtin_error(
+            textual_loc,
+            name,
+            format!("{arg_name} must be an integer constant, got {exp:?}"),
+        )),
+    }
+}
+
+fn metadata_pvar_arg(
+    name: &str,
+    arg_name: &str,
+    decls: &DeclEnv,
+    pname: &procname::Procname,
+    exp: &ast::Exp,
+    textual_loc: &ast::Location,
+) -> Result<pvar::Pvar, ConvError> {
+    match exp {
+        ast::Exp::Lvar(var_name) => Ok(lvar_to_sil_pvar(decls, pname, var_name)),
+        _ => Err(metadata_builtin_error(
+            textual_loc,
+            name,
+            format!("{arg_name} must be an lvar, got {exp:?}"),
+        )),
+    }
+}
+
+fn metadata_var_arg(
+    name: &str,
+    decls: &DeclEnv,
+    pname: &procname::Procname,
+    exp: &ast::Exp,
+    textual_loc: &ast::Location,
+) -> Result<sil::var::Var, ConvError> {
+    match exp {
+        ast::Exp::Lvar(var_name) => Ok(sil::var::Var::of_pvar(lvar_to_sil_pvar(
+            decls, pname, var_name,
+        ))),
+        ast::Exp::Var(id) => Ok(sil::var::Var::of_id(ident_to_sil(*id))),
+        _ => Err(metadata_builtin_error(
+            textual_loc,
+            name,
+            format!("exit_scope args must be lvars or logical vars, got {exp:?}"),
+        )),
+    }
+}
+
+fn metadata_typ_arg(
+    name: &str,
+    arg_name: &str,
+    lang: Lang,
+    exp: &ast::Exp,
+    textual_loc: &ast::Location,
+) -> Result<typ::Typ, ConvError> {
+    match exp {
+        ast::Exp::Typ(textual_typ) => Ok(typ_to_sil(lang, textual_typ)),
+        _ => Err(metadata_builtin_error(
+            textual_loc,
+            name,
+            format!("{arg_name} must be a type expression, got {exp:?}"),
+        )),
+    }
+}
+
+fn sil_builtin_to_metadata(
+    name: &str,
+    args: &[ast::Exp],
+    lang: Lang,
+    decls: &DeclEnv,
+    pname: &procname::Procname,
+    textual_loc: &ast::Location,
+    loc: &location::Location,
+) -> Result<Option<instr::InstrMetadata>, ConvError> {
+    // Cross-ref: OCaml TextualOfSil.ml `InstrBridge.of_sil_metadata`.
+    let metadata = match name {
+        "__sil_metadata_abstract" => {
+            if !args.is_empty() {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 0 args, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::Abstract(loc.clone())
+        }
+        "__sil_metadata_catch_entry" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::CatchEntry {
+                try_id: metadata_i32_arg(name, "try_id", &args[0], textual_loc)?,
+                loc: loc.clone(),
+            }
+        }
+        "__sil_metadata_exit_scope" => instr::InstrMetadata::ExitScope(
+            args.iter()
+                .map(|arg| metadata_var_arg(name, decls, pname, arg, textual_loc))
+                .collect::<Result<Vec<_>, ConvError>>()?,
+            loc.clone(),
+        ),
+        "__sil_metadata_nullify" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::Nullify(
+                metadata_pvar_arg(name, "pvar", decls, pname, &args[0], textual_loc)?,
+                loc.clone(),
+            )
+        }
+        "__sil_metadata_loop_back_edge" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::LoopBackEdge {
+                header_id: metadata_i32_arg(name, "header_id", &args[0], textual_loc)?,
+            }
+        }
+        "__sil_metadata_loop_entry" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::LoopEntry {
+                header_id: metadata_i32_arg(name, "header_id", &args[0], textual_loc)?,
+            }
+        }
+        "__sil_metadata_loop_exit" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::LoopExit {
+                header_id: metadata_i32_arg(name, "header_id", &args[0], textual_loc)?,
+            }
+        }
+        "__sil_metadata_skip" => {
+            if !args.is_empty() {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 0 args, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::Skip
+        }
+        "__sil_metadata_try_entry" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::TryEntry {
+                try_id: metadata_i32_arg(name, "try_id", &args[0], textual_loc)?,
+                loc: loc.clone(),
+            }
+        }
+        "__sil_metadata_try_exit" => {
+            if args.len() != 1 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 1 arg, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::TryExit {
+                try_id: metadata_i32_arg(name, "try_id", &args[0], textual_loc)?,
+                loc: loc.clone(),
+            }
+        }
+        "__sil_metadata_variable_lifetime_begins" => {
+            if args.len() != 2 {
+                return Err(metadata_builtin_error(
+                    textual_loc,
+                    name,
+                    format!("expected 2 args, got {}", args.len()),
+                ));
+            }
+            instr::InstrMetadata::VariableLifetimeBegins {
+                pvar: metadata_pvar_arg(name, "pvar", decls, pname, &args[0], textual_loc)?,
+                typ: metadata_typ_arg(name, "typ", lang, &args[1], textual_loc)?,
+                loc: loc.clone(),
+                is_cpp_structured_binding: false,
+            }
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(metadata))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sil_builtin_to_instr(
     name: &str,
@@ -868,6 +1106,12 @@ fn sil_builtin_to_instr(
                 loc: loc.clone(),
             }));
         }
+    }
+
+    if let Some(metadata) =
+        sil_builtin_to_metadata(name, args, lang, decls, pname, textual_loc, loc)?
+    {
+        return Ok(Some(instr::Instr::Metadata(metadata)));
     }
 
     // Allocate builtins → BuiltinDecl.__new / __new_array
@@ -1178,6 +1422,111 @@ define f() : void {
         let pdesc = cfg.iter_proc_descs().next().unwrap();
         assert!(pdesc.is_empty_body());
         assert!(!pdesc.is_defined);
+    }
+
+    #[test]
+    fn test_metadata_builtins_lower_to_sil_metadata() {
+        let src = r#".source_language = "c"
+
+define f(x: int) : void {
+  #entry:
+    _ = __sil_metadata_abstract()
+    _ = __sil_metadata_nullify(&x)
+    _ = __sil_metadata_exit_scope(&x, n0)
+    _ = __sil_metadata_loop_entry(7)
+    _ = __sil_metadata_loop_back_edge(7)
+    _ = __sil_metadata_loop_exit(7)
+    _ = __sil_metadata_skip()
+    _ = __sil_metadata_try_entry(3)
+    _ = __sil_metadata_catch_entry(3)
+    _ = __sil_metadata_try_exit(3)
+    _ = __sil_metadata_variable_lifetime_begins(&x, <int>)
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        let metadata_instrs: Vec<_> = pdesc
+            .iter_instrs()
+            .filter_map(|(_, instr)| match instr {
+                instr::Instr::Metadata(metadata) => Some(metadata),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(metadata_instrs.len(), 11);
+        assert!(matches!(
+            metadata_instrs[0],
+            instr::InstrMetadata::Abstract(_)
+        ));
+        assert!(matches!(
+            metadata_instrs[1],
+            instr::InstrMetadata::Nullify(_, _)
+        ));
+        match metadata_instrs[2] {
+            instr::InstrMetadata::ExitScope(vars, _) => {
+                assert_eq!(vars.len(), 2);
+                assert!(matches!(vars[0], sil::var::Var::ProgramVar(_)));
+                assert!(matches!(vars[1], sil::var::Var::LogicalVar(_)));
+            }
+            other => panic!("expected ExitScope metadata, got {other:?}"),
+        }
+        assert!(matches!(
+            metadata_instrs[3],
+            instr::InstrMetadata::LoopEntry { header_id: 7 }
+        ));
+        assert!(matches!(
+            metadata_instrs[4],
+            instr::InstrMetadata::LoopBackEdge { header_id: 7 }
+        ));
+        assert!(matches!(
+            metadata_instrs[5],
+            instr::InstrMetadata::LoopExit { header_id: 7 }
+        ));
+        assert!(matches!(metadata_instrs[6], instr::InstrMetadata::Skip));
+        assert!(matches!(
+            metadata_instrs[7],
+            instr::InstrMetadata::TryEntry { try_id: 3, .. }
+        ));
+        assert!(matches!(
+            metadata_instrs[8],
+            instr::InstrMetadata::CatchEntry { try_id: 3, .. }
+        ));
+        assert!(matches!(
+            metadata_instrs[9],
+            instr::InstrMetadata::TryExit { try_id: 3, .. }
+        ));
+        assert!(matches!(
+            metadata_instrs[10],
+            instr::InstrMetadata::VariableLifetimeBegins {
+                is_cpp_structured_binding: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_invalid_metadata_builtin_reports_conversion_error() {
+        let src = r#".source_language = "c"
+
+define f() : void {
+  #entry:
+    _ = __sil_metadata_nullify(0)
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, decl_errors) = DeclEnv::from_module(&module);
+        assert!(decl_errors.is_empty());
+
+        let errors = module_to_sil(&module, &decls).unwrap_err();
+        assert!(
+            errors.iter().any(|err| err
+                .message
+                .contains("invalid `__sil_metadata_nullify` metadata builtin")),
+            "expected metadata builtin conversion error, got: {errors:?}"
+        );
     }
 
     #[test]

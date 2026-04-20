@@ -227,6 +227,85 @@ impl FixpointStats {
     }
 }
 
+fn fixpoint_node_dump_enabled() -> bool {
+    !config::get().debug_fixpoint_nodes.is_empty() && log::log_enabled!(log::Level::Debug)
+}
+
+fn node_instrs_summary(node: &sil::procdesc::Node) -> String {
+    if node.instrs.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut instrs = node
+        .instrs
+        .iter()
+        .take(3)
+        .map(|instr| format!("{instr}"))
+        .collect::<Vec<_>>();
+    if node.instrs.len() > 3 {
+        instrs.push(format!("...(+{} more)", node.instrs.len() - 3));
+    }
+    instrs.join(" | ")
+}
+
+fn dump_selected_fixpoint_nodes(
+    proc_name: &str,
+    pdesc: &Procdesc,
+    inv_map: &interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>,
+) {
+    if !fixpoint_node_dump_enabled() {
+        return;
+    }
+
+    let verbose = config::get().debug_level_analysis >= 2;
+    for &node_id in &config::get().debug_fixpoint_nodes {
+        let preds: Vec<_> = pdesc.get_preds(node_id).copied().collect();
+        let succs: Vec<_> = pdesc.get_succs(node_id).copied().collect();
+        match (pdesc.get_node(node_id), inv_map.get(&node_id)) {
+            (Some(node), Some(state)) => {
+                log::debug!(
+                    "[pulse-fixpoint] proc={proc_name} node={node_id} loc={:?} visit_count={} pre_disjuncts={} post_disjuncts={} preds={preds:?} succs={succs:?} instrs={}",
+                    node.loc,
+                    state.visit_count,
+                    state.pre.disjuncts.len(),
+                    state.post.disjuncts.len(),
+                    node_instrs_summary(node),
+                );
+                if verbose {
+                    log::debug!(
+                        "[pulse-fixpoint] proc={proc_name} node={node_id} retained PRE = {:#?}",
+                        state.pre
+                    );
+                    log::debug!(
+                        "[pulse-fixpoint] proc={proc_name} node={node_id} retained POST = {:#?}",
+                        state.post
+                    );
+                }
+            }
+            (Some(node), None) => {
+                log::debug!(
+                    "[pulse-fixpoint] proc={proc_name} node={node_id} loc={:?} preds={preds:?} succs={succs:?} retained-state=missing instrs={}",
+                    node.loc,
+                    node_instrs_summary(node),
+                );
+            }
+            (None, Some(state)) => {
+                log::debug!(
+                    "[pulse-fixpoint] proc={proc_name} node={node_id} retained node missing from CFG visit_count={} pre_disjuncts={} post_disjuncts={}",
+                    state.visit_count,
+                    state.pre.disjuncts.len(),
+                    state.post.disjuncts.len(),
+                );
+            }
+            (None, None) => {
+                log::debug!(
+                    "[pulse-fixpoint] proc={proc_name} node={node_id} missing from CFG and invariant map"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ProcProgress {
     started: Instant,
@@ -448,6 +527,7 @@ pub fn analyze_with_specialization_and_requests(
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
     let fixpoint_stats = pulse_progress_enabled().then(|| FixpointStats::from_inv_map(&inv_map));
+    dump_selected_fixpoint_nodes(&pulse_tf.proc_name, pdesc, &inv_map);
     let exit_has_normal_path = inv_map.get(&pdesc.exit_node).is_some_and(|exit_state| {
         exit_state.post.disjuncts.iter().any(|d| {
             matches!(

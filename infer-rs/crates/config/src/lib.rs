@@ -195,6 +195,14 @@ pub struct InferConfig {
     #[serde(rename = "procedures-filter")]
     pub procedures_filter: Option<String>,
 
+    /// Specific CFG node IDs whose final retained fixpoint states should be
+    /// logged after analysis.
+    ///
+    /// Debug-only aid for comparing Rust's WTO/disjunctive retention against
+    /// OCaml on hot procedures.
+    #[serde(rename = "debug-fixpoint-nodes")]
+    pub debug_fixpoint_nodes: Vec<u32>,
+
     // ---- Parallelism ----
     /// Number of parallel analysis jobs. None = use all available CPUs.
     /// OCaml: `-j` / `--jobs` (default: number of CPUs)
@@ -233,6 +241,7 @@ impl Default for InferConfig {
             debug_level_analysis: 0,
             trace_ondemand: false,
             procedures_filter: None,
+            debug_fixpoint_nodes: Vec::new(),
             jobs: None,
             quiet: false,
         }
@@ -331,6 +340,7 @@ mod tests {
         assert!(config.pulse_model_unknown_pure.is_empty());
         assert!(!config.trace_ondemand);
         assert!(config.procedures_filter.is_none());
+        assert!(config.debug_fixpoint_nodes.is_empty());
         assert!(!config.quiet);
     }
 
@@ -444,6 +454,12 @@ mod tests {
     fn test_from_json_procedures_filter() {
         let config = InferConfig::from_json(r#"{"procedures-filter": "foo\\.c:target"}"#);
         assert_eq!(config.procedures_filter.as_deref(), Some("foo\\.c:target"));
+    }
+
+    #[test]
+    fn test_from_json_debug_fixpoint_nodes() {
+        let config = InferConfig::from_json(r#"{"debug-fixpoint-nodes": [18, 20, 22]}"#);
+        assert_eq!(config.debug_fixpoint_nodes, vec![18, 20, 22]);
     }
 
     #[test]

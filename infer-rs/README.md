@@ -53,6 +53,16 @@ OpenSSL benchmark status on this host:
   `152` post snapshots across `178` CFG nodes, about `98727` post heap nodes,
   `53889` edges, and `39663` attr entries, with no final node retaining more
   than `1` disjunct
+- Rust Textual→SIL now lowers OCaml-exported `__sil_metadata_*` helper calls
+  back to SIL metadata, with focused tests in `crates/textual/src/to_sil.rs`
+- on the current `wp_block.sil` export, that importer support does not move
+  the hotspot by itself: the file contains
+  `__sil_metadata_variable_lifetime_begins`, but still no
+  `__sil_metadata_abstract`, `nullify`, `exit_scope`, or `loop_*` metadata on
+  the hot loop path around line `540`; a post-importer rerun still ends at
+  `1m46s`, `611` retained disjunct states, and the same top retained nodes
+  `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v, 26:4d:4v,
+  27:4d:4v`
 - `--pulse-recency-limit 32` is now available as an opt-in OCaml-style
   experiment, but it is intentionally not the default: default-enabling it
   reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad` false
@@ -66,7 +76,8 @@ OpenSSL benchmark status on this host:
   `whirlpool_block` (Rust still above OCaml's `152`-snapshot final shape),
   retained invariant-map storage across hot procedures, remaining local Pulse
   cost, abnormal termination in merged runs, and exported-Textual proc-identity
-  loss for some duplicate C names, not merge/callgraph setup
+  loss for some duplicate C names plus missing cleanup metadata on this
+  exported hotspot, not merge/callgraph setup
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an
@@ -297,6 +308,7 @@ after textual export, because it excludes capture/export overhead.
 | `--debug-level-analysis N` | 0=quiet, 1=per-instruction, 2=full state dumps |
 | `--trace-ondemand` | Emit on-demand scheduler progress snapshots through the logger |
 | `--procedures-filter REGEX` | OCaml-compatible procedure filter: `proc_regex` or `source_regex:proc_regex` |
+| `--debug-fixpoint-nodes N1,N2,...` | Rust-only debug aid: dump final retained fixpoint shape for selected CFG node IDs |
 | `--inferconfig-path FILE` | Path to .inferconfig file |
 | `--pulse-model-abort PROCNAME` | Model an exact procname as non-returning (repeatable) |
 | `--pulse-model-unreachable PROCNAME` | Model an exact procname as unreachable (repeatable) |
@@ -334,6 +346,11 @@ OpenSSL memory investigation.
 `procedures-filter` is also `.inferconfig`/CLI compatible with OCaml's flag name and split
 syntax. A single regex filters procnames; `source_regex:proc_regex` filters both source file and
 procname.
+`debug-fixpoint-nodes` is a Rust-only debug knob for narrowed WTO/disjunctive
+parity work. Use it with `RUST_LOG=pulse=debug` (or broader `debug`) to log
+the final retained disjunct / visit counts for selected CFG nodes, and add
+`--debug-level-analysis 2` when you need the full retained PRE/POST dumps for
+those nodes.
 `pulse-model-returns-copy-pattern` is still intentionally unsupported because Rust does not yet
 implement OCaml's non-disjunctive unnecessary-copy tracking.
 
