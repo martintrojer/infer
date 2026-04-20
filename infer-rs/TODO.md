@@ -162,11 +162,17 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   rebinding and structured-binding skip behavior. Keep that correctness fix
   too: the completed selected-node rerun still finishes at the same
   `1222` / `8` final shape in `4m56s`.
+- Treat the old-vs-new `VariableLifetimeBegins` selected-node dump diffs as
+  serialization noise until proven otherwise: representative hot blocks
+  (`29:PRE`, `31:PRE`, `38:POST`) keep identical line counts, abstract-value
+  counts, invalid / initialized attr counts, `must_be_valid` counts, and
+  variable-name sets before vs after the fix, even though raw hashes differ.
 - Next narrowed hotspot step: rerun the richer export with
   `--debug-level-analysis 2 --debug-fixpoint-nodes 29,31,32,33,35,36,37,38`
   and compare Rust's retained PRE/POST states to the OCaml line `540` /
-  `752-755` block using location/instruction mapping rather than assuming raw
-  node-id parity across frontends.
+  `752-755` block using location/instruction mapping rather than spending more
+  time on Rust-vs-Rust raw dump hashes or assuming raw node-id parity across
+  frontends.
 - Do not spend time on `Nullify` / `Abstract` metadata here unless new
   evidence appears: OCaml Pulse keeps them as no-op too.
 - Keep the current OCaml comparison in view while doing that dump: the
@@ -226,6 +232,7 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 - **Retained-state tracing**: `--trace-ondemand` now also emits `live-fixpoint` heartbeats so OpenSSL debugging can separate active frontier cost from retained invariant-map cost.
 - **Selected-node retained dumps**: `--debug-fixpoint-nodes 18,20,22` (with `RUST_LOG=pulse=debug`) logs final retained disjunct / visit counts for chosen CFG nodes; add `--debug-level-analysis 2` to dump retained PRE/POST states too.
 - **Comparison script**: `scripts/compare_traces.py` — parses OCaml `--debug` HTML and Rust log, side-by-side per-instruction with disjunct counts.
+- **Retained-block comparison script**: `scripts/compare_fixpoint_blocks.py` — compares selected Rust retained PRE/POST dumps across two runs, reports coarse signatures, and shows the first normalized diff.
 - **Compliance recipe**: see CLAUDE.md "Step-by-step tracing for compliance debugging".
 
 ## Code issues

@@ -86,6 +86,12 @@ OpenSSL benchmark status on this host:
   finishes in `4m56s` with the same `1222` retained states,
   `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
   `29,31,32,33,35,36,37,38`
+- representative retained PRE/POST dumps for hot nodes `29`, `31`, and `38`
+  are also structurally unchanged before vs after that fix: the selected
+  blocks keep identical line counts, abstract-value counts, invalid/initialized
+  attribute counts, `must_be_valid` counts, and variable-name sets; the raw
+  block hashes still differ, but the first visible diff is local ordering
+  (`ctx` vs `n`) rather than a new retained-state shape
 - the remaining gap is therefore sharper: the selected nodes map to the line
   `540` `r++` / load / prune block and the line `752-755`
   `S.q[...] = L*` stores, while matching OCaml HTML on those lines ends with
@@ -463,6 +469,9 @@ infer-rs/
 - **Correctness over counts**: keep semantically correct OCaml-backed behavior even when sweep totals move temporarily; accepted divergences are documented instead of hidden
 - **Test through comparison**: compare against OCaml's `issues.exp` for compliance
 - **Per-instruction tracing**: `--debug-level-analysis` + `scripts/compare_traces.py` for debugging divergences
+- **Retained-block comparison**: `scripts/compare_fixpoint_blocks.py` compares
+  selected Rust retained PRE/POST dumps across two runs and reports coarse
+  structural signatures plus the first normalized diff
 - **Scheduler tracing for long runs**: `--trace-ondemand` uses the logger to expose wave progress and ETA during merged interproc analysis, and now also emits `pulse-progress` frontier heartbeats plus `live-fixpoint` retained-state heartbeats for long-running procedures
 
 ## Documentation

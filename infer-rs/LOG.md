@@ -115,6 +115,14 @@ changes, and move finished results to durable docs/tests/commits.
     `pre_posts=2`, same top retained nodes
     `29:8d:4v, 31:8d:4v, 32:8d:4v, 33:8d:4v, 35:8d:4v, 36:8d:4v,
     37:8d:4v, 38:8d:4v`
+  - representative retained blocks are structurally unchanged before vs after
+    that fix:
+    `29:PRE`, `29:POST`, `31:PRE`, `31:POST`, `38:PRE`, and `38:POST`
+    keep identical line counts plus identical counts of abstract values,
+    invalid attrs, initialized attrs, `must_be_valid`, and distinct var names;
+    raw normalized hashes still differ and the first visible line diff is
+    local ordering (`ctx` vs `n`), so do not treat old/new Rust block hashes
+    as semantic evidence by themselves
   - selected-node mapping from the Rust dump:
     node `29` is the empty join block at line `540`,
     nodes `31/32/33` are the `r++` / load / prune chain at line `540`,
@@ -180,10 +188,10 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Next Probes
 
-- Re-run the richer single-file `wp_block.c` hotspot with
-  `--debug-level-analysis 2 --debug-fixpoint-nodes 29,31,32,33,35,36,37,38`
-  and compare the exact retained PRE/POST states against the OCaml line
-  `540` / `752-755` block.
+- Compare the current richer single-file `wp_block.c` retained PRE/POST states
+  against the OCaml line `540` / `752-755` block. Do not spend more time
+  diffing pre-VLB vs post-VLB Rust dumps unless a normalized retained-block
+  compare points to a real structural change.
 - Do not chase `Nullify` / `Abstract` metadata work here: OCaml Pulse keeps
   them as no-op too.
 - Re-export the shared OpenSSL corpus with the patched OCaml exporter and use

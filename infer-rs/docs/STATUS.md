@@ -82,6 +82,12 @@
   `1222` retained states, `204` CFG nodes, `173` revisited nodes,
   `max_visit_count=4`, `max_node_disjuncts=8`, `pre_posts=2`, and the same
   top retained nodes `29,31,32,33,35,36,37,38`.
+- Representative retained PRE/POST blocks for hot nodes `29`, `31`, and `38`
+  are structurally unchanged before vs after that fix too. The old/new dumps
+  keep identical block line counts, abstract-value counts, invalid /
+  initialized attribute counts, `must_be_valid` counts, and variable-name
+  sets; the raw hashes still differ, but the first visible diff is local
+  ordering (`ctx` vs `n`) rather than an obvious new retained-state shape.
 - The selected-node dump pins that remaining block to line `540`
   (`r++` / load / prune) and lines `752-755` (`S.q[...] = L*`). Matching
   OCaml HTML on those lines ends with `Got 1 disjunct back`, and the last
@@ -208,8 +214,14 @@ Recent correctness / robustness fixes:
   `debug-fixpoint-nodes` is available through CLI/config for Rust-only hotspot
   work. With `RUST_LOG=pulse=debug` it logs final retained disjunct / visit
   counts for selected CFG nodes, and `--debug-level-analysis 2` upgrades that
-  to full retained PRE/POST dumps. This is the surface that pinned the
-  remaining `whirlpool_block` hotspot to nodes `18,20,21,22,24,25,26,27`.
+  to full retained PRE/POST dumps. This first pinned the remaining shared-run
+  `whirlpool_block` hotspot to nodes `18,20,21,22,24,25,26,27`; on the newer
+  richer single-file export, the corresponding narrowed block is now
+  `29,31,32,33,35,36,37,38`.
+- `scripts/compare_fixpoint_blocks.py` now compares selected retained PRE/POST
+  dumps across two Rust runs and reports coarse structural signatures plus the
+  first normalized line diff, which is the current surface for separating
+  fresh-id / ordering drift from real retained-state shape changes.
 - `pulse-recency-limit` is now wired through config/CLI and `BaseMemory::Edges`
   mirrors OCaml `RecencyMap` batching when that flag is set. Rust keeps the
   default unset, though: matching OCaml's default `32` cap by default would
