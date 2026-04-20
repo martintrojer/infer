@@ -55,14 +55,28 @@ OpenSSL benchmark status on this host:
   than `1` disjunct
 - Rust Textual→SIL now lowers OCaml-exported `__sil_metadata_*` helper calls
   back to SIL metadata, with focused tests in `crates/textual/src/to_sil.rs`
-- on the current `wp_block.sil` export, that importer support does not move
-  the hotspot by itself: the file contains
-  `__sil_metadata_variable_lifetime_begins`, but still no
-  `__sil_metadata_abstract`, `nullify`, `exit_scope`, or `loop_*` metadata on
-  the hot loop path around line `540`; a post-importer rerun still ends at
-  `1m46s`, `611` retained disjunct states, and the same top retained nodes
-  `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v, 26:4d:4v,
-  27:4d:4v`
+- the sibling OCaml `infer` repo now locally fixes `infer debug
+  --export-textual` for C/Java by regenerating textual from loaded procdescs
+  after preanalysis/WTO setup; a focused C regression now locks in exported
+  `abstract` / `nullify` / `exit_scope` /
+  `variable_lifetime_begins` helpers
+- on a fresh single-file OpenSSL `wp_block.c` export, those cleanup metadata
+  helpers are now present, so the old export-boundary explanation is gone; the
+  Rust filtered `whirlpool_block` run on that richer input now finishes in
+  `4m52s` with `1222` retained states and top retained nodes
+  `29,31,32,33,35,36,37,38`, so this remains Rust-side fixpoint work, not a
+  missing textual import
+- Rust Pulse now also executes exported `Metadata::ExitScope` semantically
+  instead of treating all metadata as a no-op: dead post-stack temps/locals
+  are removed while pre-rooted formals stay available for summary
+  construction, matching the OCaml `ExitScope` intent
+- that `ExitScope` fix materially improves the same richer single-file hotspot:
+  a fresh rerun was interrupted at `2m05s` with `1022` retained states after
+  earlier checkpoints of `668 / max_node_disjuncts=6` at `10.3s`,
+  `768 / 6` at `31.0s`, and `922 / 6` at `1m12s`
+- the remaining gap is therefore narrower and more explicit: later revisits on
+  the richer export still climb back to `max_node_disjuncts=8`, so the next
+  work stays on retained-state convergence rather than exporter fidelity
 - `--pulse-recency-limit 32` is now available as an opt-in OCaml-style
   experiment, but it is intentionally not the default: default-enabling it
   reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad` false
@@ -73,11 +87,11 @@ OpenSSL benchmark status on this host:
   `equal_fast` / semantic-`leq` split
 - there is still no final apples-to-apples whole-program timing claim: the
   remaining gap is the smaller residual loop-head convergence difference on
-  `whirlpool_block` (Rust still above OCaml's `152`-snapshot final shape),
-  retained invariant-map storage across hot procedures, remaining local Pulse
-  cost, abnormal termination in merged runs, and exported-Textual proc-identity
-  loss for some duplicate C names plus missing cleanup metadata on this
-  exported hotspot, not merge/callgraph setup
+  `whirlpool_block` (Rust still above OCaml's `152`-snapshot final shape on
+  the shared capture), retained invariant-map storage across hot procedures,
+  remaining local Pulse cost, abnormal termination in merged runs, and
+  exported-Textual proc-identity loss for some duplicate C names, not
+  merge/callgraph setup
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an
@@ -416,6 +430,9 @@ infer-rs/
 
 1. OCaml's `infer capture --store-textual` captures C/C++ source and stores textual SIL in `capture.db`
 2. `infer debug --export-textual` exports `.sil` files + `manifest.json` mapping source→sil→procedures
+   (for local C/Java work, the sibling OCaml exporter now regenerates from
+   loaded procdescs after preanalysis/WTO so exported textual matches the
+   analysis CFG more closely)
 3. `infer-rs` parses textual SIL files in parallel, transforms them, and converts each module to SIL
 4. The per-file `Cfg`/`Tenv` results are merged into one in-memory program
 5. Pulse analysis runs: WTO fixpoint with disjunctive domain, biabduction, interprocedural summary application

@@ -10,6 +10,11 @@
     "procedures": [ "apply", "call_apply" ]
   },
   {
+    "source": "codetoanalyze/c/export-textual/metadata.c",
+    "sil": "metadata.sil",
+    "procedures": [ "metadata_scope" ]
+  },
+  {
     "source": "codetoanalyze/c/export-textual/subdir/basic.c",
     "sil": "basic_1.sil",
     "procedures": [ "subtract" ]

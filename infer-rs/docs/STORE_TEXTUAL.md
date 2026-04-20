@@ -123,35 +123,54 @@ Policy:
 - treat real+real plain-name collisions as an exported-Textual fidelity limit until the textual
   boundary preserves the OCaml proc UID (or equivalent identity metadata)
 
-## Accepted Fidelity Limitation: exported cleanup metadata on hot loops
+## Local OCaml Export Fix: cleanup metadata on hot loops
 
 Rust now lowers OCaml-exported `__sil_metadata_*` helper calls back to SIL
 metadata instructions during Textual→SIL conversion. This matches
 `infer/src/textual/TextualOfSil.ml` `InstrBridge.of_sil_metadata`, and the
 Rust side has focused unit tests for the supported metadata families.
 
-What the current OpenSSL probe shows:
+The local OCaml exporter in the sibling `infer/` repo now regenerates C/Java
+textual from freshly loaded procdescs after preanalysis/WTO setup instead of
+blindly dumping the raw `source_files.textual` string. Other integrations still
+fall back to the stored payload.
 
-- the exported `wp_block.sil` does already contain
-  `__sil_metadata_variable_lifetime_begins`
-- the hot loop path around line `540` still contains no
+What the current OpenSSL probe shows after that exporter fix:
+
+- a focused OCaml regression in
+  `infer/tests/codetoanalyze/c/export-textual/metadata.c` now verifies that
+  exported C textual contains
   `__sil_metadata_abstract`, `__sil_metadata_nullify`,
-  `__sil_metadata_exit_scope`, or `__sil_metadata_loop_*` calls
-- the corresponding OCaml SIL/HTML view for the same hotspot does show the
-  cleanup/abstraction metadata on those nodes
-- after importer support landed, the narrowed `whirlpool_block` rerun still
-  finished at `1m46s` with `611` retained disjunct states and the same top
-  retained nodes `18,20,21,22,24,25,26,27`
+  `__sil_metadata_exit_scope`, and
+  `__sil_metadata_variable_lifetime_begins`
+- a fresh single-file OpenSSL `wp_block.c` export now carries the same cleanup
+  metadata families instead of only
+  `__sil_metadata_variable_lifetime_begins`
+- that removes the old export-boundary explanation for the hotspot, but it
+  does not fix Rust Pulse by itself: the fresh filtered Rust
+  `whirlpool_block` run on the regenerated export now finishes in `4m52s`
+  with `1222` retained states, `max_node_disjuncts=8`, and top retained nodes
+  `29,31,32,33,35,36,37,38`
+- Rust Pulse now also executes exported `Metadata::ExitScope` semantically
+  instead of treating metadata as a no-op. Cross-ref: OCaml `Pulse.ml`
+  `Metadata (ExitScope ...)` and `PulseAbductiveDomain.Stack.remove_vars`.
+- with that Rust-side fix in place, a fresh rerun on the same richer export
+  was interrupted at `2m05s` with `1022` retained states after earlier
+  checkpoints of `668 / max_node_disjuncts=6` at `10.3s`,
+  `768 / 6` at `31.0s`, and `922 / 6` at `1m12s`
+- that is a real retained-state improvement, but not the whole remaining
+  answer: later revisits still climb back to `max_node_disjuncts=8`, so the
+  current hotspot is narrower Rust-side retained-state convergence work, not
+  an exporter/importer metadata gap
 
 Policy:
 
-- do not add a Rust-side Pulse workaround for this specific gap just to make
-  the OpenSSL numbers look better
-- treat the missing cleanup metadata on this exported path as an
-  `--export-textual` fidelity limitation until the textual boundary preserves
-  it
-- if upstream export starts emitting those metadata calls, rerun the narrowed
-  `whirlpool_block` probe immediately before changing Pulse again
+- keep the more faithful exporter behavior even if the Rust OpenSSL numbers
+  temporarily get worse
+- do not add a Rust-side Pulse workaround whose purpose is to compensate for
+  the old missing-metadata export bug
+- treat the remaining `whirlpool_block` cost as Rust-side analysis work unless
+  a new missing textual construct is identified
 
 ## Other Notes
 

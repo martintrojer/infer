@@ -59,16 +59,42 @@ changes, and move finished results to durable docs/tests/commits.
     calls back to `Instr::Metadata` (cross-ref:
     `infer/src/textual/TextualOfSil.ml` `InstrBridge.of_sil_metadata` and
     `infer-rs/crates/textual/src/to_sil.rs`), with focused unit tests
-  - current `wp_block.sil` export does contain
-    `__sil_metadata_variable_lifetime_begins`, but it still contains no
-    `__sil_metadata_abstract`, `__sil_metadata_nullify`,
-    `__sil_metadata_exit_scope`, or `__sil_metadata_loop_*` calls on the hot
-    loop path around line `540`
-  - after landing metadata import support, the narrowed traced rerun stayed on
-    the same final shape: `1m46s`, `611` retained disjunct states,
-    `max_node_disjuncts=4`, and top retained nodes
-    `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v,
-    26:4d:4v, 27:4d:4v`
+  - the sibling OCaml `infer` repo now locally fixes `infer debug
+    --export-textual` for C/Java by regenerating textual from freshly loaded
+    procdescs after preanalysis/WTO setup instead of dumping the raw stored
+    `source_files.textual`
+  - Rust Pulse now mirrors OCaml `Pulse.ml` / `PulseAbductiveDomain.Stack`
+    for `Metadata::ExitScope`: remove dead post-stack vars while preserving
+    pre-rooted formals that must survive into summaries
+  - focused Rust regressions:
+    `transfer::tests::test_exit_scope_removes_dead_post_stack_vars` and
+    `transfer::tests::test_exit_scope_keeps_pre_rooted_formals`
+  - focused OCaml regression:
+    `infer/tests/codetoanalyze/c/export-textual/metadata.c` now verifies that
+    exported textual contains `__sil_metadata_abstract`,
+    `__sil_metadata_nullify`, `__sil_metadata_exit_scope`, and
+    `__sil_metadata_variable_lifetime_begins`
+  - fresh single-file OpenSSL `wp_block.c` export now carries those cleanup
+    helpers too, so the old export-boundary explanation is gone for this
+    hotspot
+  - correctness first result: the fresh filtered Rust `whirlpool_block` run on
+    that richer export now finishes in `4m52s` with `1222` retained states,
+    `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
+    `29:8d:4v, 31:8d:4v, 32:8d:4v, 33:8d:4v, 35:8d:4v, 36:8d:4v,
+    37:8d:4v, 38:8d:4v`; export fidelity improved, but the hotspot did not
+    magically collapse
+  - after wiring `ExitScope` semantics into Rust transfer, a fresh rerun on
+    the same richer export was interrupted at `2m05s` with materially lower
+    retained-state growth:
+    `10.3s -> 668 states / max_node_disjuncts=6`,
+    `31.0s -> 768 / 6`,
+    `1m12s -> 922 / 6`,
+    `1m23s -> 942 / 8`,
+    `2m05s -> 1022 / 8`
+  - conclusion from that rerun: missing `ExitScope` handling was a real Rust
+    correctness/performance hole, but it is not the full remaining answer;
+    later revisits on the richer export still re-expand to `8` retained
+    disjuncts
 - Active conclusion:
   - the dominant OpenSSL gap was not just storage sharing and not just
     `state_cmp`; Rust was re-executing already-known pre disjuncts on hot WTO
@@ -76,26 +102,24 @@ changes, and move finished results to durable docs/tests/commits.
   - recency is still not the dominant answer: `--pulse-recency-limit 32`
     stayed essentially unchanged on `whirlpool_block`, and default-enabling it
     reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad`
-  - Rust is now much closer to OCaml on `whirlpool_block`, but the remaining
-    semantic gap is the smaller set of loop-head states that still retain up
-    to `4` disjuncts instead of OCaml's final `0/1`
-  - the remaining `whirlpool_block` gap is no longer a Rust-side Textual
-    metadata import miss: importer support is in place and tested, but the
-    current export surface still drops the cleanup/abstraction metadata that
-    OCaml carries on the hot loop path
+  - Rust is now much closer to OCaml on the old shared export, and on the
+    corrected richer export we have now fixed both the export boundary and the
+    Rust-side `ExitScope` semantics; the remaining `whirlpool_block` problem
+    is explicitly later fixpoint / retained-state convergence work
 - Useful paths / commands:
-  - Rust hotspot file:
-    `/tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
-  - OCaml HTML dir:
-    `/tmp/infer-rs-openssl-20260417-095315-rebase-j/infer-out/captured/wp_block.c.b43ab3043ea2edad`
-  - narrowed OCaml repro:
-    `printf 'openssl-1.0.2d/crypto/whrlpool/wp_block.c\n' > /tmp/infer-rs-openssl-wp_block.changed`
-    `infer analyze --pulse-only --debug --results-dir infer-out -j 1 --changed-files-index /tmp/infer-rs-openssl-wp_block.changed --procedures-filter whirlpool_block`
-  - current narrowed Rust repro:
-    `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block /tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
-  - narrowed post-importer metadata check:
-    `rg -n "__sil_metadata_(abstract|nullify|exit_scope|loop_back_edge|loop_entry|loop_exit|try_entry|try_exit|catch_entry|skip|variable_lifetime_begins)" /tmp/infer-rs-openssl-20260417-095315-rebase-j/textual-out/wp_block.sil`
+  - fresh narrow export repro:
+    `tmpdir=$(mktemp -d /tmp/wpblock-export.XXXXXX)`
+    `tar -xf ~/infer/benchmarks/openssl/openssl-1.0.2d.tar.gz -C "$tmpdir"`
+    `cd "$tmpdir/openssl-1.0.2d"`
+    `sdk=$(xcrun --show-sdk-path) && CC=clang CFLAGS="-isysroot $sdk" ./config no-asm`
+    `infer capture --store-textual --results-dir infer-out-wp -- clang -I. -Iinclude -c crypto/whrlpool/wp_block.c`
+    `infer debug --results-dir infer-out-wp --export-textual textual-out-wp`
+  - fresh metadata check:
+    `rg -o "__sil_metadata_[a-z_]+" textual-out-wp/wp_block.sil | sort -u`
+  - fresh narrowed Rust repro:
+    `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil"`
 - Current validated working-tree checkpoint:
+  - `cargo test -p pulse test_exit_scope_ -- --nocapture`
   - `cargo test -p pulse exec_node_skips_reexecuting_old_pre_disjuncts -- --nocapture`
   - `cargo test -p pulse state_cmp -- --nocapture`
   - `cargo test -p absint --lib -- --nocapture`
@@ -120,13 +144,14 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Next Probes
 
-- Keep the missing exported cleanup metadata documented as an upstream/export
-  fidelity limit. If `--export-textual` starts emitting the corresponding
-  `__sil_metadata_{abstract,nullify,exit_scope,loop_*}` calls on this proc,
-  rerun `whirlpool_block` immediately.
+- Re-run the richer single-file `wp_block.c` selected-node dump to completion
+  now that `ExitScope` is fixed, and compare the still-live `8`-way retained
+  split against OCaml on the exact later revisit block.
+- Re-export the shared OpenSSL corpus with the patched OCaml exporter and use
+  that as the next apples-to-apples Rust checkpoint.
 - Use the current importer support as the floor: do not add a Pulse workaround
   for this specific `whirlpool_block` gap just to move the retained-state
-  numbers.
+  numbers back toward the old smaller but less faithful export.
 - Continue whole-program OpenSSL work on the publishable surfaces that remain:
   merged-run abnormal termination / memory growth and then a clean `-j 1`
   rerun on the shared exported corpus.

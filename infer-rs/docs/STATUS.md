@@ -49,14 +49,30 @@
   back to `Instr::Metadata`, matching
   `infer/src/textual/TextualOfSil.ml` `InstrBridge.of_sil_metadata`, and
   focused `to_sil` tests cover the supported metadata families.
-- That importer support does not change the current `whirlpool_block` hotspot
-  shape by itself. The exported `wp_block.sil` keeps
-  `__sil_metadata_variable_lifetime_begins`, but it still lacks the
-  `abstract` / `nullify` / `exit_scope` / `loop_*` metadata visible in the
-  corresponding OCaml SIL/HTML hot loop. A post-importer narrowed rerun still
-  ends at `1m46s`, `611` retained disjunct states, and top retained nodes
-  `18:4d:4v, 20:4d:4v, 21:4d:4v, 22:4d:4v, 24:4d:4v, 25:4d:4v, 26:4d:4v,
-  27:4d:4v`.
+- The local OCaml exporter in the sibling `infer/` repo now regenerates
+  C/Java textual from loaded procdescs after preanalysis/WTO setup instead of
+  dumping the raw stored textual string. A focused C export-textual regression
+  now locks in `abstract` / `nullify` / `exit_scope` /
+  `variable_lifetime_begins` helper emission on export.
+- A fresh single-file OpenSSL `wp_block.c` export now carries those cleanup
+  metadata helpers too, which removes the old export-boundary explanation for
+  the hotspot. That correctness fix does not solve Rust by itself, though: the
+  fresh filtered Rust `whirlpool_block` run on the regenerated export now
+  finishes in `4m52s` with `1222` retained states, `max_node_disjuncts=8`,
+  and top retained nodes `29,31,32,33,35,36,37,38`.
+- Rust Pulse now also executes exported `Metadata::ExitScope` semantically
+  instead of treating all metadata as a no-op. Cross-ref: OCaml
+  `Pulse.ml` `Metadata (ExitScope ...)` and
+  `PulseAbductiveDomain.Stack.remove_vars`. Focused tests now cover both
+  surfaces: dead post-stack temp removal and preserved pre-rooted formals.
+- That `ExitScope` fix materially improves the richer single-file hotspot but
+  does not finish it. A fresh rerun on the same `wp_block.c` export was
+  interrupted at `2m05s` with `1022` retained states after earlier checkpoints
+  of `668 / max_node_disjuncts=6` at `10.3s`, `768 / 6` at `31.0s`, and
+  `922 / 6` at `1m12s`; later revisits still climbed back to
+  `max_node_disjuncts=8` by `1m23s` and stayed there through the interrupted
+  run. This is real progress on retained-state volume, not yet final OCaml
+  parity on the hot block.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`
@@ -140,9 +156,15 @@ Recent correctness / robustness fixes:
   `Instr::Metadata`: `to_sil.rs` converts exported
   `__sil_metadata_{abstract,catch_entry,exit_scope,nullify,loop_*,skip,try_*,variable_lifetime_begins}`
   helper calls back into SIL metadata instructions instead of treating them as
-  ordinary calls. The current OpenSSL `whirlpool_block` gap remains because
-  the exported file itself still lacks the cleanup metadata seen in OCaml on
-  the hot loop path, not because Rust is missing the importer support anymore.
+  ordinary calls. The old OpenSSL export-boundary gap is therefore closed in
+  the local OCaml exporter; the remaining hotspot is now on the Rust analysis
+  side of that richer input.
+- Pulse transfer now mirrors the OCaml `ExitScope` semantics too:
+  `Instr::Metadata(ExitScope(...))` removes dead post-stack variables but keeps
+  pre-rooted formals available for summary construction. This was a real Rust
+  semantic gap on the richer exported Textual, and the focused `wp_block`
+  rerun shows it reduces retained-state growth materially even though later
+  revisits still hit the remaining `8`-way retained split.
 - CLI/debugging gained OCaml-compatible `--procedures-filter` support through
   both CLI and `.inferconfig`. Rust mirrors OCaml's proc-only vs
   `source_regex:proc_regex` split semantics, and filtered interprocedural runs

@@ -11,7 +11,7 @@
 
 use sil::const_val::Const;
 use sil::exp::Exp;
-use sil::instr::Instr;
+use sil::instr::{Instr, InstrMetadata};
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 
@@ -49,6 +49,14 @@ pub fn exec_instr_with_pdesc(
             loc,
             ..
         } => exec_call(ret_id, ret_typ, fun_exp, args, loc, state),
+        Instr::Metadata(InstrMetadata::ExitScope(vars, _loc)) => {
+            // Cross-ref: OCaml `Pulse.ml` handles `Metadata (ExitScope ...)`
+            // by removing dead vars from the post stack while preserving
+            // pre-rooted vars that must survive into summaries.
+            let mut state = state;
+            state.remove_vars(vars);
+            vec![ExecutionDomain::ContinueProgram(state)]
+        }
         Instr::Metadata(_) => vec![ExecutionDomain::ContinueProgram(state)],
     }
 }
@@ -601,6 +609,7 @@ mod tests {
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
     use sil::ident::{Ident, IdentName};
+    use sil::instr::InstrMetadata;
     use sil::int_lit::IntLit;
     use sil::mangled::Mangled;
     use sil::procdesc::Procdesc;
@@ -641,6 +650,88 @@ mod tests {
         assert!(
             results.iter().any(|r| r.is_continue()),
             "load from valid address should continue"
+        );
+    }
+
+    #[test]
+    fn test_exit_scope_removes_dead_post_stack_vars() {
+        let mut state = mk_state();
+        let tmp = Ident::create_normal(IdentName::from_string("tmp"), 0);
+        let local = Pvar::mk(Mangled::from_string("x"), Procname::c_from_string("test"));
+        let tmp_addr = AbstractValue::mk_fresh();
+        let local_addr = AbstractValue::mk_fresh();
+        state.post.stack.add(Var::LogicalVar(tmp.clone()), tmp_addr);
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(local.clone())), local_addr);
+
+        let instr = Instr::Metadata(InstrMetadata::ExitScope(
+            vec![
+                Var::LogicalVar(tmp.clone()),
+                Var::ProgramVar(Box::new(local.clone())),
+            ],
+            Location::dummy(),
+        ));
+        let results = exec_instr(&instr, state);
+        let state = results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("exit_scope should continue");
+
+        assert!(
+            state.post.stack.find(&Var::LogicalVar(tmp)).is_none(),
+            "ExitScope should remove dead logical vars from the post stack"
+        );
+        assert!(
+            state
+                .post
+                .stack
+                .find(&Var::ProgramVar(Box::new(local)))
+                .is_none(),
+            "ExitScope should remove dead local vars from the post stack"
+        );
+    }
+
+    #[test]
+    fn test_exit_scope_keeps_pre_rooted_formals() {
+        let pname = Procname::c_from_string("keep_formal");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+
+        let state = AbductiveDomain::mk_initial(&pdesc);
+        let formal = Pvar::mk(Mangled::from_string("x"), pname);
+        let formal_var = Var::ProgramVar(Box::new(formal.clone()));
+        let formal_addr = state
+            .post
+            .stack
+            .find(&formal_var)
+            .expect("formal should be present in post before exit_scope");
+
+        let instr = Instr::Metadata(InstrMetadata::ExitScope(
+            vec![formal_var.clone()],
+            Location::dummy(),
+        ));
+        let results = exec_instr(&instr, state);
+        let state = results
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("exit_scope should continue");
+
+        assert_eq!(
+            state.post.stack.find(&formal_var),
+            Some(formal_addr),
+            "ExitScope should not drop pre-rooted formal vars needed for summaries"
         );
     }
 

@@ -8,6 +8,62 @@ open! IStd
 module L = Logging
 module F = Format
 
+type textual_export_kind = Clang | Java
+
+let textual_export_kind_of_proc_name proc_name =
+  match Procname.get_language proc_name with
+  | Language.Clang ->
+      Some Clang
+  | Language.Java ->
+      Some Java
+  | Erlang | Hack | Python | Rust | Swift | CIL ->
+      None
+
+
+let can_regenerate_textual_export proc_names =
+  let same_kind kind proc_name =
+    match (kind, textual_export_kind_of_proc_name proc_name) with
+    | Clang, Some Clang | Java, Some Java ->
+        true
+    | _ ->
+        false
+  in
+  match proc_names with
+  | [] ->
+      None
+  | proc_name :: proc_names ->
+      textual_export_kind_of_proc_name proc_name
+      |> Option.filter ~f:(fun kind -> List.for_all proc_names ~f:(same_kind kind))
+
+
+let regenerate_textual_export source_file proc_names =
+  let open IOption.Let_syntax in
+  let* export_kind = can_regenerate_textual_export proc_names in
+  let* tenv = Exe_env.get_source_tenv source_file in
+  let cfg = Cfg.create () in
+  let loaded_procdesc =
+    Timer.time Timeable.Preanalysis ~on_timeout:(fun _ -> false) ~f:(fun () ->
+        List.fold proc_names ~init:false ~f:(fun loaded_procdesc proc_name ->
+            match Procdesc.load proc_name with
+            | None ->
+                loaded_procdesc
+            | Some pdesc ->
+                Procname.Hash.add cfg proc_name pdesc ;
+                if Procdesc.is_defined pdesc then (
+                  Preanal.do_preanalysis tenv pdesc ;
+                  ignore (Procdesc.get_wto pdesc) ) ;
+                true ) )
+  in
+  let* () = Option.some_if loaded_procdesc () in
+  let filename = Filename.chop_extension (SourceFile.to_abs_path source_file) ^ ".sil" in
+  Some
+    (match export_kind with
+    | Clang ->
+        TextualOfSil.to_string ~lang:Textual.Lang.C ~sil_source_file:source_file ~filename tenv
+          cfg
+    | Java ->
+        TextualOfSil.to_string ~lang:Textual.Lang.Java ~filename tenv cfg )
+
 let debug () =
   if not Config.(global_tenv || procedures || source_files || Option.is_some export_textual) then
     L.die UserError
@@ -165,15 +221,22 @@ let debug () =
       let manifest = ref [] in
       List.iter source_files ~f:(fun source_file ->
           match SourceFiles.get_textual source_file with
-          | Some textual ->
+          | Some stored_textual ->
               let source_path = SourceFile.to_rel_path source_file in
               let basename = source_path |> Filename.chop_extension |> Filename.basename in
               let sil_filename = unique_sil_filename basename in
               let out_path = Filename.concat out_dir sil_filename in
-              Utils.with_file_out out_path ~f:(fun oc -> Out_channel.output_string oc textual) ;
               let proc_names =
                 SourceFiles.proc_names_of_source source_file |> List.sort ~compare:Procname.compare
               in
+              (* Stored textual is captured before preanalysis. Rebuild the textual view from
+                 freshly loaded procdescs when we know how to serialize the language so the export
+                 matches the CFG metadata analysis injects later. *)
+              let textual =
+                regenerate_textual_export source_file proc_names
+                |> Option.value ~default:stored_textual
+              in
+              Utils.with_file_out out_path ~f:(fun oc -> Out_channel.output_string oc textual) ;
               let procedures =
                 `List
                   (List.map proc_names ~f:(fun pname ->

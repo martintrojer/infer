@@ -392,6 +392,19 @@ impl AbductiveDomain {
         }
     }
 
+    /// Remove dead stack variables from the post-state.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.Stack.remove_vars` only drops
+    /// post-stack bindings that are not part of the precondition. Formals and
+    /// other pre-rooted vars must remain available for summary construction.
+    pub fn remove_vars(&mut self, vars: &[Var]) {
+        for var in vars {
+            if self.pre.stack.find_with_history(var).is_none() {
+                self.post.stack.remove(var);
+            }
+        }
+    }
+
     /// Read through a heap edge: follow `addr --access--> target`.
     /// If no edge exists, creates a fresh target and adds the edge.
     /// Also records the read in the pre-state (biabduction).

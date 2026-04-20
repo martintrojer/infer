@@ -134,30 +134,37 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   `manifest.json` can still drop OCaml's hashed proc UIDs and collapse distinct real C functions
   onto one plain procname. Treat this as an exported-Textual fidelity limitation unless upstream
   preserves the proc UID at the textual boundary.
-- **Exported cleanup metadata fidelity**: Rust now lowers OCaml-exported
-  `__sil_metadata_*` helper calls back to SIL metadata, but the current
-  OpenSSL `wp_block.sil` still only contains
-  `__sil_metadata_variable_lifetime_begins` and lacks the
-  `abstract` / `nullify` / `exit_scope` / `loop_*` metadata present in the
-  corresponding OCaml SIL/HTML view. Treat this remaining `whirlpool_block`
-  gap as an exported-Textual fidelity limit unless the boundary preserves that
-  cleanup metadata too.
+- **Fresh preanalysis export rerun**: the local OCaml exporter in `../infer`
+  now regenerates C/Java textual after preanalysis/WTO setup, and fresh
+  `wp_block.c` exports now carry `abstract` / `nullify` / `exit_scope` /
+  `variable_lifetime_begins`. Re-run the shared OpenSSL corpus through that
+  exporter and keep debugging Rust on the richer input; the single-file
+  `whirlpool_block` probe now finishes in `4m52s` with `1222` retained
+  states, so the remaining blocker is not the old missing-metadata export bug.
 - **DeclEnv enhancements** (`decls.rs`): Missing variadic proc tracking, generics status.
 - Language-specific (defer): FixHackWrapper, FixHackInvokeClosure, TransformClosures, verify_variadic_position, SSA restoration.
 
 ### OpenSSL benchmark follow-ups
 
-- Keep the narrowed `whirlpool_block` checkpoint current:
-  post-importer-support rerun still finishes at `1m46s` with
-  `611` retained disjunct states and the same top retained nodes
-  `18,20,21,22,24,25,26,27`, versus OCaml's `152` final snapshots.
-- Do not chase a Rust/Pulse workaround for that remaining `whirlpool_block`
-  gap. The importer now handles exported `__sil_metadata_*` helpers correctly;
-  the current blocker is that the exported file still lacks the cleanup /
-  abstraction metadata visible in OCaml on the hot loop path.
-- If upstream `--export-textual` starts emitting the missing cleanup metadata
-  on `whirlpool_block`, rerun the narrowed probe before doing any new local
-  Pulse surgery.
+- Keep the narrowed `whirlpool_block` checkpoint current on the regenerated
+  export too: the fresh single-file `wp_block.c` run now finishes in `4m52s`
+  with `1222` retained states, `max_node_disjuncts=8`, and top retained nodes
+  `29,31,32,33,35,36,37,38`, versus OCaml's `152` final snapshots on the
+  shared capture.
+- Rust now executes exported `Metadata::ExitScope` semantically instead of as
+  a no-op, with focused regressions for dead temp removal and preserved
+  pre-rooted formals. A fresh rerun on the same richer export was interrupted
+  at `2m05s` with `1022` retained states: this is materially better than the
+  old `1222`, but later revisits still climb back to `max_node_disjuncts=8`.
+- Next narrowed hotspot step: finish a selected-node retained dump on the
+  richer export after the `ExitScope` fix and compare the later `8`-way split
+  to OCaml, rather than revisiting metadata import/export.
+- Do not chase a Rust/Pulse workaround that tries to restore the old smaller
+  state numbers by regressing export fidelity. The correct input now includes
+  the cleanup metadata.
+- Re-export the shared OpenSSL corpus with the patched OCaml exporter before
+  any new `whirlpool_block` surgery so the next benchmark checkpoint uses the
+  more faithful boundary end to end.
 - First rerun the shared exported corpus at `-j 1` after the narrowed hotspot
   comparison is understood, and treat that as the only current publishable
   apples-to-apples Rust timing until merged `-j > 1` runs are stable.
