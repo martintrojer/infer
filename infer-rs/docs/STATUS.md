@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster is now concentrated in broader wrapper/cycle null-path publication and richer trace/report parity; the filtered `traverse_and_crash_if_equal_to_root` latent-only repro is fixed again.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster is now concentrated in broader wrapper/cycle null-path publication and richer trace/report parity; the filtered `traverse_and_crash_if_equal_to_root` latent-only repro and the simplified one-node caller/export path are fixed again.**
 
 ## OpenSSL Benchmark
 
@@ -95,9 +95,22 @@
   nodes `31/32`, `2` at nodes `35-38`). The remaining gap is therefore
   Rust-side retained-state convergence on that loop block, not exporter
   fidelity and not missing `ExitScope` semantics.
+- New debug-only alpha signatures now make that conclusion sharper:
+  the richer single-file `whirlpool_block` run still finishes in about
+  `4m30s` with `1222` retained states and the same
+  `29,31,32,33,35,36,37,38 -> 8d:4v` hotspot, but nodes `31` and `35` each
+  contain eight distinct semantic states under the current Rust canonicalizer.
+  The states form `4` growth tiers x `2` variants, and `35:POST` matches
+  `31:PRE` exactly, which points at loop-cycle growth in retained
+  heap/attrs/formula state rather than missed alpha-dedup inside a node.
 - OCaml cross-check: `Pulse.ml` also keeps `Nullify` and `Abstract` as no-op
   metadata, so the next narrowed step remains retained PRE/POST comparison on
   the hot block, not more metadata plumbing.
+- There is now also a concrete structural-sharing prototype sketch in
+  [`docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`](./plans/STRUCTURAL_SHARING_PROTOTYPE.md).
+  That work is explicitly scoped as a memory / clone-pressure track for merged
+  OpenSSL runs, not as the primary explanation for the remaining
+  `whirlpool_block` correctness gap.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`
@@ -867,7 +880,8 @@ Current interpretation of these deltas:
   fold those branches without adding a workaround. See `docs/STORE_TEXTUAL.md`.
 - The remaining active work is concentrated in exact issue-set / reporting parity for broader
   wrapper/cycle null-path publication beyond the now-fixed filtered
-  `traverse_and_crash_if_equal_to_root` repro, plus richer trace reconstruction.
+  `traverse_and_crash_if_equal_to_root` repro and simplified one-node caller/export path, plus
+  richer trace reconstruction.
 
 **MEMORY_LEAK_C comparison vs OCaml `issues.exp`: expected 20, found 20.**
 
@@ -908,8 +922,8 @@ using any exact disjunct/null-attr mismatch counts.
      dependencies survive summary application, and `pre_heap_has_assumptions` is included in
      manifestness. The remaining active mismatch is narrower: exact publication/reporting parity
      on broader wrapper/cycle null-path publication beyond the now-fixed filtered
-     `traverse_and_crash_if_equal_to_root` repro, plus richer suppression / trace presentation
-     detail.
+     `traverse_and_crash_if_equal_to_root` repro and simplified one-node caller/export path, plus
+     richer suppression / trace presentation detail.
    - Minimal `ValueHistory` threading now exists for invalid-access provenance and dedup, but full
      OCaml `PulseValueHistory` / `PulseTrace` parity is still missing
    - No global variable handling in summary application

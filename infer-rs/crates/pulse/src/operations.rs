@@ -32,13 +32,30 @@ fn materialize_known_zero_invalid(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) {
-    // Cross-ref: OCaml eventually materializes a manifest abort summary for
-    // paths such as `if (p) { ... } *p = 42` on the `p == 0` branch. Rust was
-    // only catching the forward direction (must-be-valid, then later deduced
-    // equal to 0). When the value was already known zero before the access, we
-    // need to record the null invalidation at the access point as well.
-    if state.check_valid(addr).is_ok() && state.is_known_zero(addr) {
-        state.invalidate(
+    // Cross-ref: OCaml records `ComparedToNullInThisProcedure` when pruning
+    // `p == 0`, but an actual access on a value that is now proven null must
+    // still surface as `ConstantDereference(0)`. After Rust adopted OCaml's
+    // uniq-rank attribute storage, the earlier compared-to-null marker could
+    // mask that access-time null invalidation unless we upgrade it here.
+    if !state.is_known_zero(addr) {
+        return;
+    }
+
+    let repr = state.path_condition.get_var_repr(addr);
+    let should_materialize = match state
+        .post
+        .attrs
+        .get(&repr)
+        .and_then(|attrs| attrs.get_invalid())
+    {
+        None => true,
+        Some((Invalidation::ComparedToNullInThisProcedure(_), _)) => true,
+        Some((Invalidation::ConstantDereference(value), _)) if *value == IntLit::zero() => false,
+        Some(_) => false,
+    };
+
+    if should_materialize {
+        state.replace_invalid(
             addr,
             Invalidation::ConstantDereference(IntLit::zero()),
             history.append_event(HistoryEvent::Invalidated {
@@ -678,6 +695,44 @@ mod tests {
             state.check_valid(p).is_err(),
             "known-zero access should materialize a null invalidation for later reporting"
         );
+    }
+
+    #[test]
+    fn test_access_through_known_zero_upgrades_compared_to_null_to_null_deref() {
+        let loc = Location::dummy();
+        let pdesc = Procdesc::new(Procname::c_from_string("test"), Typ::void(), loc.clone());
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let p = AbstractValue::mk_fresh();
+        assert!(state.and_equal_const(p, 0).is_sat());
+        state.invalidate(
+            p,
+            Invalidation::ComparedToNullInThisProcedure(loc.clone()),
+            ValueHistory::invalidated(
+                Invalidation::ComparedToNullInThisProcedure(loc.clone()),
+                loc.clone(),
+            ),
+        );
+
+        let result = check_addr_access(p, &loc, &mut state);
+        assert!(matches!(
+            result,
+            PulseResult::FatalError(
+                Diagnostic::AccessToInvalidAddress {
+                    invalidation: Invalidation::ConstantDereference(value),
+                    ..
+                },
+                _
+            ) if value == IntLit::zero()
+        ));
+        let attrs = state
+            .post
+            .attrs
+            .get(&p)
+            .expect("known-zero access should keep attrs on the canonical address");
+        assert!(matches!(
+            attrs.get_invalid(),
+            Some((Invalidation::ConstantDereference(value), _)) if *value == IntLit::zero()
+        ));
     }
 
     #[test]

@@ -1119,6 +1119,19 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
         return Vec::new();
     }
 
+    // When a latent callee abort has already reified at the caller callsite
+    // and no caller-side path condition survives, keep that manifest abort.
+    // Synthesizing an extra latent invalid-access twin here suppresses the
+    // real caller report in the simplified one-node cycle shape.
+    if pre_post
+        .diagnostic
+        .as_ref()
+        .is_some_and(|diag| proc_has_call_at_location(pdesc, diag.get_location()))
+        && pre_post.post.path_condition.conditions().is_empty()
+    {
+        return Vec::new();
+    }
+
     let excluded_addr = diagnostic_addr_repr(pre_post);
     let mut recovered_pre_posts = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -2232,6 +2245,16 @@ fn pre_post_has_direct_formal_constant_deref(pdesc: &Procdesc, pre_post: &mut Pr
     let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
     let direct_formal = direct_formal_value_addrs(pdesc, pre_post).contains(&diag_addr);
     let caller_owned = caller_controlled.contains(&diag_addr) || access_history_has_formal_origin;
+    if pre_post.diagnostic.as_ref().is_some_and(|diag| match diag {
+        Diagnostic::AccessToInvalidAddress { access_history, .. } => {
+            access_history.first_call_before_invalidation().is_some()
+        }
+        _ => false,
+    }) && abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
+        && pre_post.post.path_condition.conditions().is_empty()
+    {
+        return false;
+    }
     if pre_post_has_post_written_byref_invalid_access(pdesc, pre_post, diag_addr) {
         return !pre_post_diag_addr_has_non_null_invalidation(pre_post);
     }
@@ -3437,17 +3460,19 @@ mod tests {
         astate.initialize(result);
         astate.invalidate(
             result,
-            crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
-            ValueHistory::invalidated(
-                crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
-                Location::dummy(),
-            ),
-        );
-        astate.invalidate(
-            result,
             crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
             ValueHistory::invalidated(
                 crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
+        );
+        // Cross-ref: OCaml `PulseAttribute.Attributes.Set.add` keeps the first
+        // same-rank `Invalid _` payload unless the attr is `OptionalEmpty`.
+        astate.invalidate(
+            result,
+            crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
                 Location::dummy(),
             ),
         );
@@ -3940,16 +3965,18 @@ mod tests {
         );
         astate.invalidate(
             formal_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+        // Cross-ref: OCaml `PulseAttribute.Attributes.Set.add` keeps the first
+        // same-rank `Invalid _` payload unless the attr is `OptionalEmpty`.
+        astate.invalidate(
+            formal_val,
             crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
             ValueHistory::invalidated(
                 crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
                 Location::dummy(),
             ),
-        );
-        astate.invalidate(
-            formal_val,
-            invalidation.clone(),
-            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
         );
 
         let diagnostic = dummy_invalid_access_diagnostic(formal_val, invalidation);

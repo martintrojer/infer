@@ -1508,6 +1508,59 @@ define f(x: int) : void {
     }
 
     #[test]
+    fn test_transform_preserves_metadata_after_prune() {
+        let src = r#".source_language = "c"
+
+define f(x: int) : void {
+  #entry:
+    n0: int = load &x
+    prune __sil_lt(n0, 10)
+    _ = __sil_metadata_exit_scope(n0)
+    jmp done
+  #done:
+    ret null
+}"#;
+        let mut module = parse_module(src, "test.sil").unwrap();
+        let (decls, decl_errors) = DeclEnv::from_module(&module);
+        assert!(decl_errors.is_empty());
+
+        crate::transform::run(&mut module, &decls);
+
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        let prune_node = pdesc
+            .nodes
+            .iter()
+            .find(|node| {
+                node.instrs
+                    .iter()
+                    .any(|instr| matches!(instr, instr::Instr::Prune { .. }))
+            })
+            .expect("expected a node containing the prune instruction");
+
+        let has_prune_then_exit_scope =
+            prune_node
+                .instrs
+                .windows(2)
+                .any(|pair| match (&pair[0], &pair[1]) {
+                    (
+                        instr::Instr::Prune { .. },
+                        instr::Instr::Metadata(instr::InstrMetadata::ExitScope(vars, _)),
+                    ) => {
+                        vars.len() == 1
+                            && matches!(&vars[0], sil::var::Var::LogicalVar(id) if id.stamp == 0)
+                    }
+                    _ => false,
+                });
+
+        assert!(
+            has_prune_then_exit_scope,
+            "Cross-ref: OCaml `TextualTransform` + `TextualSil` preserve metadata calls after \
+prune blocks so later Pulse cleanup sees `ExitScope`. pdesc={pdesc:?}"
+        );
+    }
+
+    #[test]
     fn test_invalid_metadata_builtin_reports_conversion_error() {
         let src = r#".source_language = "c"
 

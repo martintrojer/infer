@@ -376,6 +376,38 @@ pub(crate) fn apply_summary_with_aliasing(
 
     if let Some(summary) = stopped_summary.as_ref() {
         if let Some(diag) = summary.potential_invalid_access.as_ref() {
+            if pre_post.kind == crate::summary::PrePostKind::LatentAbortProgram {
+                if let Some(original_diag) = &pre_post.diagnostic {
+                    let mut abort_subst = subst.clone();
+                    let caller_summary_state = summary.state.clone();
+                    let translated_abort = rebase_diagnostic_to_state(
+                        translate_diagnostic(
+                            original_diag,
+                            &mut abort_subst,
+                            &caller_summary_state,
+                            &formal_histories,
+                            loc,
+                        ),
+                        &caller_summary_state,
+                    );
+                    if matches!(
+                        crate::summary::classify_abort_kind(
+                            caller_pdesc,
+                            &caller_summary_state,
+                            &translated_abort,
+                        ),
+                        crate::summary::PrePostKind::AbortProgram
+                    ) {
+                        return ApplySummaryOutcome {
+                            results: vec![ExecutionDomain::AbortProgram {
+                                state: Box::new(caller_summary_state),
+                                diagnostic: Box::new(translated_abort),
+                            }],
+                            alias_specialization: None,
+                        };
+                    }
+                }
+            }
             let mut caller_summary_state = summary.state.clone();
             let diag = rebase_diagnostic_to_state(diag.clone(), &caller_summary_state);
             mark_diagnostic_addr_must_be_valid(&mut caller_summary_state, &diag);

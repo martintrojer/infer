@@ -85,6 +85,19 @@ impl BaseAddressAttributes {
         self.add_one(addr, Attribute::Invalid(inv, history));
     }
 
+    /// Replace any existing invalidation payload for this address.
+    pub fn replace_invalid(
+        &mut self,
+        addr: AbstractValue,
+        inv: Invalidation,
+        history: ValueHistory,
+    ) {
+        self.map
+            .entry(addr)
+            .or_default()
+            .replace_invalid(inv, history);
+    }
+
     /// Mark an address as allocated.
     pub fn allocate(
         &mut self,

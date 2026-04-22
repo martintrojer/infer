@@ -53,6 +53,7 @@ pub fn has_model(callee: &Procname) -> bool {
 /// Returns `Some(results)` if a model was found, `None` if the call
 /// should be handled as an unknown function.
 pub fn dispatch(
+    caller: Option<&Procname>,
     callee: &Procname,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -65,7 +66,7 @@ pub fn dispatch(
     }
 
     // Try each language module in order
-    if let Some(results) = c::dispatch(callee, ret_id, args, loc, state.clone()) {
+    if let Some(results) = c::dispatch(caller, callee, ret_id, args, loc, state.clone()) {
         return Some(results);
     }
 

@@ -50,7 +50,7 @@ pub fn exec_instr_with_pdesc(
             args,
             loc,
             ..
-        } => exec_call(ret_id, ret_typ, fun_exp, args, loc, state),
+        } => exec_call(pdesc, ret_id, ret_typ, fun_exp, args, loc, state),
         Instr::Metadata(InstrMetadata::ExitScope(vars, _loc)) => {
             // Cross-ref: OCaml `Pulse.ml` handles `Metadata (ExitScope ...)`
             // by removing dead vars from the post stack while preserving
@@ -479,6 +479,7 @@ fn prune_eq_operands(
 /// Dispatches to built-in models (malloc/free/etc.) via `models::dispatch`.
 /// Unknown functions get a fresh return value.
 fn exec_call(
+    pdesc: Option<&Procdesc>,
     ret_id: &sil::ident::Ident,
     ret_typ: &sil::typ::Typ,
     fun_exp: &Exp,
@@ -498,8 +499,14 @@ fn exec_call(
             // reachable values, such as `*x` in `free(x)`, marked
             // `Initialized` in exported summaries.
             state.conservatively_initialize_args(model_actual_vals.iter().copied());
-            if let Some(results) = crate::models::dispatch(callee, ret_id, args, loc, state.clone())
-            {
+            if let Some(results) = crate::models::dispatch(
+                pdesc.map(|proc| &proc.proc_name),
+                callee,
+                ret_id,
+                args,
+                loc,
+                state.clone(),
+            ) {
                 return results;
             }
         }

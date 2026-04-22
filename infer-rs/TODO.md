@@ -76,9 +76,10 @@ active OCaml-parity gap.
    correctness fixes, not optional count-tuning.
 
 4. **Broader wrapper/cycle null-path publication parity**: the filtered
-   `traverse_and_crash_if_equal_to_root` latent-only repro is fixed again, but
-   Rust and OCaml can still diverge on which other latent null paths survive
-   call chains and reify as manifest reports.
+   `traverse_and_crash_if_equal_to_root` latent-only repro and the simplified
+   one-node caller/export path are fixed again, but Rust and OCaml can still
+   diverge on which other latent null paths survive call chains and reify as
+   manifest reports.
 
 5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
    dedup and `issues.exp`-style counting, but richer OCaml-style `PulseTrace` / publication detail
@@ -192,9 +193,12 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 - Then re-run the same shared corpus without `/usr/bin/time` at `-j 4` and
   `-j 8` so we can capture the real exit status and determine whether the
   current failures are external kills or some other runtime termination path.
-- Only after the retained logical shape is closer to OCaml should we spend
-  more time on storage-sharing work such as cheaper invariant-map snapshots or
-  more persistent sharing across heap / attrs / formula state.
+- Do not treat clone-reduction as the primary `whirlpool_block` fix. The
+  current selected-node alpha signatures show the remaining `8` hot disjuncts
+  are semantically distinct, not duplicate retained copies.
+- If we pursue clone-reduction for OpenSSL memory / RSS, use component-level
+  structural sharing rather than a borrow-heavy refactor. Prototype plan:
+  `docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`.
 - Keep the new `pulse-recency-limit` flag experimental only. It is useful for
   OCaml cross-checks, but it is not the current fix direction for OpenSSL.
 - Keep profiling the remaining heavy procedures after the

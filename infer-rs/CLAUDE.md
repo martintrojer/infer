@@ -99,6 +99,9 @@ should turn a callee-local latent null path into a manifest callee report.
   summaries, not just issue counts.
 - In the one-step cycle shape (`traverse_one_step_and_crash_if_equal_to_root`-style), OCaml keeps
   the callee summary latent-only and reifies the manifest null-deref only in the caller.
+- In the simplified one-node caller/export shape, once the caller has already reified that latent
+  abort at the callsite and no caller-side conditions remain, keep the caller `AbortProgram`
+  instead of suppressing it behind a synthetic latent-invalid-access twin during summary export.
 - Do not broaden Rust manifest-twin heuristics for field-derived cursor rewrites unless the
   caller-control / reachability check is done over canonical summary-space values and OCaml proves
   the broader behavior.

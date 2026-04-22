@@ -50,6 +50,50 @@ struct CanonicalState {
     formula: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DebugSignature {
+    hash: u64,
+    pre_stack: usize,
+    post_stack: usize,
+    pre_heap: usize,
+    post_heap: usize,
+    pre_attrs: usize,
+    post_attrs: usize,
+    formula: usize,
+}
+
+impl std::fmt::Display for DebugSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hash={:016x} pre[s={} h={} a={}] post[s={} h={} a={}] formula={}",
+            self.hash,
+            self.pre_stack,
+            self.pre_heap,
+            self.pre_attrs,
+            self.post_stack,
+            self.post_heap,
+            self.post_attrs,
+            self.formula,
+        )
+    }
+}
+
+pub(crate) fn debug_signature(state: &AbductiveDomain) -> DebugSignature {
+    let canonical = canonicalize(state);
+    let hash = stable_hash_state(&canonical.state);
+    DebugSignature {
+        hash,
+        pre_stack: canonical.state.pre_stack.len(),
+        post_stack: canonical.state.post_stack.len(),
+        pre_heap: canonical.state.pre_heap.len(),
+        post_heap: canonical.state.post_heap.len(),
+        pre_attrs: canonical.state.pre_attrs.len(),
+        post_attrs: canonical.state.post_attrs.len(),
+        formula: canonical.state.formula.len(),
+    }
+}
+
 /// Compare two states modulo abstract-value renaming.
 pub fn alpha_equivalent(lhs: &AbductiveDomain, rhs: &AbductiveDomain) -> bool {
     canonicalize(lhs).state == canonicalize(rhs).state
@@ -112,6 +156,33 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
             formula: canonical_formula(state, &canon),
         },
         canon,
+    }
+}
+
+fn stable_hash_state(state: &CanonicalState) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    hash_section(&mut hash, &state.pre_stack);
+    hash_section(&mut hash, &state.post_stack);
+    hash_section(&mut hash, &state.pre_heap);
+    hash_section(&mut hash, &state.post_heap);
+    hash_section(&mut hash, &state.pre_attrs);
+    hash_section(&mut hash, &state.post_attrs);
+    hash_section(&mut hash, &state.formula);
+    hash
+}
+
+fn hash_section(hash: &mut u64, lines: &[String]) {
+    stable_hash_bytes(hash, &(lines.len() as u64).to_le_bytes());
+    for line in lines {
+        stable_hash_bytes(hash, line.as_bytes());
+        stable_hash_bytes(hash, &[0xff]);
+    }
+}
+
+fn stable_hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
     }
 }
 
@@ -1001,6 +1072,16 @@ mod tests {
     }
 
     #[test]
+    fn test_debug_signature_matches_alpha_equivalent_states() {
+        AbstractValue::reset_counters();
+        let state1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let state2 = make_state(2, false);
+
+        assert_eq!(debug_signature(&state1), debug_signature(&state2));
+    }
+
+    #[test]
     fn test_alpha_equivalent_states_do_not_dedup_during_fast_join() {
         AbstractValue::reset_counters();
         let state1 = make_state(0, false);
@@ -1079,5 +1160,16 @@ mod tests {
 
         assert!(!exec1.leq(&exec2));
         assert!(!exec2.leq(&exec1));
+    }
+
+    #[test]
+    fn test_debug_signature_changes_for_reachable_heap_difference() {
+        AbstractValue::reset_counters();
+        let state1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(2, false);
+        add_extra_reachable_edge(&mut state2);
+
+        assert_ne!(debug_signature(&state1), debug_signature(&state2));
     }
 }

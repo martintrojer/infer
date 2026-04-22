@@ -29,7 +29,73 @@ changes, and move finished results to durable docs/tests/commits.
   - `ssl_set_client_disabled` still proves the earlier `equal_fast` split was
     real: about `1m09s` -> about `5.2s`, same `173` transfer steps / `20`
     disjuncts / hottest node `33:24`
+  - latest selected-node alpha-signature rerun on the richer
+    `whirlpool_block` export finished in `4m30s` with the same
+    `1222` retained states and `29/31/32/33/35/36/37/38 -> 8d:4v`, but it
+    proves nodes `31` and `35` contain eight distinct semantic states under
+    the current Rust canonicalizer, not duplicate alpha-equivalent states
 - Current strongest hotspot evidence on `whirlpool_block`:
+  - new correctness fix in Rust attr storage:
+    `Attribute::add` now mirrors OCaml
+    `PulseAttribute.Attributes.Set.add` rank semantics instead of keeping
+    multiple same-kind payloads in a raw `BTreeSet`
+  - precise parity implemented:
+    ordinary same-rank attrs keep the first payload,
+    `WrittenTo` replaces the previous payload by rank,
+    and `Invalid(OptionalEmpty, ...)` also replaces by rank
+  - focused Rust regressions for that behavior:
+    `attribute::tests::test_invalid_keeps_first_same_rank_attribute_like_ocaml`,
+    `attribute::tests::test_written_to_replaces_previous_same_rank_attribute`,
+    and `attribute::tests::test_invalid_optional_empty_replaces_previous_invalid`
+  - targeted validation after the attr-rank fix:
+    `cargo test -p pulse attribute::tests -- --nocapture` and
+    `cargo test -p pulse checker::tests::test_fixpoint_loop_does_not_keep_exit_scope_temps_rooted -- --nocapture`
+    both pass
+  - fresh rebuilt release rerun on the richer single-file export still ends at
+    the same top-level hotspot shape:
+    `4m58s`, `1222` retained states, `max_visit_count=4`,
+    `max_node_disjuncts=8`, `exit_disjuncts=2`, `pre_posts=2`,
+    top retained nodes
+    `29:8d:4v, 31:8d:4v, 32:8d:4v, 33:8d:4v, 35:8d:4v, 36:8d:4v,
+    37:8d:4v, 38:8d:4v`
+  - however the retained selected blocks did change materially internally:
+    `compare_fixpoint_blocks.py` on the rebuilt release log shows large
+    duplicate-invalid cleanup without changing the disjunct counts
+  - representative examples from that retained-block compare:
+    `29:PRE invalid 2566 -> 80`,
+    `31:PRE 3338 -> 84`,
+    `35:PRE 3336 -> 84`,
+    `38:POST 3332 -> 84`,
+    while `must_be_valid` stays `8` and the visible var-set stays `18`
+  - real Textual correctness fix landed too:
+    `remove_effects_in_subexprs` / `let_propagation` now mirror OCaml
+    `Textual.ProcDecl.is_side_effect_free_sil_expr` instead of treating all
+    top-level `__sil_*` calls as removable; metadata builtins such as
+    `__sil_metadata_exit_scope` now survive the real transform path
+  - focused regressions for that metadata fix:
+    `textual::transform::test_let_propagation_keeps_metadata_calls` and
+    `textual::to_sil::test_transform_preserves_metadata_after_prune`
+  - retained-block compare against the pre-metadata-fix log shows the hotspot
+    blocks got materially smaller and more faithful even though the final
+    `1222 / 8d` shape did not change:
+    `29:PRE lines 1020591 -> 544317 vars 18 -> 9 uninitialized 0 -> 20`,
+    `31:PRE 1390025 -> 812463 vars 18 -> 9`,
+    `35:PRE 1383567 -> 809423 vars 18 -> 10`,
+    `38:POST 1370651 -> 803343 vars 18 -> 12`
+  - focused count on node `35:PRE` confirms the remaining problem is not gone:
+    occurrences of `col: 33` drop `388 -> 266`, but logical temp stamps
+    `56/57/58` stay present with the same counts and the final hotspot shape
+    is unchanged
+  - new debug-only alpha signatures in Rust `state_cmp` plus selected-node
+    fixpoint logging give a much better readout than raw pretty-printed
+    retained states:
+    `/tmp/wpblock-alpha-signatures.log`
+  - those alpha signatures show a clear ladder, not accidental duplicates:
+    nodes `31` and `35` each have `8` unique hashes arranged as
+    `4` growth tiers x `2` structural variants;
+    `35:POST` is exactly the same signature set as `31:PRE`;
+    successive tiers add roughly `+258` post heap entries,
+    `+129` post attr entries, and `+896` formula items
   - OCaml final retained state on the narrowed proc:
     `152` post snapshots across `178` CFG nodes, about `98727` post heap
     nodes, `53889` post heap edges, `13698` attr addrs, `39663` attr entries,
@@ -155,6 +221,14 @@ changes, and move finished results to durable docs/tests/commits.
   - the dominant OpenSSL gap was not just storage sharing and not just
     `state_cmp`; Rust was re-executing already-known pre disjuncts on hot WTO
     revisits
+  - the new attr-rank fix was also a real OCaml parity bug and removes a lot
+    of duplicate retained invalidation payload, but it is not the main
+    `whirlpool_block` convergence lever because the final `1222 / 8d` shape
+    remains unchanged
+  - the remaining `31/35` hotspot is not "missed alpha dedup inside a node":
+    the retained disjunct hashes are all distinct under the current
+    stack-reachable canonicalizer, and the block now looks like loop-cycle
+    growth across `4` revisit tiers rather than duplicate copies of one state
   - recency is still not the dominant answer: `--pulse-recency-limit 32`
     stayed essentially unchanged on `whirlpool_block`, and default-enabling it
     reintroduced the real `nullptr.c` `FN_nullptr_deref_old_bad`
@@ -175,7 +249,10 @@ changes, and move finished results to durable docs/tests/commits.
     `rg -o "__sil_metadata_[a-z_]+" textual-out-wp/wp_block.sil | sort -u`
   - fresh narrowed Rust repro:
     `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil"`
+  - focused selected-node alpha-signature repro:
+    `RUST_LOG='pulse::checker::fixpoint=debug,ondemand=info,ondemand::runner=info' target/release/infer-rs --pulse-only --debug-level-analysis 1 --trace-ondemand --debug-fixpoint-nodes 31,35 -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil" >/tmp/wpblock-alpha-signatures.log 2>&1`
 - Current validated working-tree checkpoint:
+  - `cargo test -p pulse test_debug_signature -- --nocapture`
   - `cargo test -p pulse test_exit_scope_ -- --nocapture`
   - `cargo test -p pulse test_variable_lifetime_begins_ -- --nocapture`
   - `cargo test -p pulse exec_node_skips_reexecuting_old_pre_disjuncts -- --nocapture`
@@ -199,13 +276,31 @@ changes, and move finished results to durable docs/tests/commits.
 - Semantic summary parity checkpoint:
   - `specialization.c` main summaries: `21 / 21`
   - combined main + specialized harness: `Matching: 21`
+- Wrapper/cycle publication checkpoint:
+  - the simplified one-node caller repro without explicit
+    `__sil_metadata_variable_lifetime_begins` now keeps the reified caller
+    `AbortProgram` instead of suppressing it behind a recovered latent
+    invalid-access twin during summary export
+  - focused validation now includes
+    `checker::tests::test_apply_summary_reifies_one_node_cycle_latent_abort_before_summary_export`,
+    `test_e2e_one_node_cycle_keeps_callee_latent_and_reifies_in_caller`,
+    `test_e2e_two_hop_field_write_keeps_null_derefs_latent`,
+    the latent-cycle subset, full `cargo test -p pulse`, and `make check`
 
 ## Next Probes
 
 - Compare the current richer single-file `wp_block.c` retained PRE/POST states
-  against the OCaml line `540` / `752-755` block. Do not spend more time
-  diffing pre-VLB vs post-VLB Rust dumps unless a normalized retained-block
-  compare points to a real structural change.
+  against the OCaml line `540` / `752-755` block using the new alpha-signature
+  readout: explain why Rust keeps `4` growth tiers x `2` variants at nodes
+  `31/35` while OCaml ends those source lines at `2-4` visible PRE states and
+  `Got 1` on the last transfer.
+- After the attr-rank cleanup, focus the next probe on the surviving
+  `540:33` / logical-temp provenance inside nodes `31-38`; duplicate
+  `Invalid(...)` accumulation is no longer the main noise source there.
+- Focus specifically on what grows monotonically between the four Rust
+  signature tiers, especially the formula and stack-reachable post graph.
+  The next likely correctness gap is later loop-cycle collapse, not import of
+  metadata or rank handling.
 - Do not chase `Nullify` / `Abstract` metadata work here: OCaml Pulse keeps
   them as no-op too.
 - Re-export the shared OpenSSL corpus with the patched OCaml exporter and use

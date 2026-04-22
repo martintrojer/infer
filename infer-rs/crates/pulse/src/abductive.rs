@@ -517,6 +517,17 @@ impl AbductiveDomain {
         self.post.attrs.invalidate(repr, inv, history);
     }
 
+    /// Replace any existing invalidation payload on the canonicalized address.
+    pub fn replace_invalid(
+        &mut self,
+        addr: AbstractValue,
+        inv: Invalidation,
+        history: ValueHistory,
+    ) {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.post.attrs.replace_invalid(repr, inv, history);
+    }
+
     /// Mark an address as allocated.
     pub fn allocate(&mut self, addr: AbstractValue, allocator: Allocator, loc: Location) {
         let repr = self.path_condition.get_var_repr(addr);

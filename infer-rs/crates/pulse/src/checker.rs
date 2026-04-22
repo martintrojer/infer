@@ -46,6 +46,7 @@ use crate::transfer;
 /// long-running procedures when logger-based progress is enabled.
 const PROC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PROC_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(5);
+const FIXPOINT_LOG_TARGET: &str = "pulse::checker::fixpoint";
 
 fn pulse_progress_enabled() -> bool {
     log::log_enabled!(target: "ondemand", log::Level::Info)
@@ -228,7 +229,8 @@ impl FixpointStats {
 }
 
 fn fixpoint_node_dump_enabled() -> bool {
-    !config::get().debug_fixpoint_nodes.is_empty() && log::log_enabled!(log::Level::Debug)
+    !config::get().debug_fixpoint_nodes.is_empty()
+        && log::log_enabled!(target: FIXPOINT_LOG_TARGET, log::Level::Debug)
 }
 
 fn node_instrs_summary(node: &sil::procdesc::Node) -> String {
@@ -248,6 +250,37 @@ fn node_instrs_summary(node: &sil::procdesc::Node) -> String {
     instrs.join(" | ")
 }
 
+fn exec_domain_kind(exec: &ExecutionDomain) -> &'static str {
+    match exec {
+        ExecutionDomain::ContinueProgram(_) => "continue",
+        ExecutionDomain::AbortProgram { .. } => "abort",
+        ExecutionDomain::LatentAbortProgram { .. } => "latent-abort",
+        ExecutionDomain::LatentInvalidAccess { .. } => "latent-invalid",
+        ExecutionDomain::ExitProgram(_) => "exit",
+        ExecutionDomain::ExceptionRaised(_) => "exception",
+    }
+}
+
+fn disjunctive_alpha_summary(domain: &DisjunctiveDomain<ExecutionDomain>) -> String {
+    if domain.disjuncts.is_empty() {
+        return "none".to_string();
+    }
+
+    domain
+        .disjuncts
+        .iter()
+        .enumerate()
+        .map(|(index, disjunct)| {
+            format!(
+                "#{index}:{} {}",
+                exec_domain_kind(disjunct),
+                crate::state_cmp::debug_signature(disjunct.get_astate())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn dump_selected_fixpoint_nodes(
     proc_name: &str,
     pdesc: &Procdesc,
@@ -264,6 +297,7 @@ fn dump_selected_fixpoint_nodes(
         match (pdesc.get_node(node_id), inv_map.get(&node_id)) {
             (Some(node), Some(state)) => {
                 log::debug!(
+                    target: FIXPOINT_LOG_TARGET,
                     "[pulse-fixpoint] proc={proc_name} node={node_id} loc={:?} visit_count={} pre_disjuncts={} post_disjuncts={} preds={preds:?} succs={succs:?} instrs={}",
                     node.loc,
                     state.visit_count,
@@ -271,12 +305,24 @@ fn dump_selected_fixpoint_nodes(
                     state.post.disjuncts.len(),
                     node_instrs_summary(node),
                 );
+                log::debug!(
+                    target: FIXPOINT_LOG_TARGET,
+                    "[pulse-fixpoint] proc={proc_name} node={node_id} retained PRE alpha = {}",
+                    disjunctive_alpha_summary(&state.pre)
+                );
+                log::debug!(
+                    target: FIXPOINT_LOG_TARGET,
+                    "[pulse-fixpoint] proc={proc_name} node={node_id} retained POST alpha = {}",
+                    disjunctive_alpha_summary(&state.post)
+                );
                 if verbose {
                     log::debug!(
+                        target: FIXPOINT_LOG_TARGET,
                         "[pulse-fixpoint] proc={proc_name} node={node_id} retained PRE = {:#?}",
                         state.pre
                     );
                     log::debug!(
+                        target: FIXPOINT_LOG_TARGET,
                         "[pulse-fixpoint] proc={proc_name} node={node_id} retained POST = {:#?}",
                         state.post
                     );
@@ -284,6 +330,7 @@ fn dump_selected_fixpoint_nodes(
             }
             (Some(node), None) => {
                 log::debug!(
+                    target: FIXPOINT_LOG_TARGET,
                     "[pulse-fixpoint] proc={proc_name} node={node_id} loc={:?} preds={preds:?} succs={succs:?} retained-state=missing instrs={}",
                     node.loc,
                     node_instrs_summary(node),
@@ -291,6 +338,7 @@ fn dump_selected_fixpoint_nodes(
             }
             (None, Some(state)) => {
                 log::debug!(
+                    target: FIXPOINT_LOG_TARGET,
                     "[pulse-fixpoint] proc={proc_name} node={node_id} retained node missing from CFG visit_count={} pre_disjuncts={} post_disjuncts={}",
                     state.visit_count,
                     state.pre.disjuncts.len(),
@@ -299,6 +347,7 @@ fn dump_selected_fixpoint_nodes(
             }
             (None, None) => {
                 log::debug!(
+                    target: FIXPOINT_LOG_TARGET,
                     "[pulse-fixpoint] proc={proc_name} node={node_id} missing from CFG and invariant map"
                 );
             }
@@ -2001,12 +2050,13 @@ mod tests {
     use crate::access::Access;
     use crate::summary::{PrePost, PrePostKind};
     use crate::value_history::ValueHistory;
+    use sil::binop::Binop;
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
     use sil::exp::Exp;
     use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
-    use sil::instr::Instr;
+    use sil::instr::{IfKind, Instr, InstrMetadata};
     use sil::int_lit::IntLit;
     use sil::location::Location;
     use sil::mangled::Mangled;
@@ -3429,6 +3479,162 @@ mod tests {
         pdesc
     }
 
+    fn make_exit_scope_loop_proc() -> (Procdesc, sil::procdesc::NodeId) {
+        let pname = Procname::c_from_string("exit_scope_loop");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+
+        let int_typ = Typ::int(sil::typ::IKind::IInt);
+        let r = Pvar::mk(Mangled::from_string("r"), pname.clone());
+        let l = Pvar::mk(Mangled::from_string("l"), pname.clone());
+        let out = Pvar::mk(Mangled::from_string("out"), pname.clone());
+        let n56 = Ident::create_normal(IdentName::from_string("n"), 56);
+        let n57 = Ident::create_normal(IdentName::from_string("n"), 57);
+        let n58 = Ident::create_normal(IdentName::from_string("n"), 58);
+        let zero = Exp::Const(Const::Cint(IntLit::zero()));
+        let one = Exp::Const(Const::Cint(IntLit::of_int(1)));
+        let two = Exp::Const(Const::Cint(IntLit::of_int(2)));
+
+        let init = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![
+                Instr::Store {
+                    e1: Box::new(Exp::Lvar(r.clone())),
+                    typ: int_typ.clone(),
+                    e2: Box::new(zero.clone()),
+                    loc: Location::dummy(),
+                },
+                Instr::Store {
+                    e1: Box::new(Exp::Lvar(l.clone())),
+                    typ: int_typ.clone(),
+                    e2: Box::new(one.clone()),
+                    loc: Location::dummy(),
+                },
+                Instr::Store {
+                    e1: Box::new(Exp::Lvar(out.clone())),
+                    typ: int_typ.clone(),
+                    e2: Box::new(zero),
+                    loc: Location::dummy(),
+                },
+            ],
+            Location::dummy(),
+        );
+        let load_check = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Load {
+                id: n57.clone(),
+                e: Exp::Lvar(r.clone()),
+                typ: int_typ.clone(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        let prune_then = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![
+                Instr::Prune {
+                    exp: Exp::BinOp(
+                        Binop::Lt,
+                        Box::new(Exp::Var(n57.clone())),
+                        Box::new(two.clone()),
+                    ),
+                    loc: Location::dummy(),
+                    is_then_branch: true,
+                    if_kind: IfKind::While,
+                },
+                Instr::Metadata(InstrMetadata::ExitScope(
+                    vec![Var::LogicalVar(n57.clone())],
+                    Location::dummy(),
+                )),
+            ],
+            Location::dummy(),
+        );
+        let prune_else = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![
+                Instr::Prune {
+                    exp: Exp::BinOp(Binop::Lt, Box::new(Exp::Var(n57.clone())), Box::new(two)),
+                    loc: Location::dummy(),
+                    is_then_branch: false,
+                    if_kind: IfKind::While,
+                },
+                Instr::Metadata(InstrMetadata::ExitScope(
+                    vec![Var::LogicalVar(n57)],
+                    Location::dummy(),
+                )),
+            ],
+            Location::dummy(),
+        );
+        let store_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![
+                Instr::Load {
+                    id: n58.clone(),
+                    e: Exp::Lvar(l),
+                    typ: int_typ.clone(),
+                    loc: Location::dummy(),
+                },
+                Instr::Store {
+                    e1: Box::new(Exp::Lvar(out)),
+                    typ: int_typ.clone(),
+                    e2: Box::new(Exp::Var(n58.clone())),
+                    loc: Location::dummy(),
+                },
+                Instr::Metadata(InstrMetadata::ExitScope(
+                    vec![Var::LogicalVar(n58)],
+                    Location::dummy(),
+                )),
+            ],
+            Location::dummy(),
+        );
+        let inc_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![
+                Instr::Load {
+                    id: n56.clone(),
+                    e: Exp::Lvar(r.clone()),
+                    typ: int_typ.clone(),
+                    loc: Location::dummy(),
+                },
+                Instr::Store {
+                    e1: Box::new(Exp::Lvar(r)),
+                    typ: int_typ.clone(),
+                    e2: Box::new(Exp::BinOp(
+                        Binop::PlusA(Some(sil::typ::IKind::IInt)),
+                        Box::new(Exp::Var(n56.clone())),
+                        Box::new(one),
+                    )),
+                    loc: Location::dummy(),
+                },
+                Instr::Metadata(InstrMetadata::ExitScope(
+                    vec![Var::LogicalVar(n56)],
+                    Location::dummy(),
+                )),
+                Instr::Metadata(InstrMetadata::Abstract(Location::dummy())),
+            ],
+            Location::dummy(),
+        );
+
+        pdesc.set_succs(0, vec![init]);
+        pdesc.set_succs(init, vec![load_check]);
+        pdesc.set_succs(load_check, vec![prune_then, prune_else]);
+        pdesc.set_succs(prune_then, vec![store_node]);
+        pdesc.set_succs(store_node, vec![inc_node]);
+        pdesc.set_succs(inc_node, vec![load_check]);
+        pdesc.set_succs(prune_else, vec![1]);
+        (pdesc, store_node)
+    }
+
+    fn stack_logical_stamps(state: &crate::abductive::AbductiveDomain) -> Vec<i32> {
+        let mut stamps: Vec<_> = state
+            .post
+            .stack
+            .iter()
+            .filter_map(|(var, _addr)| var.get_ident().map(|id| id.stamp))
+            .collect();
+        stamps.sort_unstable();
+        stamps
+    }
+
     #[test]
     fn test_two_hop_field_write_keeps_local_null_derefs_latent() {
         let pdesc = make_two_hop_field_write_proc();
@@ -3604,6 +3810,47 @@ mod tests {
         // exports a single `ContinueProgram` summary for this shape.
         assert_eq!(continue_paths, 1, "summary={summary:?}");
         assert_eq!(latent_null_derefs, 0, "summary={summary:?}");
+    }
+
+    #[test]
+    fn test_fixpoint_loop_does_not_keep_exit_scope_temps_rooted() {
+        // Cross-ref: OCaml `Pulse.ml` handles `Metadata (ExitScope ...)` by
+        // removing dead temps from the post stack. On the richer OpenSSL
+        // `whirlpool_block` slice, the comparable retained PRE states before
+        // the `q[...] = L*` stores do not keep the earlier `n56` / `n57`
+        // increment/load temps as visible roots.
+        let (pdesc, store_node) = make_exit_scope_loop_proc();
+        let callee_summaries: HashMap<Procname, PulseSummary> = HashMap::new();
+        let cfg = config::get();
+        let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
+        let initial_domain = DisjunctiveDomain::singleton(
+            initial_exec,
+            cfg.pulse_max_disjuncts,
+            cfg.pulse_widen_threshold,
+        );
+        let pulse_tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            proc_name: format!("{}", pdesc.proc_name),
+            spec_requests: RefCell::new(Vec::new()),
+            progress: RefCell::new(ProcProgress::new()),
+        };
+        let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
+        let retained = inv_map
+            .get(&store_node)
+            .expect("store node should have a retained invariant");
+
+        for disjunct in &retained.pre.disjuncts {
+            let ExecutionDomain::ContinueProgram(state) = disjunct else {
+                continue;
+            };
+            let logical_stamps = stack_logical_stamps(state);
+            assert!(
+                !logical_stamps.iter().any(|stamp| [56, 57, 58].contains(stamp)),
+                "retained PRE at the store node should not keep earlier ExitScope temps rooted: {logical_stamps:?}\nstate={state:#?}"
+            );
+        }
     }
 
     #[test]
@@ -4019,6 +4266,7 @@ mod tests {
             &mut tm,
             &[
                 "traverse_and_crash_if_equal_to_root",
+                "crash_after_one_node_bad",
                 "crash_after_two_nodes_bad",
                 "FN_crash_after_six_nodes_bad",
             ],
@@ -4049,7 +4297,11 @@ mod tests {
         let mut callee_summaries = HashMap::new();
         callee_summaries.insert(traverse.proc_name.clone(), traverse_summary);
 
-        for caller_name in ["crash_after_two_nodes_bad", "FN_crash_after_six_nodes_bad"] {
+        for caller_name in [
+            "crash_after_one_node_bad",
+            "crash_after_two_nodes_bad",
+            "FN_crash_after_six_nodes_bad",
+        ] {
             let caller = tm
                 .cfg
                 .iter_proc_descs()
@@ -4209,5 +4461,175 @@ mod tests {
                 eprintln!("  exit[{i}] isolated={isolated_shape:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_apply_summary_reifies_one_node_cycle_latent_abort_before_summary_export() {
+        let mut tm = textual_utils::parse_and_convert(
+            r#"
+            .source_language = "C"
+            type node = {next: *node}
+            define traverse_one_step_and_crash_if_equal_to_root(p: *node) : void {
+              local old_p: *node, crash: *int
+              #entry:
+                n0:*node = load &p
+                store &old_p <- n0:*node
+                n1:*node = load &p
+                n2:*node = load n1.node.next
+                store &p <- n2:*node
+                n3:*node = load &old_p
+                n4:*node = load &p
+                jmp equal, notequal
+              #equal:
+                prune __sil_eq(n3, n4)
+                store &crash <- 0:*int
+                n5:*int = load &crash
+                store n5 <- 42:int
+                ret null
+              #notequal:
+                prune __sil_lnot(__sil_eq(n3, n4))
+                ret null
+            }
+            define crash_after_one_node_bad(q: *node) : void {
+              #entry:
+                n0:*node = load &q
+                n1:*node = load &q
+                store n1.node.next <- n0:*node
+                _ = traverse_one_step_and_crash_if_equal_to_root(n0)
+                ret null
+            }
+        "#,
+        );
+        retain_named_procs(
+            &mut tm,
+            &[
+                "traverse_one_step_and_crash_if_equal_to_root",
+                "crash_after_one_node_bad",
+            ],
+        );
+
+        let traverse = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| {
+                format!("{}", pdesc.proc_name) == "traverse_one_step_and_crash_if_equal_to_root"
+            })
+            .expect("callee procdesc should exist")
+            .clone();
+        let traverse_summary = analyze(&traverse);
+        let latent_abort = traverse_summary
+            .pre_posts
+            .iter()
+            .find(|pp| pp.kind == PrePostKind::LatentAbortProgram)
+            .cloned()
+            .expect("callee latent abort pre/post should exist");
+
+        let caller = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "crash_after_one_node_bad")
+            .expect("caller procdesc should exist")
+            .clone();
+
+        let cfg = config::get();
+        let mut local_domain = DisjunctiveDomain::singleton(
+            ExecutionDomain::ContinueProgram(crate::abductive::AbductiveDomain::mk_initial(
+                &caller,
+            )),
+            cfg.pulse_max_disjuncts,
+            cfg.pulse_widen_threshold,
+        );
+        let call_node = caller
+            .nodes
+            .iter()
+            .find(|node| {
+                node.instrs
+                    .iter()
+                    .any(|instr| matches!(instr, Instr::Call { .. }))
+            })
+            .expect("call node should exist");
+        let call_instr_idx = call_node
+            .instrs
+            .iter()
+            .position(|instr| matches!(instr, Instr::Call { .. }))
+            .expect("call instruction should exist");
+        for instr in &call_node.instrs[..call_instr_idx] {
+            let mut replayed = Vec::new();
+            for disjunct in &local_domain.disjuncts {
+                match disjunct {
+                    ExecutionDomain::ContinueProgram(state) => replayed.extend(
+                        crate::transfer::exec_instr_with_pdesc(Some(&caller), instr, state.clone()),
+                    ),
+                    other => replayed.push(other.clone()),
+                }
+            }
+            local_domain = DisjunctiveDomain {
+                disjuncts: replayed,
+                max_disjuncts: cfg.pulse_max_disjuncts,
+                max_widen_iters: cfg.pulse_widen_threshold,
+                had_dropped_disjuncts: false,
+            };
+            local_domain.dedup();
+            local_domain.bound();
+        }
+        let caller_state_after_store = match local_domain.disjuncts.as_slice() {
+            [ExecutionDomain::ContinueProgram(state)] => state.clone(),
+            other => panic!("expected one continue state after local replay, got {other:?}"),
+        };
+
+        let (ret_id, actuals, call_loc) = call_node
+            .instrs
+            .iter()
+            .find_map(|instr| match instr {
+                Instr::Call {
+                    ret: (ret_id, _ret_typ),
+                    args,
+                    loc,
+                    ..
+                } => Some((ret_id.clone(), args.clone(), loc.clone())),
+                _ => None,
+            })
+            .expect("call instruction should exist");
+
+        let outcome = crate::interproc::apply_summary_with_aliasing(
+            &caller,
+            &latent_abort,
+            &ret_id,
+            &actuals,
+            &call_loc,
+            caller_state_after_store,
+        );
+        assert!(
+            matches!(
+                outcome.results.as_slice(),
+                [ExecutionDomain::AbortProgram { .. }]
+            ),
+            "one-node cycle should reify the latent abort before caller summary export, got {:?}",
+            outcome
+                .results
+                .iter()
+                .map(summarize_exec_domain)
+                .collect::<Vec<_>>()
+        );
+
+        let isolated = PulseSummary::of_proc_with_metadata(
+            &caller,
+            outcome.results.as_slice(),
+            Vec::new(),
+            caller.is_no_return,
+            false,
+        );
+        assert!(
+            isolated
+                .pre_posts
+                .iter()
+                .any(|pp| pp.kind == PrePostKind::AbortProgram),
+            "caller summary export should keep the reified abort, got {:?}",
+            isolated
+                .pre_posts
+                .iter()
+                .map(|pp| format!("{:?}", pp.kind))
+                .collect::<Vec<_>>()
+        );
     }
 }

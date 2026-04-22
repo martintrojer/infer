@@ -170,31 +170,54 @@ fn fix_closure_app_boolexp(bexp: &mut BoolExp, local_vars: &HashSet<String>, dec
 // 2. remove_effects_in_subexprs
 // ===========================================================================
 
-/// Check if a call is a side-effect-free SIL expression (unop, binop, cast).
-fn is_sil_builtin(proc: &QualifiedProcName) -> bool {
+/// Check if a call is a side-effect-free SIL expression (cast/cfun/unop/binop).
+///
+/// Cross-ref: OCaml `Textual.ProcDecl.is_side_effect_free_sil_expr`.
+/// Metadata builtins are intentionally excluded because they encode effectful
+/// SIL `Instr::Metadata` markers that must survive the transform pipeline.
+fn is_side_effect_free_sil_expr(proc: &QualifiedProcName) -> bool {
     if proc.enclosing_class != EnclosingClass::TopLevel {
         return false;
     }
     let name = &proc.name.value;
-    // Cast builtin
-    if name == "__sil_cast" {
-        return true;
-    }
-    // Unary operators
-    if matches!(name.as_str(), "__sil_neg" | "__sil_bnot" | "__sil_lnot") {
-        return true;
-    }
-    // Binary operators (all __sil_ prefixed arithmetic/comparison/bitwise)
-    if name.starts_with("__sil_")
-        && !name.starts_with("__sil_allocate")
-        && !name.starts_with("__sil_get_lazy")
-        && !name.starts_with("__sil_lazy_class")
-        && !name.starts_with("__sil_instanceof")
-        && !name.starts_with("__sil_metadata")
-    {
-        return true;
-    }
-    false
+    matches!(
+        name.as_str(),
+        "__sil_cast"
+            | "__sil_cfun"
+            | "__sil_neg"
+            | "__sil_bnot"
+            | "__sil_lnot"
+            | "__sil_plusa"
+            | "__sil_plusa_int"
+            | "__sil_plusa_uint"
+            | "__sil_plusa_ulong"
+            | "__sil_pluspi"
+            | "__sil_minusa"
+            | "__sil_minusa_int"
+            | "__sil_minusa_uint"
+            | "__sil_minuspi"
+            | "__sil_minuspp"
+            | "__sil_mult"
+            | "__sil_mult_int"
+            | "__sil_mult_ulong"
+            | "__sil_div"
+            | "__sil_divi"
+            | "__sil_divf"
+            | "__sil_mod"
+            | "__sil_shiftlt"
+            | "__sil_shiftrt"
+            | "__sil_lt"
+            | "__sil_gt"
+            | "__sil_le"
+            | "__sil_ge"
+            | "__sil_eq"
+            | "__sil_ne"
+            | "__sil_band"
+            | "__sil_bxor"
+            | "__sil_bor"
+            | "__sil_land"
+            | "__sil_lor"
+    )
 }
 
 /// Check if an expression contains sub-expressions that need flattening.
@@ -352,7 +375,7 @@ fn flatten_exp(exp: &Exp, loc: &Location, toplevel: bool, state: &mut FlattenSta
                 .iter()
                 .map(|a| flatten_exp(a, loc, false, state))
                 .collect();
-            if is_sil_builtin(proc) {
+            if is_side_effect_free_sil_expr(proc) {
                 // Side-effect-free: keep inline
                 Exp::Call {
                     proc: proc.clone(),
@@ -457,7 +480,7 @@ fn flatten_in_instr(instr: &Instr, state: &mut FlattenState) {
         Instr::Let { id, exp, loc } => {
             // For non-builtin calls: flatten only the args, keep the Call at top level
             if let Exp::Call { proc, args, kind } = exp {
-                if !is_sil_builtin(proc) {
+                if !is_side_effect_free_sil_expr(proc) {
                     let flat_args: Vec<Exp> = args
                         .iter()
                         .map(|a| flatten_exp(a, loc, false, state))
@@ -909,11 +932,7 @@ fn is_side_effect_free(exp: &Exp) -> bool {
             proc,
             kind: CallKind::NonVirtual,
             ..
-        } => {
-            // SIL builtins are side-effect-free
-            proc.enclosing_class == EnclosingClass::TopLevel
-                && proc.name.value.starts_with("__sil_")
-        }
+        } => is_side_effect_free_sil_expr(proc),
         Exp::Call { .. } => false,
         Exp::Apply { .. } => false,
         Exp::Var(_) | Exp::Lvar(_) | Exp::Const(_) | Exp::Typ(_) => true,
@@ -1561,6 +1580,38 @@ define f(x: int, y: int) : int {
             assert_eq!(
                 let_count, 1,
                 "only the effectful foo() call should remain as Let"
+            );
+        }
+    }
+
+    #[test]
+    fn test_let_propagation_keeps_metadata_calls() {
+        let src = r#".source_language = "c"
+
+define f(x: int) : void {
+  #entry:
+    n0: int = load &x
+    _ = __sil_metadata_exit_scope(n0)
+    ret null
+}"#;
+        let mut module = parse_module(src, "test.sil").unwrap();
+        remove_effects_in_subexprs(&mut module);
+
+        if let Decl::Proc(pdesc) = &mut module.decls[0] {
+            let_propagation(pdesc);
+
+            assert!(
+                pdesc.nodes[0].instrs.iter().any(|instr| {
+                    matches!(
+                        instr,
+                        Instr::Let {
+                            exp: Exp::Call { proc, .. },
+                            ..
+                        } if proc.name.value == "__sil_metadata_exit_scope"
+                    )
+                }),
+                "Cross-ref: OCaml `TextualTransform.let_propagation` keeps metadata calls so \
+`TextualSil` can lower them to SIL metadata. proc={pdesc:?}"
             );
         }
     }

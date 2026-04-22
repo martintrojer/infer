@@ -69,16 +69,18 @@ pub const MODELED_NAMES: &[&str] = &[
 
 /// Dispatch a call to the matching C model.
 pub fn dispatch(
+    caller: Option<&Procname>,
     callee: &Procname,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     loc: &Location,
     state: AbductiveDomain,
 ) -> Option<Vec<ExecutionDomain>> {
-    dispatch_with_config(callee, ret_id, args, loc, state, config::get())
+    dispatch_with_config(caller, callee, ret_id, args, loc, state, config::get())
 }
 
 fn dispatch_with_config(
+    caller: Option<&Procname>,
     callee: &Procname,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -95,7 +97,7 @@ fn dispatch_with_config(
     if builtin_decl::match_builtin(&builtin_decl::__new(), callee)
         || builtin_decl::match_builtin(&builtin_decl::__new_array(), callee)
     {
-        return Some(cpp_new(ret_id, loc, state));
+        return Some(new_model(caller, ret_id, loc, state));
     }
     if builtin_decl::match_builtin(&builtin_decl::__delete(), callee)
         || builtin_decl::match_builtin(&builtin_decl::__delete_array(), callee)
@@ -184,6 +186,13 @@ fn dispatch_with_config(
     }
 
     None
+}
+
+fn caller_uses_no_leak_new(caller: Option<&Procname>) -> bool {
+    matches!(
+        caller,
+        Some(Procname::Java(_) | Procname::Hack(_) | Procname::CSharp(_) | Procname::Python(_))
+    )
 }
 
 /// Dynamic-model pre-check for regex-configured wrappers.
@@ -459,8 +468,35 @@ fn free(
 }
 
 /// Model: `ret = new T` / `ret = new T[]` — allocate.
+fn new_model(
+    caller: Option<&Procname>,
+    ret_id: &Ident,
+    loc: &Location,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    if caller_uses_no_leak_new(caller) {
+        return new_no_leak(ret_id, loc, state);
+    }
+    cpp_new(ret_id, loc, state)
+}
+
+/// OCaml `internal_new_`: Java/Hack/C#/Python `__new` is non-null but not a
+/// C/C++ leak-tracked allocation.
+fn new_no_leak(ret_id: &Ident, loc: &Location, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
+    let addr = AbstractValue::mk_fresh();
+    let _ = state.and_positive(addr);
+    operations::write_id_with_history(
+        ret_id,
+        crate::value_history::ValueWithHistory::new(addr, ValueHistory::assignment(loc.clone())),
+        &mut state,
+    );
+    vec![ExecutionDomain::ContinueProgram(state)]
+}
+
+/// Model: `ret = new T` / `ret = new T[]` — tracked C++ allocation.
 fn cpp_new(ret_id: &Ident, loc: &Location, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
     let addr = AbstractValue::mk_fresh();
+    let _ = state.and_positive(addr);
     operations::allocate(addr, Allocator::CppNew, loc.clone(), &mut state);
     operations::write_id_with_history(
         ret_id,
@@ -880,7 +916,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = builtin_decl::malloc();
-        let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_some(), "malloc should be dispatched");
     }
 
@@ -889,7 +925,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = builtin_decl::free();
-        let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_some(), "free should be dispatched");
     }
 
@@ -898,7 +934,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = Procname::c_from_string("unknown_func");
-        let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_none(), "unknown function should not dispatch");
     }
 
@@ -907,7 +943,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = Procname::c_from_string("__infer_fail");
-        let result = dispatch(&callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(
             result.is_none(),
             "__infer_fail should fall back to normal empty-body/unknown-call handling"
@@ -925,8 +961,9 @@ mod tests {
             ..config::InferConfig::default()
         };
 
-        let result = dispatch_with_config(&callee, &ret_id, &[], &Location::dummy(), state, &cfg)
-            .expect("configured malloc wrapper should dispatch");
+        let result =
+            dispatch_with_config(None, &callee, &ret_id, &[], &Location::dummy(), state, &cfg)
+                .expect("configured malloc wrapper should dispatch");
 
         let continue_state = result
             .into_iter()
@@ -959,7 +996,8 @@ mod tests {
             ..config::InferConfig::default()
         };
 
-        let result = dispatch_with_config(&callee, &ret_id, &[], &Location::dummy(), state, &cfg);
+        let result =
+            dispatch_with_config(None, &callee, &ret_id, &[], &Location::dummy(), state, &cfg);
         assert!(
             result.is_some(),
             "configured realloc wrapper should dispatch"
@@ -997,6 +1035,98 @@ mod tests {
             ..config::InferConfig::default()
         };
         assert!(matches_configured_wrapper(&callee, &cfg));
+    }
+
+    #[test]
+    fn test_builtin_new_is_not_leak_tracked_for_java_callers() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let caller = Procname::Java(sil::procname::JavaProcname {
+            class_name: sil::typ::JavaClassName("Test".into()),
+            method_name: "f".into(),
+            parameters: vec![],
+            return_type: None,
+            kind: sil::procname::JavaKind::Static,
+        });
+        let callee = builtin_decl::__new();
+
+        let result = dispatch(
+            Some(&caller),
+            &callee,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            state,
+        )
+        .expect("__new should dispatch");
+
+        let continue_state = result
+            .into_iter()
+            .find_map(|exec| match exec {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("__new should continue");
+        let ret_addr = continue_state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id.clone()))
+            .expect("return should be bound");
+        assert!(
+            continue_state
+                .post
+                .attrs
+                .get(&ret_addr)
+                .and_then(|attrs| attrs.get_allocated())
+                .is_none(),
+            "Java/Hack/C#/Python `__new` should not be tracked as a C/C++ memory leak source"
+        );
+        assert!(
+            !continue_state.is_known_zero(ret_addr),
+            "no-leak new should still be constrained non-null like OCaml"
+        );
+    }
+
+    #[test]
+    fn test_builtin_new_is_leak_tracked_for_c_callers() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let caller = Procname::c_from_string("test");
+        let callee = builtin_decl::__new();
+
+        let result = dispatch(
+            Some(&caller),
+            &callee,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            state,
+        )
+        .expect("__new should dispatch");
+
+        let continue_state = result
+            .into_iter()
+            .find_map(|exec| match exec {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("__new should continue");
+        let ret_addr = continue_state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id.clone()))
+            .expect("return should be bound");
+        let (allocator, _) = continue_state
+            .post
+            .attrs
+            .get(&ret_addr)
+            .and_then(|attrs| attrs.get_allocated())
+            .expect("C/C++ `__new` should stay tracked as an allocation");
+        assert_eq!(allocator, &Allocator::CppNew);
+        assert!(
+            !continue_state.is_known_zero(ret_addr),
+            "tracked C++ new should also be constrained non-null"
+        );
     }
 
     #[test]

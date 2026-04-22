@@ -24,6 +24,40 @@ use crate::abstract_value::AbstractValue;
 use crate::invalidation::{Invalidation, MustBeValidReason};
 use crate::value_history::ValueHistory;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddSemantics {
+    KeepExisting,
+    ReplaceExisting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum AttributeRank {
+    AddressOfCppTemporary,
+    AddressOfStackVariable,
+    Allocated,
+    AlwaysReachable,
+    Closure,
+    EndOfCollection,
+    InReportedRetainCycle,
+    Initialized,
+    Invalid,
+    JavaResourceReleased,
+    CSharpResourceReleased,
+    AwaitedAwaitable,
+    MustBeAwaited,
+    MustBeInitialized,
+    MustBeValid,
+    ReturnedFromUnknown,
+    StaticType,
+    StdMoved,
+    StdVectorReserve,
+    UnknownEffect,
+    Uninitialized,
+    UnreachableAt,
+    UsedAsBranchCond,
+    WrittenTo,
+}
+
 /// Timestamp for ordering events in the analysis.
 pub type Timestamp = u64;
 
@@ -122,6 +156,47 @@ impl fmt::Display for Attribute {
 }
 
 impl Attribute {
+    fn rank(&self) -> AttributeRank {
+        match self {
+            Self::AddressOfCppTemporary(_) => AttributeRank::AddressOfCppTemporary,
+            Self::AddressOfStackVariable(_, _) => AttributeRank::AddressOfStackVariable,
+            Self::Allocated(_, _) => AttributeRank::Allocated,
+            Self::AlwaysReachable => AttributeRank::AlwaysReachable,
+            Self::Closure(_) => AttributeRank::Closure,
+            Self::EndOfCollection => AttributeRank::EndOfCollection,
+            Self::InReportedRetainCycle => AttributeRank::InReportedRetainCycle,
+            Self::Initialized => AttributeRank::Initialized,
+            Self::Invalid(_, _) => AttributeRank::Invalid,
+            Self::JavaResourceReleased => AttributeRank::JavaResourceReleased,
+            Self::CSharpResourceReleased => AttributeRank::CSharpResourceReleased,
+            Self::AwaitedAwaitable => AttributeRank::AwaitedAwaitable,
+            Self::MustBeAwaited => AttributeRank::MustBeAwaited,
+            Self::MustBeInitialized(_, _) => AttributeRank::MustBeInitialized,
+            Self::MustBeValid(_, _, _) => AttributeRank::MustBeValid,
+            Self::ReturnedFromUnknown(_) => AttributeRank::ReturnedFromUnknown,
+            Self::StaticType(_) => AttributeRank::StaticType,
+            Self::StdMoved => AttributeRank::StdMoved,
+            Self::StdVectorReserve => AttributeRank::StdVectorReserve,
+            Self::UnknownEffect => AttributeRank::UnknownEffect,
+            Self::Uninitialized => AttributeRank::Uninitialized,
+            Self::UnreachableAt(_) => AttributeRank::UnreachableAt,
+            Self::UsedAsBranchCond(_, _) => AttributeRank::UsedAsBranchCond,
+            Self::WrittenTo(_, _) => AttributeRank::WrittenTo,
+        }
+    }
+
+    fn add_semantics(&self) -> AddSemantics {
+        match self {
+            // Cross-ref: OCaml `PulseAttribute.Attributes.Set.add` uses
+            // `update` for `WrittenTo` and `Invalid(OptionalEmpty, _)`,
+            // replacing any earlier same-rank payload.
+            Self::WrittenTo(_, _) | Self::Invalid(Invalidation::OptionalEmpty, _) => {
+                AddSemantics::ReplaceExisting
+            }
+            _ => AddSemantics::KeepExisting,
+        }
+    }
+
     /// Cross-ref: OCaml `PulseAttribute.is_suitable_for_pre_summary`.
     pub fn is_suitable_for_pre_summary(&self) -> bool {
         matches!(
@@ -159,7 +234,24 @@ impl Attributes {
     }
 
     pub fn add(&mut self, attr: Attribute) {
-        self.0.insert(attr);
+        let rank = attr.rank();
+        match attr.add_semantics() {
+            AddSemantics::KeepExisting => {
+                if self.0.iter().all(|existing| existing.rank() != rank) {
+                    self.0.insert(attr);
+                }
+            }
+            AddSemantics::ReplaceExisting => {
+                self.0.retain(|existing| existing.rank() != rank);
+                self.0.insert(attr);
+            }
+        }
+    }
+
+    pub fn replace_invalid(&mut self, invalidation: Invalidation, history: ValueHistory) {
+        self.0
+            .retain(|existing| existing.rank() != AttributeRank::Invalid);
+        self.0.insert(Attribute::Invalid(invalidation, history));
     }
 
     pub fn remove(&mut self, attr: &Attribute) {
@@ -318,7 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_invalid_prefers_stronger_invalidation_over_compared_to_null() {
+    fn test_invalid_keeps_first_same_rank_attribute_like_ocaml() {
+        // Cross-ref: OCaml `PulseAttribute.Attributes.Set.add` keeps the
+        // first payload for ordinary same-rank attributes.
         let mut attrs = Attributes::empty();
         let loc = Location::dummy();
 
@@ -335,7 +429,10 @@ mod tests {
         ));
 
         let (inv, _history) = attrs.get_invalid().expect("expected an invalidation");
-        assert_eq!(*inv, Invalidation::ConstantDereference(IntLit::zero()));
+        assert!(matches!(
+            inv,
+            Invalidation::ComparedToNullInThisProcedure(_)
+        ));
     }
 
     #[test]
@@ -351,7 +448,44 @@ mod tests {
     }
 
     #[test]
-    fn test_distinct_invalid_attributes_are_preserved() {
+    fn test_written_to_replaces_previous_same_rank_attribute() {
+        // Cross-ref: OCaml `PulseAttribute.Attributes.Set.add` uses `update`
+        // for `WrittenTo`, so the latest write replaces older payloads.
+        let mut attrs = Attributes::empty();
+        let loc1 = Location {
+            file: SourceFile::new("a.c"),
+            line: 10,
+            col: 1,
+            macro_file_opt: None,
+            macro_line: -1,
+        };
+        let loc2 = Location {
+            file: SourceFile::new("a.c"),
+            line: 20,
+            col: 1,
+            macro_file_opt: None,
+            macro_line: -1,
+        };
+
+        attrs.add(Attribute::WrittenTo(1, loc1.clone()));
+        attrs.add(Attribute::WrittenTo(2, loc2.clone()));
+
+        let (ts, loc) = attrs.get_written_to().expect("expected a write marker");
+        assert_eq!(ts, 2);
+        assert_eq!(loc, &loc2);
+        assert_eq!(
+            attrs
+                .iter()
+                .filter(|attr| matches!(attr, Attribute::WrittenTo(_, _)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_invalid_optional_empty_replaces_previous_invalid() {
+        // Cross-ref: OCaml `PulseAttribute.Attributes.Set.add` also uses
+        // `update` for `Invalid(OptionalEmpty, _)`.
         let mut attrs = Attributes::empty();
         let loc1 = Location {
             file: SourceFile::new("a.c"),
@@ -373,14 +507,18 @@ mod tests {
             ValueHistory::invalidated(Invalidation::ConstantDereference(IntLit::zero()), loc1),
         ));
         attrs.add(Attribute::Invalid(
-            Invalidation::ConstantDereference(IntLit::zero()),
-            ValueHistory::invalidated(Invalidation::ConstantDereference(IntLit::zero()), loc2),
+            Invalidation::OptionalEmpty,
+            ValueHistory::invalidated(Invalidation::OptionalEmpty, loc2),
         ));
 
-        let invalid_count = attrs
-            .iter()
-            .filter(|attr| matches!(attr, Attribute::Invalid(_, _)))
-            .count();
-        assert_eq!(invalid_count, 2);
+        let (inv, _history) = attrs.get_invalid().expect("expected an invalidation");
+        assert_eq!(*inv, Invalidation::OptionalEmpty);
+        assert_eq!(
+            attrs
+                .iter()
+                .filter(|attr| matches!(attr, Attribute::Invalid(_, _)))
+                .count(),
+            1
+        );
     }
 }
