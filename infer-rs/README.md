@@ -12,6 +12,11 @@ Current verified checkpoint:
 - main summaries: `21 / 21` procedures match
 - combined per-procedure harness: `Matching: 21`
 
+The real exported `latent.c` issue-set compare is also exact again at
+`(procedure, line, issue-type)`: `17` Rust issues, `17` OCaml issues, with no
+Rust-only or OCaml-only entries. The remaining work in that cluster is now
+summary-surface parity inside exported summaries, not current report counts.
+
 OpenSSL benchmark status on this host:
 
 - shared capture/export setup is now stable: repo clang on `PATH`, `CC=clang`,
@@ -243,6 +248,22 @@ remaining published NPE delta is:
 - `sizeof.c` (+2): accepted `--store-textual` / `--export-textual` fidelity limitation. Exported
   Textual lowers array `sizeof(...)` expressions to `<int[]>` without `nbytes` or array length, so
   the Rust roundtrip cannot constant-fold those branches.
+
+The latest latent-invalid-access export pass also restores the real exported
+`latent.c` issue surface to exact parity. Rust now keeps recovered caller abort
+pre/posts in summaries while suppressing only duplicate manifest publication,
+restores OCaml's local `AbortProgram` + `LatentAbortProgram` twin for
+`traverse_and_crash_if_equal_to_root`, dedups latent invalid accesses by
+caller-visible heap path rather than raw access location, and keeps mixed
+local+imported direct-formal latent-invalid shapes out of the published report
+surface. The local-vs-callsite publication split is tighter again too:
+one-step cycle callees stay latent-only while callers reify the manifest null
+deref, and local trailing field-write aborts keep both recovered latent null
+paths plus the trailing manifest diagnostic without reintroducing the real
+`FN_crash_after_six_nodes_bad` duplicate-manifest bug. The remaining drift here
+is narrower and summary-shaped: `FN_nonlatent_use_after_free_bad{,2}` and
+`latent_use_after_free` still carry extra `ContinueProgram` /
+`LatentAbortProgram` combinations versus dumped OCaml summaries.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model

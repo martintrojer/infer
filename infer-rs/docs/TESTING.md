@@ -48,6 +48,11 @@ Current baseline:
 - Leaks 20/20
 - UAF 7/7
 
+The separate real-file `latent.c` compare is also exact again at
+`(procedure, line, issue-type)` (`17` Rust vs `17` OCaml, no side-only
+entries). Remaining work in that cluster is summary-surface parity inside
+dumped summaries, not the issue-set counts.
+
 See [STATUS.md](STATUS.md) for the per-file differences.
 
 ## External Benchmark Comparison

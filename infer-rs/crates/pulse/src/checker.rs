@@ -638,7 +638,10 @@ pub fn analyze_with_specialization_and_requests(
                     let classified_kind =
                         crate::summary::classify_abort_kind(pdesc, state, diagnostic);
                     let is_manifest_abort = diagnostic_originates_in_proc(pdesc, diagnostic)
-                        && matches!(classified_kind, crate::summary::PrePostKind::AbortProgram);
+                        && matches!(classified_kind, crate::summary::PrePostKind::AbortProgram)
+                        && crate::summary::abort_should_publish_manifest_diagnostic(
+                            pdesc, state, diagnostic,
+                        );
                     if pulse_progress_enabled()
                         && classify_start.elapsed() >= PROC_SLOW_LOG_THRESHOLD
                     {

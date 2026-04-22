@@ -183,6 +183,22 @@ pub(crate) fn classify_abort_kind(
     pp.kind
 }
 
+pub(crate) fn abort_should_publish_manifest_diagnostic(
+    pdesc: &Procdesc,
+    astate: &AbductiveDomain,
+    diagnostic: &Diagnostic,
+) -> bool {
+    let mut pp = build_pre_post(
+        pdesc,
+        astate.clone(),
+        PrePostKind::AbortProgram,
+        Some(diagnostic.clone()),
+    );
+    let _ = pp.normalize();
+    classify_non_exit_abort_pre_post(pdesc, &mut pp);
+    abort_pre_post_should_publish_manifest_diagnostic(pdesc, &pp)
+}
+
 impl PrePost {
     /// Canonicalize the exported state to the current formula representatives
     /// before summary filtering.
@@ -781,9 +797,10 @@ impl PulseSummary {
                 &pp,
                 &existing_latent_invalid_access_keys,
             );
-            let suppress_original_abort = !recovered_invalid_accesses.is_empty();
+            let is_manifest_abort =
+                pp.kind == PrePostKind::AbortProgram && pre_post_is_manifest(pdesc, &pp);
             let export_local_latent_abort_twin = pp.kind == PrePostKind::AbortProgram
-                && !pre_post_is_manifest(pdesc, &pp)
+                && !is_manifest_abort
                 && abort_should_keep_local_manifest_twin(pdesc, &pp);
 
             // Classify AbortProgram as manifest or latent.
@@ -806,8 +823,8 @@ impl PulseSummary {
                     && !abort_should_keep_local_manifest_twin(pdesc, &pp)
                 {
                     pp.kind = PrePostKind::LatentAbortProgram;
-                } else if !suppress_original_abort {
-                    if let Some(diag) = &pp.diagnostic {
+                } else if let Some(diag) = &pp.diagnostic {
+                    if abort_pre_post_should_publish_manifest_diagnostic(pdesc, &pp) {
                         diagnostics.push(diag.clone());
                     }
                 }
@@ -821,19 +838,17 @@ impl PulseSummary {
                 pp.diagnostic = None;
             }
 
-            if !suppress_original_abort {
-                let latent_abort_twin = export_local_latent_abort_twin.then(|| {
-                    let mut twin = pp.clone();
-                    twin.kind = PrePostKind::LatentAbortProgram;
-                    twin
-                });
-                pre_posts.push(pp);
-                if let Some(twin) = latent_abort_twin {
-                    pre_posts.push(twin);
-                }
-                if let Some(latent_pp) = extra_continue_latent_invalid_access {
-                    pre_posts.push(latent_pp);
-                }
+            let latent_abort_twin = export_local_latent_abort_twin.then(|| {
+                let mut twin = pp.clone();
+                twin.kind = PrePostKind::LatentAbortProgram;
+                twin
+            });
+            pre_posts.push(pp);
+            if let Some(twin) = latent_abort_twin {
+                pre_posts.push(twin);
+            }
+            if let Some(latent_pp) = extra_continue_latent_invalid_access {
+                pre_posts.push(latent_pp);
             }
             for recovered in &recovered_invalid_accesses {
                 if recovered.kind == PrePostKind::AbortProgram {
@@ -846,10 +861,17 @@ impl PulseSummary {
         }
 
         let latent_invalid_access_specificity = |pre_post: &PrePost| {
+            let location_rank = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
+                .map(|diag| {
+                    let loc = diag.get_location();
+                    (u32::MAX - loc.line as u32, u32::MAX - loc.col as u32)
+                })
+                .unwrap_or((0, 0));
             (
                 pre_post.post.path_condition.conditions().len(),
                 usize::from(!pre_post_is_manifest(pdesc, pre_post)),
                 usize::from(pre_post.diagnostic.is_some()),
+                location_rank,
             )
         };
         let mut keyed_pre_posts = Vec::with_capacity(pre_posts.len());
@@ -891,15 +913,25 @@ impl PulseSummary {
             .filter_map(|pre_post| pre_post.diagnostic.as_ref())
             .map(Diagnostic::dedup_key)
             .collect();
-        let manifest_abort_keys: std::collections::HashSet<_> = pre_posts
+        let abort_keys: std::collections::HashSet<_> = pre_posts
             .iter()
             .filter(|pre_post| pre_post.kind == PrePostKind::AbortProgram)
             .filter_map(|pre_post| pre_post.diagnostic.as_ref())
             .map(Diagnostic::dedup_key)
             .collect();
+        let publishable_manifest_abort_keys: std::collections::HashSet<_> = pre_posts
+            .iter()
+            .filter(|pre_post| abort_pre_post_should_publish_manifest_diagnostic(pdesc, pre_post))
+            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+            .map(Diagnostic::dedup_key)
+            .collect();
         diagnostics.retain(|diag| {
             let key = diag.dedup_key();
-            !latent_keys.contains(&key) || manifest_abort_keys.contains(&key)
+            let latent_ok =
+                !latent_keys.contains(&key) || publishable_manifest_abort_keys.contains(&key);
+            let abort_ok =
+                !abort_keys.contains(&key) || publishable_manifest_abort_keys.contains(&key);
+            latent_ok && abort_ok
         });
 
         // Deduplicate leak diagnostics: multiple disjuncts (e.g., malloc
@@ -1040,45 +1072,49 @@ pub(crate) fn recovered_invalid_accesses_from_continue_state(
 
     let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, &pp);
     let direct_formal_values = direct_formal_value_addrs(pdesc, &pp);
-    latent_invalid_access_diagnostics_from_normalized_pre_post(pdesc, &pp, None)
-        .into_iter()
-        .filter_map(|(addr, diagnostic)| {
-            let mut recovered_state = pp.post.clone();
-            if recovered_state.and_equal_const(addr, 0).is_sat() {
-                let mut recovered = PrePost {
-                    pre: pp.pre.clone(),
-                    post: recovered_state,
-                    formals: pp.formals.clone(),
-                    result: pp.result,
-                    kind: if direct_formal_values.contains(&addr) {
-                        PrePostKind::LatentInvalidAccess
-                    } else {
-                        PrePostKind::AbortProgram
-                    },
-                    diagnostic: Some(diagnostic),
-                };
-                if recovered.kind != PrePostKind::LatentInvalidAccess
-                    || !caller_controlled.contains(&addr)
-                {
-                    classify_recovered_invalid_access_pre_post(pdesc, &mut recovered);
-                }
-                let diagnostic = Box::new(recovered.diagnostic.take()?);
-                Some(match recovered.kind {
-                    PrePostKind::AbortProgram => ExecutionDomain::AbortProgram {
-                        state: Box::new(recovered.post),
-                        diagnostic,
-                    },
-                    PrePostKind::LatentInvalidAccess => ExecutionDomain::LatentInvalidAccess {
-                        state: Box::new(recovered.post),
-                        diagnostic,
-                    },
-                    _ => return None,
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
+    let candidate =
+        potential_invalid_access_from_normalized_continue_pre_post(pdesc, &pp, &HashSet::new());
+    let Some(candidate) = candidate else {
+        return Vec::new();
+    };
+    let Diagnostic::AccessToInvalidAddress { addr, .. } = &candidate.diagnostic else {
+        return Vec::new();
+    };
+    let addr = pp.post.path_condition.get_var_repr(*addr);
+    let mut recovered_state = pp.post.clone();
+    if recovered_state.and_equal_const(addr, 0).is_unsat() {
+        return Vec::new();
+    }
+
+    let mut recovered = PrePost {
+        pre: pp.pre.clone(),
+        post: recovered_state,
+        formals: pp.formals.clone(),
+        result: pp.result,
+        kind: if direct_formal_values.contains(&addr) {
+            PrePostKind::LatentInvalidAccess
+        } else {
+            PrePostKind::AbortProgram
+        },
+        diagnostic: Some(candidate.diagnostic),
+    };
+    if recovered.kind != PrePostKind::LatentInvalidAccess || !caller_controlled.contains(&addr) {
+        classify_recovered_invalid_access_pre_post(pdesc, &mut recovered);
+    }
+    let Some(diagnostic) = recovered.diagnostic.take() else {
+        return Vec::new();
+    };
+    match recovered.kind {
+        PrePostKind::AbortProgram => vec![ExecutionDomain::AbortProgram {
+            state: Box::new(recovered.post),
+            diagnostic: Box::new(diagnostic),
+        }],
+        PrePostKind::LatentInvalidAccess => vec![ExecutionDomain::LatentInvalidAccess {
+            state: Box::new(recovered.post),
+            diagnostic: Box::new(diagnostic),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 fn recovered_invalid_access_pre_posts_from_abort_state(
@@ -1090,9 +1126,9 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
     // creation has preserved a caller-reifiable `must_be_valid` obligation
     // (`PotentialInvalidAccessSummary` in `PulseSummary.ml` /
     // `PulseReport.ml`). A generic latent pre-heap is not enough by itself:
-    // non-manifest local aborts such as
-    // `latent.c:traverse_and_crash_if_equal_to_root` should stay
-    // `LatentAbortProgram`, not sprout extra latent invalid-access twins.
+    // keep abort-space recovery to the OCaml-backed cases where the caller
+    // wrote a caller-visible field path or imported the invalid access
+    // through a call.
     if pre_post.kind != PrePostKind::AbortProgram
         || (!abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
             && !abort_invalid_access_is_imported_from_call(pdesc, pre_post))
@@ -1187,7 +1223,12 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
         .map(|((_, location, _), _)| location.clone())
         .collect();
 
-    if unique_locations.len() == 1 {
+    let is_callsite_reified_abort = pre_post
+        .diagnostic
+        .as_ref()
+        .is_some_and(|diag| proc_has_call_at_location(pdesc, diag.get_location()));
+
+    if unique_locations.len() == 1 || !is_callsite_reified_abort {
         return recovered_pre_posts
             .into_iter()
             .map(|(_key, recovered)| recovered)
@@ -1369,8 +1410,114 @@ fn normalize_direct_formal_latent_invalid_access_shape(
         return false;
     }
     prune_later_direct_formal_artifacts_for_potential_invalid_access(pdesc, pre_post, addr);
+    if latent_invalid_access_has_mixed_condition_depths(pre_post) {
+        return false;
+    }
+    if !latent_invalid_access_has_only_path_local_conditions(pre_post, addr) {
+        return false;
+    }
     drop_selected_null_invalidation(pre_post, addr);
     true
+}
+
+/// Cross-ref: the remaining OCaml direct-formal latent-invalid summaries in
+/// `latent.c` keep either purely local or purely imported guard depth. The
+/// mixed local+imported shape that Rust can synthesize for
+/// `FN_nonlatent_use_after_free_bad{,2}` does not survive as a latent invalid
+/// access in the OCaml summary surface.
+fn latent_invalid_access_has_mixed_condition_depths(pre_post: &PrePost) -> bool {
+    let mut depths = pre_post.post.path_condition.conditions().values().copied();
+    let Some(first_depth) = depths.next() else {
+        return false;
+    };
+    depths.any(|depth| depth != first_depth)
+}
+
+/// Cross-ref: real OCaml summaries for `latent.c` only export a direct-formal
+/// latent invalid access when the surviving summary conditions stay on the
+/// selected caller-visible heap path. If unrelated branch state remains (for
+/// example the independent `b` branch in `FN_nonlatent_use_after_free_bad`),
+/// OCaml keeps the path as a plain `ContinueProgram` instead of publishing a
+/// latent invalid-access summary.
+fn latent_invalid_access_has_only_path_local_conditions(
+    pre_post: &PrePost,
+    selected_addr: AbstractValue,
+) -> bool {
+    let selected_repr = pre_post.post.path_condition.get_var_repr(selected_addr);
+    let Some(path_values) = latent_invalid_access_path_values(pre_post, selected_repr) else {
+        return true;
+    };
+
+    pre_post
+        .post
+        .path_condition
+        .conditions()
+        .iter()
+        .all(|(atom, _depth)| {
+            atom.all_vars().into_iter().all(|var| {
+                let repr = pre_post.post.path_condition.get_var_repr(var);
+                path_values.contains(&repr)
+            })
+        })
+}
+
+fn latent_invalid_access_path_values(
+    pre_post: &PrePost,
+    target: AbstractValue,
+) -> Option<std::collections::HashSet<AbstractValue>> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    let mut best: Option<Vec<AbstractValue>> = None;
+
+    for (_formal, stack_addr) in &pre_post.formals {
+        find_path_values_to_target(
+            pre_post,
+            *stack_addr,
+            target,
+            &repr_of,
+            &mut Vec::new(),
+            &mut std::collections::HashSet::new(),
+            &mut best,
+        );
+    }
+
+    best.map(|path| path.into_iter().collect())
+}
+
+fn find_path_values_to_target(
+    pre_post: &PrePost,
+    addr: AbstractValue,
+    target: AbstractValue,
+    repr_of: &impl Fn(AbstractValue) -> AbstractValue,
+    path: &mut Vec<AbstractValue>,
+    visited: &mut std::collections::HashSet<AbstractValue>,
+    best: &mut Option<Vec<AbstractValue>>,
+) {
+    let repr = repr_of(addr);
+    if !visited.insert(repr) {
+        return;
+    }
+
+    path.push(repr);
+    if repr == target {
+        let replace = best
+            .as_ref()
+            .is_none_or(|current| path.len() < current.len());
+        if replace {
+            *best = Some(path.clone());
+        }
+        path.pop();
+        visited.remove(&repr);
+        return;
+    }
+
+    if let Some(edges) = pre_post.pre.heap.get_edges(addr) {
+        for (_access, next_addr) in edges.iter() {
+            find_path_values_to_target(pre_post, *next_addr, target, repr_of, path, visited, best);
+        }
+    }
+
+    path.pop();
+    visited.remove(&repr);
 }
 
 /// Cross-ref: OCaml publishes `PotentialInvalidAccessSummary` obligations in
@@ -1698,6 +1845,9 @@ pub(crate) fn exported_latent_invalid_access_is_reportable(
     pre_post: &PrePost,
 ) -> bool {
     if pre_post.kind != PrePostKind::LatentInvalidAccess {
+        return false;
+    }
+    if latent_invalid_access_has_mixed_condition_depths(pre_post) {
         return false;
     }
 
@@ -2128,26 +2278,19 @@ pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
 }
 
 pub(crate) fn latent_invalid_access_report_key(pre_post: &PrePost) -> Option<String> {
-    let diagnostic = latent_invalid_access_diagnostic_from_summary_state(pre_post)?;
+    if pre_post.kind != PrePostKind::LatentInvalidAccess {
+        return None;
+    }
+    let diagnostic = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)?;
     let issue_type = diagnostic.get_issue_type_id();
-    let Diagnostic::AccessToInvalidAddress {
-        addr,
-        access_location,
-        ..
-    } = diagnostic
-    else {
+    let Diagnostic::AccessToInvalidAddress { addr, .. } = diagnostic else {
         return None;
     };
     let target = pre_post.post.path_condition.get_var_repr(addr);
     let path_key = latent_invalid_access_heap_path(pre_post, target)
         .map(|path| format!("{path}"))
         .unwrap_or_else(|| format!("{target}"));
-    Some(format!(
-        "{}|{}|{}",
-        issue_type.id(),
-        access_location,
-        path_key
-    ))
+    Some(format!("{}|{}", issue_type.id(), path_key))
 }
 
 fn latent_invalid_access_heap_path(pre_post: &PrePost, target: AbstractValue) -> Option<HeapPath> {
@@ -2289,16 +2432,88 @@ fn abort_has_local_invalid_access(pdesc: &Procdesc, pre_post: &PrePost) -> bool 
     !caller_controlled.contains(&diag_addr) && !access_history_has_formal_origin
 }
 
+fn abort_invalid_access_has_call_origin(pre_post: &PrePost) -> bool {
+    pre_post.diagnostic.as_ref().is_some_and(|diag| match diag {
+        Diagnostic::AccessToInvalidAddress { access_history, .. } => {
+            access_history.first_call_before_invalidation().is_some()
+        }
+        _ => false,
+    })
+}
+
+fn abort_pre_post_should_publish_manifest_diagnostic(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    if pre_post.kind != PrePostKind::AbortProgram {
+        return false;
+    }
+
+    let is_manifest_abort = pre_post_is_manifest(pdesc, pre_post);
+    let keep_local_manifest_twin =
+        !is_manifest_abort && abort_should_keep_local_manifest_twin(pdesc, pre_post);
+    let recovered_invalid_accesses = recovered_invalid_access_pre_posts_from_abort_state(
+        pdesc,
+        pre_post,
+        &std::collections::HashSet::new(),
+    );
+    let has_recovered_invalid_accesses = !recovered_invalid_accesses.is_empty();
+    let is_callsite_reified_abort = pre_post
+        .diagnostic
+        .as_ref()
+        .is_some_and(|diag| proc_has_call_at_location(pdesc, diag.get_location()));
+    let keep_local_manifest_twin_is_branch_control_only = keep_local_manifest_twin
+        && !abort_state_has_caller_sensitive_field_write(pdesc, pre_post)
+        && !abort_invalid_access_is_imported_from_call(pdesc, pre_post);
+    let publish_local_manifest_abort = is_manifest_abort
+        && abort_has_local_invalid_access(pdesc, pre_post)
+        && !abort_invalid_access_has_call_origin(pre_post)
+        && !abort_has_caller_visible_branch_control(pdesc, pre_post)
+        // Keep trailing local aborts manifest even when we also recover
+        // earlier caller-visible latent invalid accesses from the same state.
+        // The duplicate-publication suppression is for callsite-reified aborts
+        // like `FN_crash_after_six_nodes_bad`, not for purely local trailing
+        // crashes such as the field-write fixtures in `checker.rs`.
+        && (!has_recovered_invalid_accesses || !is_callsite_reified_abort);
+    if keep_local_manifest_twin
+        && (!keep_local_manifest_twin_is_branch_control_only
+            || !pre_post.post.path_condition.conditions().is_empty())
+    {
+        return true;
+    }
+    if keep_local_manifest_twin_is_branch_control_only
+        && pre_post.post.path_condition.conditions().is_empty()
+    {
+        return false;
+    }
+    if publish_local_manifest_abort {
+        return true;
+    }
+
+    !has_recovered_invalid_accesses
+}
+
+fn abort_has_caller_visible_branch_control(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
+    let deref_targets = pre_heap_deref_value_targets(pre_post);
+    caller_controlled
+        .into_iter()
+        .filter(|addr| deref_targets.contains(addr))
+        .any(|addr| addr_was_used_as_branch_cond(pre_post, addr))
+}
+
 /// Cross-ref: OCaml goes through `PulseLatentIssue.should_report` and
 /// `PulseArithmetic.is_manifest`, and that manifestness check already rejects
 /// summaries with `pre_heap_has_assumptions`.
 ///
-/// Rust therefore keeps a local manifest twin only for narrower shapes that
-/// stay caller-sensitive for reasons other than a generic latent pre-heap:
-/// caller-sensitive field writes in the current proc, or imported call-side
-/// must-be-valid obligations. Plain latent pre-heap assumptions should keep
-/// the local crash latent, which is the OCaml behavior for
-/// `latent.c:traverse_and_crash_if_equal_to_root`.
+/// OCaml keeps a local manifest twin for a narrower non-manifest null-like
+/// abort slice:
+/// - caller-sensitive field rewrites still get the old manifest twin
+/// - imported call-side invalid accesses still get the old manifest twin
+/// - `traverse_and_crash_if_equal_to_root`-style local cursor crashes also
+///   keep the twin when the latent side still depends on caller-visible
+///   branch-controlled dereference state
+///
+/// Purely local null-like aborts whose only caller-sensitive signal is a
+/// generic latent pre-heap assumption or imported arithmetic guard should stay
+/// latent-only.
 fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
     let Some(Diagnostic::AccessToInvalidAddress { invalidation, .. }) =
         pre_post.diagnostic.as_ref()
@@ -2314,18 +2529,16 @@ fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -
         return false;
     }
 
-    let has_local_invalid_access = abort_has_local_invalid_access(pdesc, pre_post);
-    if !has_local_invalid_access {
-        return false;
-    }
-
-    let has_caller_sensitive_field_write =
-        abort_state_has_caller_sensitive_field_write(pdesc, pre_post);
-    if has_caller_sensitive_field_write {
+    if abort_state_has_caller_sensitive_field_write(pdesc, pre_post) {
         return true;
     }
 
-    abort_invalid_access_is_imported_from_call(pdesc, pre_post)
+    if abort_invalid_access_is_imported_from_call(pdesc, pre_post) {
+        return true;
+    }
+
+    abort_has_local_invalid_access(pdesc, pre_post)
+        && abort_has_caller_visible_branch_control(pdesc, pre_post)
 }
 
 fn abort_invalid_access_is_imported_from_call(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
@@ -5156,9 +5369,12 @@ mod tests {
                     abort_invalid_access_is_imported_from_call(pdesc, pre_post);
                 let caller_sensitive_field_write =
                     abort_state_has_caller_sensitive_field_write(pdesc, pre_post);
+                let publish_manifest =
+                    abort_pre_post_should_publish_manifest_diagnostic(pdesc, pre_post);
+                let diag_key = pre_post.diagnostic.as_ref().map(Diagnostic::dedup_key);
                 let conditions = format!("{:?}", pre_post.post.path_condition.conditions());
                 eprintln!(
-                    "  pp[{i}] kind={:?} manifest={manifest} imported_from_call={imported_from_call} caller_sensitive_field_write={caller_sensitive_field_write} heap_path={heap_path:?} report_key={report_key:?} recovered_keys={recovered_keys:?} conditions={conditions}",
+                    "  pp[{i}] kind={:?} manifest={manifest} publish_manifest={publish_manifest} imported_from_call={imported_from_call} caller_sensitive_field_write={caller_sensitive_field_write} diag_key={diag_key:?} heap_path={heap_path:?} report_key={report_key:?} recovered_keys={recovered_keys:?} conditions={conditions}",
                     pre_post.kind,
                 );
 

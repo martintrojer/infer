@@ -75,11 +75,17 @@ active OCaml-parity gap.
    `summary_eq_zero` latent-invalid-access workaround there. These are
    correctness fixes, not optional count-tuning.
 
-4. **Broader wrapper/cycle null-path publication parity**: the filtered
-   `traverse_and_crash_if_equal_to_root` latent-only repro and the simplified
-   one-node caller/export path are fixed again, but Rust and OCaml can still
-   diverge on which other latent null paths survive call chains and reify as
-   manifest reports.
+4. **Broader wrapper/cycle null-path publication parity**: the real exported
+   `latent.c` issue-set compare is exact again at `(procedure, line,
+   issue-type)`, and the filtered `traverse_and_crash_if_equal_to_root`
+   one-node caller/export path is fixed too, and the reduced one-step / local
+   two-hop field-write publication fixtures are green again. Remaining work
+   here is now summary-surface parity rather than current report-count drift:
+   broader wrapper/cycle call chains still need richer OCaml-aligned
+   trace/publication detail, `FN_nonlatent_use_after_free_bad{,2}` still keep
+   extra latent-invalid / latent-abort shapes where OCaml keeps
+   `ContinueProgram` + `LatentAbortProgram`, and `latent_use_after_free` still
+   keeps an extra `LatentAbortProgram` where OCaml keeps `ContinueProgram`.
 
 5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
    dedup and `issues.exp`-style counting, but richer OCaml-style `PulseTrace` / publication detail
@@ -124,6 +130,16 @@ Recent groundwork that should stay in place even though the current NPE total mo
   latent, and ordinary callee-written field nulls stay manifest again
 - this narrowing restored the direct `.sil` `store_bad` / `use_not_modeled_bad` regressions and
   keeps `funptr.c` at parity; do not undo it just to chase headline totals
+- the real exported `latent.c` compare is now exact again at the
+  `(procedure, line, issue-type)` level: Rust restores OCaml's local
+  `AbortProgram` + `LatentAbortProgram` twin publication for
+  `traverse_and_crash_if_equal_to_root`, keeps recovered caller abort pre/posts
+  in summaries without republishing their manifest diagnostics, dedups latent
+  invalid accesses by caller-visible heap path with earlier-location
+  preference, and filters mixed local+imported direct-formal latent-invalid
+  publication from the report surface; keep
+  `test_e2e_latent_cycle_summary_shapes_match_ocaml_subset` and
+  `test_e2e_mixed_depth_direct_formal_latent_invalid_is_not_reported` green
 
 Remaining active store-textual work is concentrated in the issue-set / trace-quality invalid-access
 cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_deref_old_bad`.

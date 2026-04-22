@@ -73,6 +73,12 @@ solver equalities.
   classification depends on that signal together with the local zero condition.
 - Do not treat "the formula contains `addr == 0`" as sufficient evidence that a direct-formal null
   dereference should be manifest. `latent.c:deref_then_free_then_deref_bad` is the counterexample.
+- Mixed local+imported guard-depth shapes are also a real pitfall: in
+  `latent.c` OCaml does not publish a direct-formal latent-invalid-access
+  report when the surviving summary conditions combine unrelated local and
+  imported branches (`FN_nonlatent_use_after_free_bad{,2}`-style). Check the
+  dumped OCaml summary surface before turning that shape into a latent invalid
+  access instead of a plain `ContinueProgram` / latent-abort path.
 
 ## Imported arithmetic latent-summary gotcha
 
@@ -99,9 +105,17 @@ should turn a callee-local latent null path into a manifest callee report.
   summaries, not just issue counts.
 - In the one-step cycle shape (`traverse_one_step_and_crash_if_equal_to_root`-style), OCaml keeps
   the callee summary latent-only and reifies the manifest null-deref only in the caller.
+- When Rust keeps an `AbortProgram` + `LatentAbortProgram` twin only because of caller-visible
+  branch-controlled cursor state, do not automatically publish the callee manifest diagnostic if no
+  caller-side conditions survive in the exported summary.
 - In the simplified one-node caller/export shape, once the caller has already reified that latent
   abort at the callsite and no caller-side conditions remain, keep the caller `AbortProgram`
   instead of suppressing it behind a synthetic latent-invalid-access twin during summary export.
+- Conversely, purely local trailing field-write aborts can still publish their manifest diagnostic
+  even when earlier caller-visible latent invalid accesses are recovered from the same state.
+- On the real exported `latent.c` compare, the issue surface is now exact at
+  `(procedure, line, issue-type)`. Remaining work in this cluster is
+  summary-surface parity, not current report-count drift.
 - Do not broaden Rust manifest-twin heuristics for field-derived cursor rewrites unless the
   caller-control / reachability check is done over canonical summary-space values and OCaml proves
   the broader behavior.

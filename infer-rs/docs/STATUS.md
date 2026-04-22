@@ -2,7 +2,7 @@
 
 ## Summary
 
-**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Exact issue-set parity work outside this summary cluster is now concentrated in broader wrapper/cycle null-path publication and richer trace/report parity; the filtered `traverse_and_crash_if_equal_to_root` latent-only repro and the simplified one-node caller/export path are fixed again.**
+**~37,000 lines of Rust across 11 crates. 350+ tests. The latest authoritative store-textual sweep currently covers 52 of 55 C Pulse files (3 skipped for fixpoint exhaustion). NPE detection: expected 131, found 134. Leak detection: expected 20, found 20. UAF detection: expected 7, found 7. The remaining count deltas are the accepted `nullptr.c` `+1` real-bug divergence (`FN_nullptr_deref_old_bad`) and the accepted `sizeof.c` `+2` exported-Textual fidelity limit. Fine-grained summary parity is now driven by the semantic `specialization.c` harness in `crates/test-harness/src/summary_compare.rs`: all `21 / 21` procedures match on `main.pre_post_list`, and the widened harness now also compares specialized summaries with a current verified checkpoint of `Matching: 21` and no diffs. The real exported `latent.c` issue-set compare is now exact again at `(procedure, line, issue-type)` (`17` Rust, `17` OCaml, no side-only entries). Recent OCaml-backed correctness work that stays in place now mirrors OCaml's dynamic-type specialization path (`PulseArithmetic.and_dynamic_type_is_unsafe`) instead of exporting `Closure(...)` attrs, routes resolved `__call_c_function_ptr` targets with no summary through the direct known-call unknown fallback, materializes missing imported callee pre-edges onto caller state while still skipping value-actual formal-stack bookkeeping cells, preserves latent-invalid-access export/import parity while rematerializing caller-visible non-zero `ConstantDereference(k)` invalidations at summary export, and extends the comparator only for true semantic noise (deterministic specialization keys, witness inequalities, syntax-first witness-atom collapse, unit-affine / exact-RHS / inverse-scaling / eq-closure `is_int(...)` normalization with redundant formula-only witness drop). `invoke`, `invoke_itself_bad`, `may_double_free_if_alias`, and `two_pointers_recursion_bad` now match. Remaining work in the latent-invalid-access cluster is the smaller `FN_nonlatent_use_after_free_bad{,2}` / `latent_use_after_free` summary-surface gap plus richer trace/publication detail, not current issue-count drift.**
 
 ## OpenSSL Benchmark
 
@@ -158,6 +158,23 @@ Recent correctness / robustness fixes:
   now matches that behavior with the narrow
   `checker::tests::test_formal_load_then_exit_stays_continue_only` guard
   instead of changing the wider summary-formula simplification rules.
+- Real exported `latent.c` issue-set parity is exact again:
+  Rust and OCaml now both report `17` issues with no side-only
+  `(procedure, line, issue-type)` entries. The key correctness fixes are:
+  recovered caller abort paths stay in summaries even when latent-invalid
+  siblings are recovered from them, checker-side manifest publication now
+  suppresses only the duplicate report rather than the `AbortProgram` pre/post
+  itself, local `traverse_and_crash_if_equal_to_root`-style null aborts keep
+  the OCaml `AbortProgram` + `LatentAbortProgram` twin, latent-invalid dedup
+  keys on caller-visible heap path instead of raw access location, and mixed
+  local+imported direct-formal latent-invalid shapes stay out of the report
+  surface.
+- The latent publication split that had broken `make check` is green again:
+  `traverse_one_step_and_crash_if_equal_to_root` now stays latent-only at the
+  callee while the caller reifies the manifest null dereference, local two-hop
+  field-write aborts keep both recovered latent null paths plus the trailing
+  manifest abort, and the real `FN_crash_after_six_nodes_bad` duplicate
+  manifest suppression stays intact.
 - Disjunctive Pulse execution now mirrors the OCaml split between cheap
   disjunct equality and semantic subsumption more closely. `absint` gained an
   explicit `Comparable::equal_fast(...)` hook, `DisjunctiveDomain::{join,dedup}`
@@ -963,8 +980,10 @@ The current Rust implementation now has condition-depth tracking, latent invalid
 specialized-summary filtering, imported pure-call dependency translation, and
 `pre_heap_has_assumptions` in summary manifestness. The remaining general gap is narrower:
 
-- precise latent-vs-manifest execution-kind selection for caller-visible invalid accesses
-- wrapper/cycle null-path survival and reification through call chains
+- summary-surface parity on the reduced `latent.c` fixtures:
+  `FN_nonlatent_use_after_free_bad{,2}` still keep extra latent-invalid /
+  latent-abort shapes where OCaml keeps `ContinueProgram` + `LatentAbortProgram`,
+  and `latent_use_after_free` still carries an extra `LatentAbortProgram`
 - latent issue type reporting / traces
 - suppressed-report presentation / trace detail
 

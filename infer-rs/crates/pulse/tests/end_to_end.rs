@@ -1826,10 +1826,13 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             vec![
                 "ContinueProgram",
                 "ContinueProgram",
+                "AbortProgram",
                 "LatentAbortProgram",
                 "ContinueProgram",
+                "AbortProgram",
                 "LatentAbortProgram",
                 "ContinueProgram",
+                "AbortProgram",
                 "LatentAbortProgram",
             ],
         ),
@@ -1842,6 +1845,7 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             vec![
                 "ContinueProgram",
                 "LatentInvalidAccess",
+                "AbortProgram",
                 "LatentInvalidAccess",
                 "AbortProgram",
             ],
@@ -1851,14 +1855,22 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             vec![
                 "ContinueProgram",
                 "LatentInvalidAccess",
+                "AbortProgram",
                 "LatentInvalidAccess",
+                "AbortProgram",
                 "LatentInvalidAccess",
+                "AbortProgram",
                 "LatentInvalidAccess",
             ],
         ),
     ];
 
     for (proc_name, expected_kinds) in expected {
+        let pdesc = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == proc_name)
+            .unwrap_or_else(|| panic!("procdesc for {proc_name} should exist"));
         let summary = store
             .to_vec()
             .into_iter()
@@ -1874,6 +1886,34 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             actual_kinds, expected_kinds,
             "{proc_name} summary kinds diverged"
         );
+
+        let issue_ids: Vec<_> = pulse::checker::to_issue_log_with_pdesc(&summary, pdesc)
+            .issues
+            .into_iter()
+            .map(|issue| issue.issue_type.id)
+            .collect();
+        if proc_name == "traverse_and_crash_if_equal_to_root" {
+            assert!(
+                issue_ids
+                    .iter()
+                    .any(|id| id == IssueTypeId::NullptrDereference.id()),
+                "traverse should publish a local manifest null dereference, got {issue_ids:?}"
+            );
+            assert!(
+                issue_ids.iter().any(|id| {
+                    id == &format!("{}_LATENT", IssueTypeId::NullptrDereference.id())
+                }),
+                "traverse should also keep the latent null path, got {issue_ids:?}"
+            );
+        }
+        if proc_name == "FN_crash_after_six_nodes_bad" {
+            assert!(
+                !issue_ids
+                    .iter()
+                    .any(|id| id == IssueTypeId::NullptrDereference.id()),
+                "six-node caller should not publish a manifest null dereference, got {issue_ids:?}"
+            );
+        }
     }
 }
 
@@ -3386,6 +3426,69 @@ fn test_e2e_deref_then_free_then_deref_keeps_npe_latent() {
                 .as_ref()
                 .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)),
         "expected a latent NULL_DEREFERENCE pre/post to stay in the summary"
+    );
+}
+
+#[test]
+fn test_e2e_mixed_depth_direct_formal_latent_invalid_is_not_reported() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define create_branching(b: int) : void {
+          #entry:
+            n0:int = load &b
+            jmp branch_true, branch_false
+          #branch_true:
+            prune __sil_eq(n0, 1)
+            ret null
+          #branch_false:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define FN_nonlatent_use_after_free_bad(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = create_branching(n0)
+            _ = free(n1)
+            n2:*int = load &x
+            store n2 <- 42:int
+            ret null
+        }
+    "#,
+    );
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+    let proc_name = "FN_nonlatent_use_after_free_bad";
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == proc_name)
+        .map(|(_, summary)| summary)
+        .expect("summary should exist");
+    let pdesc = tm
+        .cfg
+        .iter_proc_descs()
+        .find(|pdesc| format!("{}", pdesc.proc_name) == proc_name)
+        .expect("procdesc should exist");
+    let issue_ids: Vec<_> = pulse::checker::to_issue_log_with_pdesc(&summary, pdesc)
+        .issues
+        .into_iter()
+        .map(|issue| issue.issue_type.id)
+        .collect();
+
+    assert!(
+        !issue_ids
+            .iter()
+            .any(|id| id == &format!("{}_LATENT", IssueTypeId::NullptrDereference.id())),
+        "mixed local+imported guard latent invalid access should stay out of the report surface, got {issue_ids:?}"
+    );
+    assert!(
+        issue_ids
+            .iter()
+            .any(|id| id == &format!("{}_LATENT", IssueTypeId::UseAfterFree.id())),
+        "the latent use-after-free should still be reported, got {issue_ids:?}"
     );
 }
 
