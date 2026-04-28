@@ -321,6 +321,9 @@ pub fn report_dead_stores(pdesc: &Procdesc) -> IssueLog {
                                 column: loc.col as u32,
                                 procedure: proc_name.clone(),
                                 trace: "Write of unused value".to_string(),
+                                bug_trace: None,
+                                bug_trace_length: None,
+                                bug_trace_max_depth: None,
                             });
                         }
                     }

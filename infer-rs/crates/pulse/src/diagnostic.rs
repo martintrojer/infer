@@ -163,6 +163,11 @@ impl Diagnostic {
         } else {
             self.trace_message()
         };
+        let bug_trace = self.structured_bug_trace();
+        let bug_trace_length = bug_trace.as_ref().map(|entries| entries.len() as u32);
+        let bug_trace_max_depth = bug_trace
+            .as_ref()
+            .and_then(|entries| entries.iter().map(|entry| entry.level).max());
         diagnostics::issue::Issue {
             issue_type: self.build_issue_type(latent),
             qualifier: format!("{self}"),
@@ -171,6 +176,9 @@ impl Diagnostic {
             column: loc.col as u32,
             procedure: procedure.to_string(),
             trace,
+            bug_trace,
+            bug_trace_length,
+            bug_trace_max_depth,
         }
     }
 
@@ -197,6 +205,50 @@ impl Diagnostic {
         }
     }
 
+    fn structured_bug_trace(&self) -> Option<Vec<diagnostics::issue::BugTraceEntry>> {
+        match self {
+            Diagnostic::AccessToInvalidAddress {
+                access_location,
+                access_history,
+                invalidation_history,
+                ..
+            } => {
+                let mut trace = Vec::new();
+                if !invalidation_history.is_epoch() {
+                    trace.push(make_bug_trace_entry(
+                        0,
+                        access_location,
+                        "invalidation part of the trace starts here".to_string(),
+                    ));
+                    trace.extend(history_to_bug_trace(invalidation_history, access_location));
+                }
+                if !access_history.is_epoch() {
+                    trace.push(make_bug_trace_entry(
+                        0,
+                        access_location,
+                        "access part of the trace starts here".to_string(),
+                    ));
+                    trace.extend(history_to_bug_trace(access_history, access_location));
+                }
+                (!trace.is_empty()).then_some(trace)
+            }
+            Diagnostic::MemoryLeak {
+                allocator,
+                allocation_location,
+                ..
+            } => Some(vec![make_bug_trace_entry(
+                0,
+                allocation_location,
+                format!("memory allocated via {allocator:?} here"),
+            )]),
+            Diagnostic::RetainCycle { location } => Some(vec![make_bug_trace_entry(
+                0,
+                location,
+                "retain cycle here".to_string(),
+            )]),
+        }
+    }
+
     /// Cross-ref: OCaml `PulseReport.is_constant_deref_without_invalidation`.
     pub fn is_suppressed(&self) -> bool {
         match self {
@@ -214,6 +266,110 @@ impl Diagnostic {
             Diagnostic::MemoryLeak { .. } | Diagnostic::RetainCycle { .. } => false,
         }
     }
+}
+
+fn make_bug_trace_entry(
+    level: u32,
+    loc: &Location,
+    description: String,
+) -> diagnostics::issue::BugTraceEntry {
+    diagnostics::issue::BugTraceEntry {
+        level,
+        filename: format!("{}", loc.file),
+        line_number: loc.line as u32,
+        column_number: loc.col as u32,
+        description,
+    }
+}
+
+fn bug_trace_event_location(
+    events: &[crate::value_history::HistoryEvent],
+    index: usize,
+    fallback: &Location,
+) -> Location {
+    events[index]
+        .location()
+        .or_else(|| {
+            events[index + 1..]
+                .iter()
+                .find_map(|event| event.location())
+        })
+        .or_else(|| {
+            events[..index]
+                .iter()
+                .rev()
+                .find_map(|event| event.location())
+        })
+        .cloned()
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn history_to_bug_trace(
+    history: &ValueHistory,
+    fallback: &Location,
+) -> Vec<diagnostics::issue::BugTraceEntry> {
+    let Some(path) = history.primary_path() else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::new();
+    let mut level = 1u32;
+    for (index, event) in path.events().iter().enumerate() {
+        match event {
+            crate::value_history::HistoryEvent::ReturnFromCall { .. } => {
+                level = level.saturating_sub(1);
+            }
+            crate::value_history::HistoryEvent::Call { proc, location } => {
+                entries.push(make_bug_trace_entry(
+                    level,
+                    location,
+                    format!("when calling `{proc}` here"),
+                ));
+                level += 1;
+            }
+            crate::value_history::HistoryEvent::FormalArgument(pvar) => {
+                let loc = bug_trace_event_location(path.events(), index, fallback);
+                entries.push(make_bug_trace_entry(
+                    level,
+                    &loc,
+                    format!("parameter `{}`", pvar.name),
+                ));
+            }
+            crate::value_history::HistoryEvent::ActualArgument(pvar) => {
+                let loc = bug_trace_event_location(path.events(), index, fallback);
+                entries.push(make_bug_trace_entry(
+                    level,
+                    &loc,
+                    format!("actual argument for `{}`", pvar.name),
+                ));
+            }
+            crate::value_history::HistoryEvent::Assignment(location) => {
+                entries.push(make_bug_trace_entry(
+                    level,
+                    location,
+                    "assigned here".to_string(),
+                ));
+            }
+            crate::value_history::HistoryEvent::Returned(location) => {
+                entries.push(make_bug_trace_entry(
+                    level,
+                    location,
+                    "returned here".to_string(),
+                ));
+            }
+            crate::value_history::HistoryEvent::Invalidated {
+                invalidation,
+                location,
+            } => {
+                entries.push(make_bug_trace_entry(
+                    level,
+                    location,
+                    format!("{invalidation}"),
+                ));
+            }
+        }
+    }
+    entries
 }
 
 impl fmt::Display for Diagnostic {
@@ -317,6 +473,15 @@ mod tests {
         assert!(issue.trace.contains("access history:"));
         assert!(issue.trace.contains("formal("));
         assert!(issue.trace.contains("assign@"));
+        assert!(issue
+            .bug_trace
+            .as_ref()
+            .is_some_and(|trace| !trace.is_empty()));
+        assert_eq!(
+            issue.bug_trace_length,
+            issue.bug_trace.as_ref().map(|trace| trace.len() as u32)
+        );
+        assert!(issue.bug_trace_max_depth.is_some_and(|depth| depth > 0));
     }
 
     #[test]
@@ -336,5 +501,9 @@ mod tests {
         assert!(issue.trace.starts_with("*** SUPPRESSED ***,"));
         assert!(issue.trace.contains("invalidation history:"));
         assert!(issue.trace.contains("access history:"));
+        assert!(issue
+            .bug_trace
+            .as_ref()
+            .is_some_and(|trace| !trace.is_empty()));
     }
 }

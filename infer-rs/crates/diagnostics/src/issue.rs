@@ -15,6 +15,15 @@ use sil::location::Location;
 
 use crate::issue_type::IssueType;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BugTraceEntry {
+    pub level: u32,
+    pub filename: String,
+    pub line_number: u32,
+    pub column_number: u32,
+    pub description: String,
+}
+
 /// A single reported issue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
@@ -30,8 +39,15 @@ pub struct Issue {
     pub column: u32,
     /// Procedure where the issue was found.
     pub procedure: String,
-    /// Short trace description (e.g. "Write of unused value (type `int`)").
+    /// Short trace description (e.g. "Write of unused value (type `int`)`).
     pub trace: String,
+    /// Optional structured bug trace, closer to OCaml's `report.json` shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_trace: Option<Vec<BugTraceEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_trace_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_trace_max_depth: Option<u32>,
 }
 
 /// A collection of issues from one or more checker runs.
@@ -79,7 +95,7 @@ impl IssueLog {
 
     /// Format as `issues.exp` lines for comparison with OCaml test expectations.
     ///
-    /// Format: `file, procedure, line, ISSUE_TYPE, no_bucket, SEVERITY, [trace]`
+    /// Format: `file, procedure, line, ISSUE_TYPE, bucket, severity, [trace]`
     pub fn to_issues_exp(&self) -> String {
         let mut sorted = self.issues.clone();
         sorted.sort_by(|a, b| {
@@ -117,6 +133,9 @@ impl IssueLog {
             column: loc.col as u32,
             procedure: procedure.to_string(),
             trace,
+            bug_trace: None,
+            bug_trace_length: None,
+            bug_trace_max_depth: None,
         }
     }
 }
@@ -139,6 +158,9 @@ mod tests {
             column: 5,
             procedure: "foo".into(),
             trace: "Write of unused value (type `int`)".into(),
+            bug_trace: None,
+            bug_trace_length: None,
+            bug_trace_max_depth: None,
         });
 
         assert_eq!(log.len(), 1);
@@ -156,6 +178,9 @@ mod tests {
             column: 3,
             procedure: "bar".into(),
             trace: "Write of unused value (type `int`)".into(),
+            bug_trace: None,
+            bug_trace_length: None,
+            bug_trace_max_depth: None,
         });
 
         let exp = log.to_issues_exp();
@@ -173,6 +198,9 @@ mod tests {
             column: 0,
             procedure: "f".into(),
             trace: "".into(),
+            bug_trace: None,
+            bug_trace_length: None,
+            bug_trace_max_depth: None,
         });
         log.report(Issue {
             issue_type: IssueType::dead_store(),
@@ -182,6 +210,9 @@ mod tests {
             column: 0,
             procedure: "g".into(),
             trace: "".into(),
+            bug_trace: None,
+            bug_trace_length: None,
+            bug_trace_max_depth: None,
         });
 
         log.sort();

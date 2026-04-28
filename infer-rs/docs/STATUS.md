@@ -995,8 +995,9 @@ specialized-summary filtering, imported pure-call dependency translation, and
 
 - latent issue type reporting / traces
   (serialized issue traces now append minimal invalidation/access history
-  signatures, but Rust still lacks OCaml's richer structured `PulseTrace`
-  publication detail)
+  signatures, and `report.json` now carries a minimal structured `bug_trace`
+  / `bug_trace_{length,max_depth}` payload, but Rust still lacks OCaml's
+  richer structured `PulseTrace` publication detail)
 - suppressed-report presentation / trace detail
 
 ### Other gaps

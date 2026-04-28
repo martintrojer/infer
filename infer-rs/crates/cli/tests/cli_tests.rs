@@ -334,6 +334,25 @@ fn test_pulse_detects_null_deref() {
         !stdout.contains("safe_store_ok"),
         "safe_store_ok should have no issues: {stdout}"
     );
+
+    let report = std::fs::read_to_string(tmp_dir.join("report.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let issues = parsed
+        .as_array()
+        .expect("report.json should be a JSON array");
+    assert!(
+        issues.iter().any(|issue| {
+            issue["issue_type"]["id"].as_str() == Some(IssueTypeId::NullptrDereference.id())
+                && issue["bug_trace"].is_array()
+                && issue["bug_trace_length"]
+                    .as_u64()
+                    .is_some_and(|len| len > 0)
+                && issue["bug_trace_max_depth"]
+                    .as_u64()
+                    .is_some_and(|depth| depth > 0)
+        }),
+        "null-deref reports should include structured bug trace metadata: {report}"
+    );
 }
 
 #[test]

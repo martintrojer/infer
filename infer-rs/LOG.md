@@ -43,9 +43,12 @@ changes, and move finished results to durable docs/tests/commits.
     export and removes the old `main` / `manifest_use_after_free` manifest NPE
     regressions again
   - report-side trace strings are a little richer now too: default Pulse
-    issues keep the old one-line qualifier, but the serialized `trace` field
-    now appends minimal invalidation/access history signatures so latent-chain
-    debugging does not require reopening the summary dumps for simple cases
+    issues keep the old one-line qualifier, the serialized `trace` field now
+    appends minimal invalidation/access history signatures, and `report.json`
+    now also carries a minimal structured `bug_trace` /
+    `bug_trace_{length,max_depth}` payload derived from the same histories so
+    latent-chain debugging does not require reopening the summary dumps for
+    simple cases
   - `transfer::tests::test_store_to_formula_known_zero_detects_error` was
     updated to build the caller-visible heap path first; this matches the
     existing `EqZero`/heap-allocated semantics used elsewhere in the Rust port

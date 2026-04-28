@@ -45,7 +45,7 @@ pub enum HistoryEvent {
 }
 
 impl HistoryEvent {
-    fn location(&self) -> Option<&Location> {
+    pub(crate) fn location(&self) -> Option<&Location> {
         match self {
             Self::FormalArgument(_) | Self::ActualArgument(_) => None,
             Self::Assignment(location)
@@ -64,6 +64,10 @@ pub struct HistoryPath(pub Vec<HistoryEvent>);
 impl HistoryPath {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn events(&self) -> &[HistoryEvent] {
+        &self.0
     }
 
     fn append(&self, event: HistoryEvent) -> Self {
@@ -355,6 +359,10 @@ impl ValueHistory {
     pub fn signature(&self) -> String {
         let parts: Vec<String> = self.0.iter().map(ToString::to_string).collect();
         parts.join(" || ")
+    }
+
+    pub(crate) fn primary_path(&self) -> Option<&HistoryPath> {
+        self.0.iter().next()
     }
 }
 
