@@ -47,8 +47,8 @@ changes, and move finished results to durable docs/tests/commits.
     appends minimal invalidation/access history signatures, and `report.json`
     now also carries a minimal structured `bug_trace` /
     `bug_trace_{length,max_depth}` payload plus flat `bug_type` / `severity`
-    / `category` aliases, stable `key`, `procedure_start_line`, and empty
-    `extras`
+    / `category` aliases, stable `key`, `node_key`, `hash`,
+    `procedure_start_line`, and empty `extras`
   - access-side bug traces now reorder caller provenance before a synthetic
     `when calling ... here` step into the callee parameter/value, which makes
     `manifest_use_after_free` and `main` look closer to OCaml without changing

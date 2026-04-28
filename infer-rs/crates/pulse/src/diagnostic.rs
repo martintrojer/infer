@@ -180,20 +180,27 @@ impl Diagnostic {
             .as_ref()
             .and_then(|entries| entries.iter().map(|entry| entry.level).max());
         let issue_type = self.build_issue_type(latent);
+        let qualifier = format!("{self}");
         let file = format!("{}", loc.file);
-        let key = std::path::Path::new(&file)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("{name}|{procedure}|{}", issue_type.id));
+        let (key, node_key, hash) = diagnostics::issue::derive_issue_metadata(
+            &issue_type,
+            &file,
+            procedure,
+            loc.line as u32,
+            loc.col as u32,
+            &qualifier,
+        );
         diagnostics::issue::Issue {
             bug_type: Some(issue_type.id.clone()),
             bug_type_hum: Some(issue_type.human_name()),
             severity: Some(issue_type.severity.to_string()),
             category: Some(issue_type.category.to_string()),
             issue_type,
-            qualifier: format!("{self}"),
+            qualifier,
             procedure_start_line,
             key,
+            node_key,
+            hash,
             file,
             line: loc.line as u32,
             column: loc.col as u32,

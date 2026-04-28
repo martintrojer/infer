@@ -275,15 +275,15 @@ qualifier stays the same, the `trace` field appends minimal
 invalidation/access history signatures, and `report.json` now also carries a
 minimal structured `bug_trace` / `bug_trace_{length,max_depth}` payload plus
 flat OCaml-style `bug_type` / `severity` / `category` aliases, stable `key`,
-`procedure_start_line`, and empty `extras`, all derived from the same issue
-metadata for easier latent-chain debugging. The structured bug trace is also a
-little closer to OCaml now: access traces reorder caller provenance before a
-synthetic `when calling ... here` step and then descend into the callee
-parameter/value that triggers the final invalid access, invalidation traces
-synthesize the outer callee formal before the inner call when a translated
-callee diagnostic preserves only the deeper formal, and modelled allocation
-call/return pairs such as `malloc` collapse to one `allocated by call to ...
-(modelled)` step.
+`node_key`, `hash`, `procedure_start_line`, and empty `extras`, all derived
+from the same issue metadata for easier latent-chain debugging. The structured
+bug trace is also a little closer to OCaml now: access traces reorder caller
+provenance before a synthetic `when calling ... here` step and then descend
+into the callee parameter/value that triggers the final invalid access,
+invalidation traces synthesize the outer callee formal before the inner call
+when a translated callee diagnostic preserves only the deeper formal, and
+modelled allocation call/return pairs such as `malloc` collapse to one
+`allocated by call to ... (modelled)` step.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model

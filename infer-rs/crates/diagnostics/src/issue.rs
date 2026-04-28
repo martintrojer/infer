@@ -43,6 +43,10 @@ pub struct Issue {
     pub procedure_start_line: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
     /// Source file where the issue was found.
     pub file: String,
     /// Line number.
@@ -68,6 +72,53 @@ pub struct Issue {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IssueLog {
     pub issues: Vec<Issue>,
+}
+
+fn stable_hash_hex(parts: &[&str]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn basename(file: &str) -> &str {
+    std::path::Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file)
+}
+
+pub fn derive_issue_metadata(
+    issue_type: &IssueType,
+    file: &str,
+    procedure: &str,
+    line: u32,
+    column: u32,
+    qualifier: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let key = format!("{}|{}|{}", basename(file), procedure, issue_type.id);
+    let node_key = stable_hash_hex(&[
+        &issue_type.id,
+        file,
+        procedure,
+        &line.to_string(),
+        &column.to_string(),
+    ]);
+    let hash = stable_hash_hex(&[
+        &issue_type.id,
+        file,
+        procedure,
+        &line.to_string(),
+        &column.to_string(),
+        qualifier,
+    ]);
+    (Some(key), Some(node_key), Some(hash))
 }
 
 impl IssueLog {
@@ -140,10 +191,14 @@ impl IssueLog {
         procedure: &str,
     ) -> Issue {
         let file = format!("{}", loc.file);
-        let key = std::path::Path::new(&file)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("{name}|{procedure}|{}", issue_type.id));
+        let (key, node_key, hash) = derive_issue_metadata(
+            &issue_type,
+            &file,
+            procedure,
+            loc.line as u32,
+            loc.col as u32,
+            &qualifier,
+        );
         Issue {
             bug_type: Some(issue_type.id.clone()),
             bug_type_hum: Some(issue_type.human_name()),
@@ -153,6 +208,8 @@ impl IssueLog {
             qualifier,
             procedure_start_line: None,
             key,
+            node_key,
+            hash,
             file,
             line: loc.line as u32,
             column: loc.col as u32,
@@ -186,6 +243,8 @@ mod tests {
             qualifier: "unused value".into(),
             procedure_start_line: None,
             key: Some("test.c|foo|DEAD_STORE".into()),
+            node_key: Some("dummy".into()),
+            hash: Some("dummy".into()),
             file: "test.c".into(),
             line: 10,
             column: 5,
@@ -214,6 +273,8 @@ mod tests {
             qualifier: "unused".into(),
             procedure_start_line: None,
             key: Some("test.c|bar|DEAD_STORE".into()),
+            node_key: Some("dummy".into()),
+            hash: Some("dummy".into()),
             file: "test.c".into(),
             line: 5,
             column: 3,
@@ -242,6 +303,8 @@ mod tests {
             qualifier: "".into(),
             procedure_start_line: None,
             key: Some("b.c|f|DEAD_STORE".into()),
+            node_key: Some("dummy".into()),
+            hash: Some("dummy".into()),
             file: "b.c".into(),
             line: 10,
             column: 0,
@@ -262,6 +325,8 @@ mod tests {
             qualifier: "".into(),
             procedure_start_line: None,
             key: Some("a.c|g|DEAD_STORE".into()),
+            node_key: Some("dummy".into()),
+            hash: Some("dummy".into()),
             file: "a.c".into(),
             line: 5,
             column: 0,

@@ -93,7 +93,8 @@ active OCaml-parity gap.
    dedup and `issues.exp`-style counting, serialized issue traces now append minimal
    invalidation/access history signatures, and `report.json` now carries a minimal structured
    `bug_trace` / `bug_trace_{length,max_depth}` payload plus flat `bug_type` / `severity` /
-   `category` aliases, stable `key`, `procedure_start_line`, and empty `extras`. The structured
+   `category` aliases, stable `key`, `node_key`, `hash`, `procedure_start_line`, and empty
+   `extras`. The structured
    trace is also a bit closer to OCaml now on both access and invalidation paths (caller
    provenance before a synthetic call step, outer-formal synthesis before deeper callee formals,
    and modelled-allocation call/return compression), but richer OCaml-style `PulseTrace` /

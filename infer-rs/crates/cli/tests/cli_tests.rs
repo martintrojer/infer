@@ -354,6 +354,12 @@ fn test_pulse_detects_null_deref() {
                 && issue["key"]
                     .as_str()
                     .is_some_and(|key| key.contains("null_deref_bad"))
+                && issue["node_key"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                && issue["hash"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
                 && issue["extras"].is_object()
                 && issue["bug_trace"].is_array()
                 && issue["bug_trace_length"]

@@ -313,26 +313,27 @@ pub fn report_dead_stores(pdesc: &Procdesc) -> IssueLog {
                             let var_name = &pv.name.plain;
                             let issue_type = IssueType::dead_store();
                             let file = format!("{}", loc.file);
-                            let key = Some(format!(
-                                "{}|{}|{}",
-                                std::path::Path::new(&file)
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or_default(),
-                                proc_name,
-                                issue_type.id
-                            ));
+                            let qualifier =
+                                format!("The value written to `{var_name}` is never used");
+                            let (key, node_key, hash) = diagnostics::issue::derive_issue_metadata(
+                                &issue_type,
+                                &file,
+                                &proc_name,
+                                loc.line as u32,
+                                loc.col as u32,
+                                &qualifier,
+                            );
                             log.report(Issue {
                                 bug_type: Some(issue_type.id.clone()),
                                 bug_type_hum: Some(issue_type.human_name()),
                                 severity: Some(issue_type.severity.to_string()),
                                 category: Some(issue_type.category.to_string()),
                                 issue_type,
-                                qualifier: format!(
-                                    "The value written to `{var_name}` is never used"
-                                ),
+                                qualifier,
                                 procedure_start_line: None,
                                 key,
+                                node_key,
+                                hash,
                                 file,
                                 line: loc.line as u32,
                                 column: loc.col as u32,
