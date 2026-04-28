@@ -168,8 +168,13 @@ impl Diagnostic {
         let bug_trace_max_depth = bug_trace
             .as_ref()
             .and_then(|entries| entries.iter().map(|entry| entry.level).max());
+        let issue_type = self.build_issue_type(latent);
         diagnostics::issue::Issue {
-            issue_type: self.build_issue_type(latent),
+            bug_type: Some(issue_type.id.clone()),
+            bug_type_hum: Some(issue_type.human_name()),
+            severity: Some(issue_type.severity.to_string()),
+            category: Some(issue_type.category.to_string()),
+            issue_type,
             qualifier: format!("{self}"),
             file: format!("{}", loc.file),
             line: loc.line as u32,

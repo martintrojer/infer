@@ -31,6 +31,14 @@ pub struct Issue {
     pub issue_type: IssueType,
     /// Human-readable description.
     pub qualifier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_type_hum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// Source file where the issue was found.
     pub file: String,
     /// Line number.
@@ -126,6 +134,10 @@ impl IssueLog {
         procedure: &str,
     ) -> Issue {
         Issue {
+            bug_type: Some(issue_type.id.clone()),
+            bug_type_hum: Some(issue_type.human_name()),
+            severity: Some(issue_type.severity.to_string()),
+            category: Some(issue_type.category.to_string()),
             issue_type,
             qualifier,
             file: format!("{}", loc.file),
@@ -150,8 +162,13 @@ mod tests {
         let mut log = IssueLog::new();
         assert!(log.is_empty());
 
+        let issue_type = IssueType::dead_store();
         log.report(Issue {
-            issue_type: IssueType::dead_store(),
+            bug_type: Some(issue_type.id.clone()),
+            bug_type_hum: Some(issue_type.human_name()),
+            severity: Some(issue_type.severity.to_string()),
+            category: Some(issue_type.category.to_string()),
+            issue_type,
             qualifier: "unused value".into(),
             file: "test.c".into(),
             line: 10,
@@ -170,8 +187,13 @@ mod tests {
     #[test]
     fn test_issues_exp_format() {
         let mut log = IssueLog::new();
+        let issue_type = IssueType::dead_store();
         log.report(Issue {
-            issue_type: IssueType::dead_store(),
+            bug_type: Some(issue_type.id.clone()),
+            bug_type_hum: Some(issue_type.human_name()),
+            severity: Some(issue_type.severity.to_string()),
+            category: Some(issue_type.category.to_string()),
+            issue_type,
             qualifier: "unused".into(),
             file: "test.c".into(),
             line: 5,
@@ -190,8 +212,13 @@ mod tests {
     #[test]
     fn test_issue_log_sort() {
         let mut log = IssueLog::new();
+        let issue_type_b = IssueType::dead_store();
         log.report(Issue {
-            issue_type: IssueType::dead_store(),
+            bug_type: Some(issue_type_b.id.clone()),
+            bug_type_hum: Some(issue_type_b.human_name()),
+            severity: Some(issue_type_b.severity.to_string()),
+            category: Some(issue_type_b.category.to_string()),
+            issue_type: issue_type_b,
             qualifier: "".into(),
             file: "b.c".into(),
             line: 10,
@@ -202,8 +229,13 @@ mod tests {
             bug_trace_length: None,
             bug_trace_max_depth: None,
         });
+        let issue_type_a = IssueType::dead_store();
         log.report(Issue {
-            issue_type: IssueType::dead_store(),
+            bug_type: Some(issue_type_a.id.clone()),
+            bug_type_hum: Some(issue_type_a.human_name()),
+            severity: Some(issue_type_a.severity.to_string()),
+            category: Some(issue_type_a.category.to_string()),
+            issue_type: issue_type_a,
             qualifier: "".into(),
             file: "a.c".into(),
             line: 5,

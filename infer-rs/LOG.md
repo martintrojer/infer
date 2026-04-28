@@ -46,7 +46,8 @@ changes, and move finished results to durable docs/tests/commits.
     issues keep the old one-line qualifier, the serialized `trace` field now
     appends minimal invalidation/access history signatures, and `report.json`
     now also carries a minimal structured `bug_trace` /
-    `bug_trace_{length,max_depth}` payload derived from the same histories so
+    `bug_trace_{length,max_depth}` payload plus flat `bug_type` / `severity`
+    / `category` aliases derived from the same histories/issue metadata so
     latent-chain debugging does not require reopening the summary dumps for
     simple cases
   - `transfer::tests::test_store_to_formula_known_zero_detects_error` was

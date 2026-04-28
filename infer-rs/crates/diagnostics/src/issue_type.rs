@@ -45,6 +45,20 @@ pub enum Category {
     Other,
 }
 
+impl std::fmt::Display for Category {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Category::LogicError => write!(f, "Logic error"),
+            Category::MemoryError => write!(f, "Memory error"),
+            Category::NullPointerDereference => write!(f, "Null pointer dereference"),
+            Category::ResourceLeak => write!(f, "Resource leak"),
+            Category::RaceCondition => write!(f, "Race condition"),
+            Category::Perf => write!(f, "Performance issue"),
+            Category::Other => write!(f, "Other"),
+        }
+    }
+}
+
 /// The checker that produced an issue.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Checker(pub String);
@@ -157,5 +171,22 @@ impl IssueType {
 
     pub fn memory_leak() -> Self {
         Self::from_id(IssueTypeId::MemoryLeakC, "Pulse")
+    }
+
+    pub fn human_name(&self) -> String {
+        self.id
+            .strip_suffix("_LATENT")
+            .unwrap_or(&self.id)
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                let Some(first) = chars.next() else {
+                    return String::new();
+                };
+                let rest = chars.as_str().to_ascii_lowercase();
+                format!("{}{}", first.to_ascii_uppercase(), rest)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }

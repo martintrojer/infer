@@ -343,6 +343,8 @@ fn test_pulse_detects_null_deref() {
     assert!(
         issues.iter().any(|issue| {
             issue["issue_type"]["id"].as_str() == Some(IssueTypeId::NullptrDereference.id())
+                && issue["bug_type"].as_str() == Some(IssueTypeId::NullptrDereference.id())
+                && issue["severity"].as_str() == Some("ERROR")
                 && issue["bug_trace"].is_array()
                 && issue["bug_trace_length"]
                     .as_u64()

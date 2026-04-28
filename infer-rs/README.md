@@ -273,8 +273,9 @@ without regressing `main` back to a manifest `NULLPTR_DEREFERENCE`. Serialized
 Pulse issue traces are a little richer now too: the existing one-line
 qualifier stays the same, the `trace` field appends minimal
 invalidation/access history signatures, and `report.json` now also carries a
-minimal structured `bug_trace` / `bug_trace_{length,max_depth}` payload
-derived from the same histories for easier latent-chain debugging.
+minimal structured `bug_trace` / `bug_trace_{length,max_depth}` payload plus
+flat OCaml-style `bug_type` / `severity` / `category` aliases derived from the
+same issue metadata for easier latent-chain debugging.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model

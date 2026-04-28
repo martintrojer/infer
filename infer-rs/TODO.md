@@ -92,8 +92,9 @@ active OCaml-parity gap.
 5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
    dedup and `issues.exp`-style counting, serialized issue traces now append minimal
    invalidation/access history signatures, and `report.json` now carries a minimal structured
-   `bug_trace` / `bug_trace_{length,max_depth}` payload, but richer OCaml-style `PulseTrace` /
-   publication detail is still incomplete.
+   `bug_trace` / `bug_trace_{length,max_depth}` payload plus flat `bug_type` / `severity` /
+   `category` aliases, but richer OCaml-style `PulseTrace` / publication detail is still
+   incomplete.
 
 Recent groundwork that should stay in place even though the current NPE total moved in the wrong direction:
 - summary normalization now strips hidden formal/local stack-root `Initialized`

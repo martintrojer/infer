@@ -311,8 +311,13 @@ pub fn report_dead_stores(pdesc: &Procdesc) -> IssueLog {
                         let live_var = LiveVar::of_pvar(pv);
                         if !live.contains(&live_var) && !is_sentinel_exp(e2.as_ref()) {
                             let var_name = &pv.name.plain;
+                            let issue_type = IssueType::dead_store();
                             log.report(Issue {
-                                issue_type: IssueType::dead_store(),
+                                bug_type: Some(issue_type.id.clone()),
+                                bug_type_hum: Some(issue_type.human_name()),
+                                severity: Some(issue_type.severity.to_string()),
+                                category: Some(issue_type.category.to_string()),
+                                issue_type,
                                 qualifier: format!(
                                     "The value written to `{var_name}` is never used"
                                 ),
