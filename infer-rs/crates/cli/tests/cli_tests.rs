@@ -344,7 +344,17 @@ fn test_pulse_detects_null_deref() {
         issues.iter().any(|issue| {
             issue["issue_type"]["id"].as_str() == Some(IssueTypeId::NullptrDereference.id())
                 && issue["bug_type"].as_str() == Some(IssueTypeId::NullptrDereference.id())
+                && issue["bug_type_hum"]
+                    .as_str()
+                    .is_some_and(|hum| hum.contains("Dereference"))
                 && issue["severity"].as_str() == Some("ERROR")
+                && issue["procedure_start_line"]
+                    .as_u64()
+                    .is_some_and(|line| line > 0)
+                && issue["key"]
+                    .as_str()
+                    .is_some_and(|key| key.contains("null_deref_bad"))
+                && issue["extras"].is_object()
                 && issue["bug_trace"].is_array()
                 && issue["bug_trace_length"]
                     .as_u64()

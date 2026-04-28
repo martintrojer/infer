@@ -11,6 +11,7 @@ use std::fmt;
 
 use diagnostics::issue_type::IssueTypeId;
 use sil::location::Location;
+use sil::procname::Procname;
 
 use crate::abstract_value::AbstractValue;
 use crate::invalidation::Invalidation;
@@ -141,12 +142,12 @@ impl Diagnostic {
 
     /// Convert to a diagnostics::Issue for reporting.
     pub fn to_issue(&self, procedure: &str) -> diagnostics::issue::Issue {
-        self.to_issue_with_reporting(procedure, false, false)
+        self.to_issue_with_context(procedure, None, false, false)
     }
 
     /// Convert to a diagnostics::Issue for reporting, optionally as latent.
     pub fn to_issue_with_latent(&self, procedure: &str, latent: bool) -> diagnostics::issue::Issue {
-        self.to_issue_with_reporting(procedure, latent, false)
+        self.to_issue_with_context(procedure, None, latent, false)
     }
 
     /// Convert to a diagnostics::Issue for reporting, optionally marked as
@@ -154,6 +155,16 @@ impl Diagnostic {
     pub fn to_issue_with_reporting(
         &self,
         procedure: &str,
+        latent: bool,
+        suppressed: bool,
+    ) -> diagnostics::issue::Issue {
+        self.to_issue_with_context(procedure, None, latent, suppressed)
+    }
+
+    pub fn to_issue_with_context(
+        &self,
+        procedure: &str,
+        procedure_start_line: Option<u32>,
         latent: bool,
         suppressed: bool,
     ) -> diagnostics::issue::Issue {
@@ -169,6 +180,11 @@ impl Diagnostic {
             .as_ref()
             .and_then(|entries| entries.iter().map(|entry| entry.level).max());
         let issue_type = self.build_issue_type(latent);
+        let file = format!("{}", loc.file);
+        let key = std::path::Path::new(&file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}|{procedure}|{}", issue_type.id));
         diagnostics::issue::Issue {
             bug_type: Some(issue_type.id.clone()),
             bug_type_hum: Some(issue_type.human_name()),
@@ -176,7 +192,9 @@ impl Diagnostic {
             category: Some(issue_type.category.to_string()),
             issue_type,
             qualifier: format!("{self}"),
-            file: format!("{}", loc.file),
+            procedure_start_line,
+            key,
+            file,
             line: loc.line as u32,
             column: loc.col as u32,
             procedure: procedure.to_string(),
@@ -184,6 +202,7 @@ impl Diagnostic {
             bug_trace,
             bug_trace_length,
             bug_trace_max_depth,
+            extras: std::collections::BTreeMap::new(),
         }
     }
 
@@ -221,19 +240,35 @@ impl Diagnostic {
                 let mut trace = Vec::new();
                 if !invalidation_history.is_epoch() {
                     trace.push(make_bug_trace_entry(
-                        0,
+                        1,
                         access_location,
                         "invalidation part of the trace starts here".to_string(),
                     ));
-                    trace.extend(history_to_bug_trace(invalidation_history, access_location));
+                    trace.extend(invalidation_history_to_bug_trace(
+                        invalidation_history,
+                        access_location,
+                        2,
+                    ));
                 }
                 if !access_history.is_epoch() {
                     trace.push(make_bug_trace_entry(
-                        0,
+                        1,
                         access_location,
-                        "access part of the trace starts here".to_string(),
+                        access_trace_start_description(self),
                     ));
-                    trace.extend(history_to_bug_trace(access_history, access_location));
+                    let access_entries =
+                        access_history_to_bug_trace(access_history, access_location, 2);
+                    let access_depth = access_entries
+                        .iter()
+                        .map(|entry| entry.level)
+                        .max()
+                        .unwrap_or(2);
+                    trace.extend(access_entries);
+                    trace.push(make_bug_trace_entry(
+                        access_depth,
+                        access_location,
+                        "invalid access occurs here".to_string(),
+                    ));
                 }
                 (!trace.is_empty()).then_some(trace)
             }
@@ -309,20 +344,56 @@ fn bug_trace_event_location(
         .unwrap_or_else(|| fallback.clone())
 }
 
-fn history_to_bug_trace(
-    history: &ValueHistory,
-    fallback: &Location,
-) -> Vec<diagnostics::issue::BugTraceEntry> {
-    let Some(path) = history.primary_path() else {
-        return Vec::new();
-    };
+fn pvar_trace_description(pvar: &sil::pvar::Pvar) -> String {
+    match &pvar.kind {
+        sil::pvar::PvarKind::Local { proc_name, .. }
+        | sil::pvar::PvarKind::Callee(proc_name)
+        | sil::pvar::PvarKind::Seed(proc_name) => {
+            format!("parameter `{}` of {proc_name}", pvar.name)
+        }
+        sil::pvar::PvarKind::Global { .. } => format!("global `{}`", pvar.name),
+    }
+}
 
+fn access_trace_start_description(diagnostic: &Diagnostic) -> String {
+    match diagnostic.get_issue_type_id() {
+        IssueTypeId::UseAfterFree | IssueTypeId::UseAfterDelete | IssueTypeId::UseAfterLifetime => {
+            "use-after-lifetime part of the trace starts here".to_string()
+        }
+        _ => "access part of the trace starts here".to_string(),
+    }
+}
+
+fn is_modeled_allocation_proc(proc: &Procname) -> bool {
+    let name = format!("{proc}");
+    name.contains("malloc") || name.contains("realloc")
+}
+
+fn history_events_to_bug_trace(
+    events: &[crate::value_history::HistoryEvent],
+    fallback: &Location,
+    base_level: u32,
+) -> Vec<diagnostics::issue::BugTraceEntry> {
     let mut entries = Vec::new();
-    let mut level = 1u32;
-    for (index, event) in path.events().iter().enumerate() {
+    let mut level = base_level;
+    let mut index = 0usize;
+    while let Some(event) = events.get(index) {
         match event {
             crate::value_history::HistoryEvent::ReturnFromCall { .. } => {
                 level = level.saturating_sub(1);
+                index += 1;
+            }
+            crate::value_history::HistoryEvent::Call { proc, location }
+                if events.get(index + 1).is_some_and(|next| {
+                    matches!(next, crate::value_history::HistoryEvent::Returned(_))
+                }) && is_modeled_allocation_proc(proc) =>
+            {
+                entries.push(make_bug_trace_entry(
+                    level,
+                    location,
+                    format!("allocated by call to `{proc}` (modelled)"),
+                ));
+                index += 2;
             }
             crate::value_history::HistoryEvent::Call { proc, location } => {
                 entries.push(make_bug_trace_entry(
@@ -331,22 +402,25 @@ fn history_to_bug_trace(
                     format!("when calling `{proc}` here"),
                 ));
                 level += 1;
+                index += 1;
             }
             crate::value_history::HistoryEvent::FormalArgument(pvar) => {
-                let loc = bug_trace_event_location(path.events(), index, fallback);
+                let loc = bug_trace_event_location(events, index, fallback);
                 entries.push(make_bug_trace_entry(
                     level,
                     &loc,
-                    format!("parameter `{}`", pvar.name),
+                    pvar_trace_description(pvar),
                 ));
+                index += 1;
             }
             crate::value_history::HistoryEvent::ActualArgument(pvar) => {
-                let loc = bug_trace_event_location(path.events(), index, fallback);
+                let loc = bug_trace_event_location(events, index, fallback);
                 entries.push(make_bug_trace_entry(
                     level,
                     &loc,
-                    format!("actual argument for `{}`", pvar.name),
+                    pvar_trace_description(pvar),
                 ));
+                index += 1;
             }
             crate::value_history::HistoryEvent::Assignment(location) => {
                 entries.push(make_bug_trace_entry(
@@ -354,6 +428,7 @@ fn history_to_bug_trace(
                     location,
                     "assigned here".to_string(),
                 ));
+                index += 1;
             }
             crate::value_history::HistoryEvent::Returned(location) => {
                 entries.push(make_bug_trace_entry(
@@ -361,6 +436,7 @@ fn history_to_bug_trace(
                     location,
                     "returned here".to_string(),
                 ));
+                index += 1;
             }
             crate::value_history::HistoryEvent::Invalidated {
                 invalidation,
@@ -371,10 +447,124 @@ fn history_to_bug_trace(
                     location,
                     format!("{invalidation}"),
                 ));
+                index += 1;
             }
         }
     }
     entries
+}
+
+fn history_to_bug_trace(
+    history: &ValueHistory,
+    fallback: &Location,
+    base_level: u32,
+) -> Vec<diagnostics::issue::BugTraceEntry> {
+    let Some(path) = history.primary_path() else {
+        return Vec::new();
+    };
+    history_events_to_bug_trace(path.events(), fallback, base_level)
+}
+
+fn invalidation_history_to_bug_trace(
+    history: &ValueHistory,
+    fallback: &Location,
+    base_level: u32,
+) -> Vec<diagnostics::issue::BugTraceEntry> {
+    let Some(path) = history.primary_path() else {
+        return Vec::new();
+    };
+    let events = path.events();
+    if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(inner_pvar), ..] =
+        events
+    {
+        let inner_proc = match &inner_pvar.kind {
+            sil::pvar::PvarKind::Local { proc_name, .. }
+            | sil::pvar::PvarKind::Callee(proc_name)
+            | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name),
+            sil::pvar::PvarKind::Global { .. } => None,
+        };
+        if inner_proc.is_some_and(|inner_proc| inner_proc != proc) {
+            let outer_description = format!("parameter `{}` of {proc}", inner_pvar.name);
+            let mut entries = vec![make_bug_trace_entry(
+                base_level,
+                location,
+                outer_description,
+            )];
+            entries.push(make_bug_trace_entry(
+                base_level,
+                location,
+                format!("when calling `{}` here", inner_proc.unwrap()),
+            ));
+            entries.extend(history_events_to_bug_trace(
+                &events[1..events.len()
+                    - usize::from(matches!(
+                        events.last(),
+                        Some(crate::value_history::HistoryEvent::ReturnFromCall { .. })
+                    ))],
+                fallback,
+                base_level + 1,
+            ));
+            return entries;
+        }
+    }
+    history_to_bug_trace(history, fallback, base_level)
+}
+
+fn access_history_to_bug_trace(
+    history: &ValueHistory,
+    fallback: &Location,
+    base_level: u32,
+) -> Vec<diagnostics::issue::BugTraceEntry> {
+    fn rec(
+        events: &[crate::value_history::HistoryEvent],
+        fallback: &Location,
+        level: u32,
+    ) -> Vec<diagnostics::issue::BugTraceEntry> {
+        let Some((first, rest)) = events.split_first() else {
+            return Vec::new();
+        };
+        match first {
+            crate::value_history::HistoryEvent::ActualArgument(pvar) => {
+                let mut entries = rec(rest, fallback, level);
+                let call_loc = rest
+                    .iter()
+                    .find_map(|event| event.location())
+                    .cloned()
+                    .unwrap_or_else(|| fallback.clone());
+                let proc_name = match &pvar.kind {
+                    sil::pvar::PvarKind::Local { proc_name, .. }
+                    | sil::pvar::PvarKind::Callee(proc_name)
+                    | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name),
+                    sil::pvar::PvarKind::Global { .. } => None,
+                };
+                if let Some(proc_name) = proc_name {
+                    entries.push(make_bug_trace_entry(
+                        level,
+                        &call_loc,
+                        format!("when calling `{proc_name}` here"),
+                    ));
+                    entries.push(make_bug_trace_entry(
+                        level + 1,
+                        &call_loc,
+                        pvar_trace_description(pvar),
+                    ));
+                } else {
+                    entries.push(make_bug_trace_entry(
+                        level,
+                        &call_loc,
+                        pvar_trace_description(pvar),
+                    ));
+                }
+                entries
+            }
+            _ => history_events_to_bug_trace(events, fallback, level),
+        }
+    }
+
+    let Some(path) = history.primary_path() else {
+        return Vec::new();
+    };
+    rec(path.events(), fallback, base_level)
 }
 
 impl fmt::Display for Diagnostic {
@@ -486,7 +676,12 @@ mod tests {
             issue.bug_trace_length,
             issue.bug_trace.as_ref().map(|trace| trace.len() as u32)
         );
-        assert!(issue.bug_trace_max_depth.is_some_and(|depth| depth > 0));
+        assert!(issue.bug_trace_max_depth.is_some_and(|depth| depth > 1));
+        assert!(issue.bug_trace.as_ref().is_some_and(|trace| {
+            trace
+                .iter()
+                .any(|entry| entry.description.contains("parameter `x` of foo"))
+        }));
     }
 
     #[test]
@@ -510,5 +705,89 @@ mod tests {
             .bug_trace
             .as_ref()
             .is_some_and(|trace| !trace.is_empty()));
+        assert!(issue.bug_trace.as_ref().is_some_and(|trace| {
+            trace
+                .iter()
+                .any(|entry| entry.description == "access part of the trace starts here")
+        }));
+    }
+
+    #[test]
+    fn test_access_bug_trace_reorders_caller_history_before_synthetic_call() {
+        let caller = Procname::c_from_string("caller");
+        let callee = Procname::c_from_string("callee");
+        let caller_pvar = Pvar::mk(Mangled::from_string("x"), caller.clone());
+        let callee_pvar = Pvar::mk(Mangled::from_string("x"), callee.clone());
+        let diag = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: Invalidation::CFree,
+            access_location: loc(40),
+            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(callee_pvar))
+                .append_event(HistoryEvent::FormalArgument(caller_pvar)),
+            invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
+        };
+
+        let issue = diag.to_issue("caller");
+        let trace = issue.bug_trace.expect("expected structured bug trace");
+        let descriptions: Vec<_> = trace
+            .iter()
+            .map(|entry| entry.description.as_str())
+            .collect();
+        let caller_idx = descriptions
+            .iter()
+            .position(|desc| *desc == "parameter `x` of caller")
+            .expect("caller parameter entry should exist");
+        let call_idx = descriptions
+            .iter()
+            .position(|desc| *desc == "when calling `callee` here")
+            .expect("synthetic call entry should exist");
+        let callee_idx = descriptions
+            .iter()
+            .position(|desc| *desc == "parameter `x` of callee")
+            .expect("callee parameter entry should exist");
+        assert!(caller_idx < call_idx && call_idx < callee_idx);
+    }
+
+    #[test]
+    fn test_bug_trace_compresses_modelled_allocation_call_and_return() {
+        let history =
+            ValueHistory::returned(loc(12)).wrap_call(&Procname::c_from_string("malloc"), &loc(12));
+        let trace = history_to_bug_trace(&history, &loc(12), 2);
+        let descriptions: Vec<_> = trace
+            .iter()
+            .map(|entry| entry.description.as_str())
+            .collect();
+        assert_eq!(
+            descriptions,
+            vec!["allocated by call to `malloc` (modelled)"],
+            "modelled allocation call/return should collapse to one trace step"
+        );
+    }
+
+    #[test]
+    fn test_invalidation_bug_trace_synthesizes_outer_parameter_and_inner_call() {
+        let outer = Procname::c_from_string("latent_use_after_free");
+        let inner = Procname::c_from_string("conditional_free2");
+        let inner_pvar = Pvar::mk(Mangled::from_string("x"), inner.clone());
+        let history = ValueHistory::from_event(HistoryEvent::FormalArgument(inner_pvar))
+            .append_event(HistoryEvent::Invalidated {
+                invalidation: Invalidation::CFree,
+                location: loc(12),
+            })
+            .wrap_call(&outer, &loc(25));
+        let trace = invalidation_history_to_bug_trace(&history, &loc(25), 2);
+        let descriptions: Vec<_> = trace
+            .iter()
+            .map(|entry| entry.description.as_str())
+            .collect();
+        assert_eq!(
+            descriptions,
+            vec![
+                "parameter `x` of latent_use_after_free",
+                "when calling `conditional_free2` here",
+                "parameter `x` of conditional_free2",
+                "was invalidated by call to `free()`",
+            ]
+        );
     }
 }

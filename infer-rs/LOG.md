@@ -47,9 +47,20 @@ changes, and move finished results to durable docs/tests/commits.
     appends minimal invalidation/access history signatures, and `report.json`
     now also carries a minimal structured `bug_trace` /
     `bug_trace_{length,max_depth}` payload plus flat `bug_type` / `severity`
-    / `category` aliases derived from the same histories/issue metadata so
-    latent-chain debugging does not require reopening the summary dumps for
-    simple cases
+    / `category` aliases, stable `key`, `procedure_start_line`, and empty
+    `extras`
+  - access-side bug traces now reorder caller provenance before a synthetic
+    `when calling ... here` step into the callee parameter/value, which makes
+    `manifest_use_after_free` and `main` look closer to OCaml without changing
+    the qualifier text or `issues.exp` surface
+  - invalidation histories imported from callee diagnostics are now wrapped in
+    the current summary-application call context, so caller reports retain the
+    outer callsite in their structured invalidation trace too
+  - the invalidation-side structured trace is a bit closer to OCaml now too:
+    when translation leaves only the deeper callee formal in the history, the
+    report layer synthesizes the outer callee formal before the inner call, and
+    modelled allocation call/return pairs such as `malloc` now collapse to one
+    `allocated by call to ... (modelled)` access-side step
   - `transfer::tests::test_store_to_formula_known_zero_detects_error` was
     updated to build the caller-visible heap path first; this matches the
     existing `EqZero`/heap-allocated semantics used elsewhere in the Rust port
@@ -108,6 +119,8 @@ changes, and move finished results to durable docs/tests/commits.
   - `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --ignored --nocapture`
   - `cargo test -p pulse test_coalesce_zero_direct_formals_for_export -- --nocapture`
   - `cargo test -p pulse test_apply_summary_shared_zero_formal_target_prefers_pointer_actual_for_latent_invalid_access -- --nocapture`
+  - `cargo test -p pulse test_translate_diagnostic_wraps_invalidation_history_with_callee_call -- --nocapture`
+  - `cargo test -p pulse diagnostic::tests:: -- --nocapture`
   - `cargo test -p pulse 'test_apply_summary_' -- --nocapture`
   - `cargo test -p pulse --test end_to_end test_e2e_latent_cycle_summary_shapes_match_ocaml_subset -- --nocapture`
   - `cargo test -p pulse test_debug_signature -- --nocapture`

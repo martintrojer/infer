@@ -18,6 +18,7 @@ use sil::ident::Ident;
 use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
+use sil::procname::Procname;
 use sil::pvar::Pvar;
 use sil::specialization::HeapPath;
 use sil::typ::Typ;
@@ -383,6 +384,8 @@ pub(crate) fn apply_summary_with_aliasing(
         };
     }
 
+    let callee_procname = summary_procname(pre_post);
+
     let stopped_summary = (!matches!(pre_post.kind, crate::summary::PrePostKind::ContinueProgram))
         .then(|| crate::summary::summarize_stopped_state(caller_pdesc, &caller_state));
 
@@ -399,6 +402,7 @@ pub(crate) fn apply_summary_with_aliasing(
                             &caller_summary_state,
                             &formal_histories,
                             loc,
+                            callee_procname.as_ref(),
                         ),
                         &caller_summary_state,
                     );
@@ -481,7 +485,14 @@ pub(crate) fn apply_summary_with_aliasing(
             // still latent or has become manifest here.
             if let Some(diag) = &pre_post.diagnostic {
                 let diag = rebase_diagnostic_to_state(
-                    translate_diagnostic(diag, &mut subst, &caller_state, &formal_histories, loc),
+                    translate_diagnostic(
+                        diag,
+                        &mut subst,
+                        &caller_state,
+                        &formal_histories,
+                        loc,
+                        callee_procname.as_ref(),
+                    ),
                     &caller_state,
                 );
                 if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
@@ -505,7 +516,14 @@ pub(crate) fn apply_summary_with_aliasing(
             }) {
                 let mut caller_state = caller_state;
                 let diag = rebase_diagnostic_to_state(
-                    translate_diagnostic(&diag, &mut subst, &caller_state, &formal_histories, loc),
+                    translate_diagnostic(
+                        &diag,
+                        &mut subst,
+                        &caller_state,
+                        &formal_histories,
+                        loc,
+                        callee_procname.as_ref(),
+                    ),
                     &caller_state,
                 );
                 mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
@@ -533,12 +551,25 @@ pub(crate) fn apply_summary_with_aliasing(
     }
 }
 
+fn summary_procname(pre_post: &PrePost) -> Option<Procname> {
+    pre_post
+        .formals
+        .first()
+        .and_then(|(pvar, _addr)| match &pvar.kind {
+            sil::pvar::PvarKind::Local { proc_name, .. }
+            | sil::pvar::PvarKind::Callee(proc_name)
+            | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name.clone()),
+            sil::pvar::PvarKind::Global { .. } => None,
+        })
+}
+
 fn translate_diagnostic(
     diagnostic: &Diagnostic,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     caller_state: &AbductiveDomain,
     formal_histories: &std::collections::BTreeMap<Pvar, ValueHistory>,
     loc: &Location,
+    callee_procname: Option<&Procname>,
 ) -> Diagnostic {
     match diagnostic {
         Diagnostic::AccessToInvalidAddress {
@@ -551,12 +582,17 @@ fn translate_diagnostic(
             let caller_addr = caller_state
                 .path_condition
                 .get_var_repr(resolve_mut(subst, *addr));
+            let access_history = access_history.map_formals(formal_histories);
+            let invalidation_history = invalidation_history.map_formals(formal_histories);
+            let invalidation_history = callee_procname
+                .map(|proc_name| invalidation_history.wrap_call(proc_name, loc))
+                .unwrap_or(invalidation_history);
             Diagnostic::AccessToInvalidAddress {
                 addr: caller_addr,
                 invalidation: invalidation.clone(),
                 access_location: loc.clone(),
-                access_history: access_history.map_formals(formal_histories),
-                invalidation_history: invalidation_history.map_formals(formal_histories),
+                access_history,
+                invalidation_history,
             }
         }
         _ => diagnostic.clone(),
@@ -1488,7 +1524,7 @@ fn translate_attribute(
 mod tests {
     use super::*;
     use crate::attribute::Attribute;
-    use crate::value_history::ValueHistory;
+    use crate::value_history::{HistoryEvent, ValueHistory};
     use sil::fieldname::Fieldname;
     use sil::ident::IdentName;
     use sil::int_lit::IntLit;
@@ -1529,6 +1565,59 @@ mod tests {
         );
         pdesc.set_succs(0, vec![load_node]);
         pdesc.set_succs(load_node, vec![1]);
+    }
+
+    #[test]
+    fn test_translate_diagnostic_wraps_invalidation_history_with_callee_call() {
+        let callee = Procname::c_from_string("callee");
+        let caller = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller, Typ::void(), Location::dummy());
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("x"), callee.clone());
+        let call_loc = Location {
+            line: 42,
+            col: 3,
+            ..Location::dummy()
+        };
+        let diag = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: crate::invalidation::Invalidation::CFree,
+            access_location: Location::dummy(),
+            access_history: ValueHistory::formal_argument(formal_pvar.clone()),
+            invalidation_history: ValueHistory::formal_argument(formal_pvar.clone()).append_event(
+                HistoryEvent::Invalidated {
+                    invalidation: crate::invalidation::Invalidation::CFree,
+                    location: Location::dummy(),
+                },
+            ),
+        };
+        let mut subst = HashMap::new();
+        let formal_histories = std::collections::BTreeMap::from([(
+            formal_pvar,
+            ValueHistory::assignment(Location::dummy()),
+        )]);
+
+        let translated = translate_diagnostic(
+            &diag,
+            &mut subst,
+            &caller_state,
+            &formal_histories,
+            &call_loc,
+            Some(&callee),
+        );
+        let Diagnostic::AccessToInvalidAddress {
+            invalidation_history,
+            ..
+        } = translated
+        else {
+            panic!("expected invalid-access diagnostic");
+        };
+        assert!(
+            invalidation_history
+                .first_call_before_invalidation()
+                .is_some_and(|(proc, loc)| proc == &callee && loc == &call_loc),
+            "translated invalidation history should be wrapped in the callee call context"
+        );
     }
 
     fn mk_callee_summary_null_return() -> (Procdesc, PrePost) {

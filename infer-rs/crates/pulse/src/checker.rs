@@ -1934,6 +1934,12 @@ pub fn to_issue_log_with_pdesc(summary: &PulseSummary, pdesc: &Procdesc) -> Issu
     to_issue_log_impl(summary, &format!("{}", pdesc.proc_name), Some(pdesc))
 }
 
+struct IssueReportContext<'a> {
+    proc_name: &'a str,
+    procedure_start_line: Option<u32>,
+    report_suppressed: bool,
+}
+
 fn to_issue_log_impl(
     summary: &PulseSummary,
     proc_name: &str,
@@ -1941,31 +1947,19 @@ fn to_issue_log_impl(
 ) -> IssueLog {
     let mut log = IssueLog::new();
     let mut seen = std::collections::HashSet::new();
-    let report_suppressed = config::get().pulse_report_issues_for_tests;
+    let ctx = IssueReportContext {
+        proc_name,
+        procedure_start_line: pdesc.map(|pdesc| pdesc.loc.line as u32),
+        report_suppressed: config::get().pulse_report_issues_for_tests,
+    };
     for diag in &summary.diagnostics {
-        report_diagnostic_issue(
-            &mut log,
-            &mut seen,
-            diag,
-            proc_name,
-            false,
-            report_suppressed,
-            None,
-        );
+        report_diagnostic_issue(&mut log, &mut seen, diag, &ctx, false, None);
     }
     for pre_post in &summary.pre_posts {
         match pre_post.kind {
             crate::summary::PrePostKind::LatentAbortProgram => {
                 if let Some(diag) = &pre_post.diagnostic {
-                    report_diagnostic_issue(
-                        &mut log,
-                        &mut seen,
-                        diag,
-                        proc_name,
-                        true,
-                        report_suppressed,
-                        None,
-                    );
+                    report_diagnostic_issue(&mut log, &mut seen, diag, &ctx, true, None);
                 }
             }
             crate::summary::PrePostKind::LatentInvalidAccess => {
@@ -1998,9 +1992,8 @@ fn to_issue_log_impl(
                             &mut log,
                             &mut seen,
                             &diag,
-                            proc_name,
+                            &ctx,
                             true,
-                            report_suppressed,
                             Some(&latent_key),
                         );
                     }
@@ -2017,13 +2010,12 @@ fn report_diagnostic_issue(
     log: &mut IssueLog,
     seen: &mut std::collections::HashSet<String>,
     diagnostic: &Diagnostic,
-    proc_name: &str,
+    ctx: &IssueReportContext<'_>,
     latent: bool,
-    report_suppressed: bool,
     dedup_key_override: Option<&str>,
 ) {
     let suppressed = diagnostic.is_suppressed();
-    if suppressed && !report_suppressed {
+    if suppressed && !ctx.report_suppressed {
         return;
     }
     let dedup_key = dedup_key_override
@@ -2032,7 +2024,12 @@ fn report_diagnostic_issue(
     if !seen.insert(dedup_key) {
         return;
     }
-    log.report(diagnostic.to_issue_with_reporting(proc_name, latent, suppressed));
+    log.report(diagnostic.to_issue_with_context(
+        ctx.proc_name,
+        ctx.procedure_start_line,
+        latent,
+        suppressed,
+    ));
 }
 
 fn diagnostic_dedup_key(diagnostic: &Diagnostic, latent: bool) -> String {

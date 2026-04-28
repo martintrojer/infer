@@ -39,6 +39,10 @@ pub struct Issue {
     pub severity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure_start_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// Source file where the issue was found.
     pub file: String,
     /// Line number.
@@ -56,6 +60,8 @@ pub struct Issue {
     pub bug_trace_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bug_trace_max_depth: Option<u32>,
+    #[serde(default)]
+    pub extras: std::collections::BTreeMap<String, String>,
 }
 
 /// A collection of issues from one or more checker runs.
@@ -133,6 +139,11 @@ impl IssueLog {
         loc: &Location,
         procedure: &str,
     ) -> Issue {
+        let file = format!("{}", loc.file);
+        let key = std::path::Path::new(&file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}|{procedure}|{}", issue_type.id));
         Issue {
             bug_type: Some(issue_type.id.clone()),
             bug_type_hum: Some(issue_type.human_name()),
@@ -140,7 +151,9 @@ impl IssueLog {
             category: Some(issue_type.category.to_string()),
             issue_type,
             qualifier,
-            file: format!("{}", loc.file),
+            procedure_start_line: None,
+            key,
+            file,
             line: loc.line as u32,
             column: loc.col as u32,
             procedure: procedure.to_string(),
@@ -148,6 +161,7 @@ impl IssueLog {
             bug_trace: None,
             bug_trace_length: None,
             bug_trace_max_depth: None,
+            extras: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -170,6 +184,8 @@ mod tests {
             category: Some(issue_type.category.to_string()),
             issue_type,
             qualifier: "unused value".into(),
+            procedure_start_line: None,
+            key: Some("test.c|foo|DEAD_STORE".into()),
             file: "test.c".into(),
             line: 10,
             column: 5,
@@ -178,6 +194,7 @@ mod tests {
             bug_trace: None,
             bug_trace_length: None,
             bug_trace_max_depth: None,
+            extras: std::collections::BTreeMap::new(),
         });
 
         assert_eq!(log.len(), 1);
@@ -195,6 +212,8 @@ mod tests {
             category: Some(issue_type.category.to_string()),
             issue_type,
             qualifier: "unused".into(),
+            procedure_start_line: None,
+            key: Some("test.c|bar|DEAD_STORE".into()),
             file: "test.c".into(),
             line: 5,
             column: 3,
@@ -203,6 +222,7 @@ mod tests {
             bug_trace: None,
             bug_trace_length: None,
             bug_trace_max_depth: None,
+            extras: std::collections::BTreeMap::new(),
         });
 
         let exp = log.to_issues_exp();
@@ -220,6 +240,8 @@ mod tests {
             category: Some(issue_type_b.category.to_string()),
             issue_type: issue_type_b,
             qualifier: "".into(),
+            procedure_start_line: None,
+            key: Some("b.c|f|DEAD_STORE".into()),
             file: "b.c".into(),
             line: 10,
             column: 0,
@@ -228,6 +250,7 @@ mod tests {
             bug_trace: None,
             bug_trace_length: None,
             bug_trace_max_depth: None,
+            extras: std::collections::BTreeMap::new(),
         });
         let issue_type_a = IssueType::dead_store();
         log.report(Issue {
@@ -237,6 +260,8 @@ mod tests {
             category: Some(issue_type_a.category.to_string()),
             issue_type: issue_type_a,
             qualifier: "".into(),
+            procedure_start_line: None,
+            key: Some("a.c|g|DEAD_STORE".into()),
             file: "a.c".into(),
             line: 5,
             column: 0,
@@ -245,6 +270,7 @@ mod tests {
             bug_trace: None,
             bug_trace_length: None,
             bug_trace_max_depth: None,
+            extras: std::collections::BTreeMap::new(),
         });
 
         log.sort();

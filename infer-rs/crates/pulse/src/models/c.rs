@@ -267,10 +267,20 @@ fn allocate_or_null(
     // Constrain non-null return to be positive so prune(addr = 0) is Unsat.
     // Cross-ref: OCaml PulseModelsImport.ml alloc_not_null_common calls and_positive.
     let _ = ok_state.and_positive(addr);
+    let alloc_proc = match &allocator {
+        Allocator::CMalloc => Some(Procname::c_from_string("malloc")),
+        Allocator::CRealloc => Some(Procname::c_from_string("realloc")),
+        Allocator::CustomMalloc(callee) | Allocator::CustomRealloc(callee) => Some(callee.clone()),
+        _ => None,
+    };
     operations::allocate(addr, allocator, loc.clone(), &mut ok_state);
+    let ok_history = alloc_proc
+        .as_ref()
+        .map(|proc| ValueHistory::returned(loc.clone()).wrap_call(proc, loc))
+        .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
     operations::write_id_with_history(
         ret_id,
-        crate::value_history::ValueWithHistory::new(addr, ValueHistory::assignment(loc.clone())),
+        crate::value_history::ValueWithHistory::new(addr, ok_history),
         &mut ok_state,
     );
 
@@ -762,6 +772,17 @@ mod tests {
             let var = Var::LogicalVar(ret_id.clone());
             let addr = s.post.stack.find(&var).unwrap();
             assert!(s.check_valid(addr).is_ok(), "success path should be valid");
+            let history = s
+                .history_of_value(addr)
+                .expect("malloc success path should keep return provenance");
+            assert!(
+                history.signature().contains("call malloc@"),
+                "malloc success path should remember the modelled call in its history: {history}"
+            );
+            assert!(
+                history.signature().contains("returned@"),
+                "malloc success path should remember the modelled return in its history: {history}"
+            );
         }
 
         // Second disjunct: null (invalid)

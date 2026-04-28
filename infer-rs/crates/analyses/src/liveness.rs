@@ -312,6 +312,16 @@ pub fn report_dead_stores(pdesc: &Procdesc) -> IssueLog {
                         if !live.contains(&live_var) && !is_sentinel_exp(e2.as_ref()) {
                             let var_name = &pv.name.plain;
                             let issue_type = IssueType::dead_store();
+                            let file = format!("{}", loc.file);
+                            let key = Some(format!(
+                                "{}|{}|{}",
+                                std::path::Path::new(&file)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or_default(),
+                                proc_name,
+                                issue_type.id
+                            ));
                             log.report(Issue {
                                 bug_type: Some(issue_type.id.clone()),
                                 bug_type_hum: Some(issue_type.human_name()),
@@ -321,7 +331,9 @@ pub fn report_dead_stores(pdesc: &Procdesc) -> IssueLog {
                                 qualifier: format!(
                                     "The value written to `{var_name}` is never used"
                                 ),
-                                file: format!("{}", loc.file),
+                                procedure_start_line: None,
+                                key,
+                                file,
                                 line: loc.line as u32,
                                 column: loc.col as u32,
                                 procedure: proc_name.clone(),
@@ -329,6 +341,7 @@ pub fn report_dead_stores(pdesc: &Procdesc) -> IssueLog {
                                 bug_trace: None,
                                 bug_trace_length: None,
                                 bug_trace_max_depth: None,
+                                extras: std::collections::BTreeMap::new(),
                             });
                         }
                     }

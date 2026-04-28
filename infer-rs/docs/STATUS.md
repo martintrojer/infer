@@ -997,8 +997,13 @@ specialized-summary filtering, imported pure-call dependency translation, and
   (serialized issue traces now append minimal invalidation/access history
   signatures, `report.json` now carries a minimal structured `bug_trace`
   / `bug_trace_{length,max_depth}` payload plus flat `bug_type` / `severity`
-  / `category` aliases, but Rust still lacks OCaml's richer structured
-  `PulseTrace` publication detail)
+  / `category` aliases, stable `key`, `procedure_start_line`, and empty
+  `extras`, access-side bug traces now reorder caller provenance before a
+  synthetic call step into the callee parameter/value, invalidation-side traces
+  now synthesize the outer formal before the inner callee formal when needed,
+  and modelled-allocation call/return pairs such as `malloc` collapse to one
+  allocation step, but Rust still lacks OCaml's richer structured `PulseTrace`
+  publication detail)
 - suppressed-report presentation / trace detail
 
 ### Other gaps
