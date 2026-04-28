@@ -79,6 +79,12 @@ solver equalities.
   imported branches (`FN_nonlatent_use_after_free_bad{,2}`-style). Check the
   dumped OCaml summary surface before turning that shape into a latent invalid
   access instead of a plain `ContinueProgram` / latent-abort path.
+- When summary export later canonicalizes multiple zero direct formals onto one
+  surviving dereferenced summary value (`latent_use_after_free`-style), summary
+  import must conjoin equality between the corresponding caller actuals instead
+  of arbitrarily binding that shared callee value to the first actual seen.
+  Otherwise Rust can reify a bogus manifest caller `NULLPTR_DEREFERENCE` even
+  though the exported latent summary surface looks OCaml-like.
 
 ## Imported arithmetic latent-summary gotcha
 

@@ -159,9 +159,9 @@ impl Diagnostic {
     ) -> diagnostics::issue::Issue {
         let loc = self.get_location();
         let trace = if suppressed {
-            format!("*** SUPPRESSED ***, {self}")
+            format!("*** SUPPRESSED ***, {}", self.trace_message())
         } else {
-            format!("{self}")
+            self.trace_message()
         };
         diagnostics::issue::Issue {
             issue_type: self.build_issue_type(latent),
@@ -171,6 +171,29 @@ impl Diagnostic {
             column: loc.col as u32,
             procedure: procedure.to_string(),
             trace,
+        }
+    }
+
+    fn trace_message(&self) -> String {
+        match self {
+            Diagnostic::AccessToInvalidAddress {
+                access_history,
+                invalidation_history,
+                ..
+            } => {
+                let mut parts = vec![format!("{self}")];
+                if !invalidation_history.is_epoch() {
+                    parts.push(format!(
+                        "invalidation history: {}",
+                        invalidation_history.signature()
+                    ));
+                }
+                if !access_history.is_epoch() {
+                    parts.push(format!("access history: {}", access_history.signature()));
+                }
+                parts.join("; ")
+            }
+            Diagnostic::MemoryLeak { .. } | Diagnostic::RetainCycle { .. } => format!("{self}"),
         }
     }
 
@@ -250,5 +273,68 @@ impl fmt::Display for Diagnostic {
                 write!(f, "retain cycle at {location}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sil::int_lit::IntLit;
+    use sil::mangled::Mangled;
+    use sil::procname::Procname;
+    use sil::pvar::Pvar;
+
+    use crate::abstract_value::AbstractValue;
+    use crate::value_history::HistoryEvent;
+
+    fn loc(line: i32) -> Location {
+        Location {
+            line,
+            col: 1,
+            ..Location::dummy()
+        }
+    }
+
+    #[test]
+    fn test_issue_trace_includes_access_and_invalidation_history() {
+        let proc = Procname::c_from_string("foo");
+        let pvar = Pvar::mk(Mangled::from_string("x"), proc);
+        let diag = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: Invalidation::CFree,
+            access_location: loc(20),
+            access_history: ValueHistory::formal_argument(pvar.clone()).append_assignment(loc(20)),
+            invalidation_history: ValueHistory::formal_argument(pvar).append_event(
+                HistoryEvent::Invalidated {
+                    invalidation: Invalidation::CFree,
+                    location: loc(12),
+                },
+            ),
+        };
+
+        let issue = diag.to_issue("foo");
+        assert!(issue.trace.contains("invalidation history:"));
+        assert!(issue.trace.contains("access history:"));
+        assert!(issue.trace.contains("formal("));
+        assert!(issue.trace.contains("assign@"));
+    }
+
+    #[test]
+    fn test_suppressed_issue_trace_keeps_prefix_and_history() {
+        let diag = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: Invalidation::ConstantDereference(IntLit::zero()),
+            access_location: loc(30),
+            access_history: ValueHistory::assignment(loc(30)),
+            invalidation_history: ValueHistory::invalidated(
+                Invalidation::ConstantDereference(IntLit::zero()),
+                loc(18),
+            ),
+        };
+
+        let issue = diag.to_issue_with_reporting("foo", false, true);
+        assert!(issue.trace.starts_with("*** SUPPRESSED ***,"));
+        assert!(issue.trace.contains("invalidation history:"));
+        assert!(issue.trace.contains("access history:"));
     }
 }

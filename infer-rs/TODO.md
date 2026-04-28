@@ -79,16 +79,19 @@ active OCaml-parity gap.
    `latent.c` issue-set compare is exact again at `(procedure, line,
    issue-type)`, and the filtered `traverse_and_crash_if_equal_to_root`
    one-node caller/export path is fixed too, and the reduced one-step / local
-   two-hop field-write publication fixtures are green again. Remaining work
-   here is now summary-surface parity rather than current report-count drift:
-   broader wrapper/cycle call chains still need richer OCaml-aligned
-   trace/publication detail, `FN_nonlatent_use_after_free_bad{,2}` still keep
-   extra latent-invalid / latent-abort shapes where OCaml keeps
-   `ContinueProgram` + `LatentAbortProgram`, and `latent_use_after_free` still
-   keeps an extra `LatentAbortProgram` where OCaml keeps `ContinueProgram`.
+   two-hop field-write publication fixtures are green again. The remaining
+   direct-formal latent summary gap on the real exported `latent.c` fixture is
+   fixed too: `FN_nonlatent_use_after_free_bad{,2}`,
+   `latent_use_after_free`, `manifest_use_after_free`, and `main` now line up
+   again on the validated compare. Keep the new shared-direct-formal import
+   behavior in place: when one callee dereferenced-formal summary value maps to
+   multiple caller actuals, summary import must conjoin those actuals instead
+   of arbitrarily picking the first one, or the old manifest `main`
+   `NULLPTR_DEREFERENCE` comes back.
 
 5. **Exact trace/report parity**: the new minimal suppression + provenance layer is enough for
-   dedup and `issues.exp`-style counting, but richer OCaml-style `PulseTrace` / publication detail
+   dedup and `issues.exp`-style counting, and serialized issue traces now append minimal
+   invalidation/access history signatures, but richer OCaml-style `PulseTrace` / publication detail
    is still incomplete.
 
 Recent groundwork that should stay in place even though the current NPE total moved in the wrong direction:

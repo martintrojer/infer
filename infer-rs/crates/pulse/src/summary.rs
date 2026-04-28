@@ -23,6 +23,8 @@ use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
+use crate::formula::atom::Atom;
+use crate::formula::term::Term;
 use crate::formula::Operand;
 use crate::value_history::HistoryEvent;
 
@@ -732,6 +734,7 @@ impl PulseSummary {
             let mut pp =
                 build_pre_post(pdesc, state.get_astate().clone(), initial_kind, abort_diag);
             let info = pp.normalize_with_summary_info();
+            let continue_fallback = (pp.kind == PrePostKind::ContinueProgram).then(|| pp.clone());
             let leak_diags = info.leaks;
             let potential_invalid_access = if pp.kind == PrePostKind::ContinueProgram {
                 potential_invalid_access_from_normalized_continue_pre_post(
@@ -775,7 +778,12 @@ impl PulseSummary {
             if pp.kind == PrePostKind::LatentInvalidAccess
                 && !normalize_direct_formal_latent_invalid_access_shape(pdesc, &mut pp)
             {
-                continue;
+                if let Some(continue_pp) = continue_fallback {
+                    pp = continue_pp;
+                    drop_exported_latent_invalid_access_diagnostic = false;
+                } else {
+                    continue;
+                }
             }
             // Only report leaks from ordinary ContinueProgram paths — latent /
             // error paths (ExitProgram/AbortProgram/Latent*) typically
@@ -859,6 +867,21 @@ impl PulseSummary {
             }
             pre_posts.extend(recovered_invalid_accesses);
         }
+
+        // Keep the summary surface deterministic and close to OCaml: once a
+        // disjunct has been normalized and classified, an exact duplicate does
+        // not carry extra information and only inflates the exported summary.
+        let mut deduped_pre_posts = Vec::with_capacity(pre_posts.len());
+        for pre_post in pre_posts.drain(..) {
+            if deduped_pre_posts
+                .iter()
+                .any(|existing| existing == &pre_post)
+            {
+                continue;
+            }
+            deduped_pre_posts.push(pre_post);
+        }
+        pre_posts = deduped_pre_posts;
 
         let latent_invalid_access_specificity = |pre_post: &PrePost| {
             let location_rank = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
@@ -1410,23 +1433,163 @@ fn normalize_direct_formal_latent_invalid_access_shape(
         return false;
     }
     prune_later_direct_formal_artifacts_for_potential_invalid_access(pdesc, pre_post, addr);
-    if latent_invalid_access_has_mixed_condition_depths(pre_post) {
+    if latent_invalid_access_has_mixed_condition_depths(pdesc, pre_post) {
         return false;
     }
-    if !latent_invalid_access_has_only_path_local_conditions(pre_post, addr) {
+    if !latent_invalid_access_has_only_path_local_conditions(pdesc, pre_post, addr) {
         return false;
     }
+    coalesce_zero_direct_formals_for_export(pdesc, pre_post, addr);
     drop_selected_null_invalidation(pre_post, addr);
     true
+}
+
+/// Cross-ref: OCaml's surviving `latent_use_after_free` latent-invalid
+/// summary does not merely forget the selected `x == 0` fact; it also
+/// canonicalizes the two zero direct formals onto one visible summary value.
+/// Doing this only after the latent-invalid candidate has already passed the
+/// mixed-depth / path-local checks keeps the earlier `FN_nonlatent_*`
+/// filtering intact while still allowing export parity on the surviving path.
+fn coalesce_zero_direct_formals_for_export(
+    pdesc: &Procdesc,
+    pre_post: &mut PrePost,
+    selected_addr: AbstractValue,
+) {
+    let selected_repr = pre_post.post.path_condition.get_var_repr(selected_addr);
+    let local_zero_direct_formals = local_zero_direct_formals(pdesc, pre_post);
+    if !local_zero_direct_formals.contains(&selected_repr) {
+        return;
+    }
+
+    let zero_direct_formals = zero_direct_formals(pdesc, pre_post);
+    if zero_direct_formals.len() < 2 || !zero_direct_formals.contains(&selected_repr) {
+        return;
+    }
+
+    let zero_condition_depths: std::collections::HashMap<AbstractValue, usize> = pre_post
+        .post
+        .path_condition
+        .conditions()
+        .iter()
+        .filter_map(|(atom, depth)| match atom {
+            Atom::Equal(Term::Var(var), Term::Const(0))
+            | Atom::Equal(Term::Const(0), Term::Var(var)) => {
+                let repr = pre_post.post.path_condition.get_var_repr(*var);
+                zero_direct_formals
+                    .contains(&repr)
+                    .then_some((repr, *depth))
+            }
+            _ => None,
+        })
+        .fold(
+            std::collections::HashMap::new(),
+            |mut acc, (repr, depth)| {
+                acc.entry(repr)
+                    .and_modify(|existing| *existing = (*existing).min(depth))
+                    .or_insert(depth);
+                acc
+            },
+        );
+
+    let canonical_zero_formal = pdesc
+        .formals
+        .iter()
+        .filter_map(|(mangled, _typ, _annot)| {
+            let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+            let var = Var::ProgramVar(Box::new(pvar));
+            let addr = pre_post.pre.stack.find(&var)?;
+            let value = pre_post.pre.heap.find_edge(addr, &Access::Dereference)?;
+            let repr = pre_post.post.path_condition.get_var_repr(value);
+            zero_direct_formals.contains(&repr).then_some(repr)
+        })
+        .next();
+    let Some(canonical_zero_formal) = canonical_zero_formal else {
+        return;
+    };
+    let Some(&canonical_zero_depth) = zero_condition_depths.get(&canonical_zero_formal) else {
+        return;
+    };
+
+    let filtered_conditions: std::collections::BTreeMap<_, _> = pre_post
+        .post
+        .path_condition
+        .conditions()
+        .iter()
+        .filter_map(|(atom, depth)| match atom {
+            Atom::Equal(Term::Var(var), Term::Const(0))
+            | Atom::Equal(Term::Const(0), Term::Var(var)) => {
+                let repr = pre_post.post.path_condition.get_var_repr(*var);
+                (!zero_direct_formals.contains(&repr)).then_some((atom.clone(), *depth))
+            }
+            _ => Some((atom.clone(), *depth)),
+        })
+        .collect();
+
+    for addr in zero_direct_formals {
+        if addr == canonical_zero_formal {
+            continue;
+        }
+        if pre_post
+            .post
+            .and_equal(addr, canonical_zero_formal)
+            .is_unsat()
+        {
+            return;
+        }
+    }
+
+    pre_post.post.canonicalize_with_current_path_condition();
+    pre_post.pre = pre_post.post.pre.clone();
+    for (_formal, addr) in &mut pre_post.formals {
+        *addr = pre_post.post.path_condition.get_var_repr(*addr);
+    }
+    if let Some(result) = &mut pre_post.result {
+        *result = pre_post.post.path_condition.get_var_repr(*result);
+    }
+    if let Some(Diagnostic::AccessToInvalidAddress { addr, .. }) = pre_post.diagnostic.as_mut() {
+        *addr = pre_post.post.path_condition.get_var_repr(*addr);
+    }
+
+    let mut rewritten_conditions = filtered_conditions;
+    rewritten_conditions.insert(
+        Atom::Equal(Term::Var(canonical_zero_formal), Term::Const(0)),
+        canonical_zero_depth,
+    );
+    pre_post
+        .post
+        .path_condition
+        .replace_conditions(rewritten_conditions);
 }
 
 /// Cross-ref: the remaining OCaml direct-formal latent-invalid summaries in
 /// `latent.c` keep either purely local or purely imported guard depth. The
 /// mixed local+imported shape that Rust can synthesize for
 /// `FN_nonlatent_use_after_free_bad{,2}` does not survive as a latent invalid
-/// access in the OCaml summary surface.
-fn latent_invalid_access_has_mixed_condition_depths(pre_post: &PrePost) -> bool {
-    let mut depths = pre_post.post.path_condition.conditions().values().copied();
+/// access in the OCaml summary surface. The `latent_use_after_free`
+/// zero-cleanup path still survives in OCaml because the imported
+/// `b != 1` fact becomes redundant once both direct formals have been
+/// canonicalized onto zero. Only ignore those zero-formal-only atoms when the
+/// same zero fact is already present locally in the current summary path;
+/// imported-only zero guards from `create_branching` must still reject the
+/// latent-invalid export.
+fn latent_invalid_access_has_mixed_condition_depths(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
+    let direct_formal_values = direct_formal_value_addrs(pdesc, pre_post);
+    let local_zero_direct_formals = local_zero_direct_formals(pdesc, pre_post);
+    let mut depths =
+        pre_post
+            .post
+            .path_condition
+            .conditions()
+            .iter()
+            .filter_map(|(atom, depth)| {
+                let zero_direct_formal_only = atom.all_vars().into_iter().all(|var| {
+                    let repr = pre_post.post.path_condition.get_var_repr(var);
+                    direct_formal_values.contains(&repr)
+                        && pre_post.post.path_condition.is_known_zero(repr)
+                        && local_zero_direct_formals.contains(&repr)
+                });
+                (!zero_direct_formal_only).then_some(*depth)
+            });
     let Some(first_depth) = depths.next() else {
         return false;
     };
@@ -1438,8 +1601,14 @@ fn latent_invalid_access_has_mixed_condition_depths(pre_post: &PrePost) -> bool 
 /// selected caller-visible heap path. If unrelated branch state remains (for
 /// example the independent `b` branch in `FN_nonlatent_use_after_free_bad`),
 /// OCaml keeps the path as a plain `ContinueProgram` instead of publishing a
-/// latent invalid-access summary.
+/// latent invalid-access summary. The one remaining `latent_use_after_free`
+/// zero-cleanup path is the exception: summary simplification effectively
+/// canonicalizes both direct formals onto the same zero caller value, so keep
+/// extra direct-formal vars only when they are themselves proven zero by a
+/// local path fact, or when the selected caller-visible path already carries
+/// the null invalidation and the extra zero guard is just cleanup noise.
 fn latent_invalid_access_has_only_path_local_conditions(
+    pdesc: &Procdesc,
     pre_post: &PrePost,
     selected_addr: AbstractValue,
 ) -> bool {
@@ -1447,6 +1616,10 @@ fn latent_invalid_access_has_only_path_local_conditions(
     let Some(path_values) = latent_invalid_access_path_values(pre_post, selected_repr) else {
         return true;
     };
+    let direct_formal_values = direct_formal_value_addrs(pdesc, pre_post);
+    let local_zero_direct_formals = local_zero_direct_formals(pdesc, pre_post);
+    let selected_has_visible_null_invalidation =
+        post_addr_has_visible_null_invalidation(pre_post, selected_repr);
 
     pre_post
         .post
@@ -1457,8 +1630,71 @@ fn latent_invalid_access_has_only_path_local_conditions(
             atom.all_vars().into_iter().all(|var| {
                 let repr = pre_post.post.path_condition.get_var_repr(var);
                 path_values.contains(&repr)
+                    || (direct_formal_values.contains(&repr)
+                        && (local_zero_direct_formals.contains(&repr)
+                            || (selected_has_visible_null_invalidation
+                                && pre_post.post.path_condition.is_known_zero(repr))))
             })
         })
+}
+
+fn post_addr_has_visible_null_invalidation(pre_post: &PrePost, addr: AbstractValue) -> bool {
+    pre_post
+        .post
+        .post
+        .attrs
+        .get(&addr)
+        .and_then(|attrs| attrs.get_invalid())
+        .is_some_and(|(inv, _history)| inv.is_null_deref())
+}
+
+fn zero_direct_formals(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> std::collections::HashSet<AbstractValue> {
+    let direct_formal_values = direct_formal_value_addrs(pdesc, pre_post);
+    pre_post
+        .post
+        .path_condition
+        .conditions()
+        .keys()
+        .filter_map(|atom| match atom {
+            Atom::Equal(Term::Var(var), Term::Const(0))
+            | Atom::Equal(Term::Const(0), Term::Var(var)) => {
+                let repr = pre_post.post.path_condition.get_var_repr(*var);
+                (direct_formal_values.contains(&repr)
+                    && pre_post.post.path_condition.is_known_zero(repr))
+                .then_some(repr)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn local_zero_direct_formals(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+) -> std::collections::HashSet<AbstractValue> {
+    let direct_formal_values = direct_formal_value_addrs(pdesc, pre_post);
+    pre_post
+        .post
+        .path_condition
+        .conditions()
+        .iter()
+        .filter_map(|(atom, depth)| {
+            if *depth != 0 {
+                return None;
+            }
+            match atom {
+                Atom::Equal(Term::Var(var), Term::Const(0))
+                | Atom::Equal(Term::Const(0), Term::Var(var)) => {
+                    let repr = pre_post.post.path_condition.get_var_repr(*var);
+                    direct_formal_values.contains(&repr).then_some(repr)
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn latent_invalid_access_path_values(
@@ -1847,7 +2083,7 @@ pub(crate) fn exported_latent_invalid_access_is_reportable(
     if pre_post.kind != PrePostKind::LatentInvalidAccess {
         return false;
     }
-    if latent_invalid_access_has_mixed_condition_depths(pre_post) {
+    if latent_invalid_access_has_mixed_condition_depths(pdesc, pre_post) {
         return false;
     }
 
@@ -4928,6 +5164,72 @@ mod tests {
     }
 
     #[test]
+    fn test_coalesce_zero_direct_formals_for_export() {
+        let (pdesc, mut pre_post, x_val, y_val, _x_loc, y_loc) =
+            make_continue_pre_post_with_two_direct_formals();
+
+        assert!(pre_post
+            .post
+            .path_condition
+            .and_condition_direct(Atom::Equal(Term::Var(x_val), Term::Const(0)), 1)
+            .is_sat());
+        assert!(pre_post
+            .post
+            .path_condition
+            .prune_eq_const(y_val, 0, false)
+            .is_sat());
+        pre_post.kind = PrePostKind::LatentInvalidAccess;
+        pre_post.diagnostic = Some(dummy_invalid_access_diagnostic_at(
+            y_val,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            y_loc,
+        ));
+
+        coalesce_zero_direct_formals_for_export(&pdesc, &mut pre_post, y_val);
+
+        let direct_formal_values: std::collections::HashSet<_> = pre_post
+            .formals
+            .iter()
+            .filter_map(|(_formal, addr)| {
+                pre_post
+                    .pre
+                    .heap
+                    .find_edge(*addr, &Access::Dereference)
+                    .map(|value| pre_post.post.path_condition.get_var_repr(value))
+            })
+            .collect();
+        let zero_direct_formal_conditions: std::collections::HashSet<_> = pre_post
+            .post
+            .path_condition
+            .conditions()
+            .keys()
+            .filter_map(|atom| match atom {
+                Atom::Equal(Term::Var(var), Term::Const(0))
+                | Atom::Equal(Term::Const(0), Term::Var(var)) => {
+                    Some(pre_post.post.path_condition.get_var_repr(*var))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            direct_formal_values.len(),
+            1,
+            "export coalescing should alias zero direct formals onto one visible summary value"
+        );
+        assert_eq!(
+            zero_direct_formal_conditions.len(),
+            1,
+            "export coalescing should leave one remembered zero-direct-formal condition"
+        );
+        assert!(matches!(
+            pre_post.diagnostic,
+            Some(Diagnostic::AccessToInvalidAddress { addr, .. })
+                if direct_formal_values.contains(&pre_post.post.path_condition.get_var_repr(addr))
+        ));
+    }
+
+    #[test]
     fn test_potential_invalid_access_keeps_later_direct_formal_is_int_facts() {
         let pname = Procname::c_from_string("test_proc");
         let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
@@ -5435,6 +5737,267 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "debug continue-derived latent UAF/null candidate filters"]
+    fn test_debug_latent_uaf_continue_candidate_filters() {
+        let tm = textual_utils::parse_and_convert(
+            r#"
+        .source_language = "C"
+
+        define create_branching(b: int) : void {
+          #entry:
+            n0:int = load &b
+            jmp branch_true, branch_false
+          #branch_true:
+            prune __sil_eq(n0, 1)
+            ret null
+          #branch_false:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define conditional_free2(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            jmp do_free, skip_free
+          #do_free:
+            prune __sil_eq(n0, 1)
+            _ = free(n1)
+            ret null
+          #skip_free:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define FN_nonlatent_use_after_free_bad(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = create_branching(n0)
+            _ = free(n1)
+            n2:*int = load &x
+            store n2 <- 42:int
+            ret null
+        }
+
+        define FN_nonlatent_use_after_free_bad2(b: int, x: *int) : void {
+          #entry:
+            n0:*int = load &x
+            _ = free(n0)
+            n1:int = load &b
+            _ = create_branching(n1)
+            n2:*int = load &x
+            store n2 <- 42:int
+            ret null
+        }
+
+        define latent_use_after_free(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = conditional_free2(n0, n1)
+            store n1 <- 42:int
+            jmp clean_up, done
+          #clean_up:
+            prune __sil_eq(n0, 0)
+            _ = free(n1)
+            ret null
+          #done:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            ret null
+        }
+    "#,
+        );
+        let checker = TestPulseInterChecker;
+        let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+        let targets = [
+            "FN_nonlatent_use_after_free_bad",
+            "FN_nonlatent_use_after_free_bad2",
+            "latent_use_after_free",
+        ];
+
+        for target in targets {
+            let pdesc = tm
+                .cfg
+                .iter_proc_descs()
+                .find(|pdesc| format!("{}", pdesc.proc_name) == target)
+                .unwrap_or_else(|| panic!("procdesc for {target} should exist"));
+            let summary = store
+                .to_vec()
+                .into_iter()
+                .find(|(pname, _)| format!("{pname}") == target)
+                .map(|(_, summary)| summary)
+                .unwrap_or_else(|| panic!("summary for {target} should exist"));
+
+            eprintln!("TARGET {target}");
+            for (i, pre_post) in summary.pre_posts.iter().enumerate() {
+                let diag = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post);
+                let selected_addr = diag.as_ref().and_then(|diag| match diag {
+                    Diagnostic::AccessToInvalidAddress { addr, .. } => {
+                        Some(pre_post.post.path_condition.get_var_repr(*addr))
+                    }
+                    _ => None,
+                });
+                let path = selected_addr
+                    .and_then(|addr| latent_invalid_access_heap_path(pre_post, addr))
+                    .map(|path| format!("{path}"));
+                let path_values = selected_addr
+                    .and_then(|addr| latent_invalid_access_path_values(pre_post, addr))
+                    .map(|set| {
+                        let mut vars: Vec<_> = set.into_iter().collect();
+                        vars.sort();
+                        vars
+                    });
+                let conds = format!("{:?}", pre_post.post.path_condition.conditions());
+                eprintln!(
+                    "  pp[{i}] kind={:?} selected_addr={selected_addr:?} path={path:?} path_values={path_values:?} conditions={conds}",
+                    pre_post.kind
+                );
+                if pre_post.kind == PrePostKind::LatentInvalidAccess {
+                    eprintln!(
+                        "    only_path_local={} mixed_depth={}",
+                        selected_addr
+                            .map(|addr| latent_invalid_access_has_only_path_local_conditions(
+                                pdesc, pre_post, addr,
+                            ))
+                            .unwrap_or(false),
+                        latent_invalid_access_has_mixed_condition_depths(pdesc, pre_post),
+                    );
+                }
+                if pre_post.kind == PrePostKind::ContinueProgram {
+                    let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
+                    let formal_stack_addrs = formal_stack_addrs(pdesc, pre_post);
+                    let direct_formal_values = direct_formal_value_addrs(pdesc, pre_post);
+                    let deref_value_targets = pre_heap_deref_value_targets(pre_post);
+                    let mut candidates: Vec<_> =
+                        pre_post.post.must_be_valid.iter().copied().collect();
+                    candidates.sort();
+                    for addr in candidates {
+                        let repr = pre_post.post.path_condition.get_var_repr(addr);
+                        let access_history =
+                            pre_post.post.history_of_value(repr).unwrap_or_default();
+                        let path = latent_invalid_access_heap_path(pre_post, repr)
+                            .map(|path| format!("{path}"));
+                        let path_values =
+                            latent_invalid_access_path_values(pre_post, repr).map(|set| {
+                                let mut vars: Vec<_> = set.into_iter().collect();
+                                vars.sort();
+                                vars
+                            });
+                        let in_pre_mbv = pre_post
+                            .pre
+                            .attrs
+                            .get(&repr)
+                            .and_then(|attrs| attrs.get_must_be_valid())
+                            .is_some();
+                        let known_zero = pre_post.post.path_condition.is_known_zero(repr);
+                        eprintln!(
+                            "    candidate addr={repr} in_pre_mbv={in_pre_mbv} caller_controlled={} direct_formal={} formal_stack={} deref_target={} known_zero={} imported={} path={path:?} path_values={path_values:?} cond_only_local={}",
+                            caller_controlled.contains(&repr),
+                            direct_formal_values.contains(&repr),
+                            formal_stack_addrs.contains(&repr),
+                            deref_value_targets.contains(&repr),
+                            known_zero,
+                            latent_invalid_access_is_imported_from_call(
+                                pdesc,
+                                pre_post,
+                                repr,
+                                &access_history,
+                            ),
+                            latent_invalid_access_has_only_path_local_conditions(
+                                pdesc, pre_post, repr,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "debug real latent.sil continue-derived latent UAF/null candidates"]
+    fn test_debug_real_latent_uaf_continue_candidate_filters() {
+        let sil = std::path::Path::new("/tmp/interproc_debug/latent.sil");
+        if !sil.exists() {
+            eprintln!("skip");
+            return;
+        }
+        let tm = textual_utils::parse_file_and_convert(sil);
+        let checker = TestPulseInterChecker;
+        let (store, _) = ondemand::runner::run_inter(&checker, &tm.cfg, &tm.tenv);
+        let targets = [
+            "FN_nonlatent_use_after_free_bad",
+            "FN_nonlatent_use_after_free_bad2",
+            "latent_use_after_free",
+        ];
+
+        for target in targets {
+            let pdesc = tm
+                .cfg
+                .iter_proc_descs()
+                .find(|pdesc| format!("{}", pdesc.proc_name) == target)
+                .unwrap_or_else(|| panic!("procdesc for {target} should exist"));
+            let summary = store
+                .to_vec()
+                .into_iter()
+                .find(|(pname, _)| format!("{pname}") == target)
+                .map(|(_, summary)| summary)
+                .unwrap_or_else(|| panic!("summary for {target} should exist"));
+
+            eprintln!("TARGET {target}");
+            for (i, pre_post) in summary.pre_posts.iter().enumerate() {
+                eprintln!(
+                    "  pp[{i}] kind={:?} conditions={:?}",
+                    pre_post.kind,
+                    pre_post.post.path_condition.conditions()
+                );
+                if pre_post.kind != PrePostKind::ContinueProgram {
+                    continue;
+                }
+                let candidate = potential_invalid_access_from_normalized_continue_pre_post(
+                    pdesc,
+                    pre_post,
+                    &std::collections::HashSet::new(),
+                );
+                eprintln!("    candidate_present={}", candidate.is_some());
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                let Some(selected_addr) = (match &candidate.diagnostic {
+                    Diagnostic::AccessToInvalidAddress { addr, .. } => Some(*addr),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let mut latent_pp = pre_post.clone();
+                latent_pp.kind = PrePostKind::LatentInvalidAccess;
+                latent_pp.diagnostic = Some(candidate.diagnostic.clone());
+                eprintln!(
+                    "    selected_addr={selected_addr} path={:?} path_values={:?} direct_formals={:?} local_zero_direct_formals={:?} mixed_depth={} only_path_local={} imported={} known_zero={}",
+                    latent_invalid_access_heap_path(&latent_pp, selected_addr)
+                        .map(|path| format!("{path}")),
+                    latent_invalid_access_path_values(&latent_pp, selected_addr),
+                    direct_formal_value_addrs(pdesc, &latent_pp),
+                    local_zero_direct_formals(pdesc, &latent_pp),
+                    latent_invalid_access_has_mixed_condition_depths(pdesc, &latent_pp),
+                    latent_invalid_access_has_only_path_local_conditions(
+                        pdesc,
+                        &latent_pp,
+                        selected_addr,
+                    ),
+                    latent_invalid_access_is_imported_from_call(
+                        pdesc,
+                        &latent_pp,
+                        selected_addr,
+                        &latent_pp.post.history_of_value(selected_addr).unwrap_or_default(),
+                    ),
+                    latent_pp.post.path_condition.is_known_zero(selected_addr),
+                );
             }
         }
     }

@@ -7,16 +7,53 @@ changes, and move finished results to durable docs/tests/commits.
 ## Current Focus
 
 - Active parity task:
-  the latent publication gate is green again (`make check` passes and the real
-  exported `latent.c` issue surface is still exact at
-  `(procedure, line, issue-type)`), so the remaining latent drift is now the
-  smaller reduced-summary mismatch set plus the next OpenSSL retained-state
-  probe.
+  the latent publication gate is green again (`make check` passes, the real
+  exported `latent.c` issue surface is exact at
+  `(procedure, line, issue-type)`, and the reduced real-fixture summary-shape
+  mismatch set is green again too), so the next active parity work is richer
+  latent trace/publication detail plus the OpenSSL retained-state probe.
+- Fresh checkpoint on the `latent.c` summary drift:
+  - the remaining false `LatentInvalidAccess` summaries for
+    `FN_nonlatent_use_after_free_bad{,2}` are gone again on the real exported
+    fixture; Rust now matches OCaml on kind counts there
+  - the winning filter tweak was to keep extra direct-formal zero guards only
+    when they are locally zero or when the selected path already has a visible
+    null invalidation; imported-only cleanup guards from `create_branching`
+    no longer rescue a latent-invalid export
+  - do not drop the selected direct-formal `x == 0` condition from the
+    surviving `latent_use_after_free` latent-invalid summary: that looked
+    closer to OCaml locally but reintroduced a manifest `NULLPTR_DEREFERENCE`
+    in `main`, so the issue-surface-correct version keeps the extra selected
+    zero fact for now
+  - a follow-up experiment on the reduced `latent_use_after_free` shape showed
+    that blindly coalescing the two locally-zero direct formals in summary
+    space is not safe in Rust yet: it flips the latent-invalid path key from
+    `*x` to `*b` and unsuppresses the competing `b == 1 && x == 0`
+    latent-invalid pre_post that the existing `*x`-keyed tie-break used to
+    hide
+  - a second experiment moved that coalescing later, after the latent-invalid
+    candidate filters, and on the real exported `latent.c` fixture it did
+    recover the OCaml-looking latent-invalid summary condition `{b == 0}` with
+    reconstructed address `b`; the missing piece was interproc replay of that
+    coalesced direct-formal alias relation for value actuals (`b` and `x`)
+  - the winning interproc fix is to conjoin equality between caller actuals
+    when one callee dereferenced-formal summary value is shared by multiple
+    formals during summary import, instead of arbitrarily binding that value
+    to the first actual; that keeps the coalesced latent-invalid summary
+    export and removes the old `main` / `manifest_use_after_free` manifest NPE
+    regressions again
+  - report-side trace strings are a little richer now too: default Pulse
+    issues keep the old one-line qualifier, but the serialized `trace` field
+    now appends minimal invalidation/access history signatures so latent-chain
+    debugging does not require reopening the summary dumps for simple cases
+  - `transfer::tests::test_store_to_formula_known_zero_detects_error` was
+    updated to build the caller-visible heap path first; this matches the
+    existing `EqZero`/heap-allocated semantics used elsewhere in the Rust port
 - Latest validated checkpoint:
-  - compare dir: `/tmp/latent-compare.Muh07b`
-  - exported SIL: `/tmp/latent-compare.Muh07b/textual/latent.sil`
-  - OCaml report: `/tmp/latent-compare.Muh07b/ocaml-out/report.json`
-  - OCaml summaries: `/tmp/latent-compare.Muh07b/ocaml-out/all_summaries.json`
+  - compare dir: `/tmp/latent-compare.KcEUWD`
+  - exported SIL: `/tmp/latent-compare.KcEUWD/textual/latent.sil`
+  - OCaml report: `/tmp/latent-compare.KcEUWD/ocaml-out/report.json`
+  - OCaml summaries: `/tmp/latent-compare.KcEUWD/ocaml-out/all_summaries.json`
   - exact issue compare result:
     `RUST_COUNT 17`, `OCAML_COUNT 17`, no `RUST_ONLY`, no `OCAML_ONLY`
 - Rust correctness fixes now in place:
@@ -36,13 +73,11 @@ changes, and move finished results to durable docs/tests/commits.
     diagnostics, with earlier access locations preferred only as a tiebreaker
   - keep mixed local+imported direct-formal latent-invalid shapes out of the
     report surface
-- Remaining summary-surface drift from
+- Reduced `latent.c` summary checkpoint from
   `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --ignored --nocapture`:
-  - `FN_nonlatent_use_after_free_bad` / `bad2`: Rust still keeps extra
-    latent-invalid / latent-abort shapes where OCaml keeps
-    `ContinueProgram` + `LatentAbortProgram`
-  - `latent_use_after_free`: Rust still keeps an extra
-    `LatentAbortProgram` where OCaml keeps `ContinueProgram`
+  - `FN_nonlatent_use_after_free_bad{,2}`, `latent_use_after_free`,
+    `manifest_use_after_free`, and `main` now line up again on kind counts and
+    remembered summary conditions in the validated exported fixture
 - Cross-reference before changing semantics:
   `infer/src/pulse/PulseSummary.ml`,
   `infer/src/pulse/PulseLatentIssue.ml`,
@@ -67,6 +102,10 @@ changes, and move finished results to durable docs/tests/commits.
     `RUST_LOG='pulse::checker::fixpoint=debug,ondemand=info,ondemand::runner=info' target/release/infer-rs --pulse-only --debug-level-analysis 1 --trace-ondemand --debug-fixpoint-nodes 31,35 -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil" >/tmp/wpblock-alpha-signatures.log 2>&1`
 - Current validated working-tree checkpoint:
   - `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --ignored --nocapture`
+  - `cargo test -p pulse test_coalesce_zero_direct_formals_for_export -- --nocapture`
+  - `cargo test -p pulse test_apply_summary_shared_zero_formal_target_prefers_pointer_actual_for_latent_invalid_access -- --nocapture`
+  - `cargo test -p pulse 'test_apply_summary_' -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_latent_cycle_summary_shapes_match_ocaml_subset -- --nocapture`
   - `cargo test -p pulse test_debug_signature -- --nocapture`
   - `cargo test -p pulse test_exit_scope_ -- --nocapture`
   - `cargo test -p pulse test_variable_lifetime_begins_ -- --nocapture`

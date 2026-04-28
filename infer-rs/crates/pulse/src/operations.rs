@@ -32,27 +32,24 @@ fn materialize_known_zero_invalid(
     loc: &Location,
     state: &mut AbductiveDomain,
 ) {
-    // Cross-ref: OCaml records `ComparedToNullInThisProcedure` when pruning
-    // `p == 0`, but an actual access on a value that is now proven null must
-    // still surface as `ConstantDereference(0)`. After Rust adopted OCaml's
-    // uniq-rank attribute storage, the earlier compared-to-null marker could
-    // mask that access-time null invalidation unless we upgrade it here.
+    // Cross-ref: OCaml does not synthesize a brand-new invalidation merely
+    // because the arithmetic knows `p == 0`; that caller-reifiable case is
+    // surfaced later via `PotentialInvalidAccess{,Summary}`. The access-time
+    // upgrade here is only for paths that already carry the lighter
+    // `ComparedToNullInThisProcedure` marker from an earlier prune.
     if !state.is_known_zero(addr) {
         return;
     }
 
     let repr = state.path_condition.get_var_repr(addr);
-    let should_materialize = match state
-        .post
-        .attrs
-        .get(&repr)
-        .and_then(|attrs| attrs.get_invalid())
-    {
-        None => true,
-        Some((Invalidation::ComparedToNullInThisProcedure(_), _)) => true,
-        Some((Invalidation::ConstantDereference(value), _)) if *value == IntLit::zero() => false,
-        Some(_) => false,
-    };
+    let should_materialize = matches!(
+        state
+            .post
+            .attrs
+            .get(&repr)
+            .and_then(|attrs| attrs.get_invalid()),
+        Some((Invalidation::ComparedToNullInThisProcedure(_), _))
+    );
 
     if should_materialize {
         state.replace_invalid(
@@ -673,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn test_access_through_zero_records_null_invalidation() {
+    fn test_access_through_formula_zero_without_invalid_attr_stays_nonfatal() {
         let loc = Location::dummy();
         let pdesc = Procdesc::new(Procname::c_from_string("test"), Typ::void(), loc.clone());
         let mut state = AbductiveDomain::mk_initial(&pdesc);
@@ -681,19 +678,19 @@ mod tests {
         state.and_equal_const(p, 0);
 
         let result = check_addr_access(p, &loc, &mut state);
-        assert!(matches!(
-            result,
-            PulseResult::FatalError(
-                Diagnostic::AccessToInvalidAddress {
-                    invalidation: Invalidation::ConstantDereference(_),
-                    ..
-                },
-                _
-            )
-        ));
+        assert!(matches!(result, PulseResult::Ok(())));
         assert!(
-            state.check_valid(p).is_err(),
-            "known-zero access should materialize a null invalidation for later reporting"
+            state.check_valid(p).is_ok(),
+            "formula-only zero should not fabricate an invalid attr at access time"
+        );
+        assert!(
+            state
+                .post
+                .attrs
+                .get(&p)
+                .and_then(|attrs| attrs.get_invalid())
+                .is_none(),
+            "formula-only zero should stay latent until later summary/import handling"
         );
     }
 

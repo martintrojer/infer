@@ -260,10 +260,19 @@ surface. The local-vs-callsite publication split is tighter again too:
 one-step cycle callees stay latent-only while callers reify the manifest null
 deref, and local trailing field-write aborts keep both recovered latent null
 paths plus the trailing manifest diagnostic without reintroducing the real
-`FN_crash_after_six_nodes_bad` duplicate-manifest bug. The remaining drift here
-is narrower and summary-shaped: `FN_nonlatent_use_after_free_bad{,2}` and
-`latent_use_after_free` still carry extra `ContinueProgram` /
-`LatentAbortProgram` combinations versus dumped OCaml summaries.
+`FN_crash_after_six_nodes_bad` duplicate-manifest bug. The real-fixture
+`FN_nonlatent_use_after_free_bad{,2}`, `latent_use_after_free`,
+`manifest_use_after_free`, and `main` summary shapes now line up again on the
+validated exported `latent.c` compare too: Rust coalesces the surviving zero
+shared direct-formal latent-invalid path only after the mixed-depth /
+path-local filters have accepted it, and summary import now conjoins equality
+between caller actuals when multiple callee direct-formal deref roots map to
+one shared summary value instead of arbitrarily binding that value to the first
+actual. That keeps the OCaml-looking `{b == 0}` latent-invalid summary shape
+without regressing `main` back to a manifest `NULLPTR_DEREFERENCE`. Serialized
+Pulse issue traces are a little richer now too: the existing one-line
+qualifier stays the same, while the `trace` field appends minimal
+invalidation/access history signatures for easier latent-chain debugging.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model

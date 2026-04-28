@@ -1044,10 +1044,11 @@ mod tests {
             .stack
             .add(Var::ProgramVar(Box::new(pvar.clone())), stack_addr);
         let p_val = state.read_heap(stack_addr, Access::Dereference);
+        let _heap_target = state.read_heap(p_val, Access::Dereference);
         assert!(state.and_equal_const(p_val, 0).is_sat());
         assert!(
-            state.check_valid(p_val).is_ok(),
-            "formula-only null should not require a preexisting Invalid attr"
+            state.check_valid(p_val).is_err(),
+            "EqZero should invalidate caller-visible heap values once the dereference path exists"
         );
 
         let id = Ident::create_normal(IdentName::from_string("n"), 0);

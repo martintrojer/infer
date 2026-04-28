@@ -119,7 +119,19 @@ pub(crate) fn apply_summary_with_aliasing(
             if let Some(edges) = pre_heap.get_edges(*formal_stack_addr) {
                 for (access, target) in edges.iter() {
                     if matches!(access, Access::Dereference) {
-                        subst.entry(*target).or_insert(*actual_val);
+                        if let Some(existing_actual) = subst.get(target).copied() {
+                            if existing_actual != *actual_val
+                                && caller_state
+                                    .path_condition
+                                    .and_equal_vars(existing_actual, *actual_val)
+                                    .is_unsat()
+                            {
+                                return ApplySummaryOutcome::default();
+                            }
+                            subst.insert(*target, caller_state.get_var_repr(existing_actual));
+                        } else {
+                            subst.insert(*target, *actual_val);
+                        }
                         callee_heap_paths
                             .entry(*target)
                             .or_insert_with(|| Some(pvar_heap_path(formal_pvar)));
@@ -2169,6 +2181,144 @@ mod tests {
                 .iter()
                 .any(|attr| matches!(attr, Attribute::WrittenTo(_, _))),
             "summary import should preserve caller-visible WrittenTo on the old pointee"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_shared_zero_formal_target_prefers_pointer_actual_for_latent_invalid_access(
+    ) {
+        let callee_pname = Procname::c_from_string("latent_use_after_free");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![
+            (
+                Mangled::from_string("b"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("x"),
+                Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+                Default::default(),
+            ),
+        ];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let b_pvar = Pvar::mk(Mangled::from_string("b"), callee_pname.clone());
+        let b_stack = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(b_pvar.clone())))
+            .unwrap();
+        let b_val = callee_state.read_heap(b_stack, Access::Dereference);
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), callee_pname.clone());
+        let x_stack = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(x_pvar.clone())))
+            .unwrap();
+        let x_val = callee_state.read_heap(x_stack, Access::Dereference);
+
+        assert!(callee_state.and_equal(b_val, x_val).is_sat());
+        assert!(callee_state.and_equal_const(b_val, 0).is_sat());
+        let shared_zero = callee_state.get_var_repr(b_val);
+        callee_state.mark_must_be_valid_at(shared_zero, &Location::dummy());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(b_pvar, b_stack), (x_pvar, x_stack)],
+            result: None,
+            kind: crate::summary::PrePostKind::LatentInvalidAccess,
+            diagnostic: Some(dummy_invalid_access_diagnostic(
+                shared_zero,
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            )),
+        };
+
+        let caller_pname = Procname::c_from_string("main");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![
+            (
+                Mangled::from_string("argc"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("x"),
+                Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+                Default::default(),
+            ),
+        ];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let argc_pvar = Pvar::mk(Mangled::from_string("argc"), caller_pname.clone());
+        let argc_stack = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(argc_pvar)))
+            .unwrap();
+        let argc_val = caller_state.read_heap(argc_stack, Access::Dereference);
+        assert!(caller_state.and_equal_const(argc_val, 0).is_sat());
+
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname.clone());
+        let x_stack = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(x_pvar)))
+            .unwrap();
+        let caller_x_val = caller_state.read_heap(x_stack, Access::Dereference);
+        assert!(caller_state
+            .path_condition
+            .and_positive(caller_x_val)
+            .is_sat());
+
+        let argc_id = Ident::create_normal(IdentName::from_string("argc_actual"), 0);
+        crate::operations::write_id_with_history(
+            &argc_id,
+            crate::value_history::ValueWithHistory::new(
+                argc_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+        let x_id = Ident::create_normal(IdentName::from_string("x_actual"), 0);
+        crate::operations::write_id_with_history(
+            &x_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_x_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[
+                (Exp::Var(argc_id), Typ::int(sil::typ::IKind::IInt)),
+                (Exp::Var(x_id), Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt))),
+            ],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        assert!(
+            !results.iter().any(|result| matches!(
+                result,
+                ExecutionDomain::AbortProgram { diagnostic, .. }
+                    if diagnostic.get_issue_type_id()
+                        == diagnostics::issue_type::IssueTypeId::NullptrDereference
+            )),
+            "shared zero direct-formal latent invalid access should not reify a manifest NULL_DEREFERENCE when the pointer actual is known non-null: {results:?}"
+        );
+        assert!(
+            results.is_empty()
+                || results
+                    .iter()
+                    .any(|result| matches!(result, ExecutionDomain::LatentInvalidAccess { .. })),
+            "the coalesced latent-invalid path should either stay latent or become inapplicable at this caller boundary, but never reify a manifest null-deref: {results:?}"
         );
     }
 

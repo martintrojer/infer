@@ -646,6 +646,10 @@ impl Formula {
         self.conditions = conditions;
     }
 
+    pub(crate) fn replace_conditions(&mut self, conditions: BTreeMap<Atom, usize>) {
+        self.conditions = conditions;
+    }
+
     /// Forget summary-only constraints that mention the given values.
     ///
     /// Cross-ref: OCaml summary export can drop later caller-controlled guards

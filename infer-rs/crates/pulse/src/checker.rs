@@ -3788,6 +3788,107 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "debug FN_nonlatent UAF node states"]
+    fn test_debug_fn_nonlatent_uaf_node_states() {
+        let tm = textual_utils::parse_and_convert(
+            r#"
+        .source_language = "C"
+
+        define create_branching(b: int) : void {
+          #entry:
+            n0:int = load &b
+            jmp branch_true, branch_false
+          #branch_true:
+            prune __sil_eq(n0, 1)
+            ret null
+          #branch_false:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define FN_nonlatent_use_after_free_bad(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = create_branching(n0)
+            _ = free(n1)
+            n2:*int = load &x
+            store n2 <- 42:int
+            ret null
+        }
+
+        define FN_nonlatent_use_after_free_bad2(b: int, x: *int) : void {
+          #entry:
+            n0:*int = load &x
+            _ = free(n0)
+            n1:int = load &b
+            _ = create_branching(n1)
+            n2:*int = load &x
+            store n2 <- 42:int
+            ret null
+        }
+    "#,
+        );
+        let targets = [
+            "FN_nonlatent_use_after_free_bad",
+            "FN_nonlatent_use_after_free_bad2",
+        ];
+
+        for target in targets {
+            let pdesc = tm
+                .cfg
+                .iter_proc_descs()
+                .find(|pdesc| format!("{}", pdesc.proc_name) == target)
+                .unwrap_or_else(|| panic!("{target} proc should exist"))
+                .clone();
+            let mut callee_summaries = HashMap::new();
+            let create_branching = tm
+                .cfg
+                .iter_proc_descs()
+                .find(|pdesc| format!("{}", pdesc.proc_name) == "create_branching")
+                .expect("create_branching proc should exist")
+                .clone();
+            callee_summaries.insert(
+                create_branching.proc_name.clone(),
+                analyze(&create_branching),
+            );
+
+            let cfg = config::get();
+            let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+            let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
+            let initial_domain = DisjunctiveDomain::singleton(
+                initial_exec,
+                cfg.pulse_max_disjuncts,
+                cfg.pulse_widen_threshold,
+            );
+            let pulse_tf = PulseTransferFunctions {
+                callee_summaries: &callee_summaries,
+                pdesc: &pdesc,
+                proc_name: format!("{}", pdesc.proc_name),
+                spec_requests: RefCell::new(Vec::new()),
+                progress: RefCell::new(ProcProgress::new()),
+            };
+            let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
+
+            eprintln!("TARGET {target}");
+            for node in &pdesc.nodes {
+                if let Some(state) = inv_map.get(&node.id) {
+                    eprintln!("node {}", node.id);
+                    for (i, disjunct) in state.post.disjuncts.iter().enumerate() {
+                        eprintln!("  [{i}] {}", summarize_exec_domain(disjunct));
+                        if let ExecutionDomain::AbortProgram { state, diagnostic } = disjunct {
+                            let kind =
+                                crate::summary::classify_abort_kind(&pdesc, state, diagnostic);
+                            let manifest = crate::summary::abort_is_manifest(&pdesc, state);
+                            eprintln!("      classify={kind:?} manifest={}", manifest,);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_formal_load_then_exit_stays_continue_only() {
         let pdesc = make_formal_load_then_exit_proc();
         let summary = analyze(&pdesc);
