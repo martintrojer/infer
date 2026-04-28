@@ -97,7 +97,8 @@ active OCaml-parity gap.
    `extras`. The structured
    trace is also a bit closer to OCaml now on both access and invalidation paths (caller
    provenance before a synthetic call step, outer-formal synthesis before deeper callee formals,
-   and modelled-allocation call/return compression), but richer OCaml-style `PulseTrace` /
+   modelled-allocation call/return compression, and caller-side UAF qualifiers that mention the
+   outer call when that provenance is available), but richer OCaml-style `PulseTrace` /
    publication detail is still incomplete.
 
 Recent groundwork that should stay in place even though the current NPE total moved in the wrong direction:

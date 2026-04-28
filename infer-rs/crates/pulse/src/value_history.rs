@@ -364,6 +364,16 @@ impl ValueHistory {
     pub(crate) fn primary_path(&self) -> Option<&HistoryPath> {
         self.0.iter().next()
     }
+
+    pub(crate) fn first_actual_argument(&self) -> Option<&Pvar> {
+        self.primary_path()?
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                HistoryEvent::ActualArgument(pvar) => Some(pvar),
+                _ => None,
+            })
+    }
 }
 
 impl fmt::Display for ValueHistory {

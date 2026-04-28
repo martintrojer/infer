@@ -61,6 +61,10 @@ changes, and move finished results to durable docs/tests/commits.
     report layer synthesizes the outer callee formal before the inner call, and
     modelled allocation call/return pairs such as `malloc` now collapse to one
     `allocated by call to ... (modelled)` access-side step
+  - caller-side UAF qualifiers are a little closer too: when the access
+    history still identifies the outer callee call, the top-level report text
+    now uses a `The call to ... may trigger ...` shape instead of the generic
+    `accessing address that ...` wording
   - `transfer::tests::test_store_to_formula_known_zero_detects_error` was
     updated to build the caller-visible heap path first; this matches the
     existing `EqZero`/heap-allocated semantics used elsewhere in the Rust port

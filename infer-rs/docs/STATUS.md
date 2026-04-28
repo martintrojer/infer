@@ -1003,7 +1003,9 @@ specialized-summary filtering, imported pure-call dependency translation, and
   synthetic call step into the callee parameter/value, invalidation-side traces
   now synthesize the outer formal before the inner callee formal when needed,
   and modelled-allocation call/return pairs such as `malloc` collapse to one
-  allocation step, but Rust still lacks OCaml's richer structured `PulseTrace`
+  allocation step; caller-side UAF qualifiers also switch to a more OCaml-like
+  `The call to ... may trigger ...` shape when the outer call provenance is
+  available, but Rust still lacks OCaml's richer structured `PulseTrace`
   publication detail)
 - suppressed-report presentation / trace detail
 

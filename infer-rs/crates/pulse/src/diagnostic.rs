@@ -180,7 +180,7 @@ impl Diagnostic {
             .as_ref()
             .and_then(|entries| entries.iter().map(|entry| entry.level).max());
         let issue_type = self.build_issue_type(latent);
-        let qualifier = format!("{self}");
+        let qualifier = self.qualifier_message();
         let file = format!("{}", loc.file);
         let (key, node_key, hash) = diagnostics::issue::derive_issue_metadata(
             &issue_type,
@@ -210,6 +210,45 @@ impl Diagnostic {
             bug_trace_length,
             bug_trace_max_depth,
             extras: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn qualifier_message(&self) -> String {
+        match self {
+            Diagnostic::AccessToInvalidAddress {
+                invalidation,
+                access_history,
+                invalidation_history,
+                ..
+            } if matches!(
+                self.get_issue_type_id(),
+                IssueTypeId::UseAfterFree
+                    | IssueTypeId::UseAfterDelete
+                    | IssueTypeId::UseAfterLifetime
+            ) =>
+            {
+                let Some(actual_pvar) = access_history.first_actual_argument() else {
+                    return format!("{self}");
+                };
+                let proc = match &actual_pvar.kind {
+                    sil::pvar::PvarKind::Local { proc_name, .. }
+                    | sil::pvar::PvarKind::Callee(proc_name)
+                    | sil::pvar::PvarKind::Seed(proc_name) => proc_name,
+                    sil::pvar::PvarKind::Global { .. } => return format!("{self}"),
+                };
+                let base = if let Some((_inv, loc)) = invalidation_history.first_invalidation() {
+                    format!(
+                        "accesses `{}` that {invalidation} from line {}",
+                        actual_pvar.name, loc.line
+                    )
+                } else {
+                    format!("accesses `{}` that {invalidation}", actual_pvar.name)
+                };
+                format!(
+                    "The call to `{proc}` may trigger the following issue: call to `{proc}()` eventually {base}."
+                )
+            }
+            _ => format!("{self}"),
         }
     }
 
@@ -769,6 +808,26 @@ mod tests {
             vec!["allocated by call to `malloc` (modelled)"],
             "modelled allocation call/return should collapse to one trace step"
         );
+    }
+
+    #[test]
+    fn test_uaf_qualifier_mentions_outer_call_context() {
+        let callee = Procname::c_from_string("latent_use_after_free");
+        let callee_pvar = Pvar::mk(Mangled::from_string("x"), callee.clone());
+        let diag = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: Invalidation::CFree,
+            access_location: loc(40),
+            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(callee_pvar)),
+            invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
+        };
+
+        let issue = diag.to_issue("caller");
+        assert!(issue
+            .qualifier
+            .contains("The call to `latent_use_after_free` may trigger"));
+        assert!(issue.qualifier.contains("eventually accesses `x`"));
+        assert!(issue.qualifier.contains("from line 12"));
     }
 
     #[test]

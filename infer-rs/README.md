@@ -283,7 +283,11 @@ into the callee parameter/value that triggers the final invalid access,
 invalidation traces synthesize the outer callee formal before the inner call
 when a translated callee diagnostic preserves only the deeper formal, and
 modelled allocation call/return pairs such as `malloc` collapse to one
-`allocated by call to ... (modelled)` step.
+`allocated by call to ... (modelled)` step. Caller-reified UAF qualifiers are
+also a bit closer to OCaml now: when the access history still identifies the
+outer callee call, the top-level `qualifier` switches from the generic
+"accessing address that ..." wording to a `The call to ... may trigger ...`
+shape.
 
 The latest correctness pass also keeps recoverable invalid-access paths from continuing after the
 error has already been classified: transfer-side load/store recoverable errors and C-model
