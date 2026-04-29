@@ -652,8 +652,10 @@ fn translate_diagnostic(
                         .or_else(|| invalidation_history.first_formal_argument())
                     {
                         let outer_pvar = Pvar::mk(seed_pvar.name.clone(), proc_name.clone());
-                        ValueHistory::formal_argument_at(outer_pvar, start_loc.clone())
-                            .merge(&invalidation_history)
+                        invalidation_history.prepend_event(HistoryEvent::FormalArgument(
+                            outer_pvar,
+                            Some(start_loc.clone()),
+                        ))
                     } else {
                         invalidation_history
                     };

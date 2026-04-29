@@ -78,6 +78,13 @@ impl HistoryPath {
         Self(events)
     }
 
+    fn prepend(&self, event: HistoryEvent) -> Self {
+        let mut events = Vec::with_capacity(self.0.len() + 1);
+        events.push(event);
+        events.extend(self.0.clone());
+        Self(events)
+    }
+
     fn wrap_call(&self, proc: &Procname, location: &Location) -> Self {
         let mut events = Vec::with_capacity(self.0.len() + 2);
         events.push(HistoryEvent::Call {
@@ -254,6 +261,15 @@ impl ValueHistory {
             .0
             .iter()
             .map(|path| path.append(event.clone()))
+            .collect();
+        Self(paths)
+    }
+
+    pub fn prepend_event(&self, event: HistoryEvent) -> Self {
+        let paths = self
+            .0
+            .iter()
+            .map(|path| path.prepend(event.clone()))
             .collect();
         Self(paths)
     }
