@@ -491,7 +491,16 @@ fn history_events_to_bug_trace(
                     location,
                     format!("allocated by call to `{proc}` (modelled)"),
                 ));
-                index += 2;
+                let skip_return = events.get(index + 2).is_some_and(|next| {
+                    matches!(
+                        next,
+                        crate::value_history::HistoryEvent::ReturnFromCall {
+                            proc: next_proc,
+                            ..
+                        } if next_proc == proc
+                    )
+                });
+                index += if skip_return { 3 } else { 2 };
             }
             crate::value_history::HistoryEvent::Call { proc, location } => {
                 entries.push(make_bug_trace_entry(
@@ -582,6 +591,76 @@ fn invalidation_history_to_bug_trace(
         | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name.clone()),
         sil::pvar::PvarKind::Global { .. } => None,
     };
+    if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(outer_pvar, outer_loc), crate::value_history::HistoryEvent::Call {
+        proc: inner_proc_name,
+        location: inner_call_loc,
+    }, rest @ ..] = events
+    {
+        let outer_proc = inner_proc_of(outer_pvar);
+        if outer_proc
+            .as_ref()
+            .is_some_and(|outer_proc| outer_proc == proc)
+            && inner_proc_name != proc
+        {
+            let outer_loc = outer_loc.clone().unwrap_or_else(|| location.clone());
+            let mut entries = vec![make_bug_trace_entry(
+                base_level,
+                &outer_loc,
+                pvar_trace_description(outer_pvar),
+            )];
+            entries.push(make_bug_trace_entry(
+                base_level,
+                inner_call_loc,
+                format!("when calling `{}` here", inner_proc_name),
+            ));
+            entries.extend(history_events_to_bug_trace(rest, fallback, base_level + 1));
+            return entries;
+        }
+    }
+    if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(outer_pvar, outer_loc), crate::value_history::HistoryEvent::ActualArgument(
+        inner_actual_pvar,
+        Some(inner_call_loc),
+    ), rest @ ..] = events
+    {
+        let outer_proc = inner_proc_of(outer_pvar);
+        let inner_proc = inner_proc_of(inner_actual_pvar);
+        if outer_proc
+            .as_ref()
+            .is_some_and(|outer_proc| outer_proc == proc)
+            && inner_proc
+                .as_ref()
+                .is_some_and(|inner_proc| inner_proc != proc)
+        {
+            let outer_loc = outer_loc.clone().unwrap_or_else(|| location.clone());
+            let mut entries = vec![make_bug_trace_entry(
+                base_level,
+                &outer_loc,
+                pvar_trace_description(outer_pvar),
+            )];
+            entries.push(make_bug_trace_entry(
+                base_level,
+                inner_call_loc,
+                format!("when calling `{}` here", inner_proc.as_ref().unwrap()),
+            ));
+            entries.push(make_bug_trace_entry(
+                base_level + 1,
+                inner_call_loc,
+                pvar_trace_description(inner_actual_pvar),
+            ));
+            let rest = match rest.first() {
+                Some(crate::value_history::HistoryEvent::FormalArgument(pvar, _))
+                    if inner_proc_of(pvar)
+                        .as_ref()
+                        .is_some_and(|candidate| outer_proc.as_ref() == Some(candidate)) =>
+                {
+                    &rest[1..]
+                }
+                _ => rest,
+            };
+            entries.extend(history_events_to_bug_trace(rest, fallback, base_level + 1));
+            return entries;
+        }
+    }
     if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(outer_pvar, outer_loc), crate::value_history::HistoryEvent::FormalArgument(inner_pvar, _), ..] =
         events
     {
@@ -656,27 +735,51 @@ fn access_history_to_bug_trace(
     fallback: &Location,
     base_level: u32,
 ) -> Vec<diagnostics::issue::BugTraceEntry> {
+    fn proc_of_pvar(pvar: &Pvar) -> Option<&Procname> {
+        match &pvar.kind {
+            sil::pvar::PvarKind::Local { proc_name, .. }
+            | sil::pvar::PvarKind::Callee(proc_name)
+            | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name),
+            sil::pvar::PvarKind::Global { .. } => None,
+        }
+    }
+
     fn rec(
         events: &[crate::value_history::HistoryEvent],
         fallback: &Location,
         level: u32,
     ) -> Vec<diagnostics::issue::BugTraceEntry> {
-        let Some((first, rest)) = events.split_first() else {
-            return Vec::new();
-        };
-        match first {
-            crate::value_history::HistoryEvent::ActualArgument(pvar, location) => {
+        match events {
+            [crate::value_history::HistoryEvent::FormalArgument(callee_pvar, Some(callee_loc)), crate::value_history::HistoryEvent::ActualArgument(actual_pvar, location), rest @ ..]
+                if proc_of_pvar(callee_pvar)
+                    .zip(proc_of_pvar(actual_pvar))
+                    .is_some_and(|(callee_proc, actual_proc)| callee_proc == actual_proc) =>
+            {
                 let mut entries = rec(rest, fallback, level);
                 let call_loc = location
                     .clone()
                     .or_else(|| rest.iter().find_map(|event| event.location()).cloned())
                     .unwrap_or_else(|| fallback.clone());
-                let proc_name = match &pvar.kind {
-                    sil::pvar::PvarKind::Local { proc_name, .. }
-                    | sil::pvar::PvarKind::Callee(proc_name)
-                    | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name),
-                    sil::pvar::PvarKind::Global { .. } => None,
-                };
+                let proc_name = proc_of_pvar(callee_pvar).expect("matched local/callee pvar");
+                entries.push(make_bug_trace_entry(
+                    level,
+                    &call_loc,
+                    format!("when calling `{proc_name}` here"),
+                ));
+                entries.push(make_bug_trace_entry(
+                    level + 1,
+                    callee_loc,
+                    pvar_trace_description(callee_pvar),
+                ));
+                entries
+            }
+            [crate::value_history::HistoryEvent::ActualArgument(pvar, location), rest @ ..] => {
+                let mut entries = rec(rest, fallback, level);
+                let call_loc = location
+                    .clone()
+                    .or_else(|| rest.iter().find_map(|event| event.location()).cloned())
+                    .unwrap_or_else(|| fallback.clone());
+                let proc_name = proc_of_pvar(pvar);
                 if let Some(proc_name) = proc_name {
                     entries.push(make_bug_trace_entry(
                         level,
@@ -862,11 +965,9 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::CFree,
             access_location: loc(40),
-            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(
-                callee_pvar,
-                Some(loc(40)),
-            ))
-            .append_event(HistoryEvent::FormalArgument(caller_pvar, Some(loc(39)))),
+            access_history: ValueHistory::formal_argument_at(callee_pvar.clone(), loc(10))
+                .append_event(HistoryEvent::ActualArgument(callee_pvar, Some(loc(40))))
+                .append_event(HistoryEvent::FormalArgument(caller_pvar, Some(loc(39)))),
             invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
         };
 
@@ -904,6 +1005,25 @@ mod tests {
             descriptions,
             vec!["allocated by call to `malloc` (modelled)"],
             "modelled allocation call/return should collapse to one trace step"
+        );
+    }
+
+    #[test]
+    fn test_bug_trace_keeps_following_assignment_at_same_level_after_modelled_alloc() {
+        let history = ValueHistory::returned(loc(12))
+            .wrap_call(&Procname::c_from_string("malloc"), &loc(12))
+            .append_assignment(loc(13));
+        let trace = history_to_bug_trace(&history, &loc(12), 2);
+        let descriptions: Vec<_> = trace
+            .iter()
+            .map(|entry| (entry.level, entry.description.as_str()))
+            .collect();
+        assert_eq!(
+            descriptions,
+            vec![
+                (2, "allocated by call to `malloc` (modelled)"),
+                (2, "assigned here"),
+            ]
         );
     }
 

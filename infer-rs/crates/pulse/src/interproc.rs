@@ -290,6 +290,9 @@ pub(crate) fn apply_summary_with_aliasing(
         );
     }
 
+    let callee_procname = summary_procname(pre_post);
+    let callee_proc_start_location = summary_proc_start_location(pre_post);
+
     // Step 4: Translate callee's formula constraints to the caller.
     // We keep Rust's existing heap-then-formula sequencing, but preserve
     // OCaml's allocation distinction by checking imported `EqZero` against the
@@ -352,10 +355,10 @@ pub(crate) fn apply_summary_with_aliasing(
     for (callee_addr, attrs) in callee_attrs.iter() {
         let caller_addr = resolve_mut(&mut subst, *callee_addr);
         for attr in attrs.iter() {
-            caller_state
-                .post
-                .attrs
-                .add_one(caller_addr, translate_attribute(&mut subst, attr));
+            caller_state.post.attrs.add_one(
+                caller_addr,
+                translate_attribute(&mut subst, attr, callee_procname.as_ref(), Some(loc)),
+            );
         }
     }
 
@@ -384,9 +387,6 @@ pub(crate) fn apply_summary_with_aliasing(
             }
         };
     }
-
-    let callee_procname = summary_procname(pre_post);
-    let callee_proc_start_location = summary_proc_start_location(pre_post);
 
     let stopped_summary = (!matches!(pre_post.kind, crate::summary::PrePostKind::ContinueProgram))
         .then(|| crate::summary::summarize_stopped_state(caller_pdesc, &caller_state));
@@ -644,7 +644,26 @@ fn translate_diagnostic(
                 .get_var_repr(resolve_mut(subst, *addr));
             let access_history =
                 access_history.map_formals_with_callsite(formal_histories, Some(loc.clone()));
-            let invalidation_history = invalidation_history.map_formals(formal_histories);
+            let access_history = match (callee_procname, callee_proc_start_location) {
+                (Some(proc_name), Some(start_loc)) => {
+                    let access_history = if let Some(seed_pvar) = access_history
+                        .first_actual_argument()
+                        .or_else(|| access_history.first_formal_argument())
+                    {
+                        let outer_pvar = Pvar::mk(seed_pvar.name.clone(), proc_name.clone());
+                        access_history.prepend_event(HistoryEvent::FormalArgument(
+                            outer_pvar,
+                            Some(start_loc.clone()),
+                        ))
+                    } else {
+                        access_history
+                    };
+                    access_history
+                }
+                _ => access_history,
+            };
+            let invalidation_history =
+                invalidation_history.map_formals_with_callsite(formal_histories, Some(loc.clone()));
             let invalidation_history = match (callee_procname, callee_proc_start_location) {
                 (Some(proc_name), Some(start_loc)) => {
                     let invalidation_history = if let Some(seed_pvar) = invalidation_history
@@ -1205,7 +1224,7 @@ fn import_callee_pre_attributes(
             caller_state
                 .pre
                 .attrs
-                .add_one(caller_addr, translate_attribute(subst, attr));
+                .add_one(caller_addr, translate_attribute(subst, attr, None, None));
         }
     }
 }
@@ -1588,10 +1607,19 @@ fn translate_access(
 fn translate_attribute(
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     attr: &Attribute,
+    callee_procname: Option<&Procname>,
+    loc: Option<&Location>,
 ) -> Attribute {
     match attr {
         Attribute::ReturnedFromUnknown(values) => {
             Attribute::ReturnedFromUnknown(values.iter().map(|v| resolve_mut(subst, *v)).collect())
+        }
+        Attribute::Invalid(invalidation, history) => {
+            let history = match (callee_procname, loc) {
+                (Some(proc_name), Some(loc)) => history.wrap_call(proc_name, loc),
+                _ => history.clone(),
+            };
+            Attribute::Invalid(invalidation.clone(), history)
         }
         other => other.clone(),
     }
