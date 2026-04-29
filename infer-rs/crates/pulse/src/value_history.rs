@@ -25,9 +25,9 @@ use crate::invalidation::Invalidation;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HistoryEvent {
     /// Formal placeholder to be replaced by the caller actual history.
-    FormalArgument(Pvar),
+    FormalArgument(Pvar, Option<Location>),
     /// Marker that a substituted path came from a caller actual.
-    ActualArgument(Pvar),
+    ActualArgument(Pvar, Option<Location>),
     Assignment(Location),
     Call {
         proc: Procname,
@@ -47,7 +47,9 @@ pub enum HistoryEvent {
 impl HistoryEvent {
     pub(crate) fn location(&self) -> Option<&Location> {
         match self {
-            Self::FormalArgument(_) | Self::ActualArgument(_) => None,
+            Self::FormalArgument(_, location) | Self::ActualArgument(_, location) => {
+                location.as_ref()
+            }
             Self::Assignment(location)
             | Self::Returned(location)
             | Self::Invalidated { location, .. }
@@ -98,7 +100,7 @@ impl HistoryPath {
                     location,
                 } => return Some((invalidation, location)),
                 HistoryEvent::Call { .. } => return None,
-                HistoryEvent::ActualArgument(_) => {}
+                HistoryEvent::ActualArgument(_, _) => {}
                 _ => {}
             }
         }
@@ -135,7 +137,7 @@ impl HistoryPath {
         let mut saw_actual_argument = false;
         for event in &self.0 {
             match event {
-                HistoryEvent::ActualArgument(_) => saw_actual_argument = true,
+                HistoryEvent::ActualArgument(_, _) => saw_actual_argument = true,
                 HistoryEvent::Invalidated {
                     invalidation,
                     location,
@@ -151,7 +153,7 @@ impl HistoryPath {
         self.0.iter().any(|event| {
             matches!(
                 event,
-                HistoryEvent::FormalArgument(_) | HistoryEvent::ActualArgument(_)
+                HistoryEvent::FormalArgument(_, _) | HistoryEvent::ActualArgument(_, _)
             )
         })
     }
@@ -178,8 +180,8 @@ impl fmt::Display for HistoryPath {
                 write!(f, " -> ")?;
             }
             match event {
-                HistoryEvent::FormalArgument(pvar) => write!(f, "formal({pvar})")?,
-                HistoryEvent::ActualArgument(pvar) => write!(f, "actual({pvar})")?,
+                HistoryEvent::FormalArgument(pvar, _) => write!(f, "formal({pvar})")?,
+                HistoryEvent::ActualArgument(pvar, _) => write!(f, "actual({pvar})")?,
                 HistoryEvent::Assignment(location) => write!(f, "assign@{location}")?,
                 HistoryEvent::Call { proc, location } => write!(f, "call {proc}@{location}")?,
                 HistoryEvent::ReturnFromCall { proc, location } => {
@@ -221,7 +223,11 @@ impl ValueHistory {
     }
 
     pub fn formal_argument(pvar: Pvar) -> Self {
-        Self::from_event(HistoryEvent::FormalArgument(pvar))
+        Self::from_event(HistoryEvent::FormalArgument(pvar, None))
+    }
+
+    pub fn formal_argument_at(pvar: Pvar, location: Location) -> Self {
+        Self::from_event(HistoryEvent::FormalArgument(pvar, Some(location)))
     }
 
     pub fn assignment(location: Location) -> Self {
@@ -279,18 +285,29 @@ impl ValueHistory {
         &self,
         formal_histories: &std::collections::BTreeMap<Pvar, ValueHistory>,
     ) -> Self {
+        self.map_formals_with_callsite(formal_histories, None)
+    }
+
+    pub fn map_formals_with_callsite(
+        &self,
+        formal_histories: &std::collections::BTreeMap<Pvar, ValueHistory>,
+        callsite: Option<Location>,
+    ) -> Self {
         let mut translated = BTreeSet::new();
         for path in &self.0 {
             let mut partials = vec![HistoryPath::empty()];
             for event in &path.0 {
                 match event {
-                    HistoryEvent::FormalArgument(pvar) => {
+                    HistoryEvent::FormalArgument(pvar, _formal_loc) => {
                         if let Some(history) = formal_histories.get(pvar) {
                             let mut next = Vec::new();
                             for prefix in &partials {
                                 for suffix in &history.0 {
                                     let mut events = prefix.0.clone();
-                                    events.push(HistoryEvent::ActualArgument(pvar.clone()));
+                                    events.push(HistoryEvent::ActualArgument(
+                                        pvar.clone(),
+                                        callsite.clone(),
+                                    ));
                                     events.extend(suffix.0.clone());
                                     next.push(HistoryPath(events));
                                 }
@@ -370,7 +387,7 @@ impl ValueHistory {
             .events()
             .iter()
             .find_map(|event| match event {
-                HistoryEvent::ActualArgument(pvar) => Some(pvar),
+                HistoryEvent::ActualArgument(pvar, _) => Some(pvar),
                 _ => None,
             })
     }

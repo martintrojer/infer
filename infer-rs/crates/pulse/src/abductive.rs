@@ -301,7 +301,10 @@ impl AbductiveDomain {
             let addr = AbstractValue::mk_fresh();
             let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
             let var = Var::ProgramVar(Box::new(pvar.clone()));
-            let value = ValueWithHistory::new(addr, ValueHistory::formal_argument(pvar));
+            let value = ValueWithHistory::new(
+                addr,
+                ValueHistory::formal_argument_at(pvar, pdesc.loc.clone()),
+            );
             state
                 .post
                 .stack

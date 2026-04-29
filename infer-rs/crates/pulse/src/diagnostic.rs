@@ -450,8 +450,10 @@ fn history_events_to_bug_trace(
                 level += 1;
                 index += 1;
             }
-            crate::value_history::HistoryEvent::FormalArgument(pvar) => {
-                let loc = bug_trace_event_location(events, index, fallback);
+            crate::value_history::HistoryEvent::FormalArgument(pvar, location) => {
+                let loc = location
+                    .clone()
+                    .unwrap_or_else(|| bug_trace_event_location(events, index, fallback));
                 entries.push(make_bug_trace_entry(
                     level,
                     &loc,
@@ -459,8 +461,10 @@ fn history_events_to_bug_trace(
                 ));
                 index += 1;
             }
-            crate::value_history::HistoryEvent::ActualArgument(pvar) => {
-                let loc = bug_trace_event_location(events, index, fallback);
+            crate::value_history::HistoryEvent::ActualArgument(pvar, location) => {
+                let loc = location
+                    .clone()
+                    .unwrap_or_else(|| bug_trace_event_location(events, index, fallback));
                 entries.push(make_bug_trace_entry(
                     level,
                     &loc,
@@ -520,7 +524,7 @@ fn invalidation_history_to_bug_trace(
         return Vec::new();
     };
     let events = path.events();
-    if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(inner_pvar), ..] =
+    if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(inner_pvar, _), ..] =
         events
     {
         let inner_proc = match &inner_pvar.kind {
@@ -570,12 +574,11 @@ fn access_history_to_bug_trace(
             return Vec::new();
         };
         match first {
-            crate::value_history::HistoryEvent::ActualArgument(pvar) => {
+            crate::value_history::HistoryEvent::ActualArgument(pvar, location) => {
                 let mut entries = rec(rest, fallback, level);
-                let call_loc = rest
-                    .iter()
-                    .find_map(|event| event.location())
-                    .cloned()
+                let call_loc = location
+                    .clone()
+                    .or_else(|| rest.iter().find_map(|event| event.location()).cloned())
                     .unwrap_or_else(|| fallback.clone());
                 let proc_name = match &pvar.kind {
                     sil::pvar::PvarKind::Local { proc_name, .. }
@@ -768,8 +771,11 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::CFree,
             access_location: loc(40),
-            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(callee_pvar))
-                .append_event(HistoryEvent::FormalArgument(caller_pvar)),
+            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(
+                callee_pvar,
+                Some(loc(40)),
+            ))
+            .append_event(HistoryEvent::FormalArgument(caller_pvar, Some(loc(39)))),
             invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
         };
 
@@ -818,7 +824,10 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::CFree,
             access_location: loc(40),
-            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(callee_pvar)),
+            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(
+                callee_pvar,
+                Some(loc(40)),
+            )),
             invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
         };
 
@@ -835,12 +844,13 @@ mod tests {
         let outer = Procname::c_from_string("latent_use_after_free");
         let inner = Procname::c_from_string("conditional_free2");
         let inner_pvar = Pvar::mk(Mangled::from_string("x"), inner.clone());
-        let history = ValueHistory::from_event(HistoryEvent::FormalArgument(inner_pvar))
-            .append_event(HistoryEvent::Invalidated {
-                invalidation: Invalidation::CFree,
-                location: loc(12),
-            })
-            .wrap_call(&outer, &loc(25));
+        let history =
+            ValueHistory::from_event(HistoryEvent::FormalArgument(inner_pvar, Some(loc(10))))
+                .append_event(HistoryEvent::Invalidated {
+                    invalidation: Invalidation::CFree,
+                    location: loc(12),
+                })
+                .wrap_call(&outer, &loc(25));
         let trace = invalidation_history_to_bug_trace(&history, &loc(25), 2);
         let descriptions: Vec<_> = trace
             .iter()

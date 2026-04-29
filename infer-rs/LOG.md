@@ -61,6 +61,10 @@ changes, and move finished results to durable docs/tests/commits.
     report layer synthesizes the outer callee formal before the inner call, and
     modelled allocation call/return pairs such as `malloc` now collapse to one
     `allocated by call to ... (modelled)` access-side step
+  - `ValueHistory` now keeps optional source locations on formal/actual events,
+    so report-side bug traces can anchor current-procedure parameter entries and
+    synthetic call edges more precisely without changing the stable history
+    signature strings used elsewhere
   - caller-side UAF qualifiers are a little closer too: when the access
     history still identifies the outer callee call, the top-level report text
     now uses a `The call to ... may trigger ...` shape instead of the generic
