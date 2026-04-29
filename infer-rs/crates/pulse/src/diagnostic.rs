@@ -12,6 +12,7 @@ use std::fmt;
 use diagnostics::issue_type::IssueTypeId;
 use sil::location::Location;
 use sil::procname::Procname;
+use sil::pvar::Pvar;
 
 use crate::abstract_value::AbstractValue;
 use crate::invalidation::Invalidation;
@@ -285,9 +286,11 @@ impl Diagnostic {
             } => {
                 let mut trace = Vec::new();
                 if !invalidation_history.is_epoch() {
+                    let invalidation_start_loc =
+                        invalidation_trace_start_location(invalidation_history, access_location);
                     trace.push(make_bug_trace_entry(
                         1,
-                        access_location,
+                        &invalidation_start_loc,
                         "invalidation part of the trace starts here".to_string(),
                     ));
                     trace.extend(invalidation_history_to_bug_trace(
@@ -297,9 +300,11 @@ impl Diagnostic {
                     ));
                 }
                 if !access_history.is_epoch() {
+                    let access_start_loc =
+                        access_trace_start_location(access_history, access_location);
                     trace.push(make_bug_trace_entry(
                         1,
-                        access_location,
+                        &access_start_loc,
                         access_trace_start_description(self),
                     ));
                     let access_entries =
@@ -408,6 +413,53 @@ fn access_trace_start_description(diagnostic: &Diagnostic) -> String {
         }
         _ => "access part of the trace starts here".to_string(),
     }
+}
+
+fn invalidation_trace_start_location(history: &ValueHistory, fallback: &Location) -> Location {
+    let Some(path) = history.primary_path() else {
+        return fallback.clone();
+    };
+    path.events()
+        .iter()
+        .find_map(|event| match event {
+            crate::value_history::HistoryEvent::FormalArgument(_, Some(loc)) => Some(loc.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            path.events()
+                .iter()
+                .find_map(|event| event.location().cloned())
+        })
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn access_trace_start_location(history: &ValueHistory, fallback: &Location) -> Location {
+    let Some(path) = history.primary_path() else {
+        return fallback.clone();
+    };
+    let events = path.events();
+    let first_non_actual = events
+        .iter()
+        .position(|event| {
+            !matches!(
+                event,
+                crate::value_history::HistoryEvent::ActualArgument(_, _)
+            )
+        })
+        .unwrap_or(0);
+    let non_actual = &events[first_non_actual..];
+    non_actual
+        .iter()
+        .find_map(|event| match event {
+            crate::value_history::HistoryEvent::FormalArgument(_, Some(loc)) => Some(loc.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            non_actual
+                .iter()
+                .find_map(|event| event.location().cloned())
+        })
+        .unwrap_or_else(|| fallback.clone())
 }
 
 fn is_modeled_allocation_proc(proc: &Procname) -> bool {
@@ -524,16 +576,55 @@ fn invalidation_history_to_bug_trace(
         return Vec::new();
     };
     let events = path.events();
+    let inner_proc_of = |pvar: &Pvar| match &pvar.kind {
+        sil::pvar::PvarKind::Local { proc_name, .. }
+        | sil::pvar::PvarKind::Callee(proc_name)
+        | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name.clone()),
+        sil::pvar::PvarKind::Global { .. } => None,
+    };
+    if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(outer_pvar, outer_loc), crate::value_history::HistoryEvent::FormalArgument(inner_pvar, _), ..] =
+        events
+    {
+        let outer_proc = inner_proc_of(outer_pvar);
+        let inner_proc = inner_proc_of(inner_pvar);
+        if outer_proc
+            .as_ref()
+            .is_some_and(|outer_proc| outer_proc == proc)
+            && inner_proc
+                .as_ref()
+                .is_some_and(|inner_proc| inner_proc != proc)
+        {
+            let outer_loc = outer_loc.clone().unwrap_or_else(|| location.clone());
+            let mut entries = vec![make_bug_trace_entry(
+                base_level,
+                &outer_loc,
+                pvar_trace_description(outer_pvar),
+            )];
+            entries.push(make_bug_trace_entry(
+                base_level,
+                location,
+                format!("when calling `{}` here", inner_proc.as_ref().unwrap()),
+            ));
+            entries.extend(history_events_to_bug_trace(
+                &events[2..events.len()
+                    - usize::from(matches!(
+                        events.last(),
+                        Some(crate::value_history::HistoryEvent::ReturnFromCall { .. })
+                    ))],
+                fallback,
+                base_level + 1,
+            ));
+            return entries;
+        }
+    }
     if let [crate::value_history::HistoryEvent::Call { proc, location }, crate::value_history::HistoryEvent::FormalArgument(inner_pvar, _), ..] =
         events
     {
-        let inner_proc = match &inner_pvar.kind {
-            sil::pvar::PvarKind::Local { proc_name, .. }
-            | sil::pvar::PvarKind::Callee(proc_name)
-            | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name),
-            sil::pvar::PvarKind::Global { .. } => None,
-        };
-        if inner_proc.is_some_and(|inner_proc| inner_proc != proc) {
+        let inner_proc = inner_proc_of(inner_pvar);
+        if inner_proc
+            .as_ref()
+            .is_some_and(|inner_proc| inner_proc != proc)
+        {
             let outer_description = format!("parameter `{}` of {proc}", inner_pvar.name);
             let mut entries = vec![make_bug_trace_entry(
                 base_level,
@@ -543,7 +634,7 @@ fn invalidation_history_to_bug_trace(
             entries.push(make_bug_trace_entry(
                 base_level,
                 location,
-                format!("when calling `{}` here", inner_proc.unwrap()),
+                format!("when calling `{}` here", inner_proc.as_ref().unwrap()),
             ));
             entries.extend(history_events_to_bug_trace(
                 &events[1..events.len()

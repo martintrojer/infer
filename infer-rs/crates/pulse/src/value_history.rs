@@ -391,6 +391,16 @@ impl ValueHistory {
                 _ => None,
             })
     }
+
+    pub(crate) fn first_formal_argument(&self) -> Option<&Pvar> {
+        self.primary_path()?
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                HistoryEvent::FormalArgument(pvar, _) => Some(pvar),
+                _ => None,
+            })
+    }
 }
 
 impl fmt::Display for ValueHistory {

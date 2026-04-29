@@ -647,14 +647,16 @@ fn translate_diagnostic(
             let invalidation_history = invalidation_history.map_formals(formal_histories);
             let invalidation_history = match (callee_procname, callee_proc_start_location) {
                 (Some(proc_name), Some(start_loc)) => {
-                    let invalidation_history =
-                        if let Some(actual_pvar) = invalidation_history.first_actual_argument() {
-                            let outer_pvar = Pvar::mk(actual_pvar.name.clone(), proc_name.clone());
-                            ValueHistory::formal_argument_at(outer_pvar, start_loc.clone())
-                                .merge(&invalidation_history)
-                        } else {
-                            invalidation_history
-                        };
+                    let invalidation_history = if let Some(seed_pvar) = invalidation_history
+                        .first_actual_argument()
+                        .or_else(|| invalidation_history.first_formal_argument())
+                    {
+                        let outer_pvar = Pvar::mk(seed_pvar.name.clone(), proc_name.clone());
+                        ValueHistory::formal_argument_at(outer_pvar, start_loc.clone())
+                            .merge(&invalidation_history)
+                    } else {
+                        invalidation_history
+                    };
                     invalidation_history.wrap_call(proc_name, loc)
                 }
                 (Some(proc_name), None) => invalidation_history.wrap_call(proc_name, loc),
