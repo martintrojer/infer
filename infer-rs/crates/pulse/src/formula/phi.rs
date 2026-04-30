@@ -300,20 +300,18 @@ impl Phi {
         // - Equal(a,b) ∧ LessThan(a,b) → Unsat (a=b ∧ a<b impossible)
         // Cross-ref: OCaml PulseFormula checks these via interval refinement.
         match &resolved {
-            Atom::LessThan(a, b) => {
+            Atom::LessThan(a, b)
                 if self.atoms.contains(&Atom::LessThan(b.clone(), a.clone()))
                     || self.atoms.contains(&Atom::Equal(a.clone(), b.clone()))
-                    || self.atoms.contains(&Atom::Equal(b.clone(), a.clone()))
-                {
-                    return SatUnsat::Unsat;
-                }
+                    || self.atoms.contains(&Atom::Equal(b.clone(), a.clone())) =>
+            {
+                return SatUnsat::Unsat;
             }
-            Atom::Equal(a, b) => {
+            Atom::Equal(a, b)
                 if self.atoms.contains(&Atom::LessThan(a.clone(), b.clone()))
-                    || self.atoms.contains(&Atom::LessThan(b.clone(), a.clone()))
-                {
-                    return SatUnsat::Unsat;
-                }
+                    || self.atoms.contains(&Atom::LessThan(b.clone(), a.clone())) =>
+            {
+                return SatUnsat::Unsat;
             }
             _ => {}
         }

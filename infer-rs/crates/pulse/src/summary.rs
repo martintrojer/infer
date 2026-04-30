@@ -2990,8 +2990,7 @@ fn pre_post_has_post_written_byref_invalid_access(
 
         let pre_reachable =
             collect_deref_only_reachable(&pre_post.pre.heap, repr_of, seeds.iter().copied());
-        let post_reachable =
-            collect_deref_only_reachable(&pre_post.post.post.heap, repr_of, seeds.into_iter());
+        let post_reachable = collect_deref_only_reachable(&pre_post.post.post.heap, repr_of, seeds);
         if post_reachable.contains(&diag_addr) && !pre_reachable.contains(&diag_addr) {
             return true;
         }
