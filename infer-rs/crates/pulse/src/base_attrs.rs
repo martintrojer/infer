@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use sil::location::Location;
 
@@ -18,9 +19,14 @@ use crate::invalidation::Invalidation;
 use crate::value_history::ValueHistory;
 
 /// Maps abstract addresses to their attribute sets.
+///
+/// Each per-address `Attributes` set is wrapped in `Arc` so cloning the
+/// surrounding abductive state shares the structure between disjuncts and
+/// retained invariant snapshots without deep-copying it. Mutating helpers go
+/// through `Arc::make_mut` (path-copying) so the public API is unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseAddressAttributes {
-    map: BTreeMap<AbstractValue, Attributes>,
+    map: BTreeMap<AbstractValue, Arc<Attributes>>,
 }
 
 impl BaseAddressAttributes {
@@ -28,19 +34,24 @@ impl BaseAddressAttributes {
         Self::default()
     }
 
+    fn entry_mut(&mut self, addr: AbstractValue) -> &mut Attributes {
+        let arc = self.map.entry(addr).or_default();
+        Arc::make_mut(arc)
+    }
+
     /// Add a single attribute to an address.
     pub fn add_one(&mut self, addr: AbstractValue, attr: Attribute) {
-        self.map.entry(addr).or_default().add(attr);
+        self.entry_mut(addr).add(attr);
     }
 
     /// Get all attributes for an address.
     pub fn get(&self, addr: &AbstractValue) -> Option<&Attributes> {
-        self.map.get(addr)
+        self.map.get(addr).map(Arc::as_ref)
     }
 
     /// Get mutable access to the attributes for an address.
     pub fn get_mut(&mut self, addr: &AbstractValue) -> Option<&mut Attributes> {
-        self.map.get_mut(addr)
+        self.map.get_mut(addr).map(Arc::make_mut)
     }
 
     /// Check if an address is valid (not invalid).
@@ -66,7 +77,7 @@ impl BaseAddressAttributes {
         if self
             .map
             .get(&addr)
-            .is_some_and(Attributes::is_uninitialized)
+            .is_some_and(|attrs| attrs.is_uninitialized())
         {
             return Err(InitializationError::Uninitialized);
         }
@@ -92,10 +103,7 @@ impl BaseAddressAttributes {
         inv: Invalidation,
         history: ValueHistory,
     ) {
-        self.map
-            .entry(addr)
-            .or_default()
-            .replace_invalid(inv, history);
+        self.entry_mut(addr).replace_invalid(inv, history);
     }
 
     /// Mark an address as allocated.
@@ -134,13 +142,13 @@ impl BaseAddressAttributes {
     /// Used during unknown call havoc to prevent false leak reports.
     pub fn remove_allocated(&mut self, addr: AbstractValue) {
         if let Some(attrs) = self.map.get_mut(&addr) {
-            attrs.remove_allocated();
+            Arc::make_mut(attrs).remove_allocated();
         }
     }
 
     /// Iterate over all addresses and their attributes.
     pub fn iter(&self) -> impl Iterator<Item = (&AbstractValue, &Attributes)> {
-        self.map.iter()
+        self.map.iter().map(|(addr, attrs)| (addr, attrs.as_ref()))
     }
 
     /// Remove all attributes for an address.
@@ -156,22 +164,24 @@ impl BaseAddressAttributes {
 
     pub fn retain_for_pre_summary(&mut self) {
         self.map.retain(|_addr, attrs| {
-            attrs.retain_for_pre_summary();
-            !attrs.is_empty()
+            let mutable = Arc::make_mut(attrs);
+            mutable.retain_for_pre_summary();
+            !mutable.is_empty()
         });
     }
 
     pub fn retain_for_post_summary(&mut self) {
         self.map.retain(|_addr, attrs| {
-            attrs.retain_for_post_summary();
-            !attrs.is_empty()
+            let mutable = Arc::make_mut(attrs);
+            mutable.retain_for_post_summary();
+            !mutable.is_empty()
         });
     }
 
     /// Substitute abstract values.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
         if let Some(attrs) = self.map.remove(&old) {
-            let entry = self.map.entry(new).or_default();
+            let entry = self.entry_mut(new);
             for attr in attrs.iter() {
                 entry.add(attr.clone());
             }
