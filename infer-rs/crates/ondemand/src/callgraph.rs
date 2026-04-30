@@ -15,6 +15,7 @@ use sil::const_val::Const;
 use sil::exp::Exp;
 use sil::instr::Instr;
 use sil::procname::Procname;
+use sil::pvar::Pvar;
 
 /// A call graph: maps each procedure to the set of procedures it calls.
 #[derive(Debug)]
@@ -25,12 +26,27 @@ pub struct CallGraph {
     pub all_procs: HashSet<Procname>,
 }
 
+fn root_global_pvar(exp: &Exp) -> Option<&Pvar> {
+    match exp {
+        Exp::Lvar(pvar) if pvar.is_global() => Some(pvar),
+        Exp::Lfield(data, _, _) => root_global_pvar(&data.exp),
+        Exp::Lindex(base, _) | Exp::Cast(_, base) => root_global_pvar(base),
+        _ => None,
+    }
+}
+
 impl CallGraph {
     /// Build a call graph from a Cfg by scanning all Cfun references.
     ///
     /// Scans not just Call.fun_exp but ALL Cfun constants in every instruction
     /// (Store values, Call args, etc.). This captures function pointer targets
     /// from `__sil_cfun("name")` which appear as Const(Cfun) in stores/args.
+    ///
+    /// Also adds a best-effort pseudo-edge from loads rooted at globals to the
+    /// matching `__infer_globals_initializer_<name>` proc so bottom-up
+    /// scheduling / `--procedures-filter ... --include-transitive-callees`
+    /// can retain the same implicit initializer dependency that Pulse inlines
+    /// at analysis time.
     pub fn from_cfg(cfg: &Cfg) -> Self {
         let mut edges: HashMap<Procname, HashSet<Procname>> = HashMap::new();
         let mut all_procs: HashSet<Procname> = HashSet::new();
@@ -262,6 +278,10 @@ fn collect_cfun_from_instr(
         }
         Instr::Load { e, .. } => {
             collect_cfun_from_exp(e, callees, all_procs);
+            if let Some(init_pname) = root_global_pvar(e).and_then(Pvar::initializer_procname) {
+                callees.insert(init_pname.clone());
+                all_procs.insert(init_pname);
+            }
         }
         Instr::Prune { exp, .. } => {
             collect_cfun_from_exp(exp, callees, all_procs);
@@ -365,12 +385,47 @@ mod tests {
     use super::*;
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
-    use sil::exp::Exp;
+    use sil::exp::{Exp, LfieldObjData};
+    use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
     use sil::instr::Instr;
     use sil::location::Location;
+    use sil::mangled::Mangled;
     use sil::procdesc::{NodeKind, Procdesc, StmtNodeKind};
-    use sil::typ::Typ;
+    use sil::qualified_cpp_name::QualifiedCppName;
+    use sil::typ::{Typ, TypeName};
+
+    fn mk_proc_with_global_load(name: &str, global: &str) -> Procdesc {
+        let pname = Procname::c_from_string(name);
+        let mut pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        let global_pvar = sil::pvar::Pvar::mk_global(Mangled::from_string(global));
+        let field = Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_parts(vec!["Global".to_string()])),
+            "field",
+        );
+        let instrs = vec![Instr::Load {
+            id: Ident::create_normal(IdentName::from_string("n"), 0),
+            e: Exp::Lfield(
+                LfieldObjData {
+                    exp: Box::new(Exp::Lvar(global_pvar)),
+                    is_implicit: false,
+                },
+                field,
+                Typ::int(sil::typ::IKind::IInt),
+            ),
+            typ: Typ::int(sil::typ::IKind::IInt),
+            loc: Location::dummy(),
+        }];
+
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            instrs,
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
 
     fn mk_proc_with_calls(name: &str, callees: &[&str]) -> Procdesc {
         let pname = Procname::c_from_string(name);
@@ -436,6 +491,41 @@ mod tests {
         assert_eq!(waves[1][0], Procname::c_from_string("foo"));
         assert_eq!(waves[2].len(), 1);
         assert_eq!(waves[2][0], Procname::c_from_string("main"));
+    }
+
+    #[test]
+    fn test_callgraph_adds_implicit_global_initializer_edge_for_rooted_load() {
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(mk_proc_with_global_load("uses_global", "g"));
+
+        let cg = CallGraph::from_cfg(&cfg);
+        let callees: Vec<_> = cg
+            .callees(&Procname::c_from_string("uses_global"))
+            .cloned()
+            .collect();
+
+        assert!(
+            callees.contains(&Procname::c_from_string("__infer_globals_initializer_g")),
+            "implicit global initializer edge should be present: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn test_bottom_up_schedule_keeps_global_initializer_before_user_proc() {
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(mk_proc_with_global_load("uses_global", "g"));
+        cfg.add_proc_desc(mk_proc_with_calls("__infer_globals_initializer_g", &[]));
+
+        let cg = CallGraph::from_cfg(&cfg);
+        let defined: HashSet<_> = cfg.proc_descs.keys().cloned().collect();
+        let waves = cg.bottom_up_schedule(&defined);
+
+        assert_eq!(waves.len(), 2);
+        assert_eq!(
+            waves[0],
+            vec![Procname::c_from_string("__infer_globals_initializer_g")]
+        );
+        assert_eq!(waves[1], vec![Procname::c_from_string("uses_global")]);
     }
 
     #[test]

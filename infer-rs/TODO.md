@@ -179,6 +179,25 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   `1222` retained states in `4m58s`, with `204` CFG nodes,
   `max_visit_count=4`, `max_node_disjuncts=8`, and top retained nodes
   `29,31,32,33,35,36,37,38`.
+- Keep the new subtree finding in mind while narrowing further: the retained
+  `31/35` tier growth is currently concentrated in the global `Cx` table
+  subtree (about `+129` subtree nodes / array edges / initialized attrs per
+  larger tier), while the local `K` / `S` / `H` loop-state subgraphs stay
+  flat.
+- The current `--procedures-filter whirlpool_block` hotspot run no longer
+  omits `__infer_globals_initializer_Cx`: callgraph/filtering and
+  pre-analysis summary collection now retain rooted global initializer deps.
+  Keep two interpretations separate going forward:
+  (1) the older no-initializer slice is still useful for the pure loop-head
+  convergence bug, and
+  (2) the newer retained-initializer slice is the better proxy for real
+  whole-program `Cx` cost.
+- Track the new retained-initializer cost surface explicitly: on the fresh
+  release repro, `__infer_globals_initializer_Cx` alone takes about `5m22s`
+  and reaches ~`16k` live heap nodes before `whirlpool_block` even starts,
+  and the first minute of `whirlpool_block` with that summary available jumps
+  to about `33k` live heap nodes / `67k` edges per active state and
+  multi-million retained totals.
 - Rust now executes exported `Metadata::ExitScope` semantically instead of as
   a no-op, with focused regressions for dead temp removal and preserved
   pre-rooted formals. Keep that correctness fix even though the full final
@@ -200,6 +219,13 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   `752-755` block using location/instruction mapping rather than spending more
   time on Rust-vs-Rust raw dump hashes or assuming raw node-id parity across
   frontends.
+- Keep the current root-cause split explicit while doing that work: the
+  remaining `whirlpool_block` hotspot is primarily a convergence / OCaml-parity
+  problem, while clone pressure is a secondary RSS amplifier. The latest
+  selected-node alpha signatures still show `35:POST == 31:PRE` and `4`
+  monotonic growth tiers per variant, so the next narrowing should explain why
+  those tiers survive semantically before treating structural sharing as the
+  main fix.
 - Do not spend time on `Nullify` / `Abstract` metadata here unless new
   evidence appears: OCaml Pulse keeps them as no-op too.
 - Keep the current OCaml comparison in view while doing that dump: the
@@ -221,7 +247,9 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   current failures are external kills or some other runtime termination path.
 - Do not treat clone-reduction as the primary `whirlpool_block` fix. The
   current selected-node alpha signatures show the remaining `8` hot disjuncts
-  are semantically distinct, not duplicate retained copies.
+  are semantically distinct, not duplicate retained copies, and the biggest
+  hotspot wins so far came from OCaml-parity fixes rather than representation
+  changes.
 - If we pursue clone-reduction for OpenSSL memory / RSS, use component-level
   structural sharing rather than a borrow-heavy refactor. Prototype plan:
   `docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`.

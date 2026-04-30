@@ -10,8 +10,9 @@ changes, and move finished results to durable docs/tests/commits.
   the latent publication gate is green again (`make check` passes, the real
   exported `latent.c` issue surface is exact at
   `(procedure, line, issue-type)`, and the reduced real-fixture summary-shape
-  mismatch set is green again too), so the next active parity work is richer
-  latent trace/publication detail plus the OpenSSL retained-state probe.
+  mismatch set is green again too); the caller-reified real-`latent.c`
+  `USE_AFTER_FREE` subset is now locked by an ignored end-to-end regression, so
+  the next active parity work has shifted to the OpenSSL retained-state probe.
 - Fresh checkpoint on the `latent.c` summary drift:
   - the remaining false `LatentInvalidAccess` summaries for
     `FN_nonlatent_use_after_free_bad{,2}` are gone again on the real exported
@@ -132,6 +133,65 @@ changes, and move finished results to durable docs/tests/commits.
     `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil"`
   - focused selected-node alpha-signature repro:
     `RUST_LOG='pulse::checker::fixpoint=debug,ondemand=info,ondemand::runner=info' target/release/infer-rs --pulse-only --debug-level-analysis 1 --trace-ondemand --debug-fixpoint-nodes 31,35 -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil" >/tmp/wpblock-alpha-signatures.log 2>&1`
+- Fresh OpenSSL retained-state repro checkpoint:
+  - fresh corpus dir: `/tmp/wpblock-export.I3D6ov`
+  - focused alpha-signature log: `/tmp/wpblock-alpha-signatures.log`
+  - completed `whirlpool_block` focused run: `4m53s`, `1222` retained states,
+    `max_node_disjuncts=8`, top retained nodes
+    `29,31,32,33,35,36,37,38 -> 8d:4v`
+  - on this fresh export, `#node_31` / `#node_35` in `textual-out-wp/wp_block.sil`
+    currently map to source locations `[598:13]` / `[602:13]`; keep that in
+    mind when comparing against older notes that referred to the `540` /
+    `752-755` source block
+  - the selected-node alpha signatures now show the same shape as the older
+    narrowed probe but with a fresh end-to-end repro: `35:POST` matches
+    `31:PRE` exactly, and the surviving `8` states still form `4` monotonic
+    growth tiers x `2` variants; the tier growth is in retained heap / attrs /
+    formula volume rather than in alpha-equivalent duplicates
+  - current working interpretation: the remaining `whirlpool_block` blocker is
+    primarily an OCaml-parity / loop-convergence gap, while Rust clone /
+    storage cost is a secondary RSS amplifier; structural sharing is still
+    worth pursuing for merged-run memory, but it is not expected to erase the
+    `8d:4v` hotspot by itself
+  - the raw `--debug-level-analysis 2` selected-node dump on the fresh export
+    finished and confirmed a concrete per-tier growth pattern inside
+    `node=31` retained PRE states: across the three larger tiers, each step
+    adds about `+129` `Initialized` attrs, `+128..129` `ArrayAccess` edges,
+    `+129` `Cx`-subtree nodes, and about `+896` formula items, while
+    `MustBeValid` / `WrittenTo` counts stay flat. The extra retained state is
+    concentrated in the global `Cx` table subtree rather than in the local
+    `K` / `S` / `H` loop-state subgraphs.
+  - a focused canonicalized dump regression now exists as an ignored unit test
+    (`checker::tests::test_debug_wpblock_retained_canonical_states`) so the
+    narrowed `31/35` retained-state shape can be reproduced without scraping a
+    giant logger dump by hand
+  - probing the global initializer directly is also informative now:
+    running `__infer_globals_initializer_Cx` by itself on the fresh export is a
+    single-disjunct but very large path (~`16k` live heap nodes after ~`5m22s`
+    in the current release probe), so the full-program OpenSSL story likely
+    has both (a) the `whirlpool_block` retained loop-head convergence gap and
+    (b) a very expensive global-table initializer surface for `Cx`
+  - the callgraph / procedures-filter / pre-analysis summary path has now been
+    tightened too: loads rooted in globals add an implicit dependency on the
+    matching `__infer_globals_initializer_<name>` proc, so
+    `--procedures-filter whirlpool_block` now retains `3` procs on the fresh
+    export (`whirlpool_block`, `memcpy`, `__infer_globals_initializer_Cx`)
+  - the fresh release repro with that dependency in place is much harsher than
+    the old loop-head-only slice: the run spends ~`5m22s` in
+    `__infer_globals_initializer_Cx` first, and then the first minute of
+    `whirlpool_block` starts with per-state post heaps already around `33k`
+    live nodes / `67k` edges and live-fixpoint retained totals in the
+    multi-million range
+  - the older no-initializer filtered `whirlpool_block` probe is still useful
+    as a narrow slice for the pure loop-head convergence bug, but it now
+    clearly under-approximates the full-program `Cx` cost
+  - the full raw dump is still unwieldy (`/tmp/wpblock-node-dump.log` reached
+    ~`19.9M` lines), so a new lighter debugging aid is now in the working tree:
+    selected fixpoint-node dumps can emit canonicalized state lines at
+    `--debug-level-analysis 2`, reserving the old raw `{:#?}` dump for level
+    `3`
+  - a fresh narrower canonical-dump rerun on the same export is now in flight
+    and is writing to `/tmp/wpblock-canonical2.log`
 - Current validated working-tree checkpoint:
   - `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --ignored --nocapture`
   - `cargo test -p pulse test_coalesce_zero_direct_formals_for_export -- --nocapture`

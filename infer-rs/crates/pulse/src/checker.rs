@@ -281,6 +281,30 @@ fn disjunctive_alpha_summary(domain: &DisjunctiveDomain<ExecutionDomain>) -> Str
         .join(" | ")
 }
 
+fn log_disjunctive_canonical_dump(
+    proc_name: &str,
+    node_id: NodeId,
+    label: &str,
+    domain: &DisjunctiveDomain<ExecutionDomain>,
+) {
+    if domain.disjuncts.is_empty() {
+        log::debug!(
+            target: FIXPOINT_LOG_TARGET,
+            "[pulse-fixpoint] proc={proc_name} node={node_id} {label} canonical = none"
+        );
+        return;
+    }
+
+    for (index, disjunct) in domain.disjuncts.iter().enumerate() {
+        log::debug!(
+            target: FIXPOINT_LOG_TARGET,
+            "[pulse-fixpoint] proc={proc_name} node={node_id} {label} canonical #{index}:{}\n{}",
+            exec_domain_kind(disjunct),
+            crate::state_cmp::debug_canonical_dump(disjunct.get_astate())
+        );
+    }
+}
+
 fn dump_selected_fixpoint_nodes(
     proc_name: &str,
     pdesc: &Procdesc,
@@ -316,16 +340,25 @@ fn dump_selected_fixpoint_nodes(
                     disjunctive_alpha_summary(&state.post)
                 );
                 if verbose {
-                    log::debug!(
-                        target: FIXPOINT_LOG_TARGET,
-                        "[pulse-fixpoint] proc={proc_name} node={node_id} retained PRE = {:#?}",
-                        state.pre
+                    log_disjunctive_canonical_dump(proc_name, node_id, "retained PRE", &state.pre);
+                    log_disjunctive_canonical_dump(
+                        proc_name,
+                        node_id,
+                        "retained POST",
+                        &state.post,
                     );
-                    log::debug!(
-                        target: FIXPOINT_LOG_TARGET,
-                        "[pulse-fixpoint] proc={proc_name} node={node_id} retained POST = {:#?}",
-                        state.post
-                    );
+                    if config::get().debug_level_analysis >= 3 {
+                        log::debug!(
+                            target: FIXPOINT_LOG_TARGET,
+                            "[pulse-fixpoint] proc={proc_name} node={node_id} retained PRE = {:#?}",
+                            state.pre
+                        );
+                        log::debug!(
+                            target: FIXPOINT_LOG_TARGET,
+                            "[pulse-fixpoint] proc={proc_name} node={node_id} retained POST = {:#?}",
+                            state.post
+                        );
+                    }
                 }
             }
             (Some(node), None) => {
@@ -1112,17 +1145,12 @@ fn maybe_inline_global_initializer_load(
     state: AbductiveDomain,
     callee_summaries: &dyn SummaryLookup,
 ) -> Option<Vec<ExecutionDomain>> {
-    let Instr::Load {
-        e: Exp::Lvar(pvar),
-        typ,
-        loc,
-        ..
-    } = instr
-    else {
+    let Instr::Load { e, loc, .. } = instr else {
         return None;
     };
 
-    if !should_inline_global_initializer(pvar, typ, &state) {
+    let pvar = root_global_pvar(e)?;
+    if !should_inline_global_initializer(pvar, &state) {
         return None;
     }
 
@@ -1261,12 +1289,17 @@ fn values_are_equal_in_state(
         )
 }
 
-fn should_inline_global_initializer(
-    pvar: &sil::pvar::Pvar,
-    typ: &sil::typ::Typ,
-    state: &AbductiveDomain,
-) -> bool {
-    if !pvar.is_global() || !is_pointer_to_function(typ) {
+fn root_global_pvar(exp: &Exp) -> Option<&sil::pvar::Pvar> {
+    match exp {
+        Exp::Lvar(pvar) if pvar.is_global() => Some(pvar),
+        Exp::Lfield(data, _, _) => root_global_pvar(&data.exp),
+        Exp::Lindex(base, _) | Exp::Cast(_, base) => root_global_pvar(base),
+        _ => None,
+    }
+}
+
+fn should_inline_global_initializer(pvar: &sil::pvar::Pvar, state: &AbductiveDomain) -> bool {
+    if !pvar.is_global() {
         return false;
     }
 
@@ -1274,18 +1307,7 @@ fn should_inline_global_initializer(
     let Some(addr) = state.post.stack.find(&var) else {
         return true;
     };
-    state
-        .post
-        .heap
-        .find_edge(addr, &crate::access::Access::Dereference)
-        .is_none()
-}
-
-fn is_pointer_to_function(typ: &sil::typ::Typ) -> bool {
-    matches!(
-        &*typ.desc,
-        sil::typ::TypeDesc::Tptr(inner, _) if matches!(&*inner.desc, sil::typ::TypeDesc::Tfun(_))
-    )
+    state.post.heap.get_edges(addr).is_none()
 }
 
 /// Propagate needs_specialization from callee to caller.
@@ -4355,6 +4377,193 @@ mod tests {
             !summary.diagnostics.is_empty(),
             "should find null deref diagnostics"
         );
+    }
+
+    #[test]
+    #[ignore = "debug parity probe against local /tmp wp_block.sil fixture"]
+    fn test_debug_wpblock_retained_canonical_states() {
+        let sil = std::path::Path::new(
+            "/tmp/wpblock-export.I3D6ov/openssl-1.0.2d/textual-out-wp/wp_block.sil",
+        );
+        if !sil.exists() {
+            eprintln!("skip");
+            return;
+        }
+
+        let mut tm = textual_utils::parse_file_and_convert(sil);
+        retain_named_procs(&mut tm, &["whirlpool_block", "memcpy"]);
+
+        let pdesc = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "whirlpool_block")
+            .expect("whirlpool_block procdesc should exist")
+            .clone();
+
+        let mut callee_summaries = HashMap::new();
+        for callee in tm.cfg.iter_proc_descs() {
+            if callee.proc_name == pdesc.proc_name {
+                continue;
+            }
+            callee_summaries.insert(callee.proc_name.clone(), analyze(callee));
+        }
+
+        let cfg = config::get();
+        let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
+        let initial_domain = DisjunctiveDomain::singleton(
+            initial_exec,
+            cfg.pulse_max_disjuncts,
+            cfg.pulse_widen_threshold,
+        );
+        let pulse_tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            proc_name: format!("{}", pdesc.proc_name),
+            spec_requests: RefCell::new(Vec::new()),
+            progress: RefCell::new(ProcProgress::new()),
+        };
+        let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
+
+        for node_id in [31, 35] {
+            let state = inv_map
+                .get(&node_id)
+                .unwrap_or_else(|| panic!("missing retained state for node {node_id}"));
+            eprintln!(
+                "NODE {node_id} PRE alpha {}",
+                disjunctive_alpha_summary(&state.pre)
+            );
+            for (index, disjunct) in state.pre.disjuncts.iter().enumerate() {
+                eprintln!(
+                    "NODE {node_id} PRE disjunct {index} canonical\n{}",
+                    crate::state_cmp::debug_canonical_dump(disjunct.get_astate())
+                );
+            }
+            eprintln!(
+                "NODE {node_id} POST alpha {}",
+                disjunctive_alpha_summary(&state.post)
+            );
+            for (index, disjunct) in state.post.disjuncts.iter().enumerate() {
+                eprintln!(
+                    "NODE {node_id} POST disjunct {index} canonical\n{}",
+                    crate::state_cmp::debug_canonical_dump(disjunct.get_astate())
+                );
+            }
+        }
+    }
+
+    fn post_subtree_stats_for_var_name(
+        state: &crate::abductive::AbductiveDomain,
+        name: &str,
+    ) -> Option<(usize, usize, usize)> {
+        let root = state
+            .post
+            .stack
+            .iter_with_history()
+            .find_map(|(var, value)| match var {
+                Var::ProgramVar(pvar) if pvar.name.plain == name => Some(value.addr),
+                _ => None,
+            })?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut worklist = vec![root];
+        let mut edges = 0usize;
+        while let Some(addr) = worklist.pop() {
+            if !seen.insert(addr) {
+                continue;
+            }
+            if let Some(out_edges) = state.post.heap.get_edges(addr) {
+                for (_access, target) in out_edges.iter() {
+                    edges += 1;
+                    worklist.push(*target);
+                }
+            }
+        }
+
+        let attrs = state
+            .post
+            .attrs
+            .iter()
+            .filter(|(addr, _attrs)| seen.contains(addr))
+            .map(|(_addr, attrs)| attrs.iter().count())
+            .sum();
+        Some((seen.len(), edges, attrs))
+    }
+
+    #[test]
+    #[ignore = "debug parity probe against local /tmp wp_block.sil fixture"]
+    fn test_debug_wpblock_with_initializer_summary() {
+        let sil = std::path::Path::new(
+            "/tmp/wpblock-export.I3D6ov/openssl-1.0.2d/textual-out-wp/wp_block.sil",
+        );
+        if !sil.exists() {
+            eprintln!("skip");
+            return;
+        }
+
+        let mut tm = textual_utils::parse_file_and_convert(sil);
+        retain_named_procs(
+            &mut tm,
+            &[
+                "whirlpool_block",
+                "memcpy",
+                "__infer_globals_initializer_Cx",
+            ],
+        );
+
+        let pdesc = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "whirlpool_block")
+            .expect("whirlpool_block procdesc should exist")
+            .clone();
+        let init = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "__infer_globals_initializer_Cx")
+            .expect("initializer procdesc should exist")
+            .clone();
+        let memcpy = tm
+            .cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name) == "memcpy")
+            .expect("memcpy procdesc should exist")
+            .clone();
+
+        let mut callee_summaries = HashMap::new();
+        callee_summaries.insert(init.proc_name.clone(), analyze(&init));
+        callee_summaries.insert(memcpy.proc_name.clone(), analyze(&memcpy));
+
+        let cfg = config::get();
+        let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
+        let initial_domain = DisjunctiveDomain::singleton(
+            initial_exec,
+            cfg.pulse_max_disjuncts,
+            cfg.pulse_widen_threshold,
+        );
+        let pulse_tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            proc_name: format!("{}", pdesc.proc_name),
+            spec_requests: RefCell::new(Vec::new()),
+            progress: RefCell::new(ProcProgress::new()),
+        };
+        let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
+        let state = inv_map
+            .get(&31)
+            .expect("missing retained state for node 31");
+        eprintln!(
+            "NODE 31 PRE alpha {}",
+            disjunctive_alpha_summary(&state.pre)
+        );
+        for (index, disjunct) in state.pre.disjuncts.iter().enumerate() {
+            if let Some((nodes, edges, attrs)) =
+                post_subtree_stats_for_var_name(disjunct.get_astate(), "Cx")
+            {
+                eprintln!("NODE 31 PRE disjunct {index} Cx subtree nodes={nodes} edges={edges} attrs={attrs}");
+            }
+        }
     }
 
     #[test]

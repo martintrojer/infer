@@ -22,9 +22,19 @@ for the remaining `whirlpool_block` convergence gap.
   disjuncts are semantically distinct (`4` growth tiers x `2` variants), so
   clone reduction is not expected to collapse the current `8d` node shape by
   itself.
+- The biggest hotspot reductions so far came from OCaml-parity fixes
+  (`equal_fast` split and WTO revisit `exec_node(...)` parity), not from a
+  representation change. Treat structural sharing as a physical-RSS fix for
+  the bytes occupied by retained states, not as a substitute for the remaining
+  `whirlpool_block` convergence work.
 - Whole-program merged direct-`.sil` runs still show memory growth /
   abnormal termination, so reducing physical duplication is still a realistic
   systems-level lever.
+- The newer filtered OpenSSL repro now retains and analyzes the implicit
+  `__infer_globals_initializer_Cx` dependency too, and that initializer alone
+  materializes a very large single-disjunct heap. That makes structural
+  sharing even more relevant for the bytes occupied by per-state global-table
+  subgraphs once the semantic dependency is modeled correctly.
 
 ## Non-Goals
 

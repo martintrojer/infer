@@ -120,6 +120,28 @@ OpenSSL benchmark status on this host:
   remaining local Pulse cost, abnormal termination in merged runs, and
   exported-Textual proc-identity loss for some duplicate C names, not
   merge/callgraph setup
+- current working interpretation of that memory gap: the primary hotspot
+  driver still looks like a residual OCaml-parity / convergence gap, not just
+  Rust copy overhead. The biggest `whirlpool_block` reductions so far came
+  from parity fixes (`equal_fast` split and WTO revisit `exec_node(...)`
+  parity), and the latest selected-node alpha signatures still form
+  `4` growth tiers x `2` variants with exact `35:POST == 31:PRE`, which points
+  at loop-cycle state growth rather than missed alpha-dedup.
+- clone / storage cost is still a real secondary amplifier: Pulse states are
+  still deeply owned, merged whole-program runs still hit tens of GB RSS, and
+  the structural-sharing track is meant to reduce that physical duplication
+  without pretending to solve the remaining semantic `whirlpool_block` split
+  by itself
+- the narrowed probe is now more faithful too: callgraph / filtering /
+  summary-collection now retain implicit global initializer deps for loads
+  rooted in globals. On the fresh filtered `whirlpool_block` repro this keeps
+  `__infer_globals_initializer_Cx` in the retained set and runs it before the
+  hotspot. That initializer alone is already large (~`16k` live heap nodes
+  after ~`5m22s` in the current release probe), and once `whirlpool_block`
+  starts with that summary available its per-state post heap jumps to about
+  `33k` live nodes / `67k` edges almost immediately. So the old filtered
+  `whirlpool_block` run remains useful for the pure loop-head convergence gap,
+  but it under-approximated the full-program `Cx` cost.
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an

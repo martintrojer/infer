@@ -1353,29 +1353,26 @@ fn collect_cfun_summaries(
     }
 }
 
+fn root_global_pvar(exp: &sil::exp::Exp) -> Option<&sil::pvar::Pvar> {
+    match exp {
+        sil::exp::Exp::Lvar(pvar) if pvar.is_global() => Some(pvar),
+        sil::exp::Exp::Lfield(data, _, _) => root_global_pvar(&data.exp),
+        sil::exp::Exp::Lindex(base, _) | sil::exp::Exp::Cast(_, base) => root_global_pvar(base),
+        _ => None,
+    }
+}
+
 fn collect_global_initializer_refs(
     instr: &sil::instr::Instr,
     out: &mut std::collections::HashSet<sil::procname::Procname>,
 ) {
-    if let sil::instr::Instr::Load {
-        e: sil::exp::Exp::Lvar(pvar),
-        typ,
-        ..
-    } = instr
-    {
-        if pvar.is_global() && is_pointer_to_function_typ(typ) {
-            if let Some(init_pname) = pvar.initializer_procname() {
-                out.insert(init_pname);
-            }
+    if let sil::instr::Instr::Load { e, .. } = instr {
+        if let Some(init_pname) =
+            root_global_pvar(e).and_then(sil::pvar::Pvar::initializer_procname)
+        {
+            out.insert(init_pname);
         }
     }
-}
-
-fn is_pointer_to_function_typ(typ: &sil::typ::Typ) -> bool {
-    matches!(
-        &*typ.desc,
-        sil::typ::TypeDesc::Tptr(inner, _) if matches!(&*inner.desc, sil::typ::TypeDesc::Tfun(_))
-    )
 }
 
 fn collect_summary_closure_summaries(
@@ -1509,12 +1506,15 @@ mod tests {
     use super::*;
     use sil::call_flags::CallFlags;
     use sil::const_val::Const;
-    use sil::exp::Exp;
+    use sil::exp::{Exp, LfieldObjData};
+    use sil::fieldname::Fieldname;
     use sil::ident::{Ident, IdentName};
     use sil::instr::Instr;
     use sil::location::Location;
+    use sil::mangled::Mangled;
     use sil::procdesc::{NodeKind, StmtNodeKind};
-    use sil::typ::Typ;
+    use sil::qualified_cpp_name::QualifiedCppName;
+    use sil::typ::{Typ, TypeName};
 
     fn test_loc(source_file: &str) -> Location {
         Location {
@@ -1559,6 +1559,41 @@ mod tests {
                 args: vec![],
                 loc: loc.clone(),
                 flags: CallFlags::default(),
+            }],
+            loc,
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+        pdesc
+    }
+
+    fn mk_global_load_proc_in_file(
+        name: &str,
+        global: &str,
+        source_file: &str,
+    ) -> sil::procdesc::Procdesc {
+        let loc = test_loc(source_file);
+        let mut pdesc =
+            sil::procdesc::Procdesc::new(Procname::c_from_string(name), Typ::void(), loc.clone());
+        let global_pvar = sil::pvar::Pvar::mk_global(Mangled::from_string(global));
+        let field = Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_parts(vec!["Global".to_string()])),
+            "field",
+        );
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Load {
+                id: Ident::create_normal(IdentName::from_string("n"), 0),
+                e: Exp::Lfield(
+                    LfieldObjData {
+                        exp: Box::new(Exp::Lvar(global_pvar)),
+                        is_implicit: false,
+                    },
+                    field,
+                    Typ::int(sil::typ::IKind::IInt),
+                ),
+                typ: Typ::int(sil::typ::IKind::IInt),
+                loc: loc.clone(),
             }],
             loc,
         );
@@ -1835,6 +1870,52 @@ plain_local
         assert!(selection
             .cfg
             .get_proc_desc(&Procname::c_from_string("callee"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_collect_global_initializer_refs_keeps_rooted_global_load() {
+        let pdesc = mk_global_load_proc_in_file("caller", "g", "foo.c");
+        let mut refs = std::collections::HashSet::new();
+        for (_node_id, instr) in pdesc.iter_instrs() {
+            collect_global_initializer_refs(instr, &mut refs);
+        }
+
+        assert_eq!(
+            refs,
+            std::collections::HashSet::from([Procname::c_from_string(
+                "__infer_globals_initializer_g",
+            )])
+        );
+    }
+
+    #[test]
+    fn test_apply_procedures_filter_keeps_implicit_global_initializer_callee() {
+        let mut cfg = sil::cfg::Cfg::new();
+        cfg.add_proc_desc(mk_global_load_proc_in_file("caller", "g", "foo.c"));
+        cfg.add_proc_desc(mk_proc_in_file("__infer_globals_initializer_g", "foo.c"));
+        cfg.add_proc_desc(mk_proc_in_file("unrelated", "baz.c"));
+
+        let filter = ProceduresFilter {
+            raw: "caller".to_string(),
+            source_file_regex: None,
+            proc_name_regex: Some(Regex::new("caller").expect("regex should compile")),
+        };
+
+        let selection =
+            apply_procedures_filter(&cfg, &filter, true).expect("filter should match caller");
+
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("caller"))
+            .is_some());
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("__infer_globals_initializer_g"))
+            .is_some());
+        assert!(selection
+            .cfg
+            .get_proc_desc(&Procname::c_from_string("unrelated"))
             .is_none());
     }
 }

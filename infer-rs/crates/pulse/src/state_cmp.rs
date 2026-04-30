@@ -94,6 +94,43 @@ pub(crate) fn debug_signature(state: &AbductiveDomain) -> DebugSignature {
     }
 }
 
+fn append_debug_section(out: &mut String, name: &str, lines: Vec<String>) {
+    out.push_str(name);
+    out.push_str(":\n");
+    if lines.is_empty() {
+        out.push_str("  <empty>\n");
+    } else {
+        for line in lines {
+            out.push_str("  ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+}
+
+pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
+    let CanonicalState {
+        pre_stack,
+        post_stack,
+        pre_heap,
+        post_heap,
+        pre_attrs,
+        post_attrs,
+        formula,
+    } = canonicalize(state).state;
+
+    let mut out = String::new();
+    append_debug_section(&mut out, "pre_stack", pre_stack);
+    append_debug_section(&mut out, "post_stack", post_stack);
+    append_debug_section(&mut out, "pre_heap", pre_heap);
+    append_debug_section(&mut out, "post_heap", post_heap);
+    append_debug_section(&mut out, "pre_attrs", pre_attrs);
+    append_debug_section(&mut out, "post_attrs", post_attrs);
+    append_debug_section(&mut out, "formula", formula);
+    out.pop();
+    out
+}
+
 /// Compare two states modulo abstract-value renaming.
 pub fn alpha_equivalent(lhs: &AbductiveDomain, rhs: &AbductiveDomain) -> bool {
     canonicalize(lhs).state == canonicalize(rhs).state

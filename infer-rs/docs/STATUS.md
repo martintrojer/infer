@@ -96,16 +96,44 @@
   Rust-side retained-state convergence on that loop block, not exporter
   fidelity and not missing `ExitScope` semantics.
 - New debug-only alpha signatures now make that conclusion sharper:
-  the richer single-file `whirlpool_block` run still finishes in about
-  `4m30s` with `1222` retained states and the same
-  `29,31,32,33,35,36,37,38 -> 8d:4v` hotspot, but nodes `31` and `35` each
-  contain eight distinct semantic states under the current Rust canonicalizer.
-  The states form `4` growth tiers x `2` variants, and `35:POST` matches
-  `31:PRE` exactly, which points at loop-cycle growth in retained
-  heap/attrs/formula state rather than missed alpha-dedup inside a node.
+  the latest richer single-file `whirlpool_block` run finishes in `4m53s`
+  with `1222` retained states and the same
+  `29,31,32,33,35,36,37,38 -> 8d:4v` hotspot. Nodes `31` and `35` still each
+  contain eight distinct semantic states under the current Rust
+  canonicalizer, the states still form `4` growth tiers x `2` variants, and
+  `35:POST` matches `31:PRE` exactly. The monotonic growth between tiers is in
+  retained heap / attrs / formula volume rather than in duplicated
+  alpha-equivalent states, which points at loop-cycle growth in retained
+  state rather than missed alpha-dedup inside a node.
 - OCaml cross-check: `Pulse.ml` also keeps `Nullify` and `Abstract` as no-op
   metadata, so the next narrowed step remains retained PRE/POST comparison on
   the hot block, not more metadata plumbing.
+- Working interpretation of the remaining OpenSSL memory gap:
+  the primary hotspot driver still looks like a residual OCaml-parity /
+  convergence gap, not just Rust copy overhead. The biggest `whirlpool_block`
+  reductions so far came from OCaml-parity fixes (`equal_fast` split and WTO
+  revisit `exec_node(...)` parity), and the hot selected-node signatures are
+  still semantically distinct. Clone / storage cost is still a real secondary
+  amplifier, though: Pulse state remains deeply owned, whole-program runs still
+  hit tens of GB RSS, and reducing physical duplication is still worthwhile for
+  merged-run stability.
+- The narrowed OpenSSL probe is now more honest too: callgraph construction,
+  procedures filtering, and Pulse's pre-analysis summary collection now retain
+  implicit `__infer_globals_initializer_<name>` deps for loads rooted in
+  globals, instead of only following explicit `Const(Cfun(...))` calls. On the
+  fresh `--procedures-filter whirlpool_block` repro this now keeps
+  `__infer_globals_initializer_Cx` in the retained set and runs it before
+  `whirlpool_block` at `-j 1`.
+- That change shows a second major cost surface beyond the old loop-head-only
+  slice: `__infer_globals_initializer_Cx` alone is a single-disjunct but very
+  large analysis (~`16k` live heap nodes after ~`5m22s` in the current release
+  probe), and once `whirlpool_block` starts with that summary available its
+  per-state post heap immediately jumps from the old ~`1k`-node scale to about
+  `33k` live heap nodes / `67k` edges, while the live-fixpoint retained totals
+  reach multi-million heap / attr / formula counts within about a minute. The
+  older filtered `whirlpool_block` probe is still useful for the pure loop-head
+  convergence bug, but it now clearly under-approximates the whole-program `Cx`
+  cost.
 - There is now also a concrete structural-sharing prototype sketch in
   [`docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`](./plans/STRUCTURAL_SHARING_PROTOTYPE.md).
   That work is explicitly scoped as a memory / clone-pressure track for merged
