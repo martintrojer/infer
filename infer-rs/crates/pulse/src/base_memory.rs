@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
@@ -174,14 +175,25 @@ impl Edges {
 }
 
 /// The heap graph: maps abstract addresses to their outgoing edges.
+///
+/// Each address points to a refcounted `Arc<Edges>` so cloning the surrounding
+/// abductive state shares the per-address edge structure between disjuncts and
+/// retained invariant snapshots without copying it eagerly. Mutating accesses
+/// use `Arc::make_mut` (path-copying) to preserve that sharing while keeping
+/// the same `&mut self` API the rest of Pulse already expects.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseMemory {
-    graph: BTreeMap<AbstractValue, Edges>,
+    graph: BTreeMap<AbstractValue, Arc<Edges>>,
 }
 
 impl BaseMemory {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    fn entry_mut(&mut self, addr: AbstractValue) -> &mut Edges {
+        let arc = self.graph.entry(addr).or_default();
+        Arc::make_mut(arc)
     }
 
     /// Register an address in the heap (ensures it has an entry, even if empty).
@@ -191,7 +203,7 @@ impl BaseMemory {
 
     /// Add an edge: `src --access--> target`.
     pub fn add_edge(&mut self, src: AbstractValue, access: Access, target: AbstractValue) {
-        self.graph.entry(src).or_default().add(access, target);
+        self.entry_mut(src).add(access, target);
     }
 
     /// Add an edge together with the target provenance.
@@ -201,10 +213,7 @@ impl BaseMemory {
         access: Access,
         value: ValueWithHistory,
     ) {
-        self.graph
-            .entry(src)
-            .or_default()
-            .add_with_history(access, value);
+        self.entry_mut(src).add_with_history(access, value);
     }
 
     /// Find the target of an edge: `src --access--> ?`.
@@ -235,7 +244,7 @@ impl BaseMemory {
 
     /// Get all edges from an address.
     pub fn get_edges(&self, addr: AbstractValue) -> Option<&Edges> {
-        self.graph.get(&addr)
+        self.graph.get(&addr).map(Arc::as_ref)
     }
 
     /// Remove all outgoing edges for an address.
@@ -248,7 +257,7 @@ impl BaseMemory {
         if edges.is_empty() {
             self.graph.remove(&addr);
         } else {
-            self.graph.insert(addr, edges);
+            self.graph.insert(addr, Arc::new(edges));
         }
     }
 
@@ -264,7 +273,9 @@ impl BaseMemory {
 
     /// Iterate over all addresses and their edges.
     pub fn iter(&self) -> impl Iterator<Item = (&AbstractValue, &Edges)> {
-        self.graph.iter()
+        self.graph
+            .iter()
+            .map(|(addr, edges)| (addr, edges.as_ref()))
     }
 
     /// Number of addresses in the heap.
@@ -281,12 +292,12 @@ impl BaseMemory {
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
         // Substitute in edge targets
         for edges in self.graph.values_mut() {
-            edges.subst_var(old, new);
+            Arc::make_mut(edges).subst_var(old, new);
         }
         // Substitute in graph keys
         if let Some(edges) = self.graph.remove(&old) {
             // Merge with existing edges at `new` if any
-            let entry = self.graph.entry(new).or_default();
+            let entry = self.entry_mut(new);
             for (access, value) in edges.iter_with_history() {
                 entry.add_with_history(access.clone(), value.clone());
             }

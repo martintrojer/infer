@@ -194,6 +194,13 @@ changes, and move finished results to durable docs/tests/commits.
     MB`, ~`32s` wall on the broader 55-file analyze in this same bench), and
     it confirms that with the skip the dominant remaining cost is per-disjunct
     state size in `whirlpool_block` itself, not the global initializer surface.
+  - first structural-sharing baby step is now in: `BaseMemory.graph` stores
+    `Arc<Edges>` instead of `Edges`, with `Arc::make_mut` for in-place
+    updates. The outer `BTreeMap` still clones per snapshot, but each
+    per-address edge bundle is now refcount-shared across disjuncts and
+    retained invariant snapshots. A first re-run on the same bench was
+    interrupted by external memory pressure on this host, so the cost-after
+    measurement still needs a clean rerun once the box is calmer.
   - the earlier forced-retention slice remains useful as an upper bound for
     scalability work: if `__infer_globals_initializer_Cx` is actually
     analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the

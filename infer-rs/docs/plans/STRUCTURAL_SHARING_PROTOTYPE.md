@@ -98,6 +98,16 @@ Why this first:
 - This keeps the prototype scoped to snapshot/storage cost without entangling
   solver semantics.
 
+### Initial baby step landed
+
+As a low-risk first move, `BaseMemory.graph` is now
+`BTreeMap<AbstractValue, Arc<Edges>>` instead of
+`BTreeMap<AbstractValue, Edges>`. The outer map still copies on `clone`, but
+each per-address `Edges` is now refcount-shared between disjuncts, retained
+invariant snapshots, and join/widen results. Mutating helpers go through
+`Arc::make_mut` so the public `BaseMemory` API is unchanged. This is the
+first Phase 1 increment, not the full persistent-map switch.
+
 ### Phase 2: Formula Sharing, If Needed
 
 Only after the heap/attrs prototype is measured.
