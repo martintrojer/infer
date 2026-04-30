@@ -198,9 +198,15 @@ changes, and move finished results to durable docs/tests/commits.
     `Arc<Edges>` instead of `Edges`, with `Arc::make_mut` for in-place
     updates. The outer `BTreeMap` still clones per snapshot, but each
     per-address edge bundle is now refcount-shared across disjuncts and
-    retained invariant snapshots. A first re-run on the same bench was
-    interrupted by external memory pressure on this host, so the cost-after
-    measurement still needs a clean rerun once the box is calmer.
+    retained invariant snapshots.
+  - clean rerun on the same bench (after the system calmed down) confirms a
+    memory win at the cost of wall time on this slice: peak memory footprint
+    drops from ~`16.7 GB` to ~`13.84 GB` (about a `17%` reduction) for the
+    same single-file `whirlpool_block` filtered probe, with `0 swaps` and the
+    same `1222`-state / `8d:4v` checkpoint. Real time on this isolated rerun
+    measured `7m17s` vs the earlier `4m34s` baseline; the host was less idle
+    when this rerun launched, so the wall-time delta should be re-measured
+    with both versions back to back before drawing performance conclusions.
   - the earlier forced-retention slice remains useful as an upper bound for
     scalability work: if `__infer_globals_initializer_Cx` is actually
     analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the
