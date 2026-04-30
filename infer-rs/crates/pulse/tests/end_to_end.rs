@@ -242,29 +242,26 @@ fn collect_cfun_refs(
     }
 }
 
+fn root_global_pvar(exp: &sil::exp::Exp) -> Option<&sil::pvar::Pvar> {
+    match exp {
+        sil::exp::Exp::Lvar(pvar) if pvar.is_global() => Some(pvar),
+        sil::exp::Exp::Lfield(data, _, _) => root_global_pvar(&data.exp),
+        sil::exp::Exp::Lindex(base, _) | sil::exp::Exp::Cast(_, base) => root_global_pvar(base),
+        _ => None,
+    }
+}
+
 fn collect_global_initializer_refs(
     instr: &sil::instr::Instr,
     out: &mut std::collections::HashSet<sil::procname::Procname>,
 ) {
-    if let sil::instr::Instr::Load {
-        e: sil::exp::Exp::Lvar(pvar),
-        typ,
-        ..
-    } = instr
-    {
-        if pvar.is_global() && is_pointer_to_function_typ(typ) {
-            if let Some(init_pname) = pvar.initializer_procname() {
-                out.insert(init_pname);
-            }
+    if let sil::instr::Instr::Load { e, .. } = instr {
+        if let Some(init_pname) =
+            root_global_pvar(e).and_then(sil::pvar::Pvar::initializer_procname)
+        {
+            out.insert(init_pname);
         }
     }
-}
-
-fn is_pointer_to_function_typ(typ: &sil::typ::Typ) -> bool {
-    matches!(
-        &*typ.desc,
-        sil::typ::TypeDesc::Tptr(inner, _) if matches!(&*inner.desc, sil::typ::TypeDesc::Tfun(_))
-    )
 }
 
 fn collect_summary_closure_pnames(
@@ -3251,6 +3248,46 @@ fn test_e2e_global_function_pointer_initializer_is_inlined() {
             .iter()
             .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
         "global function-pointer initializer should be visible before loading fp"
+    );
+}
+
+#[test]
+fn test_e2e_global_field_initializer_is_inlined() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        type holder = { value: *int }
+
+        global g: void
+
+        define __infer_globals_initializer_g() : void {
+          #entry:
+            _ = __sil_metadata_variable_lifetime_begins(&g, <holder>)
+            store &g.holder.value <- 0:*int
+            ret null
+        }
+
+        define read_global_field_bad() : void {
+          #entry:
+            n0:*int = load &g.holder.value
+            n1:int = load n0
+            ret null
+        }
+    "#,
+    );
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+    let bad = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}").contains("read_global_field_bad"))
+        .expect("read_global_field_bad summary should exist");
+    assert!(
+        bad.1
+            .diagnostics
+            .iter()
+            .any(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference),
+        "global field initializer should be visible before loading through g.value"
     );
 }
 
