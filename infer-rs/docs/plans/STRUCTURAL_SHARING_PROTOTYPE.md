@@ -98,15 +98,31 @@ Why this first:
 - This keeps the prototype scoped to snapshot/storage cost without entangling
   solver semantics.
 
-### Initial baby step landed
+### Initial baby steps landed
 
-As a low-risk first move, `BaseMemory.graph` is now
-`BTreeMap<AbstractValue, Arc<Edges>>` instead of
-`BTreeMap<AbstractValue, Edges>`. The outer map still copies on `clone`, but
-each per-address `Edges` is now refcount-shared between disjuncts, retained
+As low-risk first moves:
+
+- `BaseMemory.graph` is now
+  `BTreeMap<AbstractValue, Arc<Edges>>` instead of
+  `BTreeMap<AbstractValue, Edges>`.
+- `BaseAddressAttributes.map` is similarly
+  `BTreeMap<AbstractValue, Arc<Attributes>>`.
+
+The outer maps still copy on `clone`, but each per-address `Edges` /
+`Attributes` payload is now refcount-shared between disjuncts, retained
 invariant snapshots, and join/widen results. Mutating helpers go through
-`Arc::make_mut` so the public `BaseMemory` API is unchanged. This is the
-first Phase 1 increment, not the full persistent-map switch.
+`Arc::make_mut` so the public APIs are unchanged.
+
+Measured impact on the filtered single-file `whirlpool_block` slice: peak
+memory footprint drops from ~`16.7 GB` baseline to ~`9.34 GB` after both
+changes (about a `44%` reduction) for the same `1222` retained-state /
+`8d:4v` checkpoint, with `0 swaps`. Wall time on the post-Arc reruns is
+currently `~7m` versus the `~4m34s` pre-Arc baseline, but the runs are not yet
+on a fully comparable host load, so wall-time vs memory tradeoff still needs
+back-to-back re-measurement.
+
+Neither change is the full persistent-map switch the rest of this plan still
+recommends; they are the first Phase 1 increments.
 
 ### Phase 2: Formula Sharing, If Needed
 
