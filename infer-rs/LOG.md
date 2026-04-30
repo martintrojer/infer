@@ -69,6 +69,15 @@ changes, and move finished results to durable docs/tests/commits.
     history still identifies the outer callee call, the top-level report text
     now uses a `The call to ... may trigger ...` shape instead of the generic
     `accessing address that ...` wording
+  - invalid-access diagnostics now carry an optional trace-only access
+    location, so caller-reified latent UAF traces can start from caller-side
+    provenance while still anchoring the final `invalid access occurs here`
+    step at the original callee access site (for the real `latent.c` fixture,
+    line `18` stays on the terminal access step)
+  - an ignored end-to-end regression now locks the current real `latent.c`
+    `USE_AFTER_FREE` bug-trace subset for `manifest_use_after_free` and
+    `main`, including the caller-side start line and the callee-side final
+    access location
   - `transfer::tests::test_store_to_formula_known_zero_detects_error` was
     updated to build the caller-visible heap path first; this matches the
     existing `EqZero`/heap-allocated semantics used elsewhere in the Rust port
@@ -129,6 +138,8 @@ changes, and move finished results to durable docs/tests/commits.
   - `cargo test -p pulse test_apply_summary_shared_zero_formal_target_prefers_pointer_actual_for_latent_invalid_access -- --nocapture`
   - `cargo test -p pulse test_translate_diagnostic_wraps_invalidation_history_with_callee_call -- --nocapture`
   - `cargo test -p pulse diagnostic::tests:: -- --nocapture`
+  - `cargo test -p pulse test_translate_diagnostic_wraps_invalidation_history_with_callee_call -- --nocapture`
+  - `cargo test -p pulse --test end_to_end test_e2e_latent_real_bug_trace_matches_ocaml_subset -- --ignored --nocapture`
   - `cargo test -p pulse 'test_apply_summary_' -- --nocapture`
   - `cargo test -p pulse --test end_to_end test_e2e_latent_cycle_summary_shapes_match_ocaml_subset -- --nocapture`
   - `cargo test -p pulse test_debug_signature -- --nocapture`

@@ -2227,6 +2227,7 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: invalidation.clone(),
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::epoch(),
             invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
         };
@@ -2255,6 +2256,7 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: invalidation.clone(),
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::epoch(),
             invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
         };
@@ -2546,6 +2548,7 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: invalidation.clone(),
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::epoch(),
             invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
         };
@@ -2575,6 +2578,7 @@ mod tests {
             addr: local_val,
             invalidation: invalidation.clone(),
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::assignment(Location::dummy()),
             invalidation_history: ValueHistory::invalidated(invalidation, Location::dummy()),
         };

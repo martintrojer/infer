@@ -1371,6 +1371,7 @@ fn potential_invalid_access_from_normalized_continue_pre_post(
                 addr: repr,
                 invalidation,
                 access_location: location.clone(),
+                trace_access_location: None,
                 access_history,
                 invalidation_history,
             },
@@ -2259,6 +2260,7 @@ fn latent_invalid_access_diagnostics_from_normalized_pre_post(
                 addr: repr,
                 invalidation,
                 access_location: location.clone(),
+                trace_access_location: None,
                 access_history,
                 invalidation_history,
             },
@@ -2494,6 +2496,7 @@ pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
             addr: repr,
             invalidation,
             access_location: location.clone(),
+            trace_access_location: None,
             access_history,
             invalidation_history,
         };
@@ -3374,6 +3377,7 @@ mod tests {
             addr,
             invalidation: invalidation.clone(),
             access_location: access_location.clone(),
+            trace_access_location: None,
             access_history: ValueHistory::assignment(access_location.clone()),
             invalidation_history: ValueHistory::invalidated(invalidation.clone(), access_location),
         }

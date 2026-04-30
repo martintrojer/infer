@@ -172,6 +172,7 @@ fn diagnostics_compatible(lhs: &Diagnostic, rhs: &Diagnostic) -> bool {
             Diagnostic::AccessToInvalidAddress {
                 invalidation: lhs_invalidation,
                 access_location: lhs_access_location,
+                trace_access_location: None,
                 access_history: lhs_access_history,
                 invalidation_history: lhs_invalidation_history,
                 ..
@@ -179,6 +180,7 @@ fn diagnostics_compatible(lhs: &Diagnostic, rhs: &Diagnostic) -> bool {
             Diagnostic::AccessToInvalidAddress {
                 invalidation: rhs_invalidation,
                 access_location: rhs_access_location,
+                trace_access_location: None,
                 access_history: rhs_access_history,
                 invalidation_history: rhs_invalidation_history,
                 ..
@@ -230,6 +232,7 @@ fn diagnostics_compatible_semantic(
                 addr: lhs_addr,
                 invalidation: lhs_invalidation,
                 access_location: lhs_access_location,
+                trace_access_location: None,
                 access_history: lhs_access_history,
                 invalidation_history: lhs_invalidation_history,
                 ..
@@ -238,6 +241,7 @@ fn diagnostics_compatible_semantic(
                 addr: rhs_addr,
                 invalidation: rhs_invalidation,
                 access_location: rhs_access_location,
+                trace_access_location: None,
                 access_history: rhs_access_history,
                 invalidation_history: rhs_invalidation_history,
                 ..
@@ -306,6 +310,7 @@ mod tests {
             addr,
             invalidation: Invalidation::ConstantDereference(IntLit::zero()),
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::epoch(),
             invalidation_history: ValueHistory::epoch(),
         }

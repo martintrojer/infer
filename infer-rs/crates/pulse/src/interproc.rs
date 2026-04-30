@@ -635,7 +635,8 @@ fn translate_diagnostic(
         Diagnostic::AccessToInvalidAddress {
             addr,
             invalidation,
-            access_location: _,
+            access_location,
+            trace_access_location,
             access_history,
             invalidation_history,
         } => {
@@ -644,24 +645,6 @@ fn translate_diagnostic(
                 .get_var_repr(resolve_mut(subst, *addr));
             let access_history =
                 access_history.map_formals_with_callsite(formal_histories, Some(loc.clone()));
-            let access_history = match (callee_procname, callee_proc_start_location) {
-                (Some(proc_name), Some(start_loc)) => {
-                    let access_history = if let Some(seed_pvar) = access_history
-                        .first_actual_argument()
-                        .or_else(|| access_history.first_formal_argument())
-                    {
-                        let outer_pvar = Pvar::mk(seed_pvar.name.clone(), proc_name.clone());
-                        access_history.prepend_event(HistoryEvent::FormalArgument(
-                            outer_pvar,
-                            Some(start_loc.clone()),
-                        ))
-                    } else {
-                        access_history
-                    };
-                    access_history
-                }
-                _ => access_history,
-            };
             let invalidation_history =
                 invalidation_history.map_formals_with_callsite(formal_histories, Some(loc.clone()));
             let invalidation_history = match (callee_procname, callee_proc_start_location) {
@@ -687,6 +670,9 @@ fn translate_diagnostic(
                 addr: caller_addr,
                 invalidation: invalidation.clone(),
                 access_location: loc.clone(),
+                trace_access_location: trace_access_location
+                    .clone()
+                    .or_else(|| Some(access_location.clone())),
                 access_history,
                 invalidation_history,
             }
@@ -701,12 +687,14 @@ fn rebase_diagnostic_to_state(diagnostic: Diagnostic, state: &AbductiveDomain) -
             addr,
             invalidation,
             access_location,
+            trace_access_location,
             access_history,
             invalidation_history,
         } => Diagnostic::AccessToInvalidAddress {
             addr: state.path_condition.get_var_repr(addr),
             invalidation,
             access_location,
+            trace_access_location,
             access_history,
             invalidation_history,
         },
@@ -737,6 +725,7 @@ fn reify_invalid_access_diagnostic(
         Diagnostic::AccessToInvalidAddress {
             addr,
             access_location,
+            trace_access_location,
             access_history,
             ..
         } => match caller_state.check_valid(addr) {
@@ -744,6 +733,7 @@ fn reify_invalid_access_diagnostic(
                 addr,
                 invalidation: inv_info.0,
                 access_location,
+                trace_access_location,
                 access_history,
                 invalidation_history: inv_info.1,
             },
@@ -753,6 +743,7 @@ fn reify_invalid_access_diagnostic(
                     sil::int_lit::IntLit::zero(),
                 ),
                 access_location,
+                trace_access_location,
                 access_history,
                 invalidation_history: ValueHistory::invalidated(
                     crate::invalidation::Invalidation::ConstantDereference(
@@ -1053,6 +1044,7 @@ fn materialize_pre(
                             addr: caller_addr,
                             invalidation: inv_info.0,
                             access_location: loc.clone(),
+                            trace_access_location: None,
                             access_history,
                             invalidation_history: inv_info.1,
                         },
@@ -1306,6 +1298,7 @@ fn translate_formula(
             addr,
             invalidation,
             access_location: loc.clone(),
+            trace_access_location: None,
             access_history,
             invalidation_history,
         }
@@ -1652,6 +1645,7 @@ mod tests {
             addr,
             invalidation: invalidation.clone(),
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::assignment(Location::dummy()),
             invalidation_history: invalidation_history(&invalidation),
         }
@@ -1688,6 +1682,7 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: crate::invalidation::Invalidation::CFree,
             access_location: Location::dummy(),
+            trace_access_location: None,
             access_history: ValueHistory::formal_argument(formal_pvar.clone()),
             invalidation_history: ValueHistory::formal_argument(formal_pvar.clone()).append_event(
                 HistoryEvent::Invalidated {

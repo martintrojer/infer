@@ -26,6 +26,7 @@ pub enum Diagnostic {
         addr: AbstractValue,
         invalidation: Invalidation,
         access_location: Location,
+        trace_access_location: Option<Location>,
         access_history: ValueHistory,
         invalidation_history: ValueHistory,
     },
@@ -237,7 +238,14 @@ impl Diagnostic {
                     | sil::pvar::PvarKind::Seed(proc_name) => proc_name,
                     sil::pvar::PvarKind::Global { .. } => return format!("{self}"),
                 };
-                let base = if let Some((_inv, loc)) = invalidation_history.first_invalidation() {
+                let base = if let Some((_inner_proc, call_loc)) =
+                    invalidation_history.last_call_before_invalidation()
+                {
+                    format!(
+                        "accesses `{}` that {invalidation} during the call to `{proc}()` on line {}",
+                        actual_pvar.name, call_loc.line
+                    )
+                } else if let Some((_inv, loc)) = invalidation_history.first_invalidation() {
                     format!(
                         "accesses `{}` that {invalidation} from line {}",
                         actual_pvar.name, loc.line
@@ -280,6 +288,7 @@ impl Diagnostic {
         match self {
             Diagnostic::AccessToInvalidAddress {
                 access_location,
+                trace_access_location,
                 access_history,
                 invalidation_history,
                 ..
@@ -315,9 +324,11 @@ impl Diagnostic {
                         .max()
                         .unwrap_or(2);
                     trace.extend(access_entries);
+                    let final_access_loc =
+                        trace_access_location.as_ref().unwrap_or(access_location);
                     trace.push(make_bug_trace_entry(
                         access_depth,
-                        access_location,
+                        final_access_loc,
                         "invalid access occurs here".to_string(),
                     ));
                 }
@@ -438,24 +449,41 @@ fn access_trace_start_location(history: &ValueHistory, fallback: &Location) -> L
         return fallback.clone();
     };
     let events = path.events();
-    let first_non_actual = events
-        .iter()
-        .position(|event| {
-            !matches!(
-                event,
-                crate::value_history::HistoryEvent::ActualArgument(_, _)
-            )
-        })
-        .unwrap_or(0);
-    let non_actual = &events[first_non_actual..];
-    non_actual
+    let proc_of_pvar = |pvar: &Pvar| match &pvar.kind {
+        sil::pvar::PvarKind::Local { proc_name, .. }
+        | sil::pvar::PvarKind::Callee(proc_name)
+        | sil::pvar::PvarKind::Seed(proc_name) => Some(proc_name.clone()),
+        sil::pvar::PvarKind::Global { .. } => None,
+    };
+    let search_events = match events {
+        [crate::value_history::HistoryEvent::FormalArgument(callee_pvar, _), crate::value_history::HistoryEvent::ActualArgument(actual_pvar, _), rest @ ..]
+            if proc_of_pvar(callee_pvar)
+                .zip(proc_of_pvar(actual_pvar))
+                .is_some_and(|(callee_proc, actual_proc)| callee_proc == actual_proc) =>
+        {
+            rest
+        }
+        _ => {
+            let first_non_actual = events
+                .iter()
+                .position(|event| {
+                    !matches!(
+                        event,
+                        crate::value_history::HistoryEvent::ActualArgument(_, _)
+                    )
+                })
+                .unwrap_or(0);
+            &events[first_non_actual..]
+        }
+    };
+    search_events
         .iter()
         .find_map(|event| match event {
             crate::value_history::HistoryEvent::FormalArgument(_, Some(loc)) => Some(loc.clone()),
             _ => None,
         })
         .or_else(|| {
-            non_actual
+            search_events
                 .iter()
                 .find_map(|event| event.location().cloned())
         })
@@ -537,7 +565,7 @@ fn history_events_to_bug_trace(
                 entries.push(make_bug_trace_entry(
                     level,
                     location,
-                    "assigned here".to_string(),
+                    "assigned".to_string(),
                 ));
                 index += 1;
             }
@@ -750,37 +778,12 @@ fn access_history_to_bug_trace(
         level: u32,
     ) -> Vec<diagnostics::issue::BugTraceEntry> {
         match events {
-            [crate::value_history::HistoryEvent::FormalArgument(callee_pvar, Some(callee_loc)), crate::value_history::HistoryEvent::ActualArgument(actual_pvar, location), rest @ ..]
-                if proc_of_pvar(callee_pvar)
-                    .zip(proc_of_pvar(actual_pvar))
-                    .is_some_and(|(callee_proc, actual_proc)| callee_proc == actual_proc) =>
-            {
-                let mut entries = rec(rest, fallback, level);
-                let call_loc = location
-                    .clone()
-                    .or_else(|| rest.iter().find_map(|event| event.location()).cloned())
-                    .unwrap_or_else(|| fallback.clone());
-                let proc_name = proc_of_pvar(callee_pvar).expect("matched local/callee pvar");
-                entries.push(make_bug_trace_entry(
-                    level,
-                    &call_loc,
-                    format!("when calling `{proc_name}` here"),
-                ));
-                entries.push(make_bug_trace_entry(
-                    level + 1,
-                    callee_loc,
-                    pvar_trace_description(callee_pvar),
-                ));
-                entries
-            }
             [crate::value_history::HistoryEvent::ActualArgument(pvar, location), rest @ ..] => {
                 let mut entries = rec(rest, fallback, level);
-                let call_loc = location
-                    .clone()
-                    .or_else(|| rest.iter().find_map(|event| event.location()).cloned())
-                    .unwrap_or_else(|| fallback.clone());
+                let call_loc = fallback.clone();
                 let proc_name = proc_of_pvar(pvar);
                 if let Some(proc_name) = proc_name {
+                    let param_loc = location.clone().unwrap_or_else(|| call_loc.clone());
                     entries.push(make_bug_trace_entry(
                         level,
                         &call_loc,
@@ -788,13 +791,14 @@ fn access_history_to_bug_trace(
                     ));
                     entries.push(make_bug_trace_entry(
                         level + 1,
-                        &call_loc,
+                        &param_loc,
                         pvar_trace_description(pvar),
                     ));
                 } else {
+                    let actual_loc = location.clone().unwrap_or_else(|| call_loc.clone());
                     entries.push(make_bug_trace_entry(
                         level,
-                        &call_loc,
+                        &actual_loc,
                         pvar_trace_description(pvar),
                     ));
                 }
@@ -897,6 +901,7 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::CFree,
             access_location: loc(20),
+            trace_access_location: None,
             access_history: ValueHistory::formal_argument(pvar.clone()).append_assignment(loc(20)),
             invalidation_history: ValueHistory::formal_argument(pvar).append_event(
                 HistoryEvent::Invalidated {
@@ -933,6 +938,7 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::ConstantDereference(IntLit::zero()),
             access_location: loc(30),
+            trace_access_location: None,
             access_history: ValueHistory::assignment(loc(30)),
             invalidation_history: ValueHistory::invalidated(
                 Invalidation::ConstantDereference(IntLit::zero()),
@@ -965,9 +971,12 @@ mod tests {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::CFree,
             access_location: loc(40),
-            access_history: ValueHistory::formal_argument_at(callee_pvar.clone(), loc(10))
-                .append_event(HistoryEvent::ActualArgument(callee_pvar, Some(loc(40))))
-                .append_event(HistoryEvent::FormalArgument(caller_pvar, Some(loc(39)))),
+            trace_access_location: None,
+            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(
+                callee_pvar,
+                Some(loc(10)),
+            ))
+            .append_event(HistoryEvent::FormalArgument(caller_pvar, Some(loc(39)))),
             invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
         };
 
@@ -1022,7 +1031,7 @@ mod tests {
             descriptions,
             vec![
                 (2, "allocated by call to `malloc` (modelled)"),
-                (2, "assigned here"),
+                (2, "assigned"),
             ]
         );
     }
@@ -1030,16 +1039,27 @@ mod tests {
     #[test]
     fn test_uaf_qualifier_mentions_outer_call_context() {
         let callee = Procname::c_from_string("latent_use_after_free");
+        let inner = Procname::c_from_string("conditional_free2");
         let callee_pvar = Pvar::mk(Mangled::from_string("x"), callee.clone());
+        let inner_pvar = Pvar::mk(Mangled::from_string("x"), inner.clone());
         let diag = Diagnostic::AccessToInvalidAddress {
             addr: AbstractValue::mk_fresh(),
             invalidation: Invalidation::CFree,
             access_location: loc(40),
+            trace_access_location: None,
             access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(
                 callee_pvar,
                 Some(loc(40)),
             )),
-            invalidation_history: ValueHistory::invalidated(Invalidation::CFree, loc(12)),
+            invalidation_history: ValueHistory::from_event(HistoryEvent::FormalArgument(
+                inner_pvar,
+                Some(loc(10)),
+            ))
+            .append_event(HistoryEvent::Invalidated {
+                invalidation: Invalidation::CFree,
+                location: loc(12),
+            })
+            .wrap_call(&inner, &loc(17)),
         };
 
         let issue = diag.to_issue("caller");
@@ -1047,7 +1067,9 @@ mod tests {
             .qualifier
             .contains("The call to `latent_use_after_free` may trigger"));
         assert!(issue.qualifier.contains("eventually accesses `x`"));
-        assert!(issue.qualifier.contains("from line 12"));
+        assert!(issue
+            .qualifier
+            .contains("during the call to `latent_use_after_free()` on line 17"));
     }
 
     #[test]

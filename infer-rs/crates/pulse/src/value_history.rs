@@ -125,6 +125,18 @@ impl HistoryPath {
         None
     }
 
+    fn last_call_before_invalidation(&self) -> Option<(&Procname, &Location)> {
+        let mut last = None;
+        for event in &self.0 {
+            match event {
+                HistoryEvent::Call { proc, location } => last = Some((proc, location)),
+                HistoryEvent::Invalidated { .. } => return last,
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn has_call_at_location_before_invalidation(&self, location: &Location) -> bool {
         self.first_call_before_invalidation()
             .is_some_and(|(_proc, call_loc)| call_loc == location)
@@ -314,7 +326,7 @@ impl ValueHistory {
             let mut partials = vec![HistoryPath::empty()];
             for event in &path.0 {
                 match event {
-                    HistoryEvent::FormalArgument(pvar, _formal_loc) => {
+                    HistoryEvent::FormalArgument(pvar, formal_loc) => {
                         if let Some(history) = formal_histories.get(pvar) {
                             let mut next = Vec::new();
                             for prefix in &partials {
@@ -322,7 +334,7 @@ impl ValueHistory {
                                     let mut events = prefix.0.clone();
                                     events.push(HistoryEvent::ActualArgument(
                                         pvar.clone(),
-                                        callsite.clone(),
+                                        formal_loc.clone().or_else(|| callsite.clone()),
                                     ));
                                     events.extend(suffix.0.clone());
                                     next.push(HistoryPath(events));
@@ -363,6 +375,12 @@ impl ValueHistory {
         self.0
             .iter()
             .find_map(HistoryPath::first_call_before_invalidation)
+    }
+
+    pub fn last_call_before_invalidation(&self) -> Option<(&Procname, &Location)> {
+        self.0
+            .iter()
+            .find_map(HistoryPath::last_call_before_invalidation)
     }
 
     pub fn has_call_at_location_before_invalidation(&self, location: &Location) -> bool {

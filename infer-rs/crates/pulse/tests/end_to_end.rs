@@ -3102,6 +3102,113 @@ fn test_e2e_nullptr_old_vector_element_is_still_tracked() {
 }
 
 #[test]
+#[ignore]
+fn test_e2e_latent_real_bug_trace_matches_ocaml_subset() {
+    use test_harness::infer_runner::InferRunner;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let c_dir = test_harness::fixtures::ocaml_c_test_dir().join("pulse");
+    let c_path = c_dir.join("latent.c");
+    if !c_path.exists() {
+        eprintln!("skipping: latent.c not found");
+        return;
+    }
+
+    let sil_path = runner
+        .dump_textual_for_c(&c_path)
+        .expect("dump-textual should succeed for latent.c");
+    let report = run_infer_rs_cli_report(
+        &sil_path,
+        Some("infer/tests/codetoanalyze/c/pulse/latent.c"),
+        &c_dir,
+    )
+    .expect("infer-rs CLI should analyze latent.c");
+    let parsed: serde_json::Value = serde_json::from_str(&report).expect("report.json must parse");
+    let issues = parsed
+        .as_array()
+        .expect("report.json should be a JSON array");
+
+    let expected = [
+        (
+            "manifest_use_after_free",
+            "The call to `latent_use_after_free` may trigger the following issue: call to `latent_use_after_free()` eventually accesses `x` that was invalidated by call to `free()` during the call to `latent_use_after_free()` on line 17.",
+            vec![
+                (1u64, 16u64, "invalidation part of the trace starts here"),
+                (2, 16, "parameter `x` of latent_use_after_free"),
+                (2, 17, "when calling `conditional_free2` here"),
+                (3, 10, "parameter `x` of conditional_free2"),
+                (3, 12, "was invalidated by call to `free()`"),
+                (1, 25, "use-after-lifetime part of the trace starts here"),
+                (2, 25, "parameter `x` of manifest_use_after_free"),
+                (2, 25, "when calling `latent_use_after_free` here"),
+                (3, 16, "parameter `x` of latent_use_after_free"),
+                (3, 18, "invalid access occurs here"),
+            ],
+        ),
+        (
+            "main",
+            "The call to `latent_use_after_free` may trigger the following issue: call to `latent_use_after_free()` eventually accesses `x` that was invalidated by call to `free()` during the call to `latent_use_after_free()` on line 17.",
+            vec![
+                (1u64, 16u64, "invalidation part of the trace starts here"),
+                (2, 16, "parameter `x` of latent_use_after_free"),
+                (2, 17, "when calling `conditional_free2` here"),
+                (3, 10, "parameter `x` of conditional_free2"),
+                (3, 12, "was invalidated by call to `free()`"),
+                (1, 57, "use-after-lifetime part of the trace starts here"),
+                (2, 57, "allocated by call to `malloc` (modelled)"),
+                (2, 57, "assigned"),
+                (2, 59, "when calling `latent_use_after_free` here"),
+                (3, 16, "parameter `x` of latent_use_after_free"),
+                (3, 18, "invalid access occurs here"),
+            ],
+        ),
+    ];
+
+    for (proc_name, expected_qualifier, expected_trace) in expected {
+        let issue = issues
+            .iter()
+            .find(|issue| {
+                issue["procedure"].as_str() == Some(proc_name)
+                    && issue["bug_type"].as_str() == Some("USE_AFTER_FREE")
+            })
+            .unwrap_or_else(|| panic!("missing USE_AFTER_FREE issue for {proc_name}: {report}"));
+        assert_eq!(
+            issue["qualifier"].as_str(),
+            Some(expected_qualifier),
+            "unexpected qualifier for {proc_name}: {report}"
+        );
+        let bug_trace = issue["bug_trace"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing bug_trace for {proc_name}: {report}"));
+        let actual_trace: Vec<_> = bug_trace
+            .iter()
+            .map(|entry| {
+                (
+                    entry["level"].as_u64().unwrap_or_default(),
+                    entry["line_number"].as_u64().unwrap_or_default(),
+                    entry["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        let expected_trace: Vec<_> = expected_trace
+            .into_iter()
+            .map(|(level, line, desc)| (level, line, desc.to_string()))
+            .collect();
+        assert_eq!(
+            actual_trace, expected_trace,
+            "unexpected bug_trace for {proc_name}: {report}"
+        );
+    }
+}
+
+#[test]
 fn test_e2e_global_function_pointer_initializer_is_inlined() {
     let tm = textual_utils::parse_and_convert(
         r#"

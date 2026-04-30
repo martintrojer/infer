@@ -21,3 +21,4 @@ num-bigint = { workspace = true }
 test-harness = { path = "../test-harness" }
 textual = { path = "../textual" }
 ondemand = { path = "../ondemand" }
+serde_json = "1"
