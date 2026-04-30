@@ -120,22 +120,26 @@ changes, and move finished results to durable docs/tests/commits.
   - `cargo test -p pulse --test end_to_end test_debug_latent_summary -- --ignored --nocapture`
   - `cargo test -p pulse --lib test_debug_real_abort_recovery_report_keys -- --ignored --nocapture`
   - `./target/debug/infer-rs --pulse-only --quiet --pulse-report-issues-for-tests --results-dir /tmp/latent-compare.Muh07b/ocaml-out --source-override codetoanalyze/c/pulse/latent.c -o /tmp/latent-rs-run.next /tmp/latent-compare.Muh07b/textual/latent.sil`
-  - fresh narrow export repro:
-    `tmpdir=$(mktemp -d /tmp/wpblock-export.XXXXXX)`
-    `tar -xf ~/infer/benchmarks/openssl/openssl-1.0.2d.tar.gz -C "$tmpdir"`
-    `cd "$tmpdir/openssl-1.0.2d"`
+  - fresh narrow export repro (use `~/infer-rs-bench/...` instead of `/tmp`,
+    because `/tmp` is reaped between sessions on this host and reruns lose
+    captured corpora):
+    `bench=~/infer-rs-bench/wpblock-$(date +%Y%m%d-%H%M%S) && mkdir -p "$bench"`
+    `tar -xf ~/infer/benchmarks/openssl/openssl-1.0.2d.tar.gz -C "$bench"`
+    `cd "$bench/openssl-1.0.2d"`
     `sdk=$(xcrun --show-sdk-path) && CC=clang CFLAGS="-isysroot $sdk" ./config no-asm`
     `infer capture --store-textual --results-dir infer-out-wp -- clang -I. -Iinclude -c crypto/whrlpool/wp_block.c`
     `infer debug --results-dir infer-out-wp --export-textual textual-out-wp`
   - fresh metadata check:
     `rg -o "__sil_metadata_[a-z_]+" textual-out-wp/wp_block.sil | sort -u`
-  - fresh narrowed Rust repro:
-    `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil"`
+  - fresh narrowed Rust repro (point at the `~/infer-rs-bench/...` corpus):
+    `RUST_LOG=warn,ondemand=info target/release/infer-rs --pulse-only --trace-ondemand -j 1 --procedures-filter whirlpool_block "$bench/openssl-1.0.2d/textual-out-wp/wp_block.sil"`
   - focused selected-node alpha-signature repro:
-    `RUST_LOG='pulse::checker::fixpoint=debug,ondemand=info,ondemand::runner=info' target/release/infer-rs --pulse-only --debug-level-analysis 1 --trace-ondemand --debug-fixpoint-nodes 31,35 -j 1 --procedures-filter whirlpool_block "$tmpdir/openssl-1.0.2d/textual-out-wp/wp_block.sil" >/tmp/wpblock-alpha-signatures.log 2>&1`
+    `RUST_LOG='pulse::checker::fixpoint=debug,ondemand=info,ondemand::runner=info' target/release/infer-rs --pulse-only --debug-level-analysis 1 --trace-ondemand --debug-fixpoint-nodes 31,35 -j 1 --procedures-filter whirlpool_block "$bench/openssl-1.0.2d/textual-out-wp/wp_block.sil" >~/infer-rs-bench/wpblock-alpha-signatures.log 2>&1`
 - Fresh OpenSSL retained-state repro checkpoint:
-  - fresh corpus dir: `/tmp/wpblock-export.I3D6ov`
-  - focused alpha-signature log: `/tmp/wpblock-alpha-signatures.log`
+  - fresh corpus dir: `~/infer-rs-bench/wpblock-20260430-181642` (older
+    `/tmp/wpblock-export.*` corpora were reaped by the host)
+  - focused alpha-signature log: rerun lives in
+    `~/infer-rs-bench/wpblock-alpha-signatures.log` if regenerated
   - completed `whirlpool_block` focused run: `4m53s`, `1222` retained states,
     `max_node_disjuncts=8`, top retained nodes
     `29,31,32,33,35,36,37,38 -> 8d:4v`
@@ -183,6 +187,13 @@ changes, and move finished results to durable docs/tests/commits.
     filtered checkpoint drops back to the familiar OCaml-comparable single-file
     shape: about `4m42s`, `1222` retained states, and the same
     `29,31,32,33,35,36,37,38 -> 8d:4v` hotspot
+  - latest single-file repro under `~/infer-rs-bench/wpblock-20260430-181642`:
+    `4m34s` real, peak memory footprint `~16.7 GB`, `~16.9 GB` max RSS for
+    just the filtered `whirlpool_block` slice with the skip in place. Rust is
+    therefore still way over OCaml on this one-file slice (OCaml peak ~`945
+    MB`, ~`32s` wall on the broader 55-file analyze in this same bench), and
+    it confirms that with the skip the dominant remaining cost is per-disjunct
+    state size in `whirlpool_block` itself, not the global initializer surface.
   - the earlier forced-retention slice remains useful as an upper bound for
     scalability work: if `__infer_globals_initializer_Cx` is actually
     analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the
