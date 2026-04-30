@@ -197,7 +197,11 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   and reaches ~`16k` live heap nodes before `whirlpool_block` even starts,
   and the first minute of `whirlpool_block` with that summary available jumps
   to about `33k` live heap nodes / `67k` edges per active state and
-  multi-million retained totals.
+  multi-million retained totals. After ~`7m28s` of `whirlpool_block` itself,
+  the fuller slice was still only at `max_node_disjuncts=4` but had already
+  grown to ~`6.85M` live heap nodes / `13.68M` live heap edges in retained
+  totals, so large per-state global-table materialization is now a first-class
+  OpenSSL blocker, not just the old disjunct-count gap.
 - Rust now executes exported `Metadata::ExitScope` semantically instead of as
   a no-op, with focused regressions for dead temp removal and preserved
   pre-rooted formals. Keep that correctness fix even though the full final

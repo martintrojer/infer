@@ -35,6 +35,10 @@ for the remaining `whirlpool_block` convergence gap.
   materializes a very large single-disjunct heap. That makes structural
   sharing even more relevant for the bytes occupied by per-state global-table
   subgraphs once the semantic dependency is modeled correctly.
+- In that fuller slice, `whirlpool_block` can already reach multi-million
+  retained heap/edge totals while `max_node_disjuncts` is still only `4`, so
+  the systems problem is no longer just “too many disjuncts” — it is also the
+  cost of storing very large per-disjunct global-table state.
 
 ## Non-Goals
 

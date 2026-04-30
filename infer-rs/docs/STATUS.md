@@ -130,8 +130,11 @@
   probe), and once `whirlpool_block` starts with that summary available its
   per-state post heap immediately jumps from the old ~`1k`-node scale to about
   `33k` live heap nodes / `67k` edges, while the live-fixpoint retained totals
-  reach multi-million heap / attr / formula counts within about a minute. The
-  older filtered `whirlpool_block` probe is still useful for the pure loop-head
+  reach multi-million heap / attr / formula counts within about a minute.
+  After ~`7m28s` of `whirlpool_block` itself, the fuller slice was still at
+  only `max_node_disjuncts=4` but had already grown to about `6.85M` live heap
+  nodes / `13.68M` live heap edges in retained fixpoint totals. The older
+  filtered `whirlpool_block` probe is still useful for the pure loop-head
   convergence bug, but it now clearly under-approximates the whole-program `Cx`
   cost.
 - There is now also a concrete structural-sharing prototype sketch in

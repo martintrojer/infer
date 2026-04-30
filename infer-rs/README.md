@@ -139,7 +139,10 @@ OpenSSL benchmark status on this host:
   hotspot. That initializer alone is already large (~`16k` live heap nodes
   after ~`5m22s` in the current release probe), and once `whirlpool_block`
   starts with that summary available its per-state post heap jumps to about
-  `33k` live nodes / `67k` edges almost immediately. So the old filtered
+  `33k` live nodes / `67k` edges almost immediately. After ~`7m28s` of
+  `whirlpool_block` itself, the fuller slice was still at only
+  `max_node_disjuncts=4` but had already grown to about `6.85M` live heap
+  nodes / `13.68M` live heap edges in retained totals. So the old filtered
   `whirlpool_block` run remains useful for the pure loop-head convergence gap,
   but it under-approximated the full-program `Cx` cost.
 

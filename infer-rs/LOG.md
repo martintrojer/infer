@@ -182,6 +182,12 @@ changes, and move finished results to durable docs/tests/commits.
     `whirlpool_block` starts with per-state post heaps already around `33k`
     live nodes / `67k` edges and live-fixpoint retained totals in the
     multi-million range
+  - that fuller slice is also qualitatively different from the old pure
+    loop-head probe: after ~`7m28s` of `whirlpool_block` itself the run was
+    still at only `max_node_disjuncts=4`, but live retained totals had already
+    grown to about `6.85M` live heap nodes / `13.68M` live heap edges. In the
+    whole-program-realistic slice, large per-state global-table materialization
+    is therefore at least as important as the old `8d:4v` convergence split.
   - the older no-initializer filtered `whirlpool_block` probe is still useful
     as a narrow slice for the pure loop-head convergence bug, but it now
     clearly under-approximates the full-program `Cx` cost
