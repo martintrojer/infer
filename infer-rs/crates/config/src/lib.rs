@@ -78,6 +78,11 @@ pub struct InferConfig {
     #[serde(rename = "pulse-widen-threshold")]
     pub pulse_widen_threshold: usize,
 
+    /// Larger CFGs than this are skipped in Pulse.
+    /// OCaml: `--pulse-max-cfg-size` (default 15000)
+    #[serde(rename = "pulse-max-cfg-size")]
+    pub pulse_max_cfg_size: usize,
+
     /// Disable inter-procedural analysis in Pulse.
     /// OCaml: `--pulse-intraprocedural-only` (default false)
     #[serde(rename = "pulse-intraprocedural-only")]
@@ -220,6 +225,7 @@ impl Default for InferConfig {
         Self {
             pulse_max_disjuncts: 20,
             pulse_widen_threshold: 3,
+            pulse_max_cfg_size: 15_000,
             pulse_intraprocedural_only: false,
             pulse_recency_limit: None,
             pulse_only: false,
@@ -320,6 +326,7 @@ mod tests {
         let config = InferConfig::default();
         assert_eq!(config.pulse_max_disjuncts, 20);
         assert_eq!(config.pulse_widen_threshold, 3);
+        assert_eq!(config.pulse_max_cfg_size, 15_000);
         assert_eq!(config.max_widens, 10_000);
         assert!(!config.pulse_intraprocedural_only);
         assert_eq!(config.pulse_recency_limit, None);
@@ -346,9 +353,10 @@ mod tests {
 
     #[test]
     fn test_from_json_known_fields() {
-        let json = r#"{"pulse-max-disjuncts": 50, "pulse-recency-limit": 17, "quiet": true, "pulse-force-continue": false}"#;
+        let json = r#"{"pulse-max-disjuncts": 50, "pulse-max-cfg-size": 1234, "pulse-recency-limit": 17, "quiet": true, "pulse-force-continue": false}"#;
         let config = InferConfig::from_json(json);
         assert_eq!(config.pulse_max_disjuncts, 50);
+        assert_eq!(config.pulse_max_cfg_size, 1234);
         assert_eq!(config.pulse_recency_limit, Some(17));
         assert!(config.quiet);
         assert!(!config.pulse_force_continue);

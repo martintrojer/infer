@@ -187,21 +187,24 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 - The current `--procedures-filter whirlpool_block` hotspot run no longer
   omits `__infer_globals_initializer_Cx`: callgraph/filtering and
   pre-analysis summary collection now retain rooted global initializer deps.
-  Keep two interpretations separate going forward:
+- Rust now also supports OCaml's default `pulse-max-cfg-size = 15000`, so the
+  default filtered repro keeps `__infer_globals_initializer_Cx` in the set but
+  skips analyzing it as a large procedure. Treat that `4m42s` / `1222`
+  retained-state checkpoint as the current OCaml-compatible single-file slice.
+- Keep two additional interpretations available when debugging:
   (1) the older no-initializer slice is still useful for the pure loop-head
   convergence bug, and
-  (2) the newer retained-initializer slice is the better proxy for real
+  (2) the forced retained-initializer slice is the better upper bound for real
   whole-program `Cx` cost.
-- Track the new retained-initializer cost surface explicitly: on the fresh
-  release repro, `__infer_globals_initializer_Cx` alone takes about `5m22s`
-  and reaches ~`16k` live heap nodes before `whirlpool_block` even starts,
-  and the first minute of `whirlpool_block` with that summary available jumps
-  to about `33k` live heap nodes / `67k` edges per active state and
-  multi-million retained totals. After ~`7m28s` of `whirlpool_block` itself,
-  the fuller slice was still only at `max_node_disjuncts=4` but had already
-  grown to ~`6.85M` live heap nodes / `13.68M` live heap edges in retained
-  totals, so large per-state global-table materialization is now a first-class
-  OpenSSL blocker, not just the old disjunct-count gap.
+- Keep the forced retained-initializer cost surface documented even though the
+  default path now skips it: on the fresh release repro,
+  `__infer_globals_initializer_Cx` alone takes about `5m22s` and reaches
+  ~`16k` live heap nodes before `whirlpool_block` even starts, and the first
+  minute of `whirlpool_block` with that summary available jumps to about `33k`
+  live heap nodes / `67k` edges per active state and multi-million retained
+  totals. After ~`7m28s` of `whirlpool_block` itself, the fuller slice was
+  still only at `max_node_disjuncts=4` but had already grown to ~`6.85M` live
+  heap nodes / `13.68M` live heap edges in retained totals.
 - Rust now executes exported `Metadata::ExitScope` semantically instead of as
   a no-op, with focused regressions for dead temp removal and preserved
   pre-rooted formals. Keep that correctness fix even though the full final

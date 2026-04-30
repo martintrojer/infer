@@ -30,15 +30,18 @@ for the remaining `whirlpool_block` convergence gap.
 - Whole-program merged direct-`.sil` runs still show memory growth /
   abnormal termination, so reducing physical duplication is still a realistic
   systems-level lever.
-- The newer filtered OpenSSL repro now retains and analyzes the implicit
-  `__infer_globals_initializer_Cx` dependency too, and that initializer alone
-  materializes a very large single-disjunct heap. That makes structural
-  sharing even more relevant for the bytes occupied by per-state global-table
-  subgraphs once the semantic dependency is modeled correctly.
-- In that fuller slice, `whirlpool_block` can already reach multi-million
-  retained heap/edge totals while `max_node_disjuncts` is still only `4`, so
-  the systems problem is no longer just “too many disjuncts” — it is also the
-  cost of storing very large per-disjunct global-table state.
+- The newer filtered OpenSSL repro now retains the implicit
+  `__infer_globals_initializer_Cx` dependency too. In the default
+  OCaml-compatible configuration Rust now skips that proc via
+  `pulse-max-cfg-size = 15000`, which keeps the standard single-file slice on
+  the familiar `1222`-state `whirlpool_block` checkpoint.
+- The forced retained-initializer repro is still useful as an upper bound:
+  if `__infer_globals_initializer_Cx` is actually analyzed, it materializes a
+  very large single-disjunct heap and pushes `whirlpool_block` into
+  multi-million retained heap/edge totals while `max_node_disjuncts` is still
+  only `4`. That makes structural sharing very relevant for the bytes occupied
+  by per-state global-table subgraphs once the semantic dependency is modeled
+  correctly.
 
 ## Non-Goals
 

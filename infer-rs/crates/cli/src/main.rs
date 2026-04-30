@@ -133,6 +133,10 @@ struct Cli {
     #[arg(long = "pulse-recency-limit")]
     pulse_recency_limit: Option<usize>,
 
+    /// Larger CFGs than this are skipped in Pulse (default: 15000).
+    #[arg(long = "pulse-max-cfg-size")]
+    pulse_max_cfg_size: Option<usize>,
+
     /// Maximum widenings before fixpoint gives up (default: 10000).
     #[arg(long = "max-widens")]
     max_widens: Option<usize>,
@@ -243,6 +247,9 @@ impl Cli {
         }
         if let Some(v) = self.pulse_max_disjuncts {
             c.pulse_max_disjuncts = v;
+        }
+        if let Some(v) = self.pulse_max_cfg_size {
+            c.pulse_max_cfg_size = v;
         }
         if let Some(v) = self.max_widens {
             c.max_widens = v;

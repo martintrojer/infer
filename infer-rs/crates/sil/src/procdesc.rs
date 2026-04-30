@@ -269,6 +269,17 @@ impl Procdesc {
             .iter()
             .flat_map(|node| node.instrs.iter().map(move |instr| (node.id, instr)))
     }
+
+    /// Coarse CFG size metric used to skip pathologically large procedures.
+    ///
+    /// Cross-ref: OCaml `Procdesc.size` counts one unit per node, one per
+    /// successor edge, and one per SIL instruction.
+    pub fn size(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| 1 + self.get_succs(node.id).count() + node.instrs.len())
+            .sum()
+    }
 }
 
 impl fmt::Display for Procdesc {

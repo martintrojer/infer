@@ -176,21 +176,23 @@ changes, and move finished results to durable docs/tests/commits.
     matching `__infer_globals_initializer_<name>` proc, so
     `--procedures-filter whirlpool_block` now retains `3` procs on the fresh
     export (`whirlpool_block`, `memcpy`, `__infer_globals_initializer_Cx`)
-  - the fresh release repro with that dependency in place is much harsher than
-    the old loop-head-only slice: the run spends ~`5m22s` in
-    `__infer_globals_initializer_Cx` first, and then the first minute of
-    `whirlpool_block` starts with per-state post heaps already around `33k`
-    live nodes / `67k` edges and live-fixpoint retained totals in the
-    multi-million range
-  - that fuller slice is also qualitatively different from the old pure
-    loop-head probe: after ~`7m28s` of `whirlpool_block` itself the run was
-    still at only `max_node_disjuncts=4`, but live retained totals had already
-    grown to about `6.85M` live heap nodes / `13.68M` live heap edges. In the
-    whole-program-realistic slice, large per-state global-table materialization
-    is therefore at least as important as the old `8d:4v` convergence split.
-  - the older no-initializer filtered `whirlpool_block` probe is still useful
-    as a narrow slice for the pure loop-head convergence bug, but it now
-    clearly under-approximates the full-program `Cx` cost
+  - Rust now also supports OCaml's default `pulse-max-cfg-size = 15000`, and
+    on the fresh filtered release repro that means
+    `__infer_globals_initializer_Cx` is retained but skipped as a large
+    procedure before `whirlpool_block` runs. With that skip in place the
+    filtered checkpoint drops back to the familiar OCaml-comparable single-file
+    shape: about `4m42s`, `1222` retained states, and the same
+    `29,31,32,33,35,36,37,38 -> 8d:4v` hotspot
+  - the earlier forced-retention slice remains useful as an upper bound for
+    scalability work: if `__infer_globals_initializer_Cx` is actually
+    analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the
+    following `whirlpool_block` slice into multi-million retained heap / edge
+    totals even while `max_node_disjuncts` is still only `4`
+  - working interpretation after the `pulse-max-cfg-size` parity fix:
+    the default OCaml-like single-file blocker is still the old
+    `whirlpool_block` convergence gap, while the forced retained-initializer
+    slice exposes a second hidden systems problem around large per-disjunct
+    global-table materialization
   - the full raw dump is still unwieldy (`/tmp/wpblock-node-dump.log` reached
     ~`19.9M` lines), so a new lighter debugging aid is now in the working tree:
     selected fixpoint-node dumps can emit canonicalized state lines at

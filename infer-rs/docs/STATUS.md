@@ -118,25 +118,32 @@
   hit tens of GB RSS, and reducing physical duplication is still worthwhile for
   merged-run stability.
 - The narrowed OpenSSL probe is now more honest too: callgraph construction,
-  procedures filtering, and Pulse's pre-analysis summary collection now retain
+  procedures filtering, and Pulse's pre-analysis summary collection retain
   implicit `__infer_globals_initializer_<name>` deps for loads rooted in
-  globals, instead of only following explicit `Const(Cfun(...))` calls. On the
-  fresh `--procedures-filter whirlpool_block` repro this now keeps
-  `__infer_globals_initializer_Cx` in the retained set and runs it before
-  `whirlpool_block` at `-j 1`.
-- That change shows a second major cost surface beyond the old loop-head-only
-  slice: `__infer_globals_initializer_Cx` alone is a single-disjunct but very
-  large analysis (~`16k` live heap nodes after ~`5m22s` in the current release
-  probe), and once `whirlpool_block` starts with that summary available its
-  per-state post heap immediately jumps from the old ~`1k`-node scale to about
-  `33k` live heap nodes / `67k` edges, while the live-fixpoint retained totals
-  reach multi-million heap / attr / formula counts within about a minute.
-  After ~`7m28s` of `whirlpool_block` itself, the fuller slice was still at
-  only `max_node_disjuncts=4` but had already grown to about `6.85M` live heap
-  nodes / `13.68M` live heap edges in retained fixpoint totals. The older
-  filtered `whirlpool_block` probe is still useful for the pure loop-head
-  convergence bug, but it now clearly under-approximates the whole-program `Cx`
-  cost.
+  globals, instead of only following explicit `Const(Cfun(...))` calls.
+- Rust now also supports OCaml's `pulse-max-cfg-size` default (`15000`). On
+  the fresh `--procedures-filter whirlpool_block` repro this keeps
+  `__infer_globals_initializer_Cx` in the retained set but skips analyzing it
+  as a large procedure, which brings the default Rust single-file behavior
+  much closer to the OCaml baseline.
+- With that skip in place, the filtered release repro returns to the familiar
+  hotspot checkpoint instead of exploding on the initializer surface: `3`
+  retained procs, about `4m42s` total elapsed, and the same `1222`
+  retained-state / `29,31,32,33,35,36,37,38 -> 8d:4v` shape for
+  `whirlpool_block`.
+- The earlier forced-retention probe is still informative as an upper bound:
+  if `__infer_globals_initializer_Cx` is actually analyzed, it is a
+  single-disjunct but very large analysis (~`16k` live heap nodes after
+  ~`5m22s` in the current release probe), and once `whirlpool_block` starts
+  with that summary available its per-state post heap jumps from the old
+  ~`1k`-node scale to about `33k` live heap nodes / `67k` edges while the
+  live-fixpoint retained totals reach multi-million heap / attr / formula
+  counts within about a minute. After ~`7m28s` of `whirlpool_block` itself,
+  the fuller slice was still at only `max_node_disjuncts=4` but had already
+  grown to about `6.85M` live heap nodes / `13.68M` live heap edges in
+  retained fixpoint totals. The old no-initializer filtered `whirlpool_block`
+  probe remains useful for the pure loop-head convergence bug; the forced
+  retained-initializer slice remains useful as a scalability upper bound.
 - There is now also a concrete structural-sharing prototype sketch in
   [`docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`](./plans/STRUCTURAL_SHARING_PROTOTYPE.md).
   That work is explicitly scoped as a memory / clone-pressure track for merged

@@ -667,6 +667,29 @@ impl PulseSummary {
         }
     }
 
+    /// Summary surface for procedures Pulse intentionally skipped.
+    ///
+    /// Cross-ref: OCaml Pulse returns no summary when `should_analyze` rejects
+    /// a procedure (for example because `Procdesc.is_too_big` tripped). Rust's
+    /// summary store currently always materializes a summary object, so encode
+    /// the same caller-visible effect as an empty pre/post list.
+    pub fn skipped(pdesc: &Procdesc) -> Self {
+        Self {
+            pre_posts: Vec::new(),
+            has_dropped_disjuncts: false,
+            specialized: Vec::new(),
+            diagnostics: Vec::new(),
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: false,
+            formal_types: pdesc
+                .formals
+                .iter()
+                .map(|(_name, typ, _annot)| typ.clone())
+                .collect(),
+        }
+    }
+
     /// Compute a summary from the execution results of a procedure.
     ///
     /// Extracts the formal→address mapping and the final post-state from

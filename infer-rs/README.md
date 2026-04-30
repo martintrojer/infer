@@ -133,18 +133,21 @@ OpenSSL benchmark status on this host:
   without pretending to solve the remaining semantic `whirlpool_block` split
   by itself
 - the narrowed probe is now more faithful too: callgraph / filtering /
-  summary-collection now retain implicit global initializer deps for loads
-  rooted in globals. On the fresh filtered `whirlpool_block` repro this keeps
-  `__infer_globals_initializer_Cx` in the retained set and runs it before the
-  hotspot. That initializer alone is already large (~`16k` live heap nodes
-  after ~`5m22s` in the current release probe), and once `whirlpool_block`
-  starts with that summary available its per-state post heap jumps to about
-  `33k` live nodes / `67k` edges almost immediately. After ~`7m28s` of
-  `whirlpool_block` itself, the fuller slice was still at only
-  `max_node_disjuncts=4` but had already grown to about `6.85M` live heap
-  nodes / `13.68M` live heap edges in retained totals. So the old filtered
-  `whirlpool_block` run remains useful for the pure loop-head convergence gap,
-  but it under-approximated the full-program `Cx` cost.
+  summary-collection retain implicit global initializer deps for loads rooted
+  in globals. Rust now also supports OCaml's `pulse-max-cfg-size` default
+  (`15000`), so the filtered `whirlpool_block` repro keeps
+  `__infer_globals_initializer_Cx` in the retained set but skips analyzing it
+  as a large procedure, matching the OCaml single-file baseline more closely.
+- with that skip in place, the fresh filtered release repro returns to the old
+  hotspot shape instead of exploding on the initializer: `3` retained procs,
+  `4m42s` total elapsed, and the familiar `1222` retained-state /
+  `29,31,32,33,35,36,37,38 -> 8d:4v` checkpoint for `whirlpool_block`.
+- the earlier forced-retention probe is still informative as an upper bound:
+  when `__infer_globals_initializer_Cx` is actually analyzed, it grows to
+  about `16k` live heap nodes by itself and pushes the following
+  `whirlpool_block` slice into multi-million retained heap / edge totals. That
+  hidden cost surface still matters for future scalability work, but the
+  default OCaml-compatible path now skips it.
 
 On the performance side, Rust now mirrors the OCaml split between cheap
 disjunct equality and semantic subsumption more closely. `Comparable` has an

@@ -586,6 +586,15 @@ pub fn analyze_with_specialization_and_requests(
     log::info!("[pulse] analyzing {}", pdesc.proc_name);
 
     let cfg = config::get();
+    if pdesc.size() > cfg.pulse_max_cfg_size {
+        log::warn!(
+            "[pulse] skipped large procedure ({}, size:{})",
+            pdesc.proc_name,
+            pdesc.size()
+        );
+        return (PulseSummary::skipped(pdesc), Vec::new());
+    }
+
     let max_disjuncts = cfg.pulse_max_disjuncts;
     let max_widen_iters = cfg.pulse_widen_threshold;
 
@@ -3937,6 +3946,30 @@ mod tests {
         // exports a single `ContinueProgram` summary for this shape.
         assert_eq!(continue_paths, 1, "summary={summary:?}");
         assert_eq!(latent_null_derefs, 0, "summary={summary:?}");
+    }
+
+    #[test]
+    fn test_analyze_skips_large_proc_by_cfg_size() {
+        let pname = Procname::c_from_string("too_large_for_pulse");
+        let mut pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        let instrs = std::iter::repeat_with(sil::instr::Instr::skip)
+            .take(config::get().pulse_max_cfg_size + 1)
+            .collect();
+        let node = pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
+            instrs,
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![node]);
+        pdesc.set_succs(node, vec![1]);
+
+        let summary = analyze(&pdesc);
+        assert!(
+            summary.pre_posts.is_empty(),
+            "summary should be skipped: {summary:?}"
+        );
+        assert!(summary.diagnostics.is_empty());
+        assert!(!summary.is_empty_body);
     }
 
     #[test]
