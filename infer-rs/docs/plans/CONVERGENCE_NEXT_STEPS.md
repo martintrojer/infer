@@ -92,3 +92,22 @@ Wrap the remaining per-state collections: `const_cache`, `must_be_valid`,
 a deep rabbit hole, B is the natural fallback so we at least measure the Arc
 work at scale before moving on. C is only worth doing as filler if both A and
 B stall.
+
+### Status
+
+First investigative pass on (A) is documented in
+[`CONVERGENCE_8D4V_FINDINGS.md`](./CONVERGENCE_8D4V_FINDINGS.md). Summary:
+
+- The `8` disjuncts decompose cleanly as `2 (pre-side) × 4 (post-side
+  tier)`. Both splits look like behaviors OCaml's strict-isograph `leq` and
+  shared `pulse_widen_threshold = 3` would also produce on the same
+  `wp_block.sil` capture.
+- A real but secondary canonicalization gap exists in Rust: `PRE#0` and
+  `PRE#2` differ only by abstract-value renaming on the pre subgraph but
+  fail to canonicalize identically. That is a missed dedup opportunity, not
+  the explanation for the `4`-tier post-side growth.
+- Concrete next step before deciding whether to keep digging on (A): re-run
+  OCaml with `--debug` on the same `wp_block.sil` capture and count the
+  retained pre/post disjuncts at `whirlpool_block` node `31`. If OCaml also
+  retains `~8` comparable disjuncts, the `8d:4v` framing was wrong and the
+  next track to pursue is (B) instead.

@@ -1,0 +1,151 @@
+# `whirlpool_block` `8d:4v` retained-state findings
+
+First pass at option A from `CONVERGENCE_NEXT_STEPS.md`: reproducing the
+8-disjunct retained state at `whirlpool_block` node `31 PRE` and inspecting
+what makes those 8 disjuncts distinct, plus first guesses about which OCaml
+mechanism might collapse them where Rust does not.
+
+Bench source: `~/infer-rs-bench/wpblock-20260430-181642/openssl-1.0.2d/textual-out-wp/wp_block.sil`,
+filtered single-procedure run with the post-Arc<Phi> + outer-Arc baselines in
+place.
+
+## Decomposition: `8 disjuncts = 2 (pre) × 4 (post tier)`
+
+The retained PRE alpha summary at node `31`:
+
+```
+#0:continue pre[s=3 h=21 a=30] post[s=450 h=584  a=338] formula=1061
+#1:continue pre[s=3 h=37 a=46] post[s=458 h=601  a=349] formula=1058
+#2:continue pre[s=3 h=21 a=30] post[s=451 h=842  a=468] formula=1956
+#3:continue pre[s=3 h=37 a=46] post[s=459 h=859  a=479] formula=1953
+#4:continue pre[s=3 h=21 a=30] post[s=451 h=1100 a=597] formula=2852
+#5:continue pre[s=3 h=37 a=46] post[s=459 h=1117 a=608] formula=2849
+#6:continue pre[s=3 h=21 a=30] post[s=451 h=1358 a=726] formula=3748
+#7:continue pre[s=3 h=37 a=46] post[s=459 h=1375 a=737] formula=3745
+```
+
+Two independent splits combine multiplicatively:
+
+- **Pre-side split (2-way)**: even-indexed disjuncts have `pre[h=21 a=30]`,
+  odd-indexed have `pre[h=37 a=46]`. The delta is exactly `+16` heap nodes
+  (`8` array cells + `8` derefs) and `+16` precondition attrs
+  (`8 × {MustBeInitialized, MustBeValid}`).
+- **Post-side tier split (4-way)**: each tier adds exactly `+258` heap
+  nodes (`+129` array edges + `+129` deref edges), `+129` post attrs, and
+  `~+896` formula items, all concentrated in the global `Cx` table subtree.
+
+`2 × 4 = 8`.
+
+## Pre-side split traces back to two distinct loop-body paths
+
+Inspecting the per-disjunct precondition `MustBeInitialized` /
+`MustBeValid` attrs:
+
+- `PRE#0`-style (smaller pre): preconditions are anchored at source lines
+  `[478, 517-525]`. These correspond to wp_block.sil basic blocks
+  (`#node_22`-`#node_15`, etc.) that read only `H[i]` and write
+  `K[i]` / `S[i] ^= K[i]`.
+- `PRE#1`-style (larger pre): preconditions are anchored at source lines
+  `[478, 530-537]`. These correspond to a second cluster of basic blocks
+  (`#node_12`, `#node_10`, `#node_7`, `#node_6`, ...) that read `H[i]`,
+  write `K[i]`, **and** additionally load `pa[i]` (an extra `*int` deref),
+  then xor `S[i] ^= K[i] ^ pa[i]`.
+
+The `+16` nodes / `+16` attrs in `PRE#1` are exactly that extra `pa[i]`
+chain: `8` `array:void` reads from `pa` plus the `8` derefs they imply.
+
+These are genuinely two different abductive inferences (one path didn't
+deref `pa`, the other did), so OCaml's `PulseAbductiveDomain.leq`
+(graph-isomorphism + `Formula.equal`) would also keep them separate.
+
+## Post-side tier split is per-iteration global-table growth
+
+For a fixed pre, the four tiers are clean stride-`+258` heap-node /
+`+129`-attr / `~+896`-formula increments, all in the global `Cx` table
+subtree, not in local `K` / `S` / `H`. With `pulse_widen_threshold=3`
+(the default we share with OCaml), four tiers is exactly the
+post-widen-cap shape: tier `0` from before any loop body, tier `1`-`3`
+from the three widening iterations OCaml allows before stopping.
+
+## Smoking gun in our canonicalizer
+
+`PRE#0` and `PRE#2` share the same alpha summary
+(`pre[s=3, h=21, a=30]`, same value-count shape) and traverse the same
+`H -> .anonymous_union -> array[i] -> deref` subgraph. But our canonical
+PRE dumps for them are **not** byte-identical — they differ purely in
+which abstract-value labels were assigned to which structural roles:
+
+```
+PRE#0 pre_heap (only-in-#0):
+  u354:field:...anonymous_union_..._478_5.q -> u417
+  u372:field:WHIRLPOOL_CTX.H            -> u418
+  u417:array:void:u342                  -> u548
+  ...
+
+PRE#2 pre_heap (only-in-#2):
+  u354:field:...anonymous_union_..._478_5.q -> u418
+  u372:field:WHIRLPOOL_CTX.H            -> u419
+  u418:array:void:u342                  -> u548
+  ...
+```
+
+That is, `u417 ↔ u418` and `u418 ↔ u419` between the two states for the
+same structural roles. `state_cmp::canonicalize` is supposed to alpha-rename
+both states into a common form so that this kind of pure renaming
+disappears, but here it does not. Existing alpha-equivalence unit tests
+(`test_alpha_equivalent_states_*`) cover simple renamings only; whatever
+PRE#0 vs PRE#2 hits in this larger graph is escaping that coverage.
+
+Note also: the same `u548` carries different `MustBeInitialized` /
+`MustBeValid` traces in `PRE#0` (line `518`) vs `PRE#2` (line `519`).
+That is structural, not just a label issue: the two preconditions arrived
+via different source lines, and Pulse's `Trace.equal` is structural so
+those two `MustBeInitialized` attrs are genuinely unequal even before any
+canonicalization.
+
+## What this rules in / out
+
+- **`leq` is not too strict in some Rust-only sense.** OCaml's
+  `PulseAbductiveDomain.leq` is `Formula.equal` on the path condition plus
+  `GraphComparison.isograph` on both pre and post, which is also a strict
+  "exact subgraph isomorphism" up to abstract-value renaming. Both rule out
+  collapsing the 4 tiers (different node counts) and rule out collapsing
+  block-A pre vs block-B pre (different precondition graphs).
+- **Loop-head widening is not bypassed.** With
+  `pulse_widen_threshold = 3`, four tiers is exactly the post-cap shape we
+  expect from one initial state plus three widening iterations.
+- **Recency limit is not the culprit.** Forcing `pulse-recency-limit = 32`
+  to match OCaml's default left this slice essentially identical (already
+  documented in `TODO.md`).
+- **There is a real partial canonicalization gap** in Rust:
+  `PRE#0`/`PRE#2` should canonicalize to the same form on the pre subgraph
+  modulo the `u417 ↔ u418` rename, and currently they do not. That is at
+  least a missed dedup opportunity, but it is not by itself the explanation
+  for the `4`-tier post-side growth.
+
+## Open question this points at
+
+The `2`-way pre split and the `4`-way post-tier split both look like
+behaviors OCaml would reproduce on the same `wp_block.sil` capture. If
+that's true, the remaining "OCaml is fast on this slice, we are slow" gap
+isn't really `8d:4v` retained at this node — it would be per-state
+representation cost (largely already addressed by Phase 1 Arc work) and/or
+some other procedure / code path entirely.
+
+Concrete next step before deciding whether to keep digging in this
+direction:
+
+- Re-run **OCaml** with `--debug` on the same `wp_block.sil` capture and
+  inspect the corresponding HTML for `whirlpool_block` node `31`. Count
+  the retained pre/post disjuncts and their per-state `h=` / `a=` /
+  `formula=` shape.
+- If OCaml shows `~8` disjuncts of comparable size, "convergence" was the
+  wrong frame and we should pivot to (B) "validate Arc savings on
+  whole-program OpenSSL."
+- If OCaml shows `<= 2` disjuncts or much smaller per-state shape, then
+  there is a real OCaml-only convergence mechanism (likely in how it joins
+  / abstracts global-table reads) we need to identify.
+
+This file is the artifact of the first investigative pass before that
+OCaml comparison. Future passes should append findings here rather than
+overwriting.
