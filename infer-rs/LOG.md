@@ -194,37 +194,39 @@ changes, and move finished results to durable docs/tests/commits.
     MB`, ~`32s` wall on the broader 55-file analyze in this same bench), and
     it confirms that with the skip the dominant remaining cost is per-disjunct
     state size in `whirlpool_block` itself, not the global initializer surface.
-  - first structural-sharing baby steps are now in:
-    - `BaseMemory.graph` stores `Arc<Edges>` instead of `Edges`, with
-      `Arc::make_mut` for in-place updates.
-    - `BaseAddressAttributes.map` similarly stores `Arc<Attributes>` per
-      address, with the same `Arc::make_mut` mutation pattern.
-    - `BaseStack.map` is now `Arc<HashMap<Var, ValueWithHistory>>` with the
-      same path-copying mutation pattern (whole-map rather than per-entry,
+  - structural-sharing baby steps now in:
+    - `BaseMemory.graph` is `Arc<BTreeMap<AbstractValue, Arc<Edges>>>` (two
+      layers: outer Arc + per-address Arc<Edges>), with `Arc::make_mut` for
+      both layers and cheap no-op pre-checks.
+    - `BaseAddressAttributes.map` is similarly
+      `Arc<BTreeMap<AbstractValue, Arc<Attributes>>>`.
+    - `BaseStack.map` is `Arc<HashMap<Var, ValueWithHistory>>` (whole-map,
       since each stack entry is small).
-    - `Formula.phi` is now `Arc<Phi>` with a `phi_mut` helper, sharing the
-      heavy phi maps (linear_eqs, term_eqs, atoms, intervals, var_eqs, ...)
-      across disjuncts and retained invariant snapshots.
-    - the outer container is still copied on snapshot/clone for each, but the
-      heavy per-cell payloads (heap edges, address attributes, stack map,
-      formula phi) are now refcount-shared across disjuncts and retained
-      invariant snapshots.
-  - clean reruns on the same bench show a real memory win on this slice for
-    the same `1222`-state / `8d:4v` filtered `whirlpool_block` checkpoint:
+    - `Formula.phi` is `Arc<Phi>` with a `phi_mut` helper, sharing the heavy
+      phi maps (linear_eqs, term_eqs, atoms, intervals, var_eqs, ...).
+    - the outer container of each is now itself reference-counted, so
+      cloning a Pulse state never deep-copies any of the four big maps
+      eagerly; mutations clone-on-write via `Arc::make_mut`, and the public
+      `BaseMemory` / `BaseAddressAttributes` / `BaseStack` / `Formula` APIs
+      are unchanged.
+  - clean reruns on the same bench show progressive memory wins on this
+    slice for the same `1222`-state / `8d:4v` filtered `whirlpool_block`
+    checkpoint:
     - baseline before any Arc sharing: peak memory footprint ~`16.7 GB`
       (`4m34s` real on a less loaded host)
-    - after `Arc<Edges>` only: ~`13.84 GB` peak (`7m17s` real)
-    - after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak (`7m37s` real)
-    - after `Arc<Edges>` + `Arc<Attributes>` + `Arc<BaseStack.map>`:
-      ~`5.97 GB` peak (`4m29s` real)
-    - after the above + `Arc<Phi>`: ~`5.73 GB` peak (`4m32s` real), i.e.
-      about a `66%` peak-memory drop vs the pre-Arc baseline at the same
-      wall time as the original
+    - after per-address `Arc<Edges>` only: ~`13.84 GB` peak (`7m17s` real)
+    - + per-address `Arc<Attributes>`: ~`9.34 GB` peak (`7m37s` real)
+    - + `Arc<BaseStack.map>`: ~`5.97 GB` peak (`4m29s` real)
+    - + `Arc<Phi>`: ~`5.73 GB` peak (`4m32s` real)
+    - + outer `Arc<BTreeMap>` for `BaseMemory.graph` and
+      `BaseAddressAttributes.map`: ~`3.93 GB` peak (`4m33s` real), i.e.
+      about a `76%` peak-memory drop vs the pre-Arc baseline, at unchanged
+      wall time
     - all reruns observe `0 swaps` and the same `1222` retained-state shape
   - the intermediate `~7m` wall-time numbers correlated with host load on
-    those runs. The latest reruns all matched the original `~4m30s` wall
-    time, so on a calm host the structural-sharing changes are effectively
-    memory-only wins for this slice.
+    those runs. All reruns since the BaseStack increment have matched the
+    original `~4m30s` wall time, so on a calm host the structural-sharing
+    changes are effectively memory-only wins for this slice.
   - the earlier forced-retention slice remains useful as an upper bound for
     scalability work: if `__infer_globals_initializer_Cx` is actually
     analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the

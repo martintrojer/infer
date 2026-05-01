@@ -103,33 +103,35 @@ Why this first:
 As low-risk first moves:
 
 - `BaseMemory.graph` is now
-  `BTreeMap<AbstractValue, Arc<Edges>>` instead of
-  `BTreeMap<AbstractValue, Edges>`.
+  `Arc<BTreeMap<AbstractValue, Arc<Edges>>>` (the outer map is itself
+  reference-counted with `Arc::make_mut`, and each address still points to
+  its own per-address `Arc<Edges>`).
 - `BaseAddressAttributes.map` is similarly
-  `BTreeMap<AbstractValue, Arc<Attributes>>`.
-- `BaseStack.map` is now `Arc<HashMap<Var, ValueWithHistory>>`, sharing the
+  `Arc<BTreeMap<AbstractValue, Arc<Attributes>>>`.
+- `BaseStack.map` is `Arc<HashMap<Var, ValueWithHistory>>`, sharing the
   whole stack map (whole-map rather than per-entry, since each stack entry is
   small).
-- `Formula.phi` is now `Arc<Phi>` with a `phi_mut` helper, sharing the heavy
+- `Formula.phi` is `Arc<Phi>` with a `phi_mut` helper, sharing the heavy
   phi maps (linear_eqs, term_eqs, atoms, intervals, var_eqs, fn_app_eqs).
 
-The outer container is still copied on `clone`, but the heavy per-cell
-payloads (heap edges, address attributes, the entire stack map, the entire
-formula phi) are now refcount-shared between disjuncts, retained invariant
-snapshots, and join/widen results. Mutating helpers go through
-`Arc::make_mut` so the public APIs are unchanged.
+Nothing on the read side changed: each container exposes the same public
+API as before. Mutating helpers clone-on-write through `Arc::make_mut`, with
+cheap no-op pre-checks (`contains_key`, `iter().all(...)`, `values().any(...)`)
+on the common paths so reads that detect a no-op mutation never force a
+clone-on-write.
 
 Measured impact on the filtered single-file `whirlpool_block` slice for the
 same `1222`-state / `8d:4v` checkpoint:
 
 - baseline before any Arc sharing: ~`16.7 GB` peak, `4m34s` real
-- after `Arc<Edges>`: ~`13.84 GB` peak
-- after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak
-- after `Arc<Edges>` + `Arc<Attributes>` + `Arc<BaseStack.map>`: ~`5.97 GB`
-  peak, `4m29s` real
-- after the above + `Arc<Phi>`: ~`5.73 GB` peak, `4m32s` real (~`66%`
-  peak-memory drop vs the pre-Arc baseline, no wall-time regression on a calm
-  host)
+- after per-address `Arc<Edges>`: ~`13.84 GB` peak
+- + per-address `Arc<Attributes>`: ~`9.34 GB` peak
+- + `Arc<BaseStack.map>`: ~`5.97 GB` peak, `4m29s` real
+- + `Arc<Phi>`: ~`5.73 GB` peak, `4m32s` real
+- + outer `Arc<BTreeMap>` for `BaseMemory.graph` and
+  `BaseAddressAttributes.map`: ~`3.93 GB` peak, `4m33s` real (~`76%`
+  peak-memory drop vs the pre-Arc baseline, no wall-time regression on a
+  calm host)
 
 All reruns observe `0 swaps` and the same `1222` retained-state shape, so
 these are pure storage / clone-cost wins, not analysis behavior changes.
