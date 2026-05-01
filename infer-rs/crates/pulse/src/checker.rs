@@ -349,6 +349,94 @@ fn log_disjunctive_canonical_dump(
     }
 }
 
+/// Drop `Var::LogicalVar(_)` post-stack bindings whose Ident is no longer
+/// live-out of `node_id`, on every disjunct of `state`. Mirrors the effect
+/// of OCaml's `Metadata (ExitScope ids)` cleanup that the textual exporter
+/// strips.
+///
+/// Cross-ref:
+/// - OCaml `Pulse.ml` `Metadata (ExitScope ...)` -> `PulseOperations.remove_vars`.
+/// - OCaml's frontend liveness pass emits `ExitScope` at logical-temp
+///   end-of-life. The textual exporter does not preserve those metadata
+///   markers, so on a textual-SIL re-analyze we synthesize the equivalent
+///   cleanup at every CFG node exit using our own backward liveness.
+fn drop_dead_logical_vars(
+    state: &mut DisjunctiveDomain<ExecutionDomain>,
+    node_id: NodeId,
+    liveness: &analyses::liveness::LivenessResult,
+    return_candidate_logical_stamp: Option<i32>,
+) {
+    use analyses::liveness::LiveVar;
+    let Some(live_out) = absint::interp::extract_pre(node_id, &liveness.inv_map) else {
+        // No backward liveness state for this node; conservatively keep all
+        // bindings (matches the pre-cleanup behavior).
+        return;
+    };
+    for disjunct in state.disjuncts.iter_mut() {
+        let astate = match disjunct {
+            ExecutionDomain::ContinueProgram(s)
+            | ExecutionDomain::ExitProgram(s)
+            | ExecutionDomain::ExceptionRaised(s) => s,
+            // Error/latent variants carry their own snapshot used in
+            // diagnostics; do not mutate them after the fact.
+            ExecutionDomain::AbortProgram { .. }
+            | ExecutionDomain::LatentAbortProgram { .. }
+            | ExecutionDomain::LatentInvalidAccess { .. } => continue,
+        };
+        let dead_logical_vars: Vec<sil::var::Var> = astate
+            .post
+            .stack
+            .iter()
+            .filter_map(|(var, _)| match var {
+                sil::var::Var::LogicalVar(id) => {
+                    if Some(id.stamp) == return_candidate_logical_stamp {
+                        // Cross-ref: see `summary::find_return_value`. When
+                        // the textual SIL has no explicit `Store __return
+                        // <- n`, the summary creator falls back to the
+                        // last-assigned logical var. Keep that binding
+                        // even when liveness says it is dead so the
+                        // summary's `result` field is still populated.
+                        return None;
+                    }
+                    let live_var = LiveVar::of_ident(id);
+                    if live_out.contains(&live_var) {
+                        None
+                    } else {
+                        Some(var.clone())
+                    }
+                }
+                sil::var::Var::ProgramVar(_) => None,
+            })
+            .collect();
+        if dead_logical_vars.is_empty() {
+            continue;
+        }
+        astate.remove_vars(&dead_logical_vars);
+    }
+}
+
+/// Compute the stamp of the logical-var that `summary::find_return_value`'s
+/// fallback heuristic would pick: the last-encountered `Load`/`Call` `id`
+/// across the procedure in iteration order. Returns `None` for void
+/// procedures (the heuristic is short-circuited there) or when the
+/// procedure has no `Load`/`Call` instructions.
+fn return_candidate_logical_stamp(pdesc: &Procdesc) -> Option<i32> {
+    if pdesc.ret_type.is_void() {
+        return None;
+    }
+    let mut last = None;
+    for node in &pdesc.nodes {
+        for instr in &node.instrs {
+            match instr {
+                sil::instr::Instr::Load { id, .. } => last = Some(id.stamp),
+                sil::instr::Instr::Call { ret: (id, _), .. } => last = Some(id.stamp),
+                _ => {}
+            }
+        }
+    }
+    last
+}
+
 fn dump_selected_fixpoint_nodes(
     proc_name: &str,
     pdesc: &Procdesc,
@@ -653,12 +741,22 @@ pub fn analyze_with_specialization_and_requests(
     let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
     let initial_domain = DisjunctiveDomain::singleton(initial_exec, max_disjuncts, max_widen_iters);
 
+    let liveness = if cfg.pulse_drop_dead_logical_vars {
+        Some(analyses::liveness::analyze(pdesc))
+    } else {
+        None
+    };
+    let return_candidate_logical_stamp = liveness
+        .as_ref()
+        .and_then(|_| return_candidate_logical_stamp(pdesc));
     let pulse_tf = PulseTransferFunctions {
         callee_summaries,
         pdesc,
         proc_name: format!("{}", pdesc.proc_name),
         spec_requests: RefCell::new(Vec::new()),
         progress: RefCell::new(ProcProgress::new()),
+        liveness,
+        return_candidate_logical_stamp,
     };
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
@@ -973,6 +1071,19 @@ struct PulseTransferFunctions<'a> {
     proc_name: String,
     spec_requests: RefCell<Vec<(Procname, PulseSpecialization)>>,
     progress: RefCell<ProcProgress>,
+    /// Backward liveness for the procedure under analysis. Used to drop
+    /// `Var::LogicalVar(_)` post-stack bindings whose Ident is no longer
+    /// live at node exit, mirroring the effect of OCaml's `ExitScope`
+    /// metadata that the textual exporter currently strips. None in tests
+    /// that build a `PulseTransferFunctions` by hand without computing
+    /// liveness; production paths populate it.
+    liveness: Option<analyses::liveness::LivenessResult>,
+    /// Stamp of the logical var that `summary::find_return_value`'s fallback
+    /// heuristic would pick for the procedure's return slot when the
+    /// `__return` pvar is missing from the textual SIL. The cleanup pass
+    /// preserves this binding even when liveness says it is dead, so that
+    /// the summary's `result` field still finds the return value.
+    return_candidate_logical_stamp: Option<i32>,
 }
 
 impl TransferFunctions for PulseTransferFunctions<'_> {
@@ -1098,6 +1209,24 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             for (idx, instr) in node.instrs.iter().enumerate() {
                 state = self.exec_instr(&state, data, node_id, idx, instr);
             }
+        }
+
+        // Cross-ref: OCaml's frontend emits `Metadata (ExitScope ids)` at
+        // logical-temp end-of-life, and `Pulse.ml` calls `remove_vars` to
+        // drop those bindings. The textual exporter currently strips that
+        // metadata, so the textual SIL we analyze keeps every `n$N:NN`
+        // logical-temp pinned in the post stack for the lifetime of the
+        // procedure, which dominates per-disjunct unique-value count on
+        // long encryption-style basic blocks. Mirror the OCaml effect by
+        // dropping logical-var bindings whose Ident is not live-out of
+        // this CFG node, using the precomputed backward liveness.
+        if let Some(liveness) = self.liveness.as_ref() {
+            drop_dead_logical_vars(
+                &mut state,
+                node_id,
+                liveness,
+                self.return_candidate_logical_stamp,
+            );
         }
 
         current_post.join(&state)
@@ -2386,6 +2515,8 @@ mod tests {
             proc_name: format!("{pname}"),
             spec_requests: RefCell::new(vec![]),
             progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
         };
         let state = DisjunctiveDomain {
             disjuncts: vec![ExecutionDomain::ContinueProgram(
@@ -2431,6 +2562,8 @@ mod tests {
             proc_name: format!("{pname}"),
             spec_requests: RefCell::new(vec![]),
             progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
         };
         let state = DisjunctiveDomain {
             disjuncts: vec![ExecutionDomain::ContinueProgram(
@@ -3847,6 +3980,8 @@ mod tests {
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
         for node in &pdesc.nodes {
@@ -3944,6 +4079,8 @@ mod tests {
                 proc_name: format!("{}", pdesc.proc_name),
                 spec_requests: RefCell::new(Vec::new()),
                 progress: RefCell::new(ProcProgress::new()),
+                liveness: None,
+                return_candidate_logical_stamp: None,
             };
             let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
 
@@ -4040,6 +4177,8 @@ mod tests {
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
         let retained = inv_map
@@ -4500,6 +4639,8 @@ mod tests {
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
 
@@ -4626,6 +4767,8 @@ mod tests {
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
         let state = inv_map
@@ -4716,6 +4859,8 @@ mod tests {
                 proc_name: format!("{}", caller.proc_name),
                 spec_requests: RefCell::new(Vec::new()),
                 progress: RefCell::new(ProcProgress::new()),
+                liveness: None,
+                return_candidate_logical_stamp: None,
             };
             let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &caller, initial_domain);
             let exit_state = inv_map

@@ -96,6 +96,19 @@ pub struct InferConfig {
     #[serde(rename = "pulse-recency-limit")]
     pub pulse_recency_limit: Option<usize>,
 
+    /// At each Pulse CFG node exit, drop `Var::LogicalVar(_)` post-stack
+    /// bindings whose Ident is not live-out of the node, mirroring the
+    /// effect of OCaml's `Metadata (ExitScope ids)` cleanup that the
+    /// textual exporter currently strips. Defaults to `true` because the
+    /// exported textual SIL never carries the cleanup metadata, and
+    /// without this pass the post stack accumulates every `n$N:NN`
+    /// logical-temp for the entire procedure, dominating per-disjunct
+    /// unique-value count on long encryption-style basic blocks. Tests
+    /// that exercise the per-instruction analysis directly without the
+    /// liveness-driven cleanup can disable it via `.inferconfig`.
+    #[serde(rename = "pulse-drop-dead-logical-vars", default = "default_true")]
+    pub pulse_drop_dead_logical_vars: bool,
+
     /// Run only the Pulse checker.
     /// OCaml: `--pulse-only` (default false)
     #[serde(rename = "pulse-only")]
@@ -220,12 +233,17 @@ pub struct InferConfig {
     pub quiet: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for InferConfig {
     fn default() -> Self {
         Self {
             pulse_max_disjuncts: 20,
             pulse_widen_threshold: 3,
             pulse_max_cfg_size: 15_000,
+            pulse_drop_dead_logical_vars: true,
             pulse_intraprocedural_only: false,
             pulse_recency_limit: None,
             pulse_only: false,

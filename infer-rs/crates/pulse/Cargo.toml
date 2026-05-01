@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 sil = { path = "../sil" }
 absint = { path = "../absint" }
+analyses = { path = "../analyses" }
 config = { path = "../config" }
 diagnostics = { path = "../diagnostics" }
 serde = { workspace = true }
