@@ -23,6 +23,7 @@ pub mod term;
 pub mod var_uf;
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use crate::abstract_value::AbstractValue;
 use crate::sat_unsat::SatUnsat;
@@ -42,10 +43,16 @@ pub enum Operand {
 /// The formula: wraps `Phi` with the public API.
 ///
 /// Mirrors OCaml's `Formula.t` which wraps `FormulaPhi.t` plus conditions.
+///
+/// `phi` is stored behind an `Arc` so cloning the surrounding abductive state
+/// shares the (typically large) phi map structure between disjuncts and
+/// retained invariant snapshots without deep-copying it. Mutating helpers go
+/// through `Arc::make_mut` (clone-on-write) so the public `Formula` API is
+/// unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Formula {
     conditions: BTreeMap<Atom, usize>,
-    phi: phi::Phi,
+    phi: Arc<phi::Phi>,
 }
 
 impl Formula {
@@ -59,6 +66,10 @@ impl Formula {
         &self.phi
     }
 
+    fn phi_mut(&mut self) -> &mut phi::Phi {
+        Arc::make_mut(&mut self.phi)
+    }
+
     /// Access the recorded prune conditions and the call depth at which they
     /// were added. Depth 0 means local to the current procedure.
     pub fn conditions(&self) -> &BTreeMap<Atom, usize> {
@@ -67,7 +78,7 @@ impl Formula {
 
     /// Add an atom constraint directly (for formula translation from callee).
     pub fn and_atom_direct(&mut self, atom: Atom) -> SatUnsat<Vec<NewEq>> {
-        self.phi.and_atom(atom)
+        self.phi_mut().and_atom(atom)
     }
 
     /// Add a translated callee condition and remember its call depth.
@@ -160,11 +171,11 @@ impl Formula {
     pub fn and_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<Vec<NewEq>> {
         match (op1, op2) {
             (Operand::AbstractValue(v1), Operand::AbstractValue(v2)) => {
-                self.phi.and_var_equal(*v1, *v2)
+                self.phi_mut().and_var_equal(*v1, *v2)
             }
             (Operand::AbstractValue(v), Operand::ConstOperand(c))
             | (Operand::ConstOperand(c), Operand::AbstractValue(v)) => {
-                self.phi.and_const_eq(*v, *c)
+                self.phi_mut().and_const_eq(*v, *c)
             }
             (Operand::ConstOperand(c1), Operand::ConstOperand(c2)) => {
                 if c1 == c2 {
@@ -178,12 +189,12 @@ impl Formula {
 
     /// Record that two variables are equal.
     pub fn and_equal_vars(&mut self, v1: AbstractValue, v2: AbstractValue) -> SatUnsat<Vec<NewEq>> {
-        self.phi.and_var_equal(v1, v2)
+        self.phi_mut().and_var_equal(v1, v2)
     }
 
     /// Record that a variable equals a constant.
     pub fn and_equal_const(&mut self, v: AbstractValue, c: i64) -> SatUnsat<Vec<NewEq>> {
-        self.phi.and_const_eq(v, c)
+        self.phi_mut().and_const_eq(v, c)
     }
 
     /// Record a pure function application: ret_val = f(actuals).
@@ -194,19 +205,19 @@ impl Formula {
         callee: &str,
         actuals: &[AbstractValue],
     ) -> SatUnsat<Vec<NewEq>> {
-        self.phi.and_fn_app(ret_val, callee, actuals)
+        self.phi_mut().and_fn_app(ret_val, callee, actuals)
     }
 
     /// Record that a variable equals a linear expression.
     pub fn and_equal_linear(&mut self, v: AbstractValue, lin: LinArith) -> SatUnsat<Vec<NewEq>> {
-        self.phi.and_linear_eq(v, lin)
+        self.phi_mut().and_linear_eq(v, lin)
     }
 
     /// Record that two operands are NOT equal.
     pub fn and_not_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<Vec<NewEq>> {
         let t1 = operand_to_term(op1, &self.phi);
         let t2 = operand_to_term(op2, &self.phi);
-        self.phi.and_atom(Atom::NotEqual(t1, t2))
+        self.phi_mut().and_atom(Atom::NotEqual(t1, t2))
     }
 
     /// Record that op1 ≤ op2.
@@ -221,7 +232,7 @@ impl Formula {
         }
         let t1 = operand_to_term(op1, &self.phi);
         let t2 = operand_to_term(op2, &self.phi);
-        self.phi.and_atom(Atom::LessEqual(t1, t2))
+        self.phi_mut().and_atom(Atom::LessEqual(t1, t2))
     }
 
     /// Record that v > 0 (v is positive / non-null).
@@ -241,14 +252,14 @@ impl Formula {
         }
         let t1 = operand_to_term(op1, &self.phi);
         let t2 = operand_to_term(op2, &self.phi);
-        self.phi.and_atom(Atom::LessThan(t1, t2))
+        self.phi_mut().and_atom(Atom::LessThan(t1, t2))
     }
 
     /// Mark a variable as integer-typed. When the linear solver later
     /// derives a non-integer rational for this variable, the path is Unsat.
     /// Cross-ref: OCaml PulseFormula.ml and_is_int.
     pub fn and_is_int(&mut self, v: AbstractValue) {
-        self.phi.mark_is_int(v);
+        self.phi_mut().mark_is_int(v);
     }
 
     /// Add a prune constraint (from a branch condition).
@@ -295,7 +306,7 @@ impl Formula {
         let result = if negated {
             self.and_not_equal(&op1, &op2)
         } else {
-            self.phi.and_var_equal(v1, v2)
+            self.phi_mut().and_var_equal(v1, v2)
         };
         if result.is_sat() {
             if let Some(atom) = normalized_condition {
@@ -361,12 +372,12 @@ impl Formula {
             citv::AbductionResult::Satisfiable(refined1, refined2) => {
                 // Refine intervals if we got tighter bounds
                 if let (Some(better), Operand::AbstractValue(v)) = (refined1, op1) {
-                    if self.phi.add_interval(*v, better).is_unsat() {
+                    if self.phi_mut().add_interval(*v, better).is_unsat() {
                         return SatUnsat::Unsat;
                     }
                 }
                 if let (Some(better), Operand::AbstractValue(v)) = (refined2, op2) {
-                    if self.phi.add_interval(*v, better).is_unsat() {
+                    if self.phi_mut().add_interval(*v, better).is_unsat() {
                         return SatUnsat::Unsat;
                     }
                 }
@@ -422,7 +433,7 @@ impl Formula {
         let result = if negated {
             self.and_not_equal(&Operand::AbstractValue(v), &Operand::ConstOperand(c))
         } else {
-            self.phi.and_const_eq(v, c)
+            self.phi_mut().and_const_eq(v, c)
         };
 
         if result.is_sat() {
@@ -443,7 +454,7 @@ impl Formula {
         y: &Operand,
     ) -> SatUnsat<Vec<NewEq>> {
         if result_of_binop_is_integer(&op, x, y, &self.phi) {
-            self.phi.mark_is_int(v);
+            self.phi_mut().mark_is_int(v);
         }
 
         // For supported arithmetic ops, create a linear equation AND
@@ -458,11 +469,11 @@ impl Formula {
                 if let Some(result_itv) = operand_interval(x, &self.phi).and_then(|ix| {
                     operand_interval(y, &self.phi).and_then(|iy| citv::CItv::binop(&op, &ix, &iy))
                 }) {
-                    if self.phi.add_interval(v, result_itv).is_unsat() {
+                    if self.phi_mut().add_interval(v, result_itv).is_unsat() {
                         return SatUnsat::Unsat;
                     }
                 }
-                self.phi.and_linear_eq(v, lx.add(&ly))
+                self.phi_mut().and_linear_eq(v, lx.add(&ly))
             }
             sil::binop::Binop::MinusA(_)
             | sil::binop::Binop::MinusPI
@@ -472,11 +483,11 @@ impl Formula {
                 if let Some(result_itv) = operand_interval(x, &self.phi).and_then(|ix| {
                     operand_interval(y, &self.phi).and_then(|iy| citv::CItv::binop(&op, &ix, &iy))
                 }) {
-                    if self.phi.add_interval(v, result_itv).is_unsat() {
+                    if self.phi_mut().add_interval(v, result_itv).is_unsat() {
                         return SatUnsat::Unsat;
                     }
                 }
-                self.phi.and_linear_eq(v, lx.sub(&ly))
+                self.phi_mut().and_linear_eq(v, lx.sub(&ly))
             }
             // Comparison ops: if both operands are known constants, fold to 0 or 1
             sil::binop::Binop::Eq
@@ -497,11 +508,12 @@ impl Formula {
                         sil::binop::Binop::Ge => cx >= cy,
                         _ => unreachable!(),
                     };
-                    self.phi.and_const_eq(v, if cmp { 1 } else { 0 })
+                    self.phi_mut().and_const_eq(v, if cmp { 1 } else { 0 })
                 } else {
                     // Record term equality: v = op(lhs, rhs).
                     // When pruning on v later, we can resolve back to the comparison.
-                    self.phi.term_eqs.insert(
+                    let phi = self.phi_mut();
+                    phi.term_eqs.insert(
                         v,
                         phi::TermEq {
                             op,
@@ -509,7 +521,7 @@ impl Formula {
                             rhs: y.clone(),
                         },
                     );
-                    let _ = self.phi.var_eqs.find(v);
+                    let _ = phi.var_eqs.find(v);
                     SatUnsat::Sat(Vec::new())
                 }
             }
@@ -520,10 +532,10 @@ impl Formula {
                     if qy != Q::from_integer(0) {
                         let result = qx / qy;
                         let lin = LinArith::of_q(result);
-                        return self.phi.and_linear_eq(v, lin);
+                        return self.phi_mut().and_linear_eq(v, lin);
                     }
                 }
-                let _ = self.phi.var_eqs.find(v);
+                let _ = self.phi_mut().var_eqs.find(v);
                 SatUnsat::Sat(Vec::new())
             }
             // Mul, DivI, Mod, Shift: fold if both operands are known constants
@@ -542,13 +554,13 @@ impl Formula {
                         sil::binop::Binop::Shiftlt if (0..64).contains(&cy) => cx << cy,
                         sil::binop::Binop::Shiftrt if (0..64).contains(&cy) => cx >> cy,
                         _ => {
-                            let _ = self.phi.var_eqs.find(v);
+                            let _ = self.phi_mut().var_eqs.find(v);
                             return SatUnsat::Sat(Vec::new());
                         }
                     };
-                    self.phi.and_const_eq(v, result)
+                    self.phi_mut().and_const_eq(v, result)
                 } else {
-                    let _ = self.phi.var_eqs.find(v);
+                    let _ = self.phi_mut().var_eqs.find(v);
                     SatUnsat::Sat(Vec::new())
                 }
             }
@@ -563,15 +575,15 @@ impl Formula {
                         sil::binop::Binop::BXor => cx ^ cy,
                         _ => unreachable!(),
                     };
-                    self.phi.and_const_eq(v, result)
+                    self.phi_mut().and_const_eq(v, result)
                 } else {
-                    let _ = self.phi.var_eqs.find(v);
+                    let _ = self.phi_mut().var_eqs.find(v);
                     SatUnsat::Sat(Vec::new())
                 }
             }
             _ => {
                 // For remaining unsupported ops, just register v
-                let _ = self.phi.var_eqs.find(v);
+                let _ = self.phi_mut().var_eqs.find(v);
                 SatUnsat::Sat(Vec::new())
             }
         }
@@ -579,7 +591,7 @@ impl Formula {
 
     /// Simplify the formula.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
-        self.phi.simplify(reachable);
+        self.phi_mut().simplify(reachable);
         let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
         for (atom, depth) in std::mem::take(&mut self.conditions) {
             if atom
@@ -621,7 +633,7 @@ impl Formula {
             })
             .collect();
 
-        self.phi.simplify(keep);
+        self.phi_mut().simplify(keep);
 
         let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
         let keep_reprs: HashSet<_> = keep.iter().map(|v| self.phi.get_repr(*v)).collect();
@@ -671,7 +683,7 @@ impl Formula {
                 .into_iter()
                 .all(|v| !ignored_reprs.contains(&self.phi.get_repr(v)))
         });
-        self.phi.forget_constraints_involving(&ignored_reprs);
+        self.phi_mut().forget_constraints_involving(&ignored_reprs);
     }
 
     /// Forget summary-only constraints that mention the given values while
@@ -691,7 +703,7 @@ impl Formula {
                 .into_iter()
                 .all(|v| !ignored_reprs.contains(&self.phi.get_repr(v)))
         });
-        self.phi
+        self.phi_mut()
             .forget_non_type_constraints_involving(&ignored_reprs);
     }
 
@@ -718,9 +730,9 @@ impl Formula {
 
     fn enforce_condition_atom(&mut self, atom: &Atom) -> SatUnsat<Vec<NewEq>> {
         match atom {
-            Atom::Equal(Term::Var(v1), Term::Var(v2)) => self.phi.and_var_equal(*v1, *v2),
+            Atom::Equal(Term::Var(v1), Term::Var(v2)) => self.phi_mut().and_var_equal(*v1, *v2),
             Atom::Equal(Term::Var(v), Term::Const(c))
-            | Atom::Equal(Term::Const(c), Term::Var(v)) => self.phi.and_const_eq(*v, *c),
+            | Atom::Equal(Term::Const(c), Term::Var(v)) => self.phi_mut().and_const_eq(*v, *c),
             Atom::LessEqual(lhs, rhs) => {
                 if let (Some(op1), Some(op2)) =
                     (simple_operand_of_term(lhs), simple_operand_of_term(rhs))
@@ -732,7 +744,7 @@ impl Formula {
                         return SatUnsat::Unsat;
                     }
                 }
-                self.phi.and_atom(atom.clone())
+                self.phi_mut().and_atom(atom.clone())
             }
             Atom::LessThan(lhs, rhs) => {
                 if let (Some(op1), Some(op2)) =
@@ -745,9 +757,9 @@ impl Formula {
                         return SatUnsat::Unsat;
                     }
                 }
-                self.phi.and_atom(atom.clone())
+                self.phi_mut().and_atom(atom.clone())
             }
-            _ => self.phi.and_atom(atom.clone()),
+            _ => self.phi_mut().and_atom(atom.clone()),
         }
     }
 }
