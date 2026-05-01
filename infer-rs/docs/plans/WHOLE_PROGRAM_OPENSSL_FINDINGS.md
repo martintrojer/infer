@@ -56,6 +56,50 @@ not per-state size; it is **per-procedure state retention across
 procedure boundaries**. That is a different problem, and Phase 1 Arc by
 itself does not address it.
 
+## Update: per-procedure peak_rss heartbeats
+
+Added `peak_rss=...` to the Pulse `done:` heartbeat (commit
+`cacd0973cb`) and re-ran a 15-file OpenSSL slice with
+`--trace-ondemand`. First three procedures to finish:
+
+```
+proc=private_AES_set_encrypt_key done: elapsed=49.0s ... peak_rss=252MB
+proc=AES_encrypt                  done: elapsed=15.8s ... peak_rss=308MB
+proc=AES_decrypt                  done: elapsed=15.8s ... peak_rss=378MB
+```
+
+That is `~+50-70 MB` per finished procedure, even on small / fast
+procedures. Extrapolating to `571` procedures gives `~30 GB` of
+cumulative growth, which matches the observed `~23 GB` whole-program
+max RSS reasonably well.
+
+The same trace run also showed a hard outlier: `DES_ede3_cfb_encrypt`
+(in `cfb64ede.sil`, `276` nodes / `~1822` Procdesc::size) was still
+running after `~17 minutes` with `4400+` retained disjuncts and
+`~726k` total post stack entries / `~488k` total addrs in attrs / `~9k`
+const_cache entries in retained sums. OCaml runs the entire same
+74-file corpus in `42.9s`, so this procedure must take seconds in
+OCaml. We have the same kind of byte-loop encryption pattern as
+`whirlpool_block`, but the absolute disjunct count here
+(`4400+` vs whirlpool_block's `8`) is dramatically worse.
+
+So the picture splits into two distinct gaps, both real:
+
+- **Per-procedure baseline accumulation**: ~`+50-70 MB` per finished
+  procedure. Likely the SummaryStore (or some other long-lived cache)
+  retaining heavy `AbductiveDomain`-shaped state per analyzed
+  procedure.
+- **Per-procedure outlier explosion**: a small number of procedures
+  (`DES_ede3_cfb_encrypt`, plausibly the same family that includes
+  `whirlpool_block`) generate `1000s` of retained disjuncts. These
+  dominate total wall time *and* total memory, not the per-proc
+  baseline. This is the same root cause as the deferred (A) follow-up
+  on per-disjunct unique-value count vs OCaml.
+
+Of the two, the outlier-explosion gap has the bigger lever: a single
+procedure currently consumes more wall time than the entire 74-file
+OCaml run.
+
 ## Hypotheses for the per-procedure retention gap
 
 In rough priority order:
@@ -90,12 +134,23 @@ dropped at procedure-end (2), then revisit ondemand caches (4).
 
 ## What this changes in `CONVERGENCE_NEXT_STEPS.md`
 
-- (B) is no longer "validate Arc savings on whole-program OpenSSL." The
-  Arc savings did not survive scaling. (B) becomes "diagnose why
-  per-procedure state isn't released across procedure boundaries."
-- (A) and (C) remain as before, but the per-state CPU / unique-value
-  question (the leftover from (A)'s reframe) and the smaller-Arc
-  candidates of (C) are both lower-priority than this new track.
+After the per-procedure `peak_rss` heartbeat data above, the picture
+updates: there are *two* distinct gaps, not one.
+
+- **Outlier-explosion gap (top priority)**: a small number of
+  procedures (`DES_ede3_cfb_encrypt`, plausibly the same family that
+  includes `whirlpool_block`) generate `1000s` of retained disjuncts
+  and dominate total wall time. This is structurally the same as the
+  deferred (A) follow-up on "reduce per-disjunct unique-value count
+  to match OCaml's denser representation," except now manifested as
+  retained-disjunct *count* explosion in encryption-style byte loops,
+  not per-disjunct verbosity.
+- **Per-procedure baseline accumulation (next priority)**: `~+50-70 MB`
+  per finished procedure. Even with the outlier fixed, multi-procedure
+  runs need to release per-procedure transient state more aggressively
+  (or shrink summary representation) to land near OCaml's `1.17 GB`
+  whole-corpus peak.
+- (C) (small remaining Arc candidates) is unchanged in priority.
 
 This file is the artifact of the first whole-program OpenSSL pass.
 Future passes should append findings here rather than overwriting.

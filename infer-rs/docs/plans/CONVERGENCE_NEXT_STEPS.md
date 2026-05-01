@@ -124,8 +124,23 @@ a 74-file partial OpenSSL capture at `-j 1`: OCaml `42.9s` /
 `~23.43 GB` peak (`~20×` more) / terminated abnormally. Findings:
 [`WHOLE_PROGRAM_OPENSSL_FINDINGS.md`](./WHOLE_PROGRAM_OPENSSL_FINDINGS.md).
 Phase 1 Arc was a real win on per-procedure peak but did not survive
-scaling: across a 74-file corpus we accumulate state we never release
-while OCaml releases per-procedure transient state aggressively. The new
-top priority is therefore not the original (B) ("validate Arc savings on
-whole-program OpenSSL") but its reframe: "diagnose why per-procedure
-state is not released across procedure boundaries."
+scaling.
+
+The `peak_rss=...` heartbeat data added in commit `cacd0973cb` then
+split the gap into two distinct findings:
+
+- **Outlier-explosion gap (top priority)**: a small number of procedures
+  (`DES_ede3_cfb_encrypt`, plausibly the same family that includes
+  `whirlpool_block`) generate `4400+` retained disjuncts and become the
+  dominant wall-time / memory blocker (`>17 minutes` for one procedure
+  vs OCaml's `<43s` for the entire 74-file corpus). Structurally this
+  is the OCaml-vs-Rust per-disjunct unique-value gap from the (A)
+  reframe, but here it manifests as retained-*count* explosion in
+  encryption-style byte loops.
+- **Per-procedure baseline accumulation (next priority)**: `~+50-70 MB`
+  per finished procedure even on small / fast procs. With `571` procs
+  this extrapolates to `~30 GB` of cumulative growth, matching the
+  observed `~23 GB` whole-program max RSS.
+
+The outlier-explosion gap has the bigger lever: a single procedure
+currently consumes more wall time than the entire 74-file OCaml run.
