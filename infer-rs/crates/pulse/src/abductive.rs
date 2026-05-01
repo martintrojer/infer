@@ -422,7 +422,17 @@ impl AbductiveDomain {
         src: ValueWithHistory,
         access: Access,
     ) -> ValueWithHistory {
-        if let Some(target) = self.post.heap.find_edge_with_history(src.addr, &access) {
+        // First try a direct lookup. Then, mirroring OCaml's
+        // `PulseBaseMemory.find_edge_opt`, retry with formula-canonicalized
+        // indices for `ArrayAccess` so that two reads `arr[i]` / `arr[j]`
+        // with `i = j` known to the formula share a single existing edge.
+        if let Some(target) =
+            self.post
+                .heap
+                .find_edge_with_history_canonicalized(src.addr, &access, |v| {
+                    self.path_condition.get_var_repr(v)
+                })
+        {
             return target.clone();
         }
 

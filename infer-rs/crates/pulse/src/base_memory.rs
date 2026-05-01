@@ -132,6 +132,39 @@ impl Edges {
         self.values.get(access)
     }
 
+    /// OCaml-style `find_edge_opt` fallback for `ArrayAccess`: if the direct
+    /// lookup misses and `access` is an `ArrayAccess`, canonicalize the index
+    /// (and the indices of every existing edge) through `get_var_repr` and
+    /// retry. This lets two reads `arr[i]` and `arr[j]` share the same edge
+    /// when the formula proves `i = j`, which is the dominant value-sharing
+    /// mechanism Pulse uses to keep per-disjunct unique-value counts small
+    /// inside encryption-style byte loops.
+    ///
+    /// Cross-ref: OCaml `PulseBaseMemory.find_edge_opt`.
+    pub fn find_with_history_canonicalized(
+        &self,
+        access: &Access,
+        get_var_repr: impl Fn(AbstractValue) -> AbstractValue,
+    ) -> Option<&ValueWithHistory> {
+        if let Some(direct) = self.values.get(access) {
+            return Some(direct);
+        }
+        match access {
+            Access::ArrayAccess(_, _) => {
+                let canonical_access = access.canonicalize(&get_var_repr);
+                self.values.iter().find_map(|(existing, value)| {
+                    let canonical_existing = existing.canonicalize(&get_var_repr);
+                    if canonical_existing == canonical_access {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
@@ -240,6 +273,20 @@ impl BaseMemory {
         self.graph
             .get(&src)
             .and_then(|edges| edges.find_with_history(access))
+    }
+
+    /// OCaml-style `find_edge_opt` with `get_var_repr`: if the direct lookup
+    /// misses on an `ArrayAccess`, canonicalize and retry. See
+    /// [`Edges::find_with_history_canonicalized`] for rationale.
+    pub fn find_edge_with_history_canonicalized(
+        &self,
+        src: AbstractValue,
+        access: &Access,
+        get_var_repr: impl Fn(AbstractValue) -> AbstractValue,
+    ) -> Option<&ValueWithHistory> {
+        self.graph
+            .get(&src)
+            .and_then(|edges| edges.find_with_history_canonicalized(access, get_var_repr))
     }
 
     /// Check if an edge exists.
