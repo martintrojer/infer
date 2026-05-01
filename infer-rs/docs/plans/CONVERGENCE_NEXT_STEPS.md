@@ -106,8 +106,14 @@ First investigative pass on (A) is documented in
   `PRE#2` differ only by abstract-value renaming on the pre subgraph but
   fail to canonicalize identically. That is a missed dedup opportunity, not
   the explanation for the `4`-tier post-side growth.
-- Concrete next step before deciding whether to keep digging on (A): re-run
-  OCaml with `--debug` on the same `wp_block.sil` capture and count the
-  retained pre/post disjuncts at `whirlpool_block` node `31`. If OCaml also
-  retains `~8` comparable disjuncts, the `8d:4v` framing was wrong and the
-  next track to pursue is (B) instead.
+
+**OCaml-comparison update (closes (A) as originally framed):** Re-running
+`infer analyze --pulse-only --debug --procedures-filter whirlpool_block`
+on the same shared capture shows OCaml retains **more** disjuncts at
+node `31` than we do (`10` vs `8`), uses **more** memory
+(`~10.05 GB` max RSS vs our `~3.93 GB` post-Arc), and is `~2.3×` faster
+on wall time. Per-disjunct, OCaml's representation is `3-6×` denser in
+unique abstract values (`~487` vs `~1500-3000`), suggesting OCaml reuses
+the same value across chained field/array accesses where we mint fresh
+values. The remaining gap is per-disjunct CPU cost, not retained-state
+count, and **(B) is now the right next step**.

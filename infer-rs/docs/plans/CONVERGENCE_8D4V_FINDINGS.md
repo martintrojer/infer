@@ -146,6 +146,56 @@ direction:
   there is a real OCaml-only convergence mechanism (likely in how it joins
   / abstracts global-table reads) we need to identify.
 
-This file is the artifact of the first investigative pass before that
-OCaml comparison. Future passes should append findings here rather than
+## Update: OCaml comparison data
+
+Ran `infer analyze --pulse-only --debug --procedures-filter whirlpool_block`
+on the same shared capture
+(`infer-out-wp/captured/wp_block.c.45acfcec405ead7e`):
+
+| metric                        | OCaml `--debug`         | Rust post-Arc filtered probe |
+|-------------------------------|--------------------------|------------------------------|
+| wall time                     | `~120s`                  | `~273s` (`~2.3×` slower)     |
+| max resident set size         | `~10.05 GB`              | `~3.93 GB` (`~2.6×` smaller) |
+| peak memory footprint         | `~14.21 GB`              | `~3.87 GB`                   |
+| retained disjuncts at node 31 | up to **`10`** per visit | `8` per visit                |
+| per-disjunct unique values    | `~487` (final 10-disj)   | `~1500-3000` per disjunct    |
+
+Key observations from the OCaml HTML:
+
+- OCaml retains **more** disjuncts at node `31` than we do (`10` vs `8`),
+  growing in the same `+2`-per-visit pattern. So our `8d:4v` shape is in
+  fact *better* converged than OCaml on this slice.
+- OCaml's per-disjunct representation is `3-6×` denser in unique abstract
+  values than ours (`~487` vs `~1500-3000`). It reuses the same value
+  across chained field accesses where we tend to mint a fresh value at
+  each step.
+- After the Phase 1 Arc work, our peak memory is now `~2.6×` *smaller*
+  than OCaml's on this slice, even though OCaml has fewer per-state
+  values.
+
+## Reframe
+
+The original "`8d:4v` convergence gap" framing was wrong on the data.
+OCaml does not converge tighter than we do on this slice; if anything we
+have fewer disjuncts. Memory after Phase 1 Arc work is well below OCaml
+here. The remaining `~2.3×` wall-time gap is therefore a per-disjunct
+*CPU* cost (each of our disjuncts has more unique values to manipulate),
+not a retained-state count problem.
+
+Consequences for the (A) / (B) / (C) plan in
+`CONVERGENCE_NEXT_STEPS.md`:
+
+- (A) as originally framed ("diagnose the `8d:4v` convergence gap") is
+  closed by this data. We can revisit it as "reduce per-disjunct unique-
+  value count to match OCaml's denser representation," but that is a
+  semantic-fidelity change in how Pulse mints abstract values during
+  field/array access, not a retained-state convergence change.
+- (B) ("validate Arc savings on whole-program OpenSSL") is now the right
+  next step. The single-procedure data here suggests Phase 1 Arc has
+  already pushed Rust's per-procedure memory below OCaml's, so the
+  whole-program memory comparison is likely much more favorable than the
+  legacy `~16-33 GB` OOM datapoints suggested.
+
+This file is the artifact of the first investigative pass plus the OCaml
+comparison. Future passes should append findings here rather than
 overwriting.
