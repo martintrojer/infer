@@ -149,3 +149,24 @@ currently consumes more wall time than the entire 74-file OCaml run.
 It is structurally the **(A) reframe** from earlier in this file:
 reduce per-disjunct unique-value count by sharing abstract values
 across chained field/array accesses (the way OCaml does).
+
+**Drop dead logical-vars (commit `1e2bf5cb9d`) update:** Mirroring the
+effect of OCaml's missing `Metadata (ExitScope ids)` cleanup via
+backward liveness + per-node-exit drop landed a real per-procedure
+peak win:
+
+- Filtered single-procedure `whirlpool_block`: `~3.93 GB` → `~0.77 GB`
+  peak (`~5×` smaller), wall time `4m33s` → `4m18s`.
+- 74-file whole-program: survives past the previous `~8 min` OOM, RSS
+  peaks at `~24 GB` then reclaims to `~11.6 GB` at `54+ min` (killed
+  manually). Wall time, not memory, is the new dominant blocker.
+
+This closes the per-procedure baseline accumulation gap for
+per-procedure peak. The remaining whole-program memory pressure is
+plausibly the SummaryStore retention plus the per-disjunct cost gap.
+
+The top priority is now firmly **wall-time CPU per disjunct**
+(the original (A) reframe). The drop pass adds backward-liveness CPU
+overhead per procedure on top of the existing per-disjunct cost
+imbalance, and together they keep multi-procedure runs far slower
+than OCaml's `~43s` baseline.

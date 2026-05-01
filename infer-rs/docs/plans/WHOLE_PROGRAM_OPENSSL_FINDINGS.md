@@ -100,6 +100,40 @@ Of the two, the outlier-explosion gap has the bigger lever: a single
 procedure currently consumes more wall time than the entire 74-file
 OCaml run.
 
+## Update: dropping dead logical-var bindings is a per-procedure win
+
+Follow-up: the missing-`ExitScope`-cleanup hypothesis turned out to be
+right. Commit `1e2bf5cb9d` adds a per-node-exit pass that drops
+`Var::LogicalVar(_)` post-stack bindings whose Ident is not live-out
+of the node (driven by backward liveness, preserving the return-value
+candidate). Measured impact:
+
+- Filtered single-procedure `whirlpool_block` slice:
+  `~3.93 GB` peak → **`~0.77 GB` peak** (`~5×` smaller), `4m33s`
+  → `4m18s` wall (small win). We are now `~13×` below OCaml on memory
+  for this one procedure (OCaml peaks at `~10 GB`, runs in `~120s`).
+- 74-file whole-program corpus at `-j 1`: in a re-run with the drop
+  pass on, the analyzer survived past the previous `~8 min` OOM
+  point. RSS still climbed to `~24 GB` peak then started reclaiming
+  to `~11.6 GB` at `54+ min`, where the run was killed manually.
+  Wall time, not memory, is now the dominant blocker on the
+  multi-procedure slice (OCaml: `42.9s` for the whole 74 files).
+
+What that updates:
+
+- **Per-procedure baseline accumulation gap** is largely closed for
+  the per-procedure peak (the metric that was extrapolating to
+  ~30 GB across 571 procs). The remaining whole-program RSS we still
+  see at scale is likely a mix of the SummaryStore retention and
+  per-disjunct cost still being too high on encryption-style outliers.
+- The new top blocker on whole-program OpenSSL is **wall time**, not
+  memory. The drop pass adds liveness-analysis CPU per procedure and
+  per-disjunct cost remains high; together they make multi-procedure
+  runs much slower than OCaml.
+- The next-step queue from `CONVERGENCE_NEXT_STEPS.md` should now
+  prioritize **wall-time CPU per disjunct** (the original (A)-reframe
+  target: reduce per-disjunct unique-value count) over memory tracks.
+
 ## Update: OCaml also caps DES_ede3_cfb_encrypt at 20 disjuncts/node
 
 Follow-up: re-checked OCaml's `--debug` HTML for `DES_ede3_cfb_encrypt`

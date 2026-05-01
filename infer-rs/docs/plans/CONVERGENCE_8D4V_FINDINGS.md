@@ -212,6 +212,27 @@ OCaml's side by some sharing/abstraction we have yet to identify.
   `operations.rs` call site via `canonicalize_for_access` /
   `const_cache`, so the new fallback rarely fires. No perf change. Kept
   as a fidelity improvement for non-constant-index workloads.
+- **Found the dominant cause and landed a fix (commit `1e2bf5cb9d`):**
+  Drop dead `Var::LogicalVar(_)` post-stack bindings at Pulse node
+  exits, mirroring the effect of OCaml's `Metadata (ExitScope ids)`
+  cleanup that the textual exporter strips (`grep` shows the OpenSSL
+  textual SIL has zero `__sil_metadata_exit_scope` markers and zero
+  `__return` pvar stores). Implemented via backward liveness +
+  per-node cleanup, preserving the candidate return-value Ident so
+  `summary::find_return_value`'s fallback heuristic still works.
+  Measured impact on the filtered single-procedure `whirlpool_block`
+  slice:
+
+  | step                                       | wall  | max RSS    |
+  |--------------------------------------------|-------|------------|
+  | baseline (no Arc)                          | 4m34s | ~16.7 GB   |
+  | + Phase 1 Arc (5 increments)               | 4m33s | ~3.93 GB   |
+  | + drop dead logical-vars (`1e2bf5cb9d`)    | 4m18s | **~0.77 GB** |
+
+  That is `~80%` peak-memory reduction beyond Phase 1 Arc and `~95%`
+  vs the pre-Arc baseline, with a small wall-time win. We now sit
+  `~13×` below OCaml's `~10 GB` peak on the same slice (OCaml runs
+  faster: `~120s`).
 
 ### Open: where does OCaml's per-iteration value sharing come from
 
