@@ -182,6 +182,55 @@ here. The remaining `~2.3×` wall-time gap is therefore a per-disjunct
 *CPU* cost (each of our disjuncts has more unique values to manipulate),
 not a retained-state count problem.
 
+### Update: per-disjunct value count is *bounded* in OCaml, *unbounded* in Rust
+
+Follow-up extraction from OCaml's `--debug` HTML for `whirlpool_block`
+node `31` (the converged `10`-disjunct block):
+
+| disjunct | OCaml unique values | Rust unique values |
+|----------|---------------------|--------------------|
+| #0 / #1 (initial)  | `67`, `81`        | `1228` (PRE#0)    |
+| #2-#9 (per tier)   | `478-502` (stable) | `1500-3914` (linear growth) |
+
+Key observation: **OCaml's per-disjunct unique-value count is bounded
+at ~`500`** even as the loop iterates and disjunct count grows from
+`#2` to `#9`. **Rust's per-disjunct count grows linearly** with tier
+(`1228` at PRE#0, climbing to `3914` at PRE#7). The +`~258` heap nodes
++ `~129` attrs + `~896` formula items per tier we previously
+documented map directly to fresh abstract values that OCaml apparently
+shares across iterations and we don't.
+
+This is the actual mechanism behind the per-disjunct cost gap. The
+gap is not constant 3-6×; it grows with iteration count, capped on
+OCaml's side by some sharing/abstraction we have yet to identify.
+
+### Investigative attempts so far
+
+- Added OCaml-style `find_edge_opt` canonical fallback for
+  `ArrayAccess` (commit `a7a3bd61ef`). The on-this-slice array indices
+  are constants (`q[0]`..`q[7]`) already canonicalized at the
+  `operations.rs` call site via `canonicalize_for_access` /
+  `const_cache`, so the new fallback rarely fires. No perf change. Kept
+  as a fidelity improvement for non-constant-index workloads.
+
+### Open: where does OCaml's per-iteration value sharing come from
+
+Not yet identified. Candidates worth investigating:
+
+- OCaml may discard / GC unreachable values from the heap+attrs+formula
+  on every loop iteration (we only do this at summary time via
+  `discard_unreachable_`).
+- OCaml's `MakeDisjunctiveTransferFunctions` may run a `canonicalize`
+  pass on each loop-head visit (Rust does not).
+- OCaml may collapse compiler-temp `n0..n9` stack bindings between
+  instructions, while Rust retains every temp `n$N` slot in the post
+  stack for the lifetime of the procedure.
+- OCaml's `Formula.simplify` may run more eagerly in mid-analysis
+  (we run it only in `simplify_for_summary`).
+
+Any one of these alone, applied between loop iterations, would cap the
+per-disjunct value count the way OCaml's `~500` cap suggests.
+
 Consequences for the (A) / (B) / (C) plan in
 `CONVERGENCE_NEXT_STEPS.md`:
 
