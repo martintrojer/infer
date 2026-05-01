@@ -176,14 +176,17 @@ impl Edges {
 
 /// The heap graph: maps abstract addresses to their outgoing edges.
 ///
-/// Each address points to a refcounted `Arc<Edges>` so cloning the surrounding
-/// abductive state shares the per-address edge structure between disjuncts and
-/// retained invariant snapshots without copying it eagerly. Mutating accesses
-/// use `Arc::make_mut` (path-copying) to preserve that sharing while keeping
-/// the same `&mut self` API the rest of Pulse already expects.
+/// Two layers of structural sharing:
+/// - the outer `BTreeMap<AbstractValue, Arc<Edges>>` is itself wrapped in
+///   `Arc<...>` so cloning the surrounding abductive state never deep-copies
+///   the heap graph eagerly; mutating accesses use `Arc::make_mut`
+///   (clone-on-write) to keep the same `&mut self` API while preserving
+///   sharing across disjuncts and retained invariant snapshots.
+/// - each address still points to its own `Arc<Edges>` so per-address edge
+///   bundles stay refcount-shared after the outer map is cloned-on-write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseMemory {
-    graph: BTreeMap<AbstractValue, Arc<Edges>>,
+    graph: Arc<BTreeMap<AbstractValue, Arc<Edges>>>,
 }
 
 impl BaseMemory {
@@ -191,14 +194,21 @@ impl BaseMemory {
         Self::default()
     }
 
+    fn graph_mut(&mut self) -> &mut BTreeMap<AbstractValue, Arc<Edges>> {
+        Arc::make_mut(&mut self.graph)
+    }
+
     fn entry_mut(&mut self, addr: AbstractValue) -> &mut Edges {
-        let arc = self.graph.entry(addr).or_default();
+        let arc = self.graph_mut().entry(addr).or_default();
         Arc::make_mut(arc)
     }
 
     /// Register an address in the heap (ensures it has an entry, even if empty).
     pub fn register_address(&mut self, addr: AbstractValue) {
-        self.graph.entry(addr).or_default();
+        if self.graph.contains_key(&addr) {
+            return;
+        }
+        self.graph_mut().entry(addr).or_default();
     }
 
     /// Add an edge: `src --access--> target`.
@@ -249,15 +259,18 @@ impl BaseMemory {
 
     /// Remove all outgoing edges for an address.
     pub fn remove(&mut self, addr: AbstractValue) {
-        self.graph.remove(&addr);
+        if !self.graph.contains_key(&addr) {
+            return;
+        }
+        self.graph_mut().remove(&addr);
     }
 
     /// Replace all outgoing edges for an address.
     pub fn set_edges(&mut self, addr: AbstractValue, edges: Edges) {
         if edges.is_empty() {
-            self.graph.remove(&addr);
+            self.remove(addr);
         } else {
-            self.graph.insert(addr, Arc::new(edges));
+            self.graph_mut().insert(addr, Arc::new(edges));
         }
     }
 
@@ -267,7 +280,14 @@ impl BaseMemory {
     /// which drops dead heap cells entirely instead of leaving empty nodes
     /// behind in exported summaries.
     pub fn retain_reachable(&mut self, reachable: &std::collections::HashSet<AbstractValue>) {
-        self.graph
+        if self
+            .graph
+            .iter()
+            .all(|(addr, edges)| reachable.contains(addr) && !edges.is_empty())
+        {
+            return;
+        }
+        self.graph_mut()
             .retain(|addr, edges| reachable.contains(addr) && !edges.is_empty());
     }
 
@@ -290,19 +310,32 @@ impl BaseMemory {
     /// Substitute abstract values: replace `old` with `new` in both
     /// addresses and edge targets.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
-        // Substitute in edge targets
-        for edges in self.graph.values_mut() {
+        let needs_target_subst = self.graph.values().any(|edges| {
+            edges
+                .iter_with_history()
+                .any(|(access, value)| value.addr == old || access_mentions(access, old))
+        });
+        let needs_key_subst = self.graph.contains_key(&old);
+        if !needs_target_subst && !needs_key_subst {
+            return;
+        }
+        let graph = self.graph_mut();
+        for edges in graph.values_mut() {
             Arc::make_mut(edges).subst_var(old, new);
         }
-        // Substitute in graph keys
-        if let Some(edges) = self.graph.remove(&old) {
-            // Merge with existing edges at `new` if any
-            let entry = self.entry_mut(new);
+        if let Some(edges) = graph.remove(&old) {
+            // Merge with existing edges at `new` if any.
+            let entry_arc = graph.entry(new).or_default();
+            let entry = Arc::make_mut(entry_arc);
             for (access, value) in edges.iter_with_history() {
                 entry.add_with_history(access.clone(), value.clone());
             }
         }
     }
+}
+
+fn access_mentions(access: &Access, old: AbstractValue) -> bool {
+    matches!(access, Access::ArrayAccess(_, idx) if *idx == old)
 }
 
 impl fmt::Display for BaseMemory {

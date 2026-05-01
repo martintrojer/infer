@@ -20,13 +20,18 @@ use crate::value_history::ValueHistory;
 
 /// Maps abstract addresses to their attribute sets.
 ///
-/// Each per-address `Attributes` set is wrapped in `Arc` so cloning the
-/// surrounding abductive state shares the structure between disjuncts and
-/// retained invariant snapshots without deep-copying it. Mutating helpers go
-/// through `Arc::make_mut` (path-copying) so the public API is unchanged.
+/// Two layers of structural sharing:
+/// - the outer `BTreeMap<AbstractValue, Arc<Attributes>>` is wrapped in
+///   `Arc<...>` so cloning the surrounding abductive state never deep-copies
+///   the attribute graph eagerly; mutating accesses use `Arc::make_mut`
+///   (clone-on-write) to keep the same `&mut self` API while preserving
+///   sharing across disjuncts and retained invariant snapshots.
+/// - each per-address `Attributes` set is also wrapped in its own `Arc`,
+///   so per-address attribute bundles stay refcount-shared after the outer
+///   map is cloned-on-write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseAddressAttributes {
-    map: BTreeMap<AbstractValue, Arc<Attributes>>,
+    map: Arc<BTreeMap<AbstractValue, Arc<Attributes>>>,
 }
 
 impl BaseAddressAttributes {
@@ -34,8 +39,12 @@ impl BaseAddressAttributes {
         Self::default()
     }
 
+    fn map_mut(&mut self) -> &mut BTreeMap<AbstractValue, Arc<Attributes>> {
+        Arc::make_mut(&mut self.map)
+    }
+
     fn entry_mut(&mut self, addr: AbstractValue) -> &mut Attributes {
-        let arc = self.map.entry(addr).or_default();
+        let arc = self.map_mut().entry(addr).or_default();
         Arc::make_mut(arc)
     }
 
@@ -51,7 +60,10 @@ impl BaseAddressAttributes {
 
     /// Get mutable access to the attributes for an address.
     pub fn get_mut(&mut self, addr: &AbstractValue) -> Option<&mut Attributes> {
-        self.map.get_mut(addr).map(Arc::make_mut)
+        if !self.map.contains_key(addr) {
+            return None;
+        }
+        self.map_mut().get_mut(addr).map(Arc::make_mut)
     }
 
     /// Check if an address is valid (not invalid).
@@ -141,7 +153,14 @@ impl BaseAddressAttributes {
     /// Remove the Allocated attribute from an address.
     /// Used during unknown call havoc to prevent false leak reports.
     pub fn remove_allocated(&mut self, addr: AbstractValue) {
-        if let Some(attrs) = self.map.get_mut(&addr) {
+        if !self
+            .map
+            .get(&addr)
+            .is_some_and(|attrs| attrs.is_allocated())
+        {
+            return;
+        }
+        if let Some(attrs) = self.map_mut().get_mut(&addr) {
             Arc::make_mut(attrs).remove_allocated();
         }
     }
@@ -153,17 +172,23 @@ impl BaseAddressAttributes {
 
     /// Remove all attributes for an address.
     pub fn remove_addr(&mut self, addr: &AbstractValue) {
-        self.map.remove(addr);
+        if !self.map.contains_key(addr) {
+            return;
+        }
+        self.map_mut().remove(addr);
     }
 
     /// Remove attributes on addresses not in the reachable set.
     /// Used during summary normalization to strip spurious attrs.
     pub fn retain_reachable(&mut self, reachable: &std::collections::HashSet<AbstractValue>) {
-        self.map.retain(|addr, _| reachable.contains(addr));
+        if self.map.keys().all(|addr| reachable.contains(addr)) {
+            return;
+        }
+        self.map_mut().retain(|addr, _| reachable.contains(addr));
     }
 
     pub fn retain_for_pre_summary(&mut self) {
-        self.map.retain(|_addr, attrs| {
+        self.map_mut().retain(|_addr, attrs| {
             let mutable = Arc::make_mut(attrs);
             mutable.retain_for_pre_summary();
             !mutable.is_empty()
@@ -171,7 +196,7 @@ impl BaseAddressAttributes {
     }
 
     pub fn retain_for_post_summary(&mut self) {
-        self.map.retain(|_addr, attrs| {
+        self.map_mut().retain(|_addr, attrs| {
             let mutable = Arc::make_mut(attrs);
             mutable.retain_for_post_summary();
             !mutable.is_empty()
@@ -180,8 +205,13 @@ impl BaseAddressAttributes {
 
     /// Substitute abstract values.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
-        if let Some(attrs) = self.map.remove(&old) {
-            let entry = self.entry_mut(new);
+        if !self.map.contains_key(&old) {
+            return;
+        }
+        let map = self.map_mut();
+        if let Some(attrs) = map.remove(&old) {
+            let entry_arc = map.entry(new).or_default();
+            let entry = Arc::make_mut(entry_arc);
             for attr in attrs.iter() {
                 entry.add(attr.clone());
             }
@@ -199,7 +229,7 @@ impl BaseAddressAttributes {
 
 impl fmt::Display for BaseAddressAttributes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (addr, attrs) in &self.map {
+        for (addr, attrs) in self.map.iter() {
             if !attrs.is_empty() {
                 write!(f, "{addr}: ")?;
                 for attr in attrs.iter() {
