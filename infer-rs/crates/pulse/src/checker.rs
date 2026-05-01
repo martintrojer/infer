@@ -52,6 +52,50 @@ fn pulse_progress_enabled() -> bool {
     log::log_enabled!(target: "ondemand", log::Level::Info)
 }
 
+/// Best-effort current peak RSS in bytes since process start, used only for
+/// per-procedure progress logs so we can see where memory accumulates across
+/// procedures. Reads `getrusage(RUSAGE_SELF).ru_maxrss`. macOS reports the
+/// value in bytes; Linux reports it in kilobytes. Returns `None` on error or
+/// non-Unix targets.
+fn process_peak_rss_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getrusage is async-signal safe and writes only to the out
+        // parameter. We pass a fresh stack buffer.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        if rc != 0 {
+            return None;
+        }
+        let raw = usage.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            // ru_maxrss is bytes on macOS.
+            Some(raw)
+        } else {
+            // ru_maxrss is kilobytes elsewhere on Unix.
+            Some(raw.saturating_mul(1024))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn format_rss(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(b) => {
+            let mb = (b as f64) / (1024.0 * 1024.0);
+            if mb >= 1024.0 {
+                format!("{:.2}GB", mb / 1024.0)
+            } else {
+                format!("{:.0}MB", mb)
+            }
+        }
+        None => "?".to_string(),
+    }
+}
+
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     if secs < 60 {
@@ -513,13 +557,14 @@ impl ProcProgress {
             .unwrap_or_else(|| "none".to_string());
         log::info!(
             target: "ondemand",
-            "[pulse-progress] proc={proc_name} done: elapsed={} steps={} exit_disjuncts={} spec_requests={} max_disjuncts={} hottest_node={}",
+            "[pulse-progress] proc={proc_name} done: elapsed={} steps={} exit_disjuncts={} spec_requests={} max_disjuncts={} hottest_node={} peak_rss={}",
             format_duration(elapsed),
             self.exec_steps,
             exit_disjuncts,
             spec_requests,
             self.max_disjuncts,
             hottest,
+            format_rss(process_peak_rss_bytes()),
         );
         if let Some(fixpoint_stats) = fixpoint_stats {
             log::info!(
