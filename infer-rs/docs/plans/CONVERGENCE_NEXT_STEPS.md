@@ -117,3 +117,15 @@ unique abstract values (`~487` vs `~1500-3000`), suggesting OCaml reuses
 the same value across chained field/array accesses where we mint fresh
 values. The remaining gap is per-disjunct CPU cost, not retained-state
 count, and **(B) is now the right next step**.
+
+**Whole-program OpenSSL update (reframes (B)):** Running both engines on
+a 74-file partial OpenSSL capture at `-j 1`: OCaml `42.9s` /
+`~1.17 GB` peak / clean, Rust post-Arc `494.75s` (`~11.5×` slower) /
+`~23.43 GB` peak (`~20×` more) / terminated abnormally. Findings:
+[`WHOLE_PROGRAM_OPENSSL_FINDINGS.md`](./WHOLE_PROGRAM_OPENSSL_FINDINGS.md).
+Phase 1 Arc was a real win on per-procedure peak but did not survive
+scaling: across a 74-file corpus we accumulate state we never release
+while OCaml releases per-procedure transient state aggressively. The new
+top priority is therefore not the original (B) ("validate Arc savings on
+whole-program OpenSSL") but its reframe: "diagnose why per-procedure
+state is not released across procedure boundaries."
