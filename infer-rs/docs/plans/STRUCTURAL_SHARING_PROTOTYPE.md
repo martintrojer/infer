@@ -107,22 +107,31 @@ As low-risk first moves:
   `BTreeMap<AbstractValue, Edges>`.
 - `BaseAddressAttributes.map` is similarly
   `BTreeMap<AbstractValue, Arc<Attributes>>`.
+- `BaseStack.map` is now `Arc<HashMap<Var, ValueWithHistory>>`, sharing the
+  whole stack map (whole-map rather than per-entry, since each stack entry is
+  small).
 
-The outer maps still copy on `clone`, but each per-address `Edges` /
-`Attributes` payload is now refcount-shared between disjuncts, retained
-invariant snapshots, and join/widen results. Mutating helpers go through
-`Arc::make_mut` so the public APIs are unchanged.
+The outer container is still copied on `clone`, but the heavy per-cell
+payloads (heap edges, address attributes, the entire stack map) are now
+refcount-shared between disjuncts, retained invariant snapshots, and
+join/widen results. Mutating helpers go through `Arc::make_mut` so the public
+APIs are unchanged.
 
-Measured impact on the filtered single-file `whirlpool_block` slice: peak
-memory footprint drops from ~`16.7 GB` baseline to ~`9.34 GB` after both
-changes (about a `44%` reduction) for the same `1222` retained-state /
-`8d:4v` checkpoint, with `0 swaps`. Wall time on the post-Arc reruns is
-currently `~7m` versus the `~4m34s` pre-Arc baseline, but the runs are not yet
-on a fully comparable host load, so wall-time vs memory tradeoff still needs
-back-to-back re-measurement.
+Measured impact on the filtered single-file `whirlpool_block` slice for the
+same `1222`-state / `8d:4v` checkpoint:
 
-Neither change is the full persistent-map switch the rest of this plan still
-recommends; they are the first Phase 1 increments.
+- baseline before any Arc sharing: ~`16.7 GB` peak, `4m34s` real
+- after `Arc<Edges>`: ~`13.84 GB` peak
+- after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak
+- after `Arc<Edges>` + `Arc<Attributes>` + `Arc<BaseStack.map>`: ~`5.97 GB`
+  peak, `4m29s` real (~`64%` peak-memory drop vs pre-Arc baseline, with no
+  wall-time regression on a calm host)
+
+All reruns observe `0 swaps` and the same `1222` retained-state shape, so
+these are pure storage / clone-cost wins, not analysis behavior changes.
+
+These are Phase 1 increments, not the full persistent-map switch the rest of
+this plan still recommends as a longer-term option.
 
 ### Phase 2: Formula Sharing, If Needed
 

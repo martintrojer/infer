@@ -199,22 +199,27 @@ changes, and move finished results to durable docs/tests/commits.
       `Arc::make_mut` for in-place updates.
     - `BaseAddressAttributes.map` similarly stores `Arc<Attributes>` per
       address, with the same `Arc::make_mut` mutation pattern.
-    - the outer `BTreeMap`s still clone per snapshot, but each per-address
-      edge / attribute bundle is now refcount-shared across disjuncts and
-      retained invariant snapshots.
-  - clean reruns on the same bench (after the system calmed down) show a real
-    memory win on this slice for the same `1222`-state / `8d:4v` filtered
-    `whirlpool_block` checkpoint:
+    - `BaseStack.map` is now `Arc<HashMap<Var, ValueWithHistory>>` with the
+      same path-copying mutation pattern (whole-map rather than per-entry,
+      since each stack entry is small).
+    - the outer container is still copied on snapshot/clone for each, but the
+      heavy per-cell payloads (heap edges, address attributes, the entire
+      stack map) are now refcount-shared across disjuncts and retained
+      invariant snapshots.
+  - clean reruns on the same bench show a real memory win on this slice for
+    the same `1222`-state / `8d:4v` filtered `whirlpool_block` checkpoint:
     - baseline before any Arc sharing: peak memory footprint ~`16.7 GB`
       (`4m34s` real on a less loaded host)
     - after `Arc<Edges>` only: ~`13.84 GB` peak (`7m17s` real)
-    - after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak (`7m37s` real),
-      i.e. about a `44%` peak-memory drop vs the pre-Arc baseline
+    - after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak (`7m37s` real)
+    - after `Arc<Edges>` + `Arc<Attributes>` + `Arc<BaseStack.map>`:
+      ~`5.97 GB` peak (`4m29s` real), i.e. about a `64%` peak-memory drop vs
+      the pre-Arc baseline at slightly faster wall time than the original
     - all reruns observe `0 swaps` and the same `1222` retained-state shape
-  - wall-time on the post-Arc reruns is consistently `~7m`, vs the `~4m34s`
-    pre-Arc baseline, but the pre-Arc baseline was measured on a less loaded
-    host. Re-measure both with the same warm cache / load before drawing
-    perf-vs-memory conclusions.
+  - the intermediate `~7m` wall-time numbers correlated with host load on
+    those runs. The latest Arc<Stack> rerun matched the original `~4m30s`
+    wall time, so on a calm host the structural-sharing changes are
+    effectively memory-only wins for this slice.
   - the earlier forced-retention slice remains useful as an upper bound for
     scalability work: if `__infer_globals_initializer_Cx` is actually
     analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the
