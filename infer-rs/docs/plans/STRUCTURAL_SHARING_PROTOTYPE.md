@@ -110,12 +110,14 @@ As low-risk first moves:
 - `BaseStack.map` is now `Arc<HashMap<Var, ValueWithHistory>>`, sharing the
   whole stack map (whole-map rather than per-entry, since each stack entry is
   small).
+- `Formula.phi` is now `Arc<Phi>` with a `phi_mut` helper, sharing the heavy
+  phi maps (linear_eqs, term_eqs, atoms, intervals, var_eqs, fn_app_eqs).
 
 The outer container is still copied on `clone`, but the heavy per-cell
-payloads (heap edges, address attributes, the entire stack map) are now
-refcount-shared between disjuncts, retained invariant snapshots, and
-join/widen results. Mutating helpers go through `Arc::make_mut` so the public
-APIs are unchanged.
+payloads (heap edges, address attributes, the entire stack map, the entire
+formula phi) are now refcount-shared between disjuncts, retained invariant
+snapshots, and join/widen results. Mutating helpers go through
+`Arc::make_mut` so the public APIs are unchanged.
 
 Measured impact on the filtered single-file `whirlpool_block` slice for the
 same `1222`-state / `8d:4v` checkpoint:
@@ -124,8 +126,10 @@ same `1222`-state / `8d:4v` checkpoint:
 - after `Arc<Edges>`: ~`13.84 GB` peak
 - after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak
 - after `Arc<Edges>` + `Arc<Attributes>` + `Arc<BaseStack.map>`: ~`5.97 GB`
-  peak, `4m29s` real (~`64%` peak-memory drop vs pre-Arc baseline, with no
-  wall-time regression on a calm host)
+  peak, `4m29s` real
+- after the above + `Arc<Phi>`: ~`5.73 GB` peak, `4m32s` real (~`66%`
+  peak-memory drop vs the pre-Arc baseline, no wall-time regression on a calm
+  host)
 
 All reruns observe `0 swaps` and the same `1222` retained-state shape, so
 these are pure storage / clone-cost wins, not analysis behavior changes.

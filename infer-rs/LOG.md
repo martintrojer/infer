@@ -202,9 +202,12 @@ changes, and move finished results to durable docs/tests/commits.
     - `BaseStack.map` is now `Arc<HashMap<Var, ValueWithHistory>>` with the
       same path-copying mutation pattern (whole-map rather than per-entry,
       since each stack entry is small).
+    - `Formula.phi` is now `Arc<Phi>` with a `phi_mut` helper, sharing the
+      heavy phi maps (linear_eqs, term_eqs, atoms, intervals, var_eqs, ...)
+      across disjuncts and retained invariant snapshots.
     - the outer container is still copied on snapshot/clone for each, but the
-      heavy per-cell payloads (heap edges, address attributes, the entire
-      stack map) are now refcount-shared across disjuncts and retained
+      heavy per-cell payloads (heap edges, address attributes, stack map,
+      formula phi) are now refcount-shared across disjuncts and retained
       invariant snapshots.
   - clean reruns on the same bench show a real memory win on this slice for
     the same `1222`-state / `8d:4v` filtered `whirlpool_block` checkpoint:
@@ -213,13 +216,15 @@ changes, and move finished results to durable docs/tests/commits.
     - after `Arc<Edges>` only: ~`13.84 GB` peak (`7m17s` real)
     - after `Arc<Edges>` + `Arc<Attributes>`: ~`9.34 GB` peak (`7m37s` real)
     - after `Arc<Edges>` + `Arc<Attributes>` + `Arc<BaseStack.map>`:
-      ~`5.97 GB` peak (`4m29s` real), i.e. about a `64%` peak-memory drop vs
-      the pre-Arc baseline at slightly faster wall time than the original
+      ~`5.97 GB` peak (`4m29s` real)
+    - after the above + `Arc<Phi>`: ~`5.73 GB` peak (`4m32s` real), i.e.
+      about a `66%` peak-memory drop vs the pre-Arc baseline at the same
+      wall time as the original
     - all reruns observe `0 swaps` and the same `1222` retained-state shape
   - the intermediate `~7m` wall-time numbers correlated with host load on
-    those runs. The latest Arc<Stack> rerun matched the original `~4m30s`
-    wall time, so on a calm host the structural-sharing changes are
-    effectively memory-only wins for this slice.
+    those runs. The latest reruns all matched the original `~4m30s` wall
+    time, so on a calm host the structural-sharing changes are effectively
+    memory-only wins for this slice.
   - the earlier forced-retention slice remains useful as an upper bound for
     scalability work: if `__infer_globals_initializer_Cx` is actually
     analyzed, it grows to ~`16k` live heap nodes by itself and then pushes the
