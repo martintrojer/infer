@@ -148,7 +148,20 @@
   [`docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`](./plans/STRUCTURAL_SHARING_PROTOTYPE.md).
   That work is explicitly scoped as a memory / clone-pressure track for merged
   OpenSSL runs, not as the primary explanation for the remaining
-  `whirlpool_block` correctness gap.
+  `whirlpool_block` correctness gap. Phase 1 baby steps are now in
+  (`Arc<Edges>`, `Arc<Attributes>`, outer `Arc<BTreeMap>` for both, plus
+  `Arc<BaseStack.map>` and `Arc<Phi>`); on the filtered single-file
+  `whirlpool_block` slice, peak memory is now `~3.93 GB` (down from
+  `~16.7 GB`, `~76%` reduction) at unchanged wall time and unchanged
+  analysis behavior.
+- The next steps after Phase 1 structural sharing are tracked in
+  [`docs/plans/CONVERGENCE_NEXT_STEPS.md`](./plans/CONVERGENCE_NEXT_STEPS.md):
+  three live tracks (A: diagnose the `8d:4v` convergence gap on
+  `whirlpool_block`; B: validate Arc savings on whole-program OpenSSL; C:
+  mop up the remaining smaller Arc candidates), with **A** as the recommended
+  next direction since cheap structural sharing has hit clear diminishing
+  returns and the remaining cost is now retained-state count, not per-state
+  size.
 - `pulse-recency-limit` now exists through both CLI and `.inferconfig` for
   OCaml-style experiments, but Rust intentionally leaves it unset by default.
   Default-enabling the OCaml `32` cap reintroduced the real `nullptr.c`

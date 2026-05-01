@@ -259,7 +259,19 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
   changes.
 - If we pursue clone-reduction for OpenSSL memory / RSS, use component-level
   structural sharing rather than a borrow-heavy refactor. Prototype plan:
-  `docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`.
+  `docs/plans/STRUCTURAL_SHARING_PROTOTYPE.md`. Phase 1 baby steps are now
+  in (`Arc<Edges>`, `Arc<Attributes>`, outer `Arc<BTreeMap>` for both, plus
+  `Arc<BaseStack.map>` and `Arc<Phi>`); on the filtered single-file
+  `whirlpool_block` slice, peak memory is now `~3.93 GB` (down from
+  `~16.7 GB`, `~76%` reduction) at unchanged wall time and unchanged
+  analysis behavior.
+- After the Phase 1 structural-sharing wins, the next steps are tracked in
+  `docs/plans/CONVERGENCE_NEXT_STEPS.md`. Three live tracks (A: diagnose the
+  `8d:4v` convergence gap; B: validate Arc savings on whole-program OpenSSL;
+  C: mop up remaining smaller Arc candidates), with **A as the
+  recommendation** since cheap structural sharing has hit clear diminishing
+  returns and the remaining cost is now retained-state count, not per-state
+  size.
 - Keep the new `pulse-recency-limit` flag experimental only. It is useful for
   OCaml cross-checks, but it is not the current fix direction for OpenSSL.
 - Keep profiling the remaining heavy procedures after the
