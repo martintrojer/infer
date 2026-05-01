@@ -100,6 +100,32 @@ Of the two, the outlier-explosion gap has the bigger lever: a single
 procedure currently consumes more wall time than the entire 74-file
 OCaml run.
 
+## Update: OCaml also caps DES_ede3_cfb_encrypt at 20 disjuncts/node
+
+Follow-up: re-checked OCaml's `--debug` HTML for `DES_ede3_cfb_encrypt`
+specifically (in the partial corpus). OCaml retains up to **`20`**
+disjuncts per node on this same procedure, hitting the same
+`pulse_max_disjuncts = 20` cap as us. So the disjunct *count* per node
+is not the differentiator.
+
+What's different is then **per-disjunct cost**: each of our retained
+disjuncts is much more expensive to manipulate than OCaml's. The
+whirlpool_block comparison showed our per-disjunct unique-value count
+at ~`1500-3000` vs OCaml's ~`487`, a `3-6×` gap. The same factor likely
+applies here, multiplied by `~20` disjuncts per node `×` `~262` nodes
+`×` per-iteration manipulation cost, which compounds into the observed
+`~17 minutes vs <43 seconds` wall-time gap.
+
+With this update, the "outlier explosion" framing collapses into the
+original **(A) reframe** from `CONVERGENCE_NEXT_STEPS.md`: reduce
+per-disjunct unique-value count by sharing abstract values across
+chained field/array accesses (the way OCaml does). The single
+outstanding investigative question is what specifically OCaml does
+during `Load (Lfield ...)`, `Load (Lindex ...)`, and chained
+`field-of-field` reads that we do not, and whether porting that yields
+a proportional drop in per-disjunct value count on encryption-style
+byte loops.
+
 ## Hypotheses for the per-procedure retention gap
 
 In rough priority order:
@@ -137,19 +163,22 @@ dropped at procedure-end (2), then revisit ondemand caches (4).
 After the per-procedure `peak_rss` heartbeat data above, the picture
 updates: there are *two* distinct gaps, not one.
 
-- **Outlier-explosion gap (top priority)**: a small number of
+- **Per-disjunct cost gap (top priority)**: a small number of
   procedures (`DES_ede3_cfb_encrypt`, plausibly the same family that
-  includes `whirlpool_block`) generate `1000s` of retained disjuncts
-  and dominate total wall time. This is structurally the same as the
-  deferred (A) follow-up on "reduce per-disjunct unique-value count
-  to match OCaml's denser representation," except now manifested as
-  retained-disjunct *count* explosion in encryption-style byte loops,
-  not per-disjunct verbosity.
+  includes `whirlpool_block`) sit at the `pulse_max_disjuncts = 20`
+  cap on most nodes, just like OCaml does, but each of our retained
+  disjuncts is `3-6×` more expensive to manipulate (more unique
+  abstract values, more formula entries). That compounds across
+  `~20 disj/node × ~262 nodes × fixpoint iterations` into the observed
+  `~17 minutes vs <43 seconds` wall-time gap. Concrete first step:
+  identify what OCaml does during `Load (Lfield ...)`,
+  `Load (Lindex ...)`, and chained field-of-field reads that we do not,
+  and port the equivalent value-sharing.
 - **Per-procedure baseline accumulation (next priority)**: `~+50-70 MB`
-  per finished procedure. Even with the outlier fixed, multi-procedure
-  runs need to release per-procedure transient state more aggressively
-  (or shrink summary representation) to land near OCaml's `1.17 GB`
-  whole-corpus peak.
+  per finished procedure. Even with the per-disjunct cost fixed,
+  multi-procedure runs need to release per-procedure transient state
+  more aggressively (or shrink summary representation) to land near
+  OCaml's `1.17 GB` whole-corpus peak.
 - (C) (small remaining Arc candidates) is unchanged in priority.
 
 This file is the artifact of the first whole-program OpenSSL pass.

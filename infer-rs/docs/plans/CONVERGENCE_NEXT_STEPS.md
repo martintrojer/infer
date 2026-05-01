@@ -126,21 +126,26 @@ a 74-file partial OpenSSL capture at `-j 1`: OCaml `42.9s` /
 Phase 1 Arc was a real win on per-procedure peak but did not survive
 scaling.
 
-The `peak_rss=...` heartbeat data added in commit `cacd0973cb` then
-split the gap into two distinct findings:
+The `peak_rss=...` heartbeat data added in commit `cacd0973cb`, plus
+the follow-up OCaml `--debug` HTML check on `DES_ede3_cfb_encrypt`,
+then split the gap into two distinct findings:
 
-- **Outlier-explosion gap (top priority)**: a small number of procedures
-  (`DES_ede3_cfb_encrypt`, plausibly the same family that includes
-  `whirlpool_block`) generate `4400+` retained disjuncts and become the
-  dominant wall-time / memory blocker (`>17 minutes` for one procedure
-  vs OCaml's `<43s` for the entire 74-file corpus). Structurally this
-  is the OCaml-vs-Rust per-disjunct unique-value gap from the (A)
-  reframe, but here it manifests as retained-*count* explosion in
-  encryption-style byte loops.
+- **Per-disjunct cost gap (top priority)**: a small number of
+  procedures (`DES_ede3_cfb_encrypt`, plausibly the same family that
+  includes `whirlpool_block`) sit at the `pulse_max_disjuncts = 20`
+  cap on most nodes, just like OCaml. So the disjunct *count* per
+  node is not the differentiator; OCaml caps at `20`/node here too.
+  What's different is per-disjunct cost: each of our retained
+  disjuncts is `3-6×` more expensive to manipulate. Across
+  `~262 nodes × ~20 disj/node × fixpoint iterations` that compounds
+  into the observed `~17 minutes vs <43 seconds` wall-time gap.
 - **Per-procedure baseline accumulation (next priority)**: `~+50-70 MB`
   per finished procedure even on small / fast procs. With `571` procs
   this extrapolates to `~30 GB` of cumulative growth, matching the
   observed `~23 GB` whole-program max RSS.
 
-The outlier-explosion gap has the bigger lever: a single procedure
+The per-disjunct cost gap has the bigger lever: a single procedure
 currently consumes more wall time than the entire 74-file OCaml run.
+It is structurally the **(A) reframe** from earlier in this file:
+reduce per-disjunct unique-value count by sharing abstract values
+across chained field/array accesses (the way OCaml does).
