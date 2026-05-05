@@ -6,6 +6,63 @@
 
 ## OpenSSL Benchmark
 
+### Current state (74-file partial capture, post perf sessions)
+
+The whole-program OpenSSL run is no longer a categorical scaling
+blocker. Headline numbers on the 74-file partial capture under
+`~/infer-rs-bench/openssl-20260501-084151/`:
+
+| metric                      | OCaml (-j 1)    | Rust (now, -j 4)         |
+|-----------------------------|-----------------|---------------------------|
+| wall time                   | `42.9s`         | `~195s` / `~3m15s`        |
+| max RSS                     | `~1.17 GB`      | `~19 GB`                  |
+| peak memory footprint       | `~1.10 GB`      | `~5.7 - 7.5 GB`           |
+| procs analyzed              | `570 / 570`     | `570 / 570`               |
+| heap+wall aborts            | n/a             | `~17 / 570` (`~3%`)       |
+| exit                        | clean (`0`)     | clean (`0`)               |
+
+Whole-program slowdown vs OCaml: **`~4.5×`** (down from `~70×` and
+OOM-killed at the start of the perf sessions). On the single
+`whirlpool_block` slice we are now **`~32%` faster than OCaml**
+(`~82s` vs OCaml `~120s`, with peak memory `~503 MB` vs OCaml
+`~10 GB`).
+
+The wins came from a series of structural-sharing, per-procedure
+cap, and per-instruction-cost-reduction commits documented in
+`docs/plans/`:
+
+- `STRUCTURAL_SHARING_PROTOTYPE.md`: Phase 1 Arc-wrap of
+  `BaseMemory.graph`, `BaseAddressAttributes.map`, `BaseStack.map`,
+  `Formula.phi`, plus the outer `BTreeMap` of the first two.
+- `WHOLE_PROGRAM_OPENSSL_FINDINGS.md`: per-procedure heap cap
+  (`pulse-max-heap-mb`, default `2048`) and wall cap
+  (`pulse-max-wall-secs`, default `120`); empty-on-abort short-
+  circuit in `exec_node`; `AbductiveDomain::shrink_for_storage` for
+  cached summaries.
+- `CONVERGENCE_8D4V_FINDINGS.md`: drop-dead-logical-vars cleanup
+  driven by backward liveness; reverse `term_value_index` for
+  BinOp result interning; canonicalize BinOp / UnOp result through
+  `const_cache`.
+- `CONVERGENCE_NEXT_STEPS.md`: `ValueSortKey` /
+  `EdgeSortKey` / `AccessSortKey` typed enums replacing String
+  sort keys in `Canonicalizer::propagate_*` (the single biggest
+  per-procedure CPU win).
+- `NEXT_STEPS.md`: A / B / C / D / E candidate work list and what's
+  done so far.
+
+Use `--pulse-max-heap-mb 0` and `--pulse-max-wall-secs 0` to
+disable each cap (escape hatches for benchmarking).
+
+### Reproduction
+
+  cd ~/infer-rs-bench/openssl-20260501-084151
+  /usr/bin/time -l target/release/infer-rs --pulse-only --quiet \
+    --trace-ondemand -j 4 textual-out/*.sil
+
+Older historical OpenSSL benchmark notes follow.
+
+### Historical notes
+
 - The benchmark setup is now understood and repeatable on this host:
   use the repo clang on `PATH`, set `CC=clang`, append
   `-isysroot $(xcrun --show-sdk-path)`, and configure OpenSSL with

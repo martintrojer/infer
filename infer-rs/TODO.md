@@ -173,6 +173,20 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 ### OpenSSL benchmark follow-ups
 
+**Current state:** The whole-program OpenSSL run is no longer a
+categorical scaling blocker. On the 74-file partial corpus at
+`-j 4` with default caps, the run completes cleanly in `~3m15s`
+(`570 / 570` procs, `~19 GB` max RSS, `~17 / 570` heap+wall
+aborts). Whole-program slowdown vs OCaml's `42.9s`: `~4.5×`. On
+`whirlpool_block` alone we are now `~32%` faster than OCaml. See
+`docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
+`docs/plans/NEXT_STEPS.md` for the headline tables and the third-
+pass perf candidates that remain (FxHashMap on `Procname`-keyed
+maps, `OBJ_bsearch_ex_` fixpoint convergence bug, per-disjunct
+value-count residue).
+
+Below: historical `whirlpool_block` notes still useful as context.
+
 - Keep the narrowed `whirlpool_block` checkpoint current on the regenerated
   export too: after the `ExitScope` fix, the completed selected-node rerun on
   the fresh single-file `wp_block.c` export still converges to

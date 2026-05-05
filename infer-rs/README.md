@@ -4,6 +4,26 @@ Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory sa
 
 Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 134. Leaks: expected 20, found 20. UAF: expected 7, found 7.
 
+**OpenSSL whole-program benchmark (74-file partial corpus, post perf sessions):**
+
+| metric                | OCaml (-j 1) | Rust (now, -j 4)     |
+|-----------------------|---------------|----------------------|
+| wall time             | `42.9s`       | `~195s` (`~3m15s`)   |
+| max RSS               | `~1.17 GB`    | `~19 GB`             |
+| procs analyzed        | `570 / 570`   | `570 / 570`          |
+| heap+wall aborts      | n/a           | `~17 / 570` (`~3%`)  |
+| exit                  | clean (0)     | clean (0)            |
+
+Whole-program slowdown vs OCaml: **`~4.5×`** (down from `~70×` and
+OOM-killed at the start of the perf sessions). On the single
+`whirlpool_block` slice we are now **`~32%` faster than OCaml**
+(`~82s` vs OCaml `~120s`, with peak memory `~503 MB` vs OCaml
+`~10 GB`). Defaults: `pulse-max-heap-mb = 2048`,
+`pulse-max-wall-secs = 120`; pass `0` to disable each cap. Full
+summary in `docs/STATUS.md` and `docs/plans/`.
+
+Historical OpenSSL benchmark notes follow.
+
 Exact summary-equality work now uses a semantic driver instead of raw JSON diffs:
 `crates/test-harness/src/summary_compare.rs` canonicalizes both
 `main.pre_post_list` and specialized summaries from `specialization.c`.

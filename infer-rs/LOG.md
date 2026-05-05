@@ -294,25 +294,45 @@ changes, and move finished results to durable docs/tests/commits.
 
 ## Next Probes
 
-- Compare the current richer single-file `wp_block.c` retained PRE/POST states
-  against the OCaml line `540` / `752-755` block using the new alpha-signature
-  readout: explain why Rust keeps `4` growth tiers x `2` variants at nodes
-  `31/35` while OCaml ends those source lines at `2-4` visible PRE states and
-  `Got 1` on the last transfer.
-- After the attr-rank cleanup, focus the next probe on the surviving
-  `540:33` / logical-temp provenance inside nodes `31-38`; duplicate
-  `Invalid(...)` accumulation is no longer the main noise source there.
-- Focus specifically on what grows monotonically between the four Rust
-  signature tiers, especially the formula and stack-reachable post graph.
-  The next likely correctness gap is later loop-cycle collapse, not import of
-  metadata or rank handling.
-- Do not chase `Nullify` / `Abstract` metadata work here: OCaml Pulse keeps
-  them as no-op too.
-- Re-export the shared OpenSSL corpus with the patched OCaml exporter and use
-  that as the next apples-to-apples Rust checkpoint.
-- Use the current importer support as the floor: do not add a Pulse workaround
-  for this specific `whirlpool_block` gap just to move the retained-state
-  numbers back toward the old smaller but less faithful export.
-- Continue whole-program OpenSSL work on the publishable surfaces that remain:
-  merged-run abnormal termination / memory growth and then a clean `-j 1`
-  rerun on the shared exported corpus.
+Most of the older `whirlpool_block` retained-state probes are
+resolved by the perf sessions documented in `docs/plans/`. Current
+live candidates (full ranked list in `docs/plans/NEXT_STEPS.md`):
+
+- **A third pass (next):** the previous `samply` profile residue
+  pointed at `<TemplateSpecInfo as Hash>::hash` (`~3.6%` self-time,
+  presumably from `Procname` HashMap lookups) and `Vec::clone`
+  (`~3.5%` across multiple sources). Tried switching
+  `SummaryStore`'s `DashMap<Procname, ...>` to `FxHasher` once but
+  measurements were too noisy on this host to attribute the change
+  vs noise; reverted. Next attempt should be on a quieter host or
+  with better benchmark plumbing.
+- **B (open):** `OBJ_bsearch_ex_` shows `max_visit_count = 6450`
+  even though `pulse_widen_threshold = 3` should stop revisiting
+  after `~3` widening iterations. Likely a real fixpoint-
+  convergence bug in our WTO scheduler or `widen` impl. Bounded
+  via `pulse-max-wall-secs` for now; clean fix would remove a
+  long-tail wall-time source.
+- **D (open):** per-disjunct value-count residue (`+637 / tier`
+  vs OCaml's `+0 / tier`) on `whirlpool_block`. Open candidates
+  are per-iteration formula GC and folding `mark_is_int` into the
+  `find_term_value` short-circuit — invasive but real.
+- **E (open):** OCaml parity gaps in `TODO.md` (mostly compliance
+  / message detail; different track from the perf work).
+
+### Resolved (for reference)
+
+- The old "explain why Rust keeps `4` growth tiers × `2` variants
+  at nodes `31/35` ..." probe: investigated in
+  `docs/plans/CONVERGENCE_8D4V_FINDINGS.md`. OCaml retains MORE
+  disjuncts on the same slice (`10` vs our `8`), so the framing
+  was wrong; the real cost was per-disjunct CPU, addressed by the
+  drop-dead-logical-vars + term_value_index + ValueSortKey work.
+- The old "merged-run abnormal termination / memory growth" work:
+  resolved by `pulse-max-heap-mb` / `pulse-max-wall-secs` caps +
+  empty-on-abort short-circuit. Whole-program OpenSSL completes
+  cleanly with default caps now.
+- The old "continue whole-program OpenSSL work on the publishable
+  surfaces" line: published, see
+  `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md`. Headline:
+  `~70× / OOM-killed` → `~4.5× / clean` vs OCaml on the 74-file
+  partial corpus.
