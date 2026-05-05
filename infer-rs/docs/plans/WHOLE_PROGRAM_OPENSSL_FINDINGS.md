@@ -258,5 +258,43 @@ peak. Whole-program impact requires a complete run to surface, but
 the principle is correct: the cached summary should not carry
 analysis-only working state.
 
+## Headline: 74-file partial OpenSSL whole-program run completes
+
+With `--pulse-max-heap-mb 1000 -j 4` on the 74-file partial OpenSSL
+corpus, the run **completes cleanly** for the first time:
+
+| metric                       | OCaml (-j 1)    | Rust (now, -j 4)        |
+|------------------------------|-----------------|--------------------------|
+| wall time                    | `42.9s`         | `1703s` (`~28m23s`)      |
+| user CPU                     | `~41s`          | `6545s` (4 cores)        |
+| max RSS                      | `~1.17 GB`      | `~16.8 GB`               |
+| peak memory footprint        | `~1.10 GB`      | `~7.16 GB`               |
+| procs analyzed               | `570 / 570`     | `570 / 570`              |
+| heap-cap aborts              | n/a             | `21 / 570` (`~3.7%`)     |
+| exit                         | clean (`0`)     | clean (`0`)              |
+
+This is a major scaling milestone: pre-cap, the same run was
+OOM-killed at `~30 / 570` procs after `~8 min`. With the cap +
+parallelism, we now complete all 570 procs in `~28 min` of wall
+time.
+
+We are still `~40×` slower and use `~14×` more memory than OCaml.
+Both gaps now look like first-order CPU efficiency issues on a
+small set of pathological procedures (`DES_ofb_encrypt`,
+`OBJ_bsearch_ln`, `sha256_block_data_order`, ...) rather than
+categorical correctness or scaling problems.
+
+Observed suspicious patterns to investigate next:
+- `OBJ_bsearch_ln`: `26` nodes but `max_visit_count = 6450`. With
+  `pulse_widen_threshold = 3` we should stop revisiting after `~3`
+  widening iterations, so `6450` per-node visits suggests a
+  fixpoint-convergence bug in the WTO scheduler or in our widen
+  implementation. Likely the same root cause as the long-tail wall
+  time on a few procedures.
+- `DES_ofb_encrypt`: large retained state (`disj=1776`, `formula
+  lin=544k`). Same family as `whirlpool_block` /
+  `DES_ede3_cfb_encrypt` — we already cut per-proc peak `5×` on
+  `whirlpool_block` so the per-disjunct cost is the residue.
+
 This file is the artifact of the first whole-program OpenSSL pass.
 Future passes should append findings here rather than overwriting.
