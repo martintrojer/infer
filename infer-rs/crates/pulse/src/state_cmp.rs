@@ -349,12 +349,8 @@ impl Canonicalizer {
         let phi = state.path_condition.phi();
 
         let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-        equalities.sort_by_key(|(lhs, rhs)| {
-            (
-                self.partial_value_label(*lhs),
-                self.partial_value_label(*rhs),
-            )
-        });
+        equalities
+            .sort_by_key(|(lhs, rhs)| (self.partial_value_key(*lhs), self.partial_value_key(*rhs)));
         for (lhs, rhs) in equalities {
             if self.get(lhs).is_some() || self.get(rhs).is_some() {
                 self.map_value(lhs);
@@ -363,7 +359,7 @@ impl Canonicalizer {
         }
 
         let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-        linear_eqs.sort_by_key(|(lhs, lin)| self.partial_linear_eq_label(**lhs, lin));
+        linear_eqs.sort_by_key(|(lhs, _)| self.partial_value_key(**lhs));
         for (lhs, lin) in linear_eqs {
             let vars: Vec<_> = std::iter::once(*lhs).chain(lin.get_variables()).collect();
             if vars.iter().any(|value| self.get(*value).is_some()) {
@@ -399,9 +395,7 @@ impl Canonicalizer {
         }
 
         let mut intervals: Vec<_> = phi.intervals.iter().collect();
-        intervals.sort_by_key(|(value, interval)| {
-            (self.partial_value_label(**value), format!("{interval:?}"))
-        });
+        intervals.sort_by_key(|(value, _)| self.partial_value_key(**value));
         for (value, _) in intervals {
             if self.get(*value).is_some() {
                 continue;
@@ -431,7 +425,7 @@ impl Canonicalizer {
         }
 
         let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-        fn_apps.sort_by_key(|(key, ret)| self.partial_fn_app_label(key, **ret));
+        fn_apps.sort_by_key(|(_, ret)| self.partial_value_key(**ret));
         for (key, ret) in fn_apps {
             let vars: Vec<_> = key
                 .actuals
