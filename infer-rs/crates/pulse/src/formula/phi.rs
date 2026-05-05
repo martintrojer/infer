@@ -75,6 +75,44 @@ pub struct Phi {
     /// Cross-ref: OCaml PulseFormulaPhi.ml term_eqs (Term→Var direction),
     /// PulseCallOperations.ml L220-235 (FunctionApplicationOperand).
     fn_app_eqs: BTreeMap<FnAppKey, AbstractValue>,
+
+    /// Reverse index for `term_eqs`: maps a canonical `(op, lhs, rhs)` key
+    /// to the abstract value the formula already uses to represent the
+    /// result of that BinOp.
+    ///
+    /// The dominant per-disjunct value-count cost on encryption-style byte
+    /// loops (whirlpool_block, DES_ede3_cfb_encrypt, ...) comes from
+    /// minting a fresh `AbstractValue` for every BinOp evaluation, even
+    /// when the same BinOp on the same canonical operands has been
+    /// evaluated before in the same disjunct. OCaml's
+    /// `PulseFormulaPhi.term_eqs` is itself indexed by the term, so a
+    /// repeated `xor(v37, v31)` returns the same `v38`. We model the same
+    /// effect with a separate reverse map keyed by canonical operands.
+    ///
+    /// Keys are computed at insert time using `Phi::canonical_term_key`,
+    /// which goes through `get_repr` for `AbstractValue` operands and
+    /// folds known constants out of `linear_eqs`. We do not actively
+    /// re-key entries on `subst_var`: a subst makes some keys stale, but
+    /// the worst case is a missed sharing opportunity (a fresh
+    /// `AbstractValue` is minted), not a soundness bug.
+    term_value_index: BTreeMap<TermKey, AbstractValue>,
+}
+
+/// Canonical key for the reverse `term_value_index`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TermKey {
+    pub op: sil::binop::Binop,
+    pub lhs: TermKeyOperand,
+    pub rhs: TermKeyOperand,
+}
+
+/// Canonicalized operand for `TermKey`: known constants are extracted from
+/// `linear_eqs` and stored as their integer value; unknown values are
+/// represented by their canonical `var_eqs` representative.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TermKeyOperand {
+    Const(i64),
+    Var(AbstractValue),
 }
 
 /// Key for function application deduplication.
@@ -130,6 +168,74 @@ impl Phi {
     pub fn get_known_const(&self, v: AbstractValue) -> Option<Q> {
         let repr = self.get_repr(v);
         self.linear_eqs.get(&repr).and_then(|l| l.get_as_const())
+    }
+
+    /// Compute the canonical key for a `(op, lhs, rhs)` BinOp, using
+    /// `get_repr` for `AbstractValue` operands and folding known integer
+    /// constants out of `linear_eqs`. Returns `None` if either operand
+    /// resolves to a non-integer constant (which we don't index).
+    pub fn canonical_term_key(
+        &self,
+        op: &sil::binop::Binop,
+        lhs: &super::Operand,
+        rhs: &super::Operand,
+    ) -> Option<TermKey> {
+        let lhs = self.canonical_term_operand(lhs)?;
+        let rhs = self.canonical_term_operand(rhs)?;
+        Some(TermKey {
+            op: op.clone(),
+            lhs,
+            rhs,
+        })
+    }
+
+    fn canonical_term_operand(&self, op: &super::Operand) -> Option<TermKeyOperand> {
+        match op {
+            super::Operand::ConstOperand(c) => Some(TermKeyOperand::Const(*c)),
+            super::Operand::AbstractValue(v) => {
+                let repr = self.get_repr(*v);
+                if let Some(q) = self.get_known_const(repr) {
+                    if q.is_integer() {
+                        return Some(TermKeyOperand::Const(*q.numer() / *q.denom()));
+                    }
+                    return None;
+                }
+                Some(TermKeyOperand::Var(repr))
+            }
+        }
+    }
+
+    /// Look up the existing representative value for a BinOp `op(lhs, rhs)`
+    /// in the reverse `term_value_index`. Returns the canonical
+    /// `AbstractValue` if a previous evaluation in the same disjunct
+    /// already minted one, else `None`.
+    pub fn find_term_value(
+        &self,
+        op: &sil::binop::Binop,
+        lhs: &super::Operand,
+        rhs: &super::Operand,
+    ) -> Option<AbstractValue> {
+        let key = self.canonical_term_key(op, lhs, rhs)?;
+        let stored = self.term_value_index.get(&key).copied()?;
+        Some(self.get_repr(stored))
+    }
+
+    /// Record that `result` is the canonical value for `op(lhs, rhs)` in
+    /// the reverse `term_value_index`. Inserts only if no entry already
+    /// exists for the canonical key, so existing bindings are never
+    /// overwritten silently.
+    pub fn register_term_value(
+        &mut self,
+        op: &sil::binop::Binop,
+        lhs: &super::Operand,
+        rhs: &super::Operand,
+        result: AbstractValue,
+    ) {
+        let Some(key) = self.canonical_term_key(op, lhs, rhs) else {
+            return;
+        };
+        let canonical_result = self.get_repr(result);
+        self.term_value_index.entry(key).or_insert(canonical_result);
     }
 
     /// Record that two variables are equal: v1 = v2.
@@ -558,6 +664,15 @@ impl Phi {
                     FnAppActual::Var(v) => is_reachable(*v),
                 })
         });
+        let term_key_operand_is_reachable = |op: &TermKeyOperand| match op {
+            TermKeyOperand::Const(_) => true,
+            TermKeyOperand::Var(v) => is_reachable(*v),
+        };
+        self.term_value_index.retain(|key, ret| {
+            is_reachable(*ret)
+                && term_key_operand_is_reachable(&key.lhs)
+                && term_key_operand_is_reachable(&key.rhs)
+        });
     }
 
     /// Forget pure constraints mentioning the given canonical values while
@@ -591,6 +706,15 @@ impl Phi {
                     FnAppActual::Const(_) => true,
                     FnAppActual::Var(v) => !touches_ignored(*v),
                 })
+        });
+        let term_key_operand_touches_ignored = |op: &TermKeyOperand| match op {
+            TermKeyOperand::Const(_) => false,
+            TermKeyOperand::Var(v) => touches_ignored(*v),
+        };
+        self.term_value_index.retain(|key, ret| {
+            !touches_ignored(*ret)
+                && !term_key_operand_touches_ignored(&key.lhs)
+                && !term_key_operand_touches_ignored(&key.rhs)
         });
     }
 
@@ -629,6 +753,15 @@ impl Phi {
                     FnAppActual::Const(_) => true,
                     FnAppActual::Var(v) => !touches_ignored(*v),
                 })
+        });
+        let term_key_operand_touches_ignored = |op: &TermKeyOperand| match op {
+            TermKeyOperand::Const(_) => false,
+            TermKeyOperand::Var(v) => touches_ignored(*v),
+        };
+        self.term_value_index.retain(|key, ret| {
+            !touches_ignored(*ret)
+                && !term_key_operand_touches_ignored(&key.lhs)
+                && !term_key_operand_touches_ignored(&key.rhs)
         });
     }
 

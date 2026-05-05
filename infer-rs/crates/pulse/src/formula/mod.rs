@@ -453,10 +453,43 @@ impl Formula {
         x: &Operand,
         y: &Operand,
     ) -> SatUnsat<Vec<NewEq>> {
+        // Cross-ref: OCaml `PulseFormulaPhi.term_eqs` is itself indexed by
+        // the term, so a repeated `xor(v37, v31)` returns the same `v38`.
+        // Mirror that with our reverse `term_value_index`: if the same
+        // BinOp on the same canonical operands has already been evaluated
+        // in this disjunct, equate the freshly minted `v` with the cached
+        // representative instead of paying the formula-update cost twice.
+        if let Some(existing) = self.phi.find_term_value(&op, x, y) {
+            if existing != v {
+                let result = self.phi_mut().and_var_equal(v, existing);
+                // Even on a hit we still want to record the term-to-value
+                // mapping if the cached entry was for a stale (substituted)
+                // value; `register_term_value` is no-op-on-existing.
+                self.phi_mut().register_term_value(&op, x, y, existing);
+                return result;
+            }
+        }
+
         if result_of_binop_is_integer(&op, x, y, &self.phi) {
             self.phi_mut().mark_is_int(v);
         }
 
+        let result = self.and_equal_binop_inner(v, op.clone(), x, y);
+        // After the inner call has populated linear_eqs / intervals /
+        // term_eqs, register the canonical key in the reverse index so a
+        // subsequent identical evaluation in the same disjunct can reuse
+        // `v` instead of minting a fresh value.
+        self.phi_mut().register_term_value(&op, x, y, v);
+        result
+    }
+
+    fn and_equal_binop_inner(
+        &mut self,
+        v: AbstractValue,
+        op: sil::binop::Binop,
+        x: &Operand,
+        y: &Operand,
+    ) -> SatUnsat<Vec<NewEq>> {
         // For supported arithmetic ops, create a linear equation AND
         // propagate intervals through CItv.
         // Cross-ref: OCaml PulseFormula.ml Normalizer.and_var_binop_var

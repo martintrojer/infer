@@ -12,7 +12,7 @@ use crate::typ::IKind;
 /// Binary operations.
 ///
 /// Mirrors OCaml's `Binop.t`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Binop {
     /// Arithmetic +.
     PlusA(Option<IKind>),
