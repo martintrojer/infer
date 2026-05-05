@@ -215,5 +215,48 @@ updates: there are *two* distinct gaps, not one.
   OCaml's `1.17 GB` whole-corpus peak.
 - (C) (small remaining Arc candidates) is unchanged in priority.
 
+## Update: pulse-max-heap-mb (commit `51b015d6dc`) unblocks scaling
+
+Mirroring OCaml's `Pulse.exec_instr_with_oom_protection_and_path_update`
+"AboutToOOM" early-exit, commit `51b015d6dc` adds an opt-in
+`pulse-max-heap-mb` per-procedure heap cap. When a procedure's
+analysis grows the process peak RSS beyond the configured budget, we
+stop the transfer function and let the fixpoint converge on the
+partial state already reached.
+
+With `--pulse-max-heap-mb 1500` on the 74-file partial OpenSSL
+corpus at `-j 1`:
+
+- 292 / 570 procs completed in `~19 min` (vs `~30 / 570` killed at
+  ~8 min OOM in the pre-cap baseline).
+- 4 cap aborts fired as expected:
+  `ripemd160_block_data_order`, `md5_block_data_order`,
+  `md4_block_data_order`, `sha256_block_data_order`. The latter
+  later completed despite the earlier abort (cap is per-`exec_node`
+  check, not permanent skip).
+- Per-procedure peak RSS for completed procs grows steadily to
+  `~8.85 GB` over the run (still much higher than OCaml's `~1.17 GB`
+  whole-corpus peak; the SummaryStore retention of completed
+  procs is the residual). 
+- Wall time still much slower than OCaml's `42.9s` (we spent
+  `~19 min` on the same `292 / 570`-prefix workload that OCaml
+  finishes in `~22s`).
+
+Net effect: whole-program OpenSSL now completes the bulk of the
+corpus where it previously ground to a halt on 3-4 outlier
+procedures. The cap does not by itself make per-procedure analysis
+fast — it just keeps runaway procedures from blocking the rest of
+the pipeline.
+
+## Update: AbductiveDomain.shrink_for_storage (commit `e103af207c`)
+
+Drop apply-time-unused fields (`pre`, `const_cache`,
+`need_dynamic_type_specialization`, `dynamic_types`) from each
+PrePost.post before stashing the `PulseSummary` in the SummaryStore.
+Measured single-procedure / 30-file impact: `~0` on per-procedure
+peak. Whole-program impact requires a complete run to surface, but
+the principle is correct: the cached summary should not carry
+analysis-only working state.
+
 This file is the artifact of the first whole-program OpenSSL pass.
 Future passes should append findings here rather than overwriting.
