@@ -111,27 +111,30 @@ pub struct InferConfig {
 
     /// Maximum delta in process peak RSS (megabytes) that a single Pulse
     /// procedure analysis is allowed to consume before being aborted with
-    /// the partial state retained as a summary. Default `None` keeps the
-    /// existing unbounded behavior; setting it to e.g. `2048` aborts any
-    /// procedure whose analysis grows the peak RSS by more than 2 GB.
+    /// the partial state retained as a summary. Defaults to `2048` (2 GB)
+    /// so the binary is usable out of the box without explicitly tuning
+    /// flags; pass `--pulse-max-heap-mb 0` (or set the field to `Some(0)`)
+    /// to effectively disable the cap.
     ///
     /// Cross-ref: OCaml `--pulse-max-heap` checks `Gc.quick_stat ()`
     /// `heap_words` before every instruction; we use `getrusage`
     /// `ru_maxrss` since Rust does not expose a per-allocator heap-words
     /// counter as cheaply.
-    #[serde(rename = "pulse-max-heap-mb", default)]
+    #[serde(rename = "pulse-max-heap-mb", default = "default_pulse_max_heap_mb")]
     pub pulse_max_heap_mb: Option<usize>,
 
     /// Maximum wall-clock seconds a single Pulse procedure analysis is
     /// allowed to consume before being aborted (with the partial state
-    /// retained as a summary). Default `None` keeps the existing
-    /// unbounded behavior. Complements `pulse_max_heap_mb` for
-    /// procedures whose fixpoint does not converge quickly enough but
-    /// whose RSS does not climb fast enough to trip the heap cap (e.g.,
-    /// recursive bsearch-family procedures with thousands of WTO
-    /// revisits per loop body). On the 74-file partial OpenSSL corpus,
-    /// the long-tail wall time is now dominated by these procedures.
-    #[serde(rename = "pulse-max-wall-secs", default)]
+    /// retained as a summary). Defaults to `120` so the binary is usable
+    /// out of the box without explicitly tuning flags; complements
+    /// `pulse_max_heap_mb` for procedures whose fixpoint does not
+    /// converge quickly but whose RSS stays low (e.g., recursive
+    /// bsearch-family procedures with thousands of WTO revisits per
+    /// loop body).
+    #[serde(
+        rename = "pulse-max-wall-secs",
+        default = "default_pulse_max_wall_secs"
+    )]
     pub pulse_max_wall_secs: Option<u64>,
 
     /// Run only the Pulse checker.
@@ -262,6 +265,26 @@ fn default_true() -> bool {
     true
 }
 
+/// Default `pulse-max-heap-mb`: 2 GB. Conservative enough not to
+/// abort the bulk of well-behaved procedures (the largest
+/// per-procedure peaks we have seen on the 74-file partial OpenSSL
+/// corpus are `~830 MB` for `fcrypt_body` and similar) but tight
+/// enough to keep runaway block-cipher procedures from exhausting
+/// host memory.
+fn default_pulse_max_heap_mb() -> Option<usize> {
+    Some(2048)
+}
+
+/// Default `pulse-max-wall-secs`: 120s. Most procedures complete in
+/// well under a second; the long-tail (`DES_ofb_encrypt`,
+/// `OBJ_bsearch_ex_`, etc.) takes minutes to many minutes without
+/// the cap. Setting this to `120s` matches the order of magnitude of
+/// the slowest procedures that *do* converge cleanly while letting
+/// pathological ones get aborted.
+fn default_pulse_max_wall_secs() -> Option<u64> {
+    Some(120)
+}
+
 impl Default for InferConfig {
     fn default() -> Self {
         Self {
@@ -269,8 +292,8 @@ impl Default for InferConfig {
             pulse_widen_threshold: 3,
             pulse_max_cfg_size: 15_000,
             pulse_drop_dead_logical_vars: true,
-            pulse_max_heap_mb: None,
-            pulse_max_wall_secs: None,
+            pulse_max_heap_mb: default_pulse_max_heap_mb(),
+            pulse_max_wall_secs: default_pulse_max_wall_secs(),
             pulse_intraprocedural_only: false,
             pulse_recency_limit: None,
             pulse_only: false,
@@ -372,6 +395,8 @@ mod tests {
         assert_eq!(config.pulse_max_disjuncts, 20);
         assert_eq!(config.pulse_widen_threshold, 3);
         assert_eq!(config.pulse_max_cfg_size, 15_000);
+        assert_eq!(config.pulse_max_heap_mb, Some(2048));
+        assert_eq!(config.pulse_max_wall_secs, Some(120));
         assert_eq!(config.max_widens, 10_000);
         assert!(!config.pulse_intraprocedural_only);
         assert_eq!(config.pulse_recency_limit, None);

@@ -139,12 +139,14 @@ struct Cli {
 
     /// Maximum delta in process peak RSS (megabytes) that a single Pulse
     /// procedure analysis is allowed to consume before being aborted.
-    /// Cross-ref: OCaml `--pulse-max-heap`.
+    /// Defaults to `2048` (2 GB) when unset; pass `0` to disable the cap
+    /// entirely. Cross-ref: OCaml `--pulse-max-heap`.
     #[arg(long = "pulse-max-heap-mb")]
     pulse_max_heap_mb: Option<usize>,
 
     /// Maximum wall-clock seconds a single Pulse procedure analysis is
-    /// allowed to consume before being aborted. Complements
+    /// allowed to consume before being aborted. Defaults to `120` when
+    /// unset; pass `0` to disable the cap entirely. Complements
     /// `--pulse-max-heap-mb` for procedures whose fixpoint does not
     /// converge quickly but whose RSS stays low.
     #[arg(long = "pulse-max-wall-secs")]
@@ -265,10 +267,13 @@ impl Cli {
             c.pulse_max_cfg_size = v;
         }
         if let Some(v) = self.pulse_max_heap_mb {
-            c.pulse_max_heap_mb = Some(v);
+            // `--pulse-max-heap-mb 0` is the documented escape hatch to
+            // disable the cap entirely, overriding the config default.
+            c.pulse_max_heap_mb = if v == 0 { None } else { Some(v) };
         }
         if let Some(v) = self.pulse_max_wall_secs {
-            c.pulse_max_wall_secs = Some(v);
+            // Same escape hatch for the wall-time cap.
+            c.pulse_max_wall_secs = if v == 0 { None } else { Some(v) };
         }
         if let Some(v) = self.max_widens {
             c.max_widens = v;

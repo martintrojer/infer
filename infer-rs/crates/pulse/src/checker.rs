@@ -1201,14 +1201,16 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         // contributions, so each node's pre stops changing and the WTO
         // loop converges in one or two more iterations rather than
         // continuing to deep-clone heavy disjunctive domains forever.
-        let abort_response = || -> Self::Domain {
-            DisjunctiveDomain::empty(pre.max_disjuncts, pre.max_widen_iters)
-        };
+        let abort_response =
+            || -> Self::Domain { DisjunctiveDomain::empty(pre.max_disjuncts, pre.max_widen_iters) };
         if self.aborted.get() {
             return abort_response();
         }
         let cfg = config::get();
-        if let Some(max_mb) = cfg.pulse_max_heap_mb {
+        // `Some(0)` is the documented escape hatch (mirrors the CLI
+        // override) to disable the cap entirely without removing the
+        // config field.
+        if let Some(max_mb) = cfg.pulse_max_heap_mb.filter(|m| *m > 0) {
             if let Some(current) = process_peak_rss_bytes() {
                 let max_bytes = (max_mb as u64).saturating_mul(1024 * 1024);
                 let delta = current.saturating_sub(self.start_peak_rss_bytes);
@@ -1225,7 +1227,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                 }
             }
         }
-        if let Some(max_secs) = cfg.pulse_max_wall_secs {
+        if let Some(max_secs) = cfg.pulse_max_wall_secs.filter(|s| *s > 0) {
             let elapsed = self.start_instant.elapsed();
             if elapsed.as_secs() > max_secs {
                 log::warn!(
