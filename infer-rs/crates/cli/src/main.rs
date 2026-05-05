@@ -143,6 +143,13 @@ struct Cli {
     #[arg(long = "pulse-max-heap-mb")]
     pulse_max_heap_mb: Option<usize>,
 
+    /// Maximum wall-clock seconds a single Pulse procedure analysis is
+    /// allowed to consume before being aborted. Complements
+    /// `--pulse-max-heap-mb` for procedures whose fixpoint does not
+    /// converge quickly but whose RSS stays low.
+    #[arg(long = "pulse-max-wall-secs")]
+    pulse_max_wall_secs: Option<u64>,
+
     /// Maximum widenings before fixpoint gives up (default: 10000).
     #[arg(long = "max-widens")]
     max_widens: Option<usize>,
@@ -259,6 +266,9 @@ impl Cli {
         }
         if let Some(v) = self.pulse_max_heap_mb {
             c.pulse_max_heap_mb = Some(v);
+        }
+        if let Some(v) = self.pulse_max_wall_secs {
+            c.pulse_max_wall_secs = Some(v);
         }
         if let Some(v) = self.max_widens {
             c.max_widens = v;

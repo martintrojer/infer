@@ -122,6 +122,18 @@ pub struct InferConfig {
     #[serde(rename = "pulse-max-heap-mb", default)]
     pub pulse_max_heap_mb: Option<usize>,
 
+    /// Maximum wall-clock seconds a single Pulse procedure analysis is
+    /// allowed to consume before being aborted (with the partial state
+    /// retained as a summary). Default `None` keeps the existing
+    /// unbounded behavior. Complements `pulse_max_heap_mb` for
+    /// procedures whose fixpoint does not converge quickly enough but
+    /// whose RSS does not climb fast enough to trip the heap cap (e.g.,
+    /// recursive bsearch-family procedures with thousands of WTO
+    /// revisits per loop body). On the 74-file partial OpenSSL corpus,
+    /// the long-tail wall time is now dominated by these procedures.
+    #[serde(rename = "pulse-max-wall-secs", default)]
+    pub pulse_max_wall_secs: Option<u64>,
+
     /// Run only the Pulse checker.
     /// OCaml: `--pulse-only` (default false)
     #[serde(rename = "pulse-only")]
@@ -258,6 +270,7 @@ impl Default for InferConfig {
             pulse_max_cfg_size: 15_000,
             pulse_drop_dead_logical_vars: true,
             pulse_max_heap_mb: None,
+            pulse_max_wall_secs: None,
             pulse_intraprocedural_only: false,
             pulse_recency_limit: None,
             pulse_only: false,

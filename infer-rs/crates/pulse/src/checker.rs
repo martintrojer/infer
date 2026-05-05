@@ -758,6 +758,7 @@ pub fn analyze_with_specialization_and_requests(
         liveness,
         return_candidate_logical_stamp,
         start_peak_rss_bytes: process_peak_rss_bytes().unwrap_or(0),
+        start_instant: Instant::now(),
         aborted: std::cell::Cell::new(false),
     };
 
@@ -1089,10 +1090,14 @@ struct PulseTransferFunctions<'a> {
     /// Procedure entry peak RSS in bytes. Used together with
     /// `pulse_max_heap_mb` to bound this procedure's RSS growth.
     start_peak_rss_bytes: u64,
+    /// Procedure entry timestamp. Used together with
+    /// `pulse_max_wall_secs` to bound this procedure's wall-time spend.
+    start_instant: std::time::Instant,
     /// Sticky abort flag: once this procedure has exceeded the
-    /// `pulse_max_heap_mb` budget, every subsequent `exec_node` call
-    /// returns the input domain unchanged so the fixpoint terminates
-    /// quickly with whatever partial state was reached.
+    /// `pulse_max_heap_mb` or `pulse_max_wall_secs` budget, every
+    /// subsequent `exec_node` call returns the input domain unchanged
+    /// so the fixpoint terminates quickly with whatever partial state
+    /// was reached.
     /// Cross-ref: OCaml `Pulse.ml` raises `AboutToOOM` from
     /// `exec_instr_with_oom_protection_and_path_update`; we take the
     /// safer-but-coarser route of stopping the transfer function rather
@@ -1184,14 +1189,26 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         pdesc: &Procdesc,
         reverse_instrs: bool,
     ) -> Self::Domain {
-        // Heap-cap abort: if a previous `exec_node` already tripped the
-        // `pulse_max_heap_mb` budget, terminate the fixpoint quickly by
-        // returning the input domain unchanged. Cross-ref: OCaml's
-        // `AboutToOOM` early exit.
+        // Heap-cap / wall-time-cap abort: if a previous `exec_node`
+        // already tripped a budget, terminate the fixpoint quickly by
+        // returning an empty post. Cross-ref: OCaml's `AboutToOOM` early
+        // exit.
+        //
+        // Why empty: the abort post gets joined into the existing
+        // node's post via `old_state.post.join(&post)` upstream, and
+        // `empty.join(x) = x` so the existing post is preserved
+        // unchanged. Subsequent `compute_pre` calls then see no new
+        // contributions, so each node's pre stops changing and the WTO
+        // loop converges in one or two more iterations rather than
+        // continuing to deep-clone heavy disjunctive domains forever.
+        let abort_response = || -> Self::Domain {
+            DisjunctiveDomain::empty(pre.max_disjuncts, pre.max_widen_iters)
+        };
         if self.aborted.get() {
-            return pre.clone();
+            return abort_response();
         }
-        if let Some(max_mb) = config::get().pulse_max_heap_mb {
+        let cfg = config::get();
+        if let Some(max_mb) = cfg.pulse_max_heap_mb {
             if let Some(current) = process_peak_rss_bytes() {
                 let max_bytes = (max_mb as u64).saturating_mul(1024 * 1024);
                 let delta = current.saturating_sub(self.start_peak_rss_bytes);
@@ -1204,8 +1221,22 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                         max_mb,
                     );
                     self.aborted.set(true);
-                    return pre.clone();
+                    return abort_response();
                 }
+            }
+        }
+        if let Some(max_secs) = cfg.pulse_max_wall_secs {
+            let elapsed = self.start_instant.elapsed();
+            if elapsed.as_secs() > max_secs {
+                log::warn!(
+                    target: "ondemand",
+                    "[pulse-progress] proc={} aborted at elapsed={} > {}s wall cap",
+                    self.proc_name,
+                    format_duration(elapsed),
+                    max_secs,
+                );
+                self.aborted.set(true);
+                return abort_response();
             }
         }
 
@@ -2557,6 +2588,7 @@ mod tests {
             liveness: None,
             return_candidate_logical_stamp: None,
             start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
         let state = DisjunctiveDomain {
@@ -2606,6 +2638,7 @@ mod tests {
             liveness: None,
             return_candidate_logical_stamp: None,
             start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
         let state = DisjunctiveDomain {
@@ -4026,6 +4059,7 @@ mod tests {
             liveness: None,
             return_candidate_logical_stamp: None,
             start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
@@ -4127,6 +4161,7 @@ mod tests {
                 liveness: None,
                 return_candidate_logical_stamp: None,
                 start_peak_rss_bytes: 0,
+                start_instant: Instant::now(),
                 aborted: std::cell::Cell::new(false),
             };
             let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
@@ -4227,6 +4262,7 @@ mod tests {
             liveness: None,
             return_candidate_logical_stamp: None,
             start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
@@ -4691,6 +4727,7 @@ mod tests {
             liveness: None,
             return_candidate_logical_stamp: None,
             start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
@@ -4821,6 +4858,7 @@ mod tests {
             liveness: None,
             return_candidate_logical_stamp: None,
             start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
@@ -4915,6 +4953,7 @@ mod tests {
                 liveness: None,
                 return_candidate_logical_stamp: None,
                 start_peak_rss_bytes: 0,
+                start_instant: Instant::now(),
                 aborted: std::cell::Cell::new(false),
             };
             let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &caller, initial_domain);
