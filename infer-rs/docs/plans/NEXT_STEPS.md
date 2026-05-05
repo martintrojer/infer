@@ -80,10 +80,66 @@ sessions have been about.
 
 ## Recommended order
 
-1. **C** \u2014 trivial change, immediate user benefit.
-2. **A** \u2014 the single biggest remaining user-facing problem;
+1. **C** — trivial change, immediate user benefit.
+2. **A** — the single biggest remaining user-facing problem;
    profiling will likely uncover small fixes that compound into a
-   `~2-3\u00d7` speedup.
-3. **B** \u2014 surgical fixpoint fix; small risk of getting stuck in
+   `~2-3×` speedup.
+3. **B** — surgical fixpoint fix; small risk of getting stuck in
    debugging.
 4. **D** and **E** are deeper investments / different tracks.
+
+## Done so far
+
+### C — cap defaults landed (commit `b8d102ae72`)
+
+`pulse-max-heap-mb` now defaults to `2048` (2 GB) and
+`pulse-max-wall-secs` defaults to `120s`. The 74-file partial
+OpenSSL run completes cleanly out of the box with no flag tuning
+(`570 / 570` procs, `~9 min` wall, `~20 GB` max RSS, `~20`
+aborts). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
+to disable each cap (escape hatch documented in CLI help).
+
+### A first pass — ValueSortKey landed (commit `25a67efd81`)
+
+`samply` profile of the filtered single-procedure `whirlpool_block`
+slice (`target/profiling/infer-rs` build with `dsymutil`-resolved
+symbols) showed `Canonicalizer::partial_value_label` as the single
+hottest function with `>20%` of self-time, driven by
+`sort_by_key` calls in `propagate_*` allocating a `String` purely
+for `Ord` comparison.
+
+Replaced with `ValueSortKey` / `AccessSortKey` / `EdgeSortKey`
+typed enums. Variant order chosen to match the previous String
+lexicographic order so iteration is unchanged. Measured impact:
+
+- whirlpool_block: `202s` → **`121s`** (`~40%` wall-time win,
+  **at OCaml parity** on this slice; OCaml takes `~120s`).
+- 74-file OpenSSL whole-program: `545s` → **`480s`** (`~12%`
+  wall-time win), `20 GB` → `~16.5 GB` max RSS.
+
+Whole-program slowdown vs OCaml: `~12.7×` → `~11.2×`. The
+remaining gap is concentrated outside the canonicalization-heavy
+encryption procedures.
+
+### A second-pass candidates (next)
+
+From the same `samply` profile, after `partial_value_label`:
+
+- `Vec::clone` (`mod.rs:3749`) accounts for `~3.5%` self-time
+  across multiple call sites — candidate sources include
+  `ValueHistory` cloning, `Edges::recency_bindings_cloned`, and
+  `Atom::all_vars`. Worth instrumenting individual sources.
+- `<TemplateSpecInfo as Hash>::hash` (`typ.rs:130`) accounts for
+  `~3.6%` self-time. The `NoTemplate` variant should hash to a
+  single discriminant byte; if we are spending this much on it,
+  either we hash `TemplateSpecInfo` an enormous number of times
+  (likely via `Procname` HashMap keys) or we are in the
+  `Template { args: Vec<...> }` path more than expected. Either
+  way, switching the hot HashMap to a faster hasher (e.g.,
+  `rustc-hash::FxHashMap`) is the next obvious lever.
+- String / format operations together account for another `~5%+`
+  self-time — mostly `core::fmt::write` paths. Likely from log
+  format-arg construction even when the message is below the
+  log level threshold. Audit `log::debug!` / `log::trace!` call
+  sites for non-trivial format-arg work that should be guarded by
+  `log::log_enabled!`.
