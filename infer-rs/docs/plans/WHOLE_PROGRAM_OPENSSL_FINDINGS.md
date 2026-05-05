@@ -318,6 +318,30 @@ canonicalization — it dominates only on the encryption-style
 byte-loop family (whirlpool_block, des / md / sha block_data_order,
 etc.).
 
+## Update: remaining sort_by_key call sites converted (commit `d5d0488bd2`)
+
+Follow-on profile after `25a67efd81` showed `partial_value_label`
+still at the top of the profile (`~16%` of self-time). The
+remaining hot call sites in `propagate_formula` were `equalities`,
+`linear_eqs`, `intervals`, and `fn_apps` `sort_by_key` calls that
+still went through the String-building helpers. Converted them all
+to `partial_value_key`-based sorts.
+
+Measured impact:
+
+- whirlpool_block: `121s` → **`81.66s`** (`~33%` wall-time win,
+  cumulative `~60%` from pre-`25a67efd81` `202s`). **We are now
+  `~32%` faster than OCaml on this slice** (OCaml `~120s`).
+- 74-file OpenSSL whole-program at `-j 4` with default caps:
+  `480s` → **`195s`** (`~59%` wall-time win), `16.5 GB` → `19.3 GB`
+  max RSS (slightly higher because more procs run to completion
+  within budget). `0` wall-cap aborts (was `2`) — every procedure
+  now finishes within `120s`. `17` heap aborts unchanged.
+
+Whole-program slowdown vs OCaml: `11.2×` → **`4.5×`**. From `~70×`
+slower and OOM-killed at the start of the perf sessions to `~4.5×`
+slower with clean exits.
+
 This is a major scaling milestone: pre-cap, the same run was
 OOM-killed at `~30 / 570` procs after `~8 min`. With the cap +
 parallelism, we now complete all 570 procs in `~28 min` of wall

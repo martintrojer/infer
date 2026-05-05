@@ -99,6 +99,25 @@ OpenSSL run completes cleanly out of the box with no flag tuning
 aborts). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
 to disable each cap (escape hatch documented in CLI help).
 
+### A second pass — remaining sort_by_key sites converted (commit `d5d0488bd2`)
+
+Follow-on to `25a67efd81`. The remaining `propagate_formula`
+`sort_by_key` call sites (`equalities`, `linear_eqs`, `intervals`,
+`fn_apps`) were still building Strings via
+`partial_*_label` helpers. Converted all four to
+`partial_value_key`-based sorts.
+
+Measured impact:
+
+- whirlpool_block: `121s` → **`81.66s`** (`~33%` wall-time win,
+  cumulative `~60%` from pre-`25a67efd81` `202s`). **We are now
+  `~32%` faster than OCaml on this slice** (OCaml `~120s`).
+- 74-file OpenSSL whole-program at `-j 4` with default caps:
+  `480s` → **`195s`** (`~59%` wall-time win). `0` wall-cap
+  aborts (was `2`); `17` heap aborts unchanged.
+
+Whole-program slowdown vs OCaml: `11.2×` → **`4.5×`**.
+
 ### A first pass — ValueSortKey landed (commit `25a67efd81`)
 
 `samply` profile of the filtered single-procedure `whirlpool_block`
