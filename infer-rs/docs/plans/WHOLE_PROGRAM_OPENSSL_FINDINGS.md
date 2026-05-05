@@ -260,18 +260,36 @@ analysis-only working state.
 
 ## Headline: 74-file partial OpenSSL whole-program run completes
 
-With `--pulse-max-heap-mb 1000 -j 4` on the 74-file partial OpenSSL
-corpus, the run **completes cleanly** for the first time:
+With `--pulse-max-heap-mb 1000 --pulse-max-wall-secs 60 -j 4` on the
+74-file partial OpenSSL corpus, the run **completes cleanly** in
+`~4m25s`:
 
-| metric                       | OCaml (-j 1)    | Rust (now, -j 4)        |
-|------------------------------|-----------------|--------------------------|
-| wall time                    | `42.9s`         | `1703s` (`~28m23s`)      |
-| user CPU                     | `~41s`          | `6545s` (4 cores)        |
-| max RSS                      | `~1.17 GB`      | `~16.8 GB`               |
-| peak memory footprint        | `~1.10 GB`      | `~7.16 GB`               |
-| procs analyzed               | `570 / 570`     | `570 / 570`              |
-| heap-cap aborts              | n/a             | `21 / 570` (`~3.7%`)     |
-| exit                         | clean (`0`)     | clean (`0`)              |
+| metric                       | OCaml (-j 1)    | Rust (now, -j 4)         | Rust (heap-only, -j 4) |
+|------------------------------|-----------------|---------------------------|--------------------------|
+| wall time                    | `42.9s`         | **`265s`** (`~4m25s`)     | `1703s` (`~28m23s`)      |
+| user CPU                     | `~41s`          | `946s` (4 cores)          | `6545s` (4 cores)        |
+| max RSS                      | `~1.17 GB`      | `~14.0 GB`                | `~16.8 GB`               |
+| peak memory footprint        | `~1.10 GB`      | `~5.7 GB`                 | `~7.16 GB`               |
+| procs analyzed               | `570 / 570`     | `570 / 570`               | `570 / 570`              |
+| heap+wall aborts             | n/a             | `26 + 1 = 27 / 570`       | `21 / 570`               |
+| exit                         | clean (`0`)     | clean (`0`)               | clean (`0`)              |
+
+The `~6.4×` speedup over the heap-only run came from two changes
+(commit `ae0589bc52`):
+
+- New `--pulse-max-wall-secs` cap as a complement to the heap cap,
+  for procedures whose fixpoint does not converge quickly but whose
+  RSS stays low (e.g., bsearch-family with thousands of WTO revisits).
+- Aborted `exec_node` returns `DisjunctiveDomain::empty(...)`
+  instead of `pre.clone()`. Because the upstream WTO scheduler
+  joins our return into `old_state.post`, and `empty.join(x) = x`,
+  the existing post stays unchanged and the WTO loop converges in
+  one or two more iterations instead of continuing to deep-clone
+  heavy disjunctive domains forever after the abort flag is set.
+
+We are now `~6.2×` slower than OCaml on wall time and `~12×` larger
+on max RSS — down from `~40×` slower and `~14×` larger pre-caps,
+and `~70×` slower / OOM-killed at the start of this session.
 
 This is a major scaling milestone: pre-cap, the same run was
 OOM-killed at `~30 / 570` procs after `~8 min`. With the cap +
