@@ -291,6 +291,33 @@ We are now `~6.2×` slower than OCaml on wall time and `~12×` larger
 on max RSS — down from `~40×` slower and `~14×` larger pre-caps,
 and `~70×` slower / OOM-killed at the start of this session.
 
+## Update: ValueSortKey landed (commit `25a67efd81`)
+
+`samply` profile of the filtered single-procedure `whirlpool_block`
+slice showed `Canonicalizer::partial_value_label` as the single
+hottest function with `>20%` of self-time, driven by the
+`sort_by_key` calls in `propagate_*` allocating a `String` purely
+for `Ord` comparison. Replaced with `ValueSortKey` /
+`AccessSortKey` / `EdgeSortKey` typed enums (commit `25a67efd81`).
+
+Measured impact:
+
+- Filtered single-procedure `whirlpool_block`: `202s` → `121s`
+  (`~40%` wall-time reduction). We are now at OCaml parity on this
+  slice (OCaml: `~120s`).
+- 74-file partial OpenSSL whole-program at `-j 4` with default caps
+  (`pulse-max-heap-mb=2048`, `pulse-max-wall-secs=120`):
+  `545s` → `480s` (`~12%` wall-time reduction), `20 GB` → `~16.5 GB`
+  max RSS (`~17%` reduction), aborts unchanged at `~19`.
+
+We are now `~11.2×` slower than OCaml on the whole-program corpus,
+down from `~12.7×` before this commit. The smaller relative win
+on whole-program (vs the `~40%` win on the single procedure)
+reflects that not every procedure spends most of its time in
+canonicalization — it dominates only on the encryption-style
+byte-loop family (whirlpool_block, des / md / sha block_data_order,
+etc.).
+
 This is a major scaling milestone: pre-cap, the same run was
 OOM-killed at `~30 / 570` procs after `~8 min`. With the cap +
 parallelism, we now complete all 570 procs in `~28 min` of wall
