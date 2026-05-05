@@ -278,6 +278,32 @@ impl std::fmt::Display for AstateSizeStats {
 }
 
 impl AbductiveDomain {
+    /// Drop fields that are not consumed at summary-application time so
+    /// the cached `PulseSummary` (kept alive in the SummaryStore for the
+    /// whole run) does not retain analysis-only working state.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.Summary` is a separate,
+    /// trimmed struct from the analysis `t` for the same reason.
+    /// Cleared fields:
+    /// - `pre`: `PrePost.pre` carries its own clone of this BaseDomain;
+    ///   the AbductiveDomain.pre embedded in the post is unused at apply
+    ///   time. Replaced with `BaseDomain::empty()`.
+    /// - `const_cache`: per-procedure analysis acceleration. Callers run
+    ///   their own `canonicalize_for_access` against their own state at
+    ///   apply time. Cleared.
+    /// - `need_dynamic_type_specialization`: caller-side; the
+    ///   summary-level needs are summarized into
+    ///   `PulseSummary::needs_specialization` before this point. Cleared.
+    /// - `dynamic_types`: caller-side; the summary-level needs are
+    ///   summarized into `PulseSummary::needs_specialization` before
+    ///   this point. Cleared.
+    pub fn shrink_for_storage(&mut self) {
+        self.pre = BaseDomain::empty();
+        self.const_cache.clear();
+        self.need_dynamic_type_specialization.clear();
+        self.dynamic_types.clear();
+    }
+
     /// Create the initial state for analyzing a procedure.
     ///
     /// Allocates fresh abstract values for each formal parameter and

@@ -993,6 +993,16 @@ impl PulseSummary {
         // Cross-ref: OCaml PulseAbductiveDomain.Summary.heap_paths_that_need_dynamic_type_specialization.
         let needs_specialization = compute_specialization_heap_paths(&pre_posts);
 
+        // Drop analysis-only working state from each PrePost's stored
+        // post-state. Run AFTER `compute_specialization_heap_paths` (which
+        // reads `need_dynamic_type_specialization`) and the rest of the
+        // dedup / classification passes above. The cached PulseSummary
+        // lives for the whole run in the SummaryStore, so this is the
+        // single biggest lever on per-procedure summary retention cost.
+        for pp in pre_posts.iter_mut() {
+            pp.post.shrink_for_storage();
+        }
+
         let is_empty_body = pdesc.is_empty_body();
         let formal_types = pdesc
             .formals
