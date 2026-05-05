@@ -137,6 +137,12 @@ struct Cli {
     #[arg(long = "pulse-max-cfg-size")]
     pulse_max_cfg_size: Option<usize>,
 
+    /// Maximum delta in process peak RSS (megabytes) that a single Pulse
+    /// procedure analysis is allowed to consume before being aborted.
+    /// Cross-ref: OCaml `--pulse-max-heap`.
+    #[arg(long = "pulse-max-heap-mb")]
+    pulse_max_heap_mb: Option<usize>,
+
     /// Maximum widenings before fixpoint gives up (default: 10000).
     #[arg(long = "max-widens")]
     max_widens: Option<usize>,
@@ -250,6 +256,9 @@ impl Cli {
         }
         if let Some(v) = self.pulse_max_cfg_size {
             c.pulse_max_cfg_size = v;
+        }
+        if let Some(v) = self.pulse_max_heap_mb {
+            c.pulse_max_heap_mb = Some(v);
         }
         if let Some(v) = self.max_widens {
             c.max_widens = v;

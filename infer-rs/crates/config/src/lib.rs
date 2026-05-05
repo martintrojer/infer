@@ -109,6 +109,19 @@ pub struct InferConfig {
     #[serde(rename = "pulse-drop-dead-logical-vars", default = "default_true")]
     pub pulse_drop_dead_logical_vars: bool,
 
+    /// Maximum delta in process peak RSS (megabytes) that a single Pulse
+    /// procedure analysis is allowed to consume before being aborted with
+    /// the partial state retained as a summary. Default `None` keeps the
+    /// existing unbounded behavior; setting it to e.g. `2048` aborts any
+    /// procedure whose analysis grows the peak RSS by more than 2 GB.
+    ///
+    /// Cross-ref: OCaml `--pulse-max-heap` checks `Gc.quick_stat ()`
+    /// `heap_words` before every instruction; we use `getrusage`
+    /// `ru_maxrss` since Rust does not expose a per-allocator heap-words
+    /// counter as cheaply.
+    #[serde(rename = "pulse-max-heap-mb", default)]
+    pub pulse_max_heap_mb: Option<usize>,
+
     /// Run only the Pulse checker.
     /// OCaml: `--pulse-only` (default false)
     #[serde(rename = "pulse-only")]
@@ -244,6 +257,7 @@ impl Default for InferConfig {
             pulse_widen_threshold: 3,
             pulse_max_cfg_size: 15_000,
             pulse_drop_dead_logical_vars: true,
+            pulse_max_heap_mb: None,
             pulse_intraprocedural_only: false,
             pulse_recency_limit: None,
             pulse_only: false,

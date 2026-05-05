@@ -757,6 +757,8 @@ pub fn analyze_with_specialization_and_requests(
         progress: RefCell::new(ProcProgress::new()),
         liveness,
         return_candidate_logical_stamp,
+        start_peak_rss_bytes: process_peak_rss_bytes().unwrap_or(0),
+        aborted: std::cell::Cell::new(false),
     };
 
     let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), pdesc, initial_domain);
@@ -1084,6 +1086,18 @@ struct PulseTransferFunctions<'a> {
     /// preserves this binding even when liveness says it is dead, so that
     /// the summary's `result` field still finds the return value.
     return_candidate_logical_stamp: Option<i32>,
+    /// Procedure entry peak RSS in bytes. Used together with
+    /// `pulse_max_heap_mb` to bound this procedure's RSS growth.
+    start_peak_rss_bytes: u64,
+    /// Sticky abort flag: once this procedure has exceeded the
+    /// `pulse_max_heap_mb` budget, every subsequent `exec_node` call
+    /// returns the input domain unchanged so the fixpoint terminates
+    /// quickly with whatever partial state was reached.
+    /// Cross-ref: OCaml `Pulse.ml` raises `AboutToOOM` from
+    /// `exec_instr_with_oom_protection_and_path_update`; we take the
+    /// safer-but-coarser route of stopping the transfer function rather
+    /// than panicking out of the fixpoint engine.
+    aborted: std::cell::Cell<bool>,
 }
 
 impl TransferFunctions for PulseTransferFunctions<'_> {
@@ -1170,6 +1184,31 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         pdesc: &Procdesc,
         reverse_instrs: bool,
     ) -> Self::Domain {
+        // Heap-cap abort: if a previous `exec_node` already tripped the
+        // `pulse_max_heap_mb` budget, terminate the fixpoint quickly by
+        // returning the input domain unchanged. Cross-ref: OCaml's
+        // `AboutToOOM` early exit.
+        if self.aborted.get() {
+            return pre.clone();
+        }
+        if let Some(max_mb) = config::get().pulse_max_heap_mb {
+            if let Some(current) = process_peak_rss_bytes() {
+                let max_bytes = (max_mb as u64).saturating_mul(1024 * 1024);
+                let delta = current.saturating_sub(self.start_peak_rss_bytes);
+                if delta > max_bytes {
+                    log::warn!(
+                        target: "ondemand",
+                        "[pulse-progress] proc={} aborted at peak_rss_delta={} > {}MB heap cap",
+                        self.proc_name,
+                        format_rss(Some(delta)),
+                        max_mb,
+                    );
+                    self.aborted.set(true);
+                    return pre.clone();
+                }
+            }
+        }
+
         let node = match pdesc.get_node(node_id) {
             Some(node) => node,
             None => return pre.clone(),
@@ -2517,6 +2556,8 @@ mod tests {
             progress: RefCell::new(ProcProgress::new()),
             liveness: None,
             return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            aborted: std::cell::Cell::new(false),
         };
         let state = DisjunctiveDomain {
             disjuncts: vec![ExecutionDomain::ContinueProgram(
@@ -2564,6 +2605,8 @@ mod tests {
             progress: RefCell::new(ProcProgress::new()),
             liveness: None,
             return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            aborted: std::cell::Cell::new(false),
         };
         let state = DisjunctiveDomain {
             disjuncts: vec![ExecutionDomain::ContinueProgram(
@@ -3982,6 +4025,8 @@ mod tests {
             progress: RefCell::new(ProcProgress::new()),
             liveness: None,
             return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
         for node in &pdesc.nodes {
@@ -4081,6 +4126,8 @@ mod tests {
                 progress: RefCell::new(ProcProgress::new()),
                 liveness: None,
                 return_candidate_logical_stamp: None,
+                start_peak_rss_bytes: 0,
+                aborted: std::cell::Cell::new(false),
             };
             let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
 
@@ -4179,6 +4226,8 @@ mod tests {
             progress: RefCell::new(ProcProgress::new()),
             liveness: None,
             return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
         let retained = inv_map
@@ -4641,6 +4690,8 @@ mod tests {
             progress: RefCell::new(ProcProgress::new()),
             liveness: None,
             return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
 
@@ -4769,6 +4820,8 @@ mod tests {
             progress: RefCell::new(ProcProgress::new()),
             liveness: None,
             return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            aborted: std::cell::Cell::new(false),
         };
         let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &pdesc, initial_domain);
         let state = inv_map
@@ -4861,6 +4914,8 @@ mod tests {
                 progress: RefCell::new(ProcProgress::new()),
                 liveness: None,
                 return_candidate_logical_stamp: None,
+                start_peak_rss_bytes: 0,
+                aborted: std::cell::Cell::new(false),
             };
             let inv_map = interp::compute_fixpoint_wto(&pulse_tf, &(), &caller, initial_domain);
             let exit_state = inv_map
