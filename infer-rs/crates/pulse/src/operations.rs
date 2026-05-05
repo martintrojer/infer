@@ -228,7 +228,13 @@ pub fn eval_with_history(
                     }
                 }
             }
-            PulseResult::Ok(ValueWithHistory::new(result, inner_val.history))
+            // Mirror the BinOp constant-canonicalization win: when the
+            // unop result resolves to a known constant via the formula,
+            // route through `const_cache` to reuse the existing
+            // representative instead of returning the fresh `result`
+            // that was just minted.
+            let canonical = state.canonicalize_for_access(result);
+            PulseResult::Ok(ValueWithHistory::new(canonical, inner_val.history))
         }
         Exp::BinOp(bop, lhs, rhs) => {
             let lhs_val = match eval_with_history(lhs, loc, state) {
