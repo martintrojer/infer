@@ -140,25 +140,28 @@ Whole-program slowdown vs OCaml: `~12.7×` → `~11.2×`. The
 remaining gap is concentrated outside the canonicalization-heavy
 encryption procedures.
 
-### A second-pass candidates (next)
+### A third-pass candidates (next)
 
-From the same `samply` profile, after `partial_value_label`:
+With the canonicalize String-allocation hotspot resolved, the
+profile re-balance shifts to the remaining suspects from the
+`samply` profile (still to be re-confirmed with a fresh profile
+run):
 
-- `Vec::clone` (`mod.rs:3749`) accounts for `~3.5%` self-time
-  across multiple call sites — candidate sources include
-  `ValueHistory` cloning, `Edges::recency_bindings_cloned`, and
-  `Atom::all_vars`. Worth instrumenting individual sources.
-- `<TemplateSpecInfo as Hash>::hash` (`typ.rs:130`) accounts for
-  `~3.6%` self-time. The `NoTemplate` variant should hash to a
-  single discriminant byte; if we are spending this much on it,
-  either we hash `TemplateSpecInfo` an enormous number of times
-  (likely via `Procname` HashMap keys) or we are in the
-  `Template { args: Vec<...> }` path more than expected. Either
-  way, switching the hot HashMap to a faster hasher (e.g.,
-  `rustc-hash::FxHashMap`) is the next obvious lever.
-- String / format operations together account for another `~5%+`
-  self-time — mostly `core::fmt::write` paths. Likely from log
-  format-arg construction even when the message is below the
+- `<TemplateSpecInfo as Hash>::hash` (`typ.rs:130`) accounted for
+  `~3.6%` self-time pre-`d5d0488bd2`. The `NoTemplate` variant
+  should hash to a single discriminant byte, so this much time
+  suggests we hash `Procname` (which embeds `TemplateSpecInfo`) an
+  enormous number of times via `HashMap` lookups. Switching the
+  hot HashMaps to `rustc-hash::FxHashMap` is the next obvious
+  lever.
+- `Vec::clone` (`mod.rs:3749`) accounted for `~3.5%` self-time
+  across multiple call sites — candidates include `ValueHistory`
+  cloning, `Edges::recency_bindings_cloned`, and `Atom::all_vars`.
+  Worth instrumenting individual sources after the FxHashMap pass
+  re-balances the profile.
+- String / format operations together accounted for another
+  `~5%+` self-time — mostly `core::fmt::write` paths. Likely from
+  log format-arg construction even when the message is below the
   log level threshold. Audit `log::debug!` / `log::trace!` call
   sites for non-trivial format-arg work that should be guarded by
   `log::log_enabled!`.
