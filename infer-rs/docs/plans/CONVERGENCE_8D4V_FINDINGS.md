@@ -234,6 +234,53 @@ OCaml's side by some sharing/abstraction we have yet to identify.
   `~13×` below OCaml's `~10 GB` peak on the same slice (OCaml runs
   faster: `~120s`).
 
+### What the drop pass does NOT change
+
+Follow-up dump on `whirlpool_block` node `31` after the drop pass
+landed:
+
+| disjunct | before drop                          | after drop                       |
+|----------|--------------------------------------|----------------------------------|
+| #0       | `pre[s=3 h=21 a=30] post[s=450 h=584 a=338]` 1228 vals | `pre[s=3 h=21 a=30] post[s=17 h=584 a=338]` 1228 vals |
+| #7       | `pre[s=3 h=37 a=46] post[s=458 h=1375 a=737]` 3914 vals | `pre[s=3 h=37 a=46] post[s=18 h=1375 a=736]` 3914 vals |
+
+Key points:
+
+- Post stack went from `450` to `17` entries per disjunct (`~26×`
+  reduction). That is where the `5×` peak-memory win came from.
+- Heap node count, attrs count, and per-disjunct unique-value count
+  are **unchanged**. The values previously bound to logical-temp
+  stack slots are still referenced by heap edges and the formula, so
+  dropping the stack binding doesn't lose them.
+- OCaml's per-disjunct unique-value cap of `~500` is therefore *not*
+  reached by the drop pass. Whatever OCaml does to bound per-disjunct
+  value count must additionally GC values that have lost all
+  stack-rooted references and become formula-only / heap-only
+  garbage.
+
+### What the drop pass changes at scale (74-file partial OpenSSL)
+
+Mixed:
+
+- We now reach procedures that previously OOM'd before completion
+  (`fcrypt_body` finishes at `1m25s` / `830 MB`).
+- Per-procedure peak savings on small procs are marginal
+  (`private_AES_set_encrypt_key 252MB → 250MB`, `AES_encrypt 308MB →
+  285MB`, `AES_decrypt 378MB → 362MB`).
+- `DES_ede3_cfb_encrypt` is *worse* on wall time after the drop
+  pass (`>32 min` and counting vs `~17 min` before, where it was
+  killed by the OOM rather than completing). Its retained shape after
+  drop has fewer disjuncts (`disj=2175` vs `4405`) but more total
+  retained heap (`hn=4.7M` vs `168k`) and more total formula
+  (`lin=1.16M` vs `214k`), suggesting the dropped temp bindings
+  freed up something that lets each per-disjunct heap grow
+  unboundedly across iterations.
+
+Net: the drop pass is a real per-procedure peak win on big procs
+like `whirlpool_block`, but it is not a wall-time win on the worst
+procs and may even be a wall-time regression there. The remaining
+gap is firmly per-disjunct CPU cost on encryption-style outliers.
+
 ### Open: where does OCaml's per-iteration value sharing come from
 
 Not yet identified. Candidates worth investigating:
