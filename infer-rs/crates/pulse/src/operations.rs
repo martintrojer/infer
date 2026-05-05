@@ -247,8 +247,18 @@ pub fn eval_with_history(
                 &Operand::AbstractValue(lhs_val.addr),
                 &Operand::AbstractValue(rhs_val.addr),
             );
+            // Cross-ref: OCaml `PulseArithmetic.eval_binop` substitutes the
+            // freshly minted `binop_addr` through the formula's new equations
+            // (`incorporate_new_eqs_on_val`). The end result is that pure
+            // constant arithmetic like `__sil_plusa_int(__sil_mult_int(3, 8),
+            // 1)` collapses through `absval_of_int` / `const_cache` to one
+            // shared value per constant instead of minting a fresh value for
+            // every distinct address-arithmetic site. On encryption-style
+            // byte loops with hundreds of constant array-index computations
+            // per iteration, this dominates per-disjunct unique-value count.
+            let canonical = state.canonicalize_for_access(result);
             PulseResult::Ok(ValueWithHistory::new(
-                result,
+                canonical,
                 lhs_val.history.merge(&rhs_val.history),
             ))
         }
