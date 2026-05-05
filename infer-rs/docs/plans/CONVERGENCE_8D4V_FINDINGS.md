@@ -281,6 +281,76 @@ like `whirlpool_block`, but it is not a wall-time win on the worst
 procs and may even be a wall-time regression there. The remaining
 gap is firmly per-disjunct CPU cost on encryption-style outliers.
 
+### Phi work landed: reverse `term_value_index`
+
+Follow-on commits address per-disjunct CPU cost directly:
+
+- `c5782b297e` canonicalize the `BinOp` result through `const_cache`
+  after `and_equal_binop` (mirrors OCaml's
+  `incorporate_new_eqs_on_val`). Pure constant arithmetic in array
+  indices like `__sil_plusa_int(__sil_mult_int(3, 8), 1)` collapses
+  through `const_cache` to a shared value per constant. Wall-time
+  `~13%` win, no per-disjunct value-count change.
+- `7302d1a0de` add a reverse `term_value_index: BTreeMap<TermKey,
+  AbstractValue>` to `Phi`, mirroring OCaml `PulseFormulaPhi.term_eqs`'s
+  term-to-value direction. A repeated `xor(v37, v31)` in the same
+  disjunct now equates the freshly minted `v` with the cached
+  representative instead of running the full per-op formula update.
+  Per-tier deltas at node 31:
+
+  | metric           | before this commit | after this commit |
+  |------------------|--------------------|-------------------|
+  | post heap nodes  | `+258` / tier      | **`+2`** / tier   |
+  | formula entries  | `+896` / tier      | `+638` / tier     |
+  | unique values    | `+893` / tier      | `+637` / tier     |
+
+The `+258 → +2` collapse on per-tier heap-node growth is direct
+evidence the index is firing.
+
+Final cumulative single-procedure measurement on `whirlpool_block`:
+
+  | step                                          | wall  | max RSS    |
+  |-----------------------------------------------|-------|------------|
+  | baseline (no Arc)                             | 4m34s | ~16.7 GB   |
+  | + Phase 1 Arc (5 increments)                  | 4m33s | ~3.93 GB   |
+  | + drop dead logical-vars                      | 4m18s | ~0.77 GB   |
+  | + canonicalize BinOp via `const_cache`        | 3m45s | ~0.77 GB   |
+  | + reverse `term_value_index`                  | **3m22s** | **~0.51 GB** |
+
+That is `~26%` wall-time reduction and `~97%` peak-memory reduction
+vs the pre-Arc baseline. We are now `~20×` below OCaml's `~10 GB`
+peak on this slice (OCaml runs `~120s`, we are `~3m22s`).
+
+Multi-procedure (74-file) impact is smaller and more uneven: per-proc
+baseline peak drops `~10-12%` on small procs
+(`private_AES_set_encrypt_key 252MB → 222MB`,
+`AES_encrypt 308MB → 273MB`, `AES_decrypt 378MB → 343MB`),
+`fcrypt_body` peak rises slightly (`830MB → 918MB`), and
+`DES_ede3_cfb_encrypt` is still the wall-time blocker (still in the
+`>17 min` regime, retained-state shape comparable to before).
+
+### Open: per-tier `+637` value-count residue
+
+With the `term_value_index` in, per-tier value growth is `+637` per
+loop iteration instead of `+893`. OCaml's per-disjunct count is
+stable at `~487`, so `+0` per tier. Remaining gap candidates worth
+investigating later:
+
+- Stale-key misses in the index: every `subst_var` makes some keys
+  stale. We currently mint a fresh value on a miss instead of
+  re-keying the index.
+- Per-iteration formula GC: a value whose only reference was a heap
+  edge that just got overwritten loses all roots. Its `linear_eqs` /
+  `intervals` / `is_int_vars` entries persist until summary-time
+  `Formula.simplify`. OCaml seems to keep similar entries during
+  analysis (the `--debug` HTML shows a tiny `Raw state` formula
+  block that is hard to reconcile with this hypothesis), but verifying
+  this requires a closer mid-analysis OCaml dump.
+- Integer-typed-mark redundancy: `is_int=1152` per disjunct is one of
+  the dominant counts. We mark every BinOp result `mark_is_int(v)`
+  even when the lookup-cache already has the same `v`. Could be
+  hoisted into the `find_term_value` short-circuit.
+
 ### Open: where does OCaml's per-iteration value sharing come from
 
 Not yet identified. Candidates worth investigating:

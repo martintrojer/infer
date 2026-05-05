@@ -161,12 +161,35 @@ peak win:
   peaks at `~24 GB` then reclaims to `~11.6 GB` at `54+ min` (killed
   manually). Wall time, not memory, is the new dominant blocker.
 
-This closes the per-procedure baseline accumulation gap for
-per-procedure peak. The remaining whole-program memory pressure is
-plausibly the SummaryStore retention plus the per-disjunct cost gap.
+**Phi work (commits `c5782b297e` + `7302d1a0de`) update:** The two
+next follow-ons attack per-disjunct CPU cost directly. Final
+cumulative single-procedure measurement on `whirlpool_block`:
 
-The top priority is now firmly **wall-time CPU per disjunct**
-(the original (A) reframe). The drop pass adds backward-liveness CPU
-overhead per procedure on top of the existing per-disjunct cost
-imbalance, and together they keep multi-procedure runs far slower
-than OCaml's `~43s` baseline.
+  | step                                          | wall  | max RSS    |
+  |-----------------------------------------------|-------|------------|
+  | baseline (no Arc)                             | 4m34s | ~16.7 GB   |
+  | + Phase 1 Arc (5 increments)                  | 4m33s | ~3.93 GB   |
+  | + drop dead logical-vars                      | 4m18s | ~0.77 GB   |
+  | + canonicalize BinOp via `const_cache`        | 3m45s | ~0.77 GB   |
+  | + reverse `term_value_index`                  | **3m22s** | **~0.51 GB** |
+
+That's `~26%` wall-time and `~97%` peak-memory reduction vs the
+pre-Arc baseline. We are now `~20×` below OCaml's `~10 GB` peak on
+this slice (OCaml runs `~120s`, we are `~3m22s`). Per-tier value
+growth dropped from `+893` to `+637` per loop iteration; per-tier
+heap-node growth collapsed from `+258` to `+2`.
+
+Multi-procedure (74-file) impact is smaller and more uneven: per-proc
+baseline peak drops `~10-12%` on small procs (e.g.
+`private_AES_set_encrypt_key 252MB → 222MB`,
+`AES_encrypt 308MB → 273MB`, `AES_decrypt 378MB → 343MB`).
+`DES_ede3_cfb_encrypt` is still the wall-time blocker.
+
+Full findings: [`CONVERGENCE_8D4V_FINDINGS.md`](./CONVERGENCE_8D4V_FINDINGS.md).
+
+The next steps for the per-disjunct cost gap are now scoped narrower:
+actively re-key `term_value_index` on `subst_var` (currently we mint
+fresh on stale-key miss), per-iteration formula GC for values that
+lose all heap roots, and folding `mark_is_int(v)` into the
+`find_term_value` short-circuit so the `is_int_vars` count stops
+growing per BinOp.
