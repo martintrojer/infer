@@ -15,6 +15,14 @@ opt-level = 3            # maximum optimization
 strip = "symbols"        # strip debug symbols from binary
 panic = "abort"          # no unwinding overhead
 
+# Profiling: same optimization as release but keeps debug symbols so
+# `samply record target/profiling/infer-rs ...` produces resolved
+# function names. Use with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = 2
+
 # Dev: keep builds fast
 [profile.dev]
 opt-level = 0

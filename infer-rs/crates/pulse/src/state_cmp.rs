@@ -30,6 +30,36 @@ enum CanonValue {
     Restricted(u32),
 }
 
+/// Allocation-free sort key for `Canonicalizer::partial_value_label`.
+///
+/// Variant order intentionally matches the lexicographic ordering of the
+/// `String` form returned by `partial_value_label` (`"r0"` < `"u0"` <
+/// `"?r0"` < `"?u0"`) so that callers that previously sorted by the
+/// `String` see the same iteration order without paying per-key heap
+/// allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ValueSortKey {
+    CanonRestricted(u32),
+    CanonUnrestricted(u32),
+    UnmappedRestricted(u64),
+    UnmappedUnrestricted(u64),
+}
+
+/// Allocation-free sort key for `Canonicalizer::partial_access_label`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum AccessSortKey {
+    Dereference,
+    Field(String),
+    Array { typ: String, index: ValueSortKey },
+}
+
+/// Allocation-free sort key for `Canonicalizer::partial_edge_label`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct EdgeSortKey {
+    access: AccessSortKey,
+    target: ValueSortKey,
+}
+
 impl std::fmt::Display for CanonValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -279,7 +309,7 @@ impl Canonicalizer {
 
     fn propagate_memory(&mut self, memory: &BaseMemory) {
         let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
-        entries.sort_by_key(|(src, _)| self.partial_value_label(*src));
+        entries.sort_by_key(|(src, _)| self.partial_value_key(*src));
         for (src, edges) in entries {
             if self.get(src).is_none() {
                 continue;
@@ -288,7 +318,7 @@ impl Canonicalizer {
                 .iter()
                 .map(|(access, target)| (access, *target))
                 .collect();
-            edge_entries.sort_by_key(|(access, target)| self.partial_edge_label(access, *target));
+            edge_entries.sort_by_key(|(access, target)| self.partial_edge_key(access, *target));
             for (access, target) in edge_entries {
                 if let Access::ArrayAccess(_, index) = access {
                     self.map_value(*index);
@@ -300,7 +330,7 @@ impl Canonicalizer {
 
     fn propagate_attrs(&mut self, attrs: &BaseAddressAttributes) {
         let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
-        entries.sort_by_key(|(addr, _)| self.partial_value_label(*addr));
+        entries.sort_by_key(|(addr, _)| self.partial_value_key(*addr));
         for (addr, attrs) in entries {
             if self.get(addr).is_none() {
                 continue;
@@ -386,7 +416,7 @@ impl Canonicalizer {
         }
 
         let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-        is_int_vars.sort_by_key(|value| self.partial_value_label(*value));
+        is_int_vars.sort_by_key(|value| self.partial_value_key(*value));
         for value in is_int_vars {
             if self.get(value).is_some() {
                 continue;
@@ -452,7 +482,7 @@ impl Canonicalizer {
         reachable: &std::collections::HashSet<AbstractValue>,
     ) {
         let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
-        entries.sort_by_key(|(src, _)| self.partial_value_label(*src));
+        entries.sort_by_key(|(src, _)| self.partial_value_key(*src));
         for (src, edges) in entries {
             if !reachable.contains(&src) {
                 continue;
@@ -462,7 +492,7 @@ impl Canonicalizer {
                 .iter()
                 .map(|(access, target)| (access, *target))
                 .collect();
-            edge_entries.sort_by_key(|(access, target)| self.partial_edge_label(access, *target));
+            edge_entries.sort_by_key(|(access, target)| self.partial_edge_key(access, *target));
             for (access, target) in edge_entries {
                 if let Access::ArrayAccess(_, index) = access {
                     self.map_value(*index);
@@ -478,7 +508,7 @@ impl Canonicalizer {
         reachable: &std::collections::HashSet<AbstractValue>,
     ) {
         let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
-        entries.sort_by_key(|(addr, _)| self.partial_value_label(*addr));
+        entries.sort_by_key(|(addr, _)| self.partial_value_key(*addr));
         for (addr, attrs) in entries {
             if !reachable.contains(&addr) {
                 continue;
@@ -547,7 +577,7 @@ impl Canonicalizer {
         }
 
         let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-        is_int_vars.sort_by_key(|value| self.partial_value_label(*value));
+        is_int_vars.sort_by_key(|value| self.partial_value_key(*value));
         for value in is_int_vars {
             self.map_value(value);
         }
@@ -574,21 +604,45 @@ impl Canonicalizer {
         )
     }
 
-    fn partial_edge_label(&self, access: &Access, target: AbstractValue) -> String {
-        format!(
-            "{}->{}",
-            self.partial_access_label(access),
-            self.partial_value_label(target)
-        )
+    /// Cheap allocation-free sort key for `partial_value_label`.
+    ///
+    /// Profile shows `Canonicalizer::partial_value_label` as the single
+    /// hottest function on the `whirlpool_block` slice (>20% of
+    /// self-time), driven by the `sort_by_key` calls in `propagate_*`.
+    /// Each call allocates a `String` purely for `Ord` comparison.
+    /// `partial_value_key` returns a comparable tuple that is
+    /// order-equivalent to the `String` form’s lexicographic order on
+    /// `"u"`/`"r"`/`"?u"`/`"?r"` prefixes, without allocating.
+    fn partial_value_key(&self, value: AbstractValue) -> ValueSortKey {
+        match self.get(value) {
+            Some(CanonValue::Restricted(i)) => ValueSortKey::CanonRestricted(i),
+            Some(CanonValue::Unrestricted(i)) => ValueSortKey::CanonUnrestricted(i),
+            None => {
+                let id = value.raw().unsigned_abs();
+                if value.is_restricted() {
+                    ValueSortKey::UnmappedRestricted(id)
+                } else {
+                    ValueSortKey::UnmappedUnrestricted(id)
+                }
+            }
+        }
     }
 
-    fn partial_access_label(&self, access: &Access) -> String {
+    fn partial_edge_key(&self, access: &Access, target: AbstractValue) -> EdgeSortKey {
+        EdgeSortKey {
+            access: self.partial_access_key(access),
+            target: self.partial_value_key(target),
+        }
+    }
+
+    fn partial_access_key(&self, access: &Access) -> AccessSortKey {
         match access {
-            Access::Dereference => "deref".to_string(),
-            Access::FieldAccess(field) => format!("field:{field}"),
-            Access::ArrayAccess(typ, index) => {
-                format!("array:{typ}:{}", self.partial_value_label(*index))
-            }
+            Access::Dereference => AccessSortKey::Dereference,
+            Access::FieldAccess(field) => AccessSortKey::Field(field.field_name.clone()),
+            Access::ArrayAccess(typ, index) => AccessSortKey::Array {
+                typ: format!("{typ}"),
+                index: self.partial_value_key(*index),
+            },
         }
     }
 
