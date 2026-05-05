@@ -140,6 +140,22 @@ Whole-program slowdown vs OCaml: `~12.7×` → `~11.2×`. The
 remaining gap is concentrated outside the canonicalization-heavy
 encryption procedures.
 
+### A third-pass attempt: FxHashMap on SummaryStore (no-go)
+
+Tried switching `SummaryStore`'s `DashMap<Procname, ...>` from
+`RandomState` to `BuildHasherDefault<FxHasher>` to bypass SipHash
+setup overhead on `Procname` lookups (which transitively hash
+`TemplateSpecInfo` per the previous profile, `~3.6%` self-time).
+
+Measurements were not consistent. wp_block measurements over the
+same binary varied between `~80s` and `~130s` across reruns,
+attributable to host noise (background processes, thermal
+throttling). The whole-program measurement dropped from `~195s` to
+`~393s` once and we could not reliably attribute that to the change
+vs noise. Reverted for now; the workspace dep was also removed.
+Will revisit with a quieter host or after more reliable
+benchmarking infrastructure.
+
 ### A third-pass candidates (next)
 
 With the canonicalize String-allocation hotspot resolved, the
