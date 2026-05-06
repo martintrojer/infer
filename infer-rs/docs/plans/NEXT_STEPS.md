@@ -211,8 +211,43 @@ attributes while keeping the location and reason fields.
 | aborts                   | 16      | 14       |
 | OBJ_bsearch_ex_ aborts   | 1 wall  | **0**    |
 
-Slowdown vs OCaml `42.9s`: `~8.7x` (was `~11.3x`, OOM-killed at
-start of session).
+### B-pass 5 (open): timestamp fix is necessary but not sufficient
+
+Re-running the same whole-program OpenSSL benchmark 3 times
+reveals the timestamp fix gives **flaky** convergence:
+
+| run | wall  | max RSS | aborts | max_visit_count |
+|-----|-------|---------|--------|-----------------|
+| 1   | 374s  | 11.8 GB | 14     | **4** (converged) |
+| 2   | 432s  | 15.5 GB | 15     | 10001 (failed)    |
+| 3   | 412s  | 19.5 GB | 20     | 10001 (failed)    |
+
+Run 1 was lucky. The fix made the bug INTERMITTENT (vs
+consistently failing pre-fix), so it's clearly relevant, but
+there's a second non-determinism source.
+
+Hypothesis: parallel scheduling at `-j 4` controls which
+callee summaries are available when `OBJ_bsearch_ex_` is
+re-analyzed, which changes the `dynamic_types` bindings, which
+changes downstream abstract values. `dynamic_types` is *not*
+in `canonicalize`, so identical-looking states are alpha-
+equivalent, but downstream behavior differs. So the analysis
+genuinely produces different per-iteration results, and the
+fixpoint can't converge.
+
+Next probe ideas for B-pass 6:
+- Add `dynamic_types` to `canonicalize` keys -- if iterations
+  truly produce different bindings, we'll see structural
+  inequality (correct) and the worklist will keep iterating;
+  but maybe widen will then catch them.
+- Inspect what specifically changes between runs of
+  `OBJ_bsearch_ex_` analysis -- dump the `linear_eqs` of all
+  20 disjuncts at `node=44` and compare across iterations.
+- Check OCaml's behavior: does OCaml's `dynamic_types` /
+  `type_constraints` participate in `leq`?
+
+Slowdown vs OCaml `42.9s`: `~8.7x` (run 1) / `~10x` (run 2/3).
+Was `~11.3x`, OOM-killed at start of session.
 
 Regression test: `test_alpha_equivalent_states_ignore_attribute_timestamps`.
 
