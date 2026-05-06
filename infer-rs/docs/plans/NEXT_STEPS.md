@@ -180,14 +180,41 @@ plus full `Phi` formula. It explicitly excludes `must_be_valid`
 `dynamic_types` and `need_dynamic_type_specialization`, which
 may or may not be a real semantic gap.
 
-This work is **deferred** in favour of correctness / parity
-work in the meantime; the per-procedure `12x` speedups from
-B-pass 1 (commit `0a4cd8437b`) ship as-is. Concrete next step
-for B-pass 4: add a regression test that re-analyzes
-`OBJ_bsearch_ex_` 5 times with a synthetic varying callee
-summary set, and confirm convergence vs blow-up. If blow-up
-reproduces, audit `canonicalize` for `dynamic_types`-class
-omissions.
+### B-pass 4 (commit `ab871f0b50`): root cause fixed
+
+Found and fixed the deterministic cause: `state_cmp::canonical_attr`
+was formatting `MustBeValid` / `MustBeInitialized` / `WrittenTo`
+attributes with `{attr:?}`, which includes their `Timestamp`
+field. Two iterations of the same procedure can assign different
+timestamps to the same logical attribute (because per-state
+`next_attr_timestamp` is bumped by intervening work), so iterated
+states differ structurally even when semantically equivalent.
+`state_cmp::alpha_equivalent` then returns false, the worklist
+re-schedules, and convergence never fires.
+
+OCaml has the same `Timestamp.t` fields but its `leq` relies on
+`phys_equal` short-circuit through structural sharing -- when
+nothing changes, the same object reference is reused. We don't
+have that level of sharing yet, so timestamps must be ignored in
+the canonical key.
+
+Fix: drop the timestamp from `canonical_attr` for those three
+attributes while keeping the location and reason fields.
+
+**Whole-program OpenSSL impact (j=4):**
+
+| metric                   | pre-fix | post-fix |
+|--------------------------|---------|----------|
+| max_visit_count across procs | 10001   | **4**    |
+| wall                     | 484s    | 374s     |
+| max RSS                  | 15.4 GB | 11.8 GB  |
+| aborts                   | 16      | 14       |
+| OBJ_bsearch_ex_ aborts   | 1 wall  | **0**    |
+
+Slowdown vs OCaml `42.9s`: `~8.7x` (was `~11.3x`, OOM-killed at
+start of session).
+
+Regression test: `test_alpha_equivalent_states_ignore_attribute_timestamps`.
 
 ## C. Set sensible cap defaults
 
