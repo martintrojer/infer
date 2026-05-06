@@ -956,6 +956,23 @@ fn canonical_attr(attr: &Attribute, canon: &Canonicalizer) -> String {
                 .join(",");
             format!("ReturnedFromUnknown({values})")
         }
+        // Cross-ref: OCaml `PulseAttribute` carries `Timestamp.t` on these
+        // attributes for trace ordering, but the timestamp itself is not
+        // semantically meaningful for fixpoint convergence. Two iterations
+        // of the same procedure analysis can assign different timestamps
+        // to the same logical attribute (because `next_attr_timestamp` is
+        // bumped by intervening work), so including the timestamp here
+        // breaks `state_cmp::alpha_equivalent` and forces the worklist to
+        // re-visit nodes long after the analysis is semantically converged.
+        // Drop the timestamp from the canonical key while keeping the
+        // location and reason fields.
+        Attribute::MustBeValid(_ts, loc, reason) => {
+            format!("MustBeValid({loc}, {reason:?})")
+        }
+        Attribute::MustBeInitialized(_ts, loc) => {
+            format!("MustBeInitialized({loc})")
+        }
+        Attribute::WrittenTo(_ts, loc) => format!("WrittenTo({loc})"),
         _ => format!("{attr:?}"),
     }
 }
@@ -1230,6 +1247,62 @@ mod tests {
 
         assert!(exec1.leq(&exec2));
         assert!(exec2.leq(&exec1));
+    }
+
+    /// Regression: each fixpoint iteration of the same procedure can
+    /// assign different `Timestamp` values to the same logical
+    /// `MustBeValid` / `MustBeInitialized` / `WrittenTo` attribute,
+    /// because the per-state `next_attr_timestamp` counter is bumped by
+    /// intervening work between iterations. Two states that differ only
+    /// in those timestamps must still be alpha-equivalent so that the
+    /// outer fixpoint converges.
+    ///
+    /// On whole-program OpenSSL, this regression broke convergence on
+    /// `OBJ_bsearch_ex_` after the third re-analysis (callees changed),
+    /// driving `max_visit_count` past `10001` (the `pulse_max_widens`
+    /// safety cap).
+    #[test]
+    fn test_alpha_equivalent_states_ignore_attribute_timestamps() {
+        use crate::attribute::Attribute;
+        use sil::location::Location;
+
+        AbstractValue::reset_counters();
+        let mut state1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(0, false);
+
+        let formal_addr_1 = state1
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+        let formal_addr_2 = state2
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+
+        // Same logical attributes, different timestamps: state1 sees
+        // ts=1, state2 sees ts=99. Locations are equal.
+        let loc = Location::dummy();
+        state1.add_attr(formal_addr_1, Attribute::MustBeValid(1, loc.clone(), None));
+        state2.add_attr(formal_addr_2, Attribute::MustBeValid(99, loc.clone(), None));
+
+        let exec1 = ExecutionDomain::ContinueProgram(state1);
+        let exec2 = ExecutionDomain::ContinueProgram(state2);
+
+        assert!(
+            exec1.leq(&exec2),
+            "states differing only in attribute timestamps should be leq"
+        );
+        assert!(
+            exec2.leq(&exec1),
+            "states differing only in attribute timestamps should be leq"
+        );
     }
 
     #[test]
