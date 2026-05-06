@@ -46,6 +46,71 @@ Likely a bug in either:
 bsearch-family, removing a wall-time long tail.
 **Cons:** debugging fixpoint convergence is fiddly; could be deep.
 
+### B-pass 1 (commit `0a4cd8437b`): widen-flag bug fixed
+
+Found and fixed two divergences in `DisjunctiveDomain::widen` vs
+OCaml `AbstractInterpreter.MakeDisjunctiveTransferFunctions.widen`:
+
+1. Over-iter branch was returning `prev.clone()` with
+   `had_dropped_disjuncts = true` when `!next.leq(self)`. Our
+   `leq` early-rejects on flag mismatch, so `widen.leq(prev)`
+   returns false and the worklist kept re-scheduling.
+2. Within-iter join had no post-join leq check, so even when the
+   joined state was semantically equal to `prev`, we returned a
+   structurally different object that failed `equal_fast`.
+
+Fix returns `prev` exactly in both branches. Two regression tests
+locked in.
+
+**Per-procedure speedups (whole-program OpenSSL, same binary, same caps):**
+
+| procedure       | before | after  | speedup |
+|-----------------|--------|--------|---------|
+| whirlpool_block | 1m25s  | 7s     | 12x     |
+| fcrypt_body     | 1m11s  | 8.7s   | 8.5x    |
+| DES_ofb_encrypt | 20m44s | 2m50s  | 7.4x    |
+| OBJ_bsearch_ex_ | 10m35s | 3m50s  | 2.8x    |
+
+**Whole-program wall:** `195s -> 484s` on a noisy host. The
+regression is because the previous "fast" path relied on
+`OBJ_bsearch_ex_` OOMing 4x and hitting empty-on-abort; with the
+widen fix it stays below heap cap and burns wall budget instead.
+The net per-procedure work is much cheaper, but the *separate*
+`OBJ_bsearch_ex_` convergence bug now dominates.
+
+### B-pass 2 (open): `OBJ_bsearch_ex_` still hits `max_widens = 10001`
+
+Even after the widen fix, `OBJ_bsearch_ex_` racks up
+`max_visit_count = 10001` (the safety cap). Live snapshot:
+
+  nodes=26 revisited_nodes=15 max_visit_count=10001
+  max_node_disjuncts=20 disj=311 kinds[c=11 li=300]
+  formula[lin=285308 itv=285908 int=905 eq=300]
+  sets[must=3647 dyn=311 spec=0 const=285300]
+
+Observations:
+- Most disjuncts (300/311) are `LatentInvalidAccess`, propagated
+  unchanged through `exec_instr`.
+- Per-disjunct shape is bounded (`max_node_disjuncts=20`,
+  per-disjunct formula `lin~951` `itv~953`).
+- `dyn=311` -- every disjunct has a distinct dynamic-type
+  attribute. Likely from `__call_c_function_ptr` resolving the
+  `cmp` callback to many concrete callees per outer
+  re-analysis.
+
+Likely root causes (need investigation):
+- Non-determinism in fresh `AbstractValue::mk_fresh()` IDs across
+  re-executions causing structurally-different but
+  semantically-equal `LatentInvalidAccess` disjuncts -- our
+  `equal_fast` returns false; semantic `leq` may also fail
+  because `state_cmp::alpha_equivalent_value` doesn't fully
+  handle dynamic-type / specialization context.
+- Per-iteration accumulating dynamic-type bindings causing
+  monotonic but slow growth that never stabilizes.
+
+Next step: enable `RUST_LOG=absint::interp=debug` on a focused
+bench run to see the actual convergence-check failures.
+
 ## C. Set sensible cap defaults
 
 Currently both `--pulse-max-heap-mb` and `--pulse-max-wall-secs`
