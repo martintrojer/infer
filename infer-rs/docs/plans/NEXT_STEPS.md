@@ -151,9 +151,43 @@ scheduling.
    stable across re-executions when the callee summary set is
    stable.
 
+### B-pass 2 follow-up: deterministic, NOT scheduling-related
+
+Re-ran the same whole-program OpenSSL benchmark at `-j 1` to
+factor out worker-order non-determinism. Result: same bug.
+`OBJ_bsearch_ex_` is analyzed multiple times as callee
+summaries change downstream. The first two re-analyses finish
+in `~6s` each. The **third re-analysis** stalls and hits
+`max_visit_count = 10001` in `4m56s`, with `hottest_node =
+44:4760`.
+
+Whole-program `-j 1` wall: **`9964.57s` (2h46m)**, vs `-j 4`
+`~427s`. Both hit the same `OBJ_bsearch_ex_` pathology, just
+with different overall scheduling.
+
+Reframed hypothesis: each re-analysis with a richer callee
+summary set generates new `AbstractValue` IDs and possibly
+new `dynamic_types` bindings. Eventually the body's predecessor
+posts vary structurally between iterations even though they're
+semantically equivalent, breaking `equal_fast` and forcing the
+slower `state_cmp::alpha_equivalent` path. If `alpha_equivalent`
+itself fails (perhaps because `dynamic_types` is not part of
+`canonicalize`), the worklist never converges.
+
+`canonicalize` in `state_cmp.rs` includes `pre/post.{stack,heap,attrs}`
+plus full `Phi` formula. It explicitly excludes `must_be_valid`
+(noted as Rust-only helper). It also excludes
+`dynamic_types` and `need_dynamic_type_specialization`, which
+may or may not be a real semantic gap.
+
 This work is **deferred** in favour of correctness / parity
 work in the meantime; the per-procedure `12x` speedups from
-B-pass 1 (commit `0a4cd8437b`) ship as-is.
+B-pass 1 (commit `0a4cd8437b`) ship as-is. Concrete next step
+for B-pass 4: add a regression test that re-analyzes
+`OBJ_bsearch_ex_` 5 times with a synthetic varying callee
+summary set, and confirm convergence vs blow-up. If blow-up
+reproduces, audit `canonicalize` for `dynamic_types`-class
+omissions.
 
 ## C. Set sensible cap defaults
 
