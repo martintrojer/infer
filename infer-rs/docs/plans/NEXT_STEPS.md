@@ -111,6 +111,50 @@ Likely root causes (need investigation):
 Next step: enable `RUST_LOG=absint::interp=debug` on a focused
 bench run to see the actual convergence-check failures.
 
+### B-pass 2 update: timing-dependent reproduction
+
+Tried adding a `log::trace!` diagnostic in `exec_wto_node` that
+fires when `old_state.visit_count >= 100`. With the diagnostic
+compiled in (no actual logging output, just the
+`log_enabled!(Trace)` short-circuit + the `>= 100` check), the
+whole-program OpenSSL run completed in `324s` with `OBJ_bsearch_ex_`
+converging at `max_visit_count = 4` (no convergence pathology).
+With the diagnostic removed (back to baseline binary), the same
+benchmark on the same host saw `OBJ_bsearch_ex_` rack up
+`max_visit_count = 10001` (safety cap) again in `427s`.
+
+That points at a **scheduling / timing-dependent** convergence
+bug, not a deterministic semantic bug. Hypothesis: at `-j 4`,
+summary-availability order across worker threads dictates
+whether `OBJ_bsearch_ex_` sees a stable callee summary set on
+its first interior loop iteration. If callee summaries flip
+mid-iteration, dynamic-type bindings (`dyn=311` in the
+snapshot) accumulate non-deterministically across re-executions,
+breaking semantic `leq` convergence.
+
+Single-procedure `OBJ_bsearch_ex_` runs always converge in
+`1.3s`. Two-file (obj_dat + obj_xref) runs also converge in
+`1.3s`. Three-file (+ obj_lib) also converges. The
+reproduction needs the full corpus *and* concurrent worker
+scheduling.
+
+**Recommended next steps for B-pass 3 (when picked up):**
+
+1. Reproduce at `-j 1` to remove worker-order non-determinism.
+   If still pathological, the bug is in our analysis logic. If
+   not, the bug is in scheduling / re-analysis triggers.
+2. Add an `assert!` (off by default behind a debug flag) that
+   the same procedure analyzed at the same dependency point
+   produces the same canonical summary. Detect non-determinism
+   in the summary store.
+3. Look at whether `compute_specialization_heap_paths` is
+   stable across re-executions when the callee summary set is
+   stable.
+
+This work is **deferred** in favour of correctness / parity
+work in the meantime; the per-procedure `12x` speedups from
+B-pass 1 (commit `0a4cd8437b`) ship as-is.
+
 ## C. Set sensible cap defaults
 
 Currently both `--pulse-max-heap-mb` and `--pulse-max-wall-secs`
