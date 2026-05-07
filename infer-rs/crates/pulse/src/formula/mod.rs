@@ -459,13 +459,7 @@ impl Formula {
         // BinOp on the same canonical operands has already been evaluated
         // in this disjunct, equate the freshly minted `v` with the cached
         // representative instead of paying the formula-update cost twice.
-        let existing = self.phi.find_term_value(&op, x, y);
-        let existing = if existing.is_none() && self.phi.term_value_index_maybe_stale() {
-            self.phi_mut().find_term_value_after_repair(&op, x, y)
-        } else {
-            existing
-        };
-        if let Some(existing) = existing {
+        if let Some(existing) = self.phi.find_term_value(&op, x, y) {
             if existing != v {
                 return self.phi_mut().and_var_equal(v, existing);
             }
@@ -1248,13 +1242,12 @@ mod tests {
     }
 
     #[test]
-    fn test_and_equal_binop_repairs_stale_term_value_index_public_path() {
+    fn test_and_equal_binop_reuses_direct_term_value_index_hit() {
         let mut f = Formula::ttrue();
-        let x = AbstractValue::of_raw(2);
-        let x_prime = AbstractValue::of_raw(1);
-        let y = AbstractValue::of_raw(3);
-        let first_result = AbstractValue::of_raw(10);
-        let second_result = AbstractValue::of_raw(11);
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+        let first_result = AbstractValue::of_raw(3);
+        let second_result = AbstractValue::of_raw(4);
         let op = sil::binop::Binop::PlusA(None);
 
         assert!(f
@@ -1265,12 +1258,11 @@ mod tests {
                 &Operand::AbstractValue(y),
             )
             .is_sat());
-        assert!(f.and_equal_vars(x, x_prime).is_sat());
         assert!(f
             .and_equal_binop(
                 second_result,
                 op,
-                &Operand::AbstractValue(x_prime),
+                &Operand::AbstractValue(x),
                 &Operand::AbstractValue(y),
             )
             .is_sat());
@@ -1278,7 +1270,7 @@ mod tests {
         assert_eq!(
             f.get_var_repr(second_result),
             f.get_var_repr(first_result),
-            "public BinOp path should repair stale term keys and reuse the old result"
+            "repeated BinOps on the same canonical operands should reuse the first result"
         );
     }
 

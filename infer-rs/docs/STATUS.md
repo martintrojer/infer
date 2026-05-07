@@ -14,20 +14,20 @@ blocker. Headline numbers on the 74-file partial capture under
 
 | metric                      | OCaml (-j 1)    | Rust (latest, -j 4)                                      |
 |-----------------------------|-----------------|-----------------------------------------------------------|
-| wall time                   | `42.9s`         | `235.19s` repeated median after stale-key repair         |
-| max RSS                     | `~1.17 GB`      | `~13.9 GB` max RSS (`~9.2 GB` peak footprint)           |
+| wall time                   | `42.9s`         | `226.63s` repeated default median                        |
+| max RSS                     | `~1.17 GB`      | `~13.4 GB` max RSS (`~9.2 GB` peak footprint)           |
 | procs analyzed              | `570 / 570`     | `570 / 570`                                              |
-| heap+wall aborts            | n/a             | `18 / 570` (`~3.2%`)                                     |
+| heap+wall aborts            | n/a             | `20 / 570` (`~3.5%`)                                     |
 | max visit count             | n/a             | `4`                                                       |
 | exit                        | clean (`0`)     | clean (`0`)                                              |
 
-Whole-program slowdown vs OCaml in the latest repeated median:
-**`~5.5×`**, down from `~70×` and OOM-killed at the start of the
-perf sessions. The previous pre-stale-key-repair repeated default median
-was `226.63s` / `~13.4 GB` max RSS / `20` aborts, so the latest run is
-slightly slower overall but with fewer aborts and a modest improvement on
-the target DES proc (`DES_ede3_cbcm_encrypt`: `86s` → `81s` median). The
-`OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer the
+Whole-program slowdown vs OCaml in the latest repeated default median:
+**`~5.3×`**, down from `~70×` and OOM-killed at the start of the
+perf sessions. A stale-key repair experiment for `term_value_index` improved
+the target DES proc (`DES_ede3_cbcm_encrypt`: `86s` → `81s` median) but made
+the whole-program median slower (`235.19s`) and was disabled as a default path
+after counters showed `0 / 443` dirty repairs produced a hit on the focused DES
+run. The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer the
 dominant OpenSSL story; the long tail remains bounded-visit DES-family /
 `OBJ_obj2txt` large-state cost and run-to-run noise. Memory-sensitive runs
 can enable `--pulse-intermediate-formula-gc` to prune unreachable
@@ -69,8 +69,8 @@ disable each cap (escape hatches for benchmarking).
   /usr/bin/time -l target/release/infer-rs --pulse-only --quiet \
     --trace-ondemand -j 4 textual-out/*.sil
 
-The no-explicit-cap out-of-box repeated checkpoint after stale-key repair is
-`235.19s` / `~13.9 GB` max RSS / `~9.2 GB` peak footprint / `18` aborts /
+The no-explicit-cap out-of-box repeated default checkpoint is `226.63s` /
+`~13.4 GB` max RSS / `~9.2 GB` peak footprint / `20` aborts /
 `max_visit_count=4`. Use `scripts/bench_openssl_partial.sh` for repeated
 runs and slow-proc summaries.
 

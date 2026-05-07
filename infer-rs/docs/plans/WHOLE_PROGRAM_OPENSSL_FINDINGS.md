@@ -406,22 +406,22 @@ Key fixes:
 
 Latest no-explicit-cap out-of-box 74-file checkpoint (`-j 4`, defaults
 `pulse-max-heap-mb=2048`, `pulse-max-wall-secs=60`, formula GC off), using
-three-run medians after the stale `term_value_index` repair:
+three-run medians on the default path:
 
 | metric                | OCaml (-j 1) | Rust latest default (-j 4) |
 |-----------------------|--------------|-----------------------------|
-| wall time             | `42.9s`      | **`235.19s`**               |
-| max RSS               | `~1.17 GB`   | `~13.9 GB`                  |
+| wall time             | `42.9s`      | **`226.63s`**               |
+| max RSS               | `~1.17 GB`   | `~13.4 GB`                  |
 | peak memory footprint | `~1.10 GB`   | `~9.2 GB`                   |
 | procs analyzed        | `570 / 570`  | `570 / 570`                 |
-| heap+wall aborts      | n/a          | `18 / 570`                  |
+| heap+wall aborts      | n/a          | `20 / 570`                  |
 | max visit count       | n/a          | **`4`**                     |
 | exit                  | clean (`0`)  | clean (`0`)                 |
 
-Current slowdown vs OCaml: `235.19 / 42.9 ~= 5.5×` (down from
-`~70×`/OOM-killed at the start of the scaling sessions). The previous
-pre-repair repeated default median was `226.63s`, so the latest patch is
-not a whole-program median win on this noisy host. The old
+Current slowdown vs OCaml: `226.63 / 42.9 ~= 5.3×` (down from
+`~70×`/OOM-killed at the start of the scaling sessions). A stale-key repair
+experiment later improved one DES slow proc but was disabled for the default
+path after counters showed no repair hits on the focused target. The old
 `OBJ_bsearch_ex_ max_visit_count=10001` symptom is not present in the
 latest convergence probes; the remaining long tail is bounded-visit
 large-state cost.
@@ -460,16 +460,18 @@ formula-GC, and stale-key-repair runs:
 | aborts | `20` | `18` | `18` |
 | max_visit_count | `4` | `4` | `4` |
 
-The stale-key repair does move the selected DES target in the right
-direction: `DES_ede3_cbcm_encrypt` median `86s` → `81s`. It does not yet
-translate into a whole-program speedup because other slow procs dominate
-or are noisy (`OBJ_obj2txt` hit `95s` in one run). Formula GC remains an
-opt-in memory-headroom knob: it lowers max RSS but is not a wall-time win.
+The stale-key repair moved the selected DES target in the right direction
+(`DES_ede3_cbcm_encrypt` median `86s` → `81s`), but focused counters showed
+that the slow path did not pay for itself on that procedure: `443` repairs
+scanned `54,110` index entries and produced `0` repair hits. Keep direct
+term-value reuse, but leave stale-key repair disabled by default. Formula GC
+remains an opt-in memory-headroom knob: it lowers max RSS but is not a
+wall-time win.
 
 Next work should target:
 
-1. profiling the stale-key repair overhead (`term_value_index` miss scan and
-   `Arc::make_mut` behavior) before relying on it as a default speedup,
-2. profiling bounded-visit DES-family procedures after heap/attr GC, and
-3. cheaper/incremental formula cleanup for the remaining linear-equality
-   residue.
+1. profiling bounded-visit DES-family procedures after heap/attr GC,
+2. cheaper/incremental formula cleanup for the remaining linear-equality
+   residue, and
+3. alternative term-value/cache strategies that do not scan stale keys on
+   misses.

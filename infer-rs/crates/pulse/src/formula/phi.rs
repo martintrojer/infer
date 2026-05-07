@@ -91,17 +91,10 @@ pub struct Phi {
     ///
     /// Keys are computed at insert time using `Phi::canonical_term_key`,
     /// which goes through `get_repr` for `AbstractValue` operands and
-    /// folds known constants out of `linear_eqs`. We do not actively
-    /// re-key entries on each equality/constant propagation; instead those
-    /// mutations mark the index maybe-stale so the next miss can rebuild it
-    /// once and restore direct lookups.
+    /// folds known constants out of `linear_eqs`. We intentionally do not
+    /// repair stale keys on misses by default: a focused DES probe showed
+    /// stale-key repair rebuilt the index frequently without producing hits.
     term_value_index: BTreeMap<TermKey, AbstractValue>,
-
-    /// True when equality or linear-constant propagation may have made
-    /// existing `term_value_index` keys stale. A direct lookup does not need
-    /// mutation; only a direct miss while this flag is set pays the rebuild
-    /// cost, and the rebuild clears the flag.
-    term_value_index_maybe_stale: bool,
 }
 
 /// Canonical key for the reverse `term_value_index`.
@@ -213,21 +206,6 @@ impl Phi {
         Some(TermKeyOperand::Var(repr))
     }
 
-    fn canonicalize_term_key(&self, key: &TermKey) -> Option<TermKey> {
-        Some(TermKey {
-            op: key.op.clone(),
-            lhs: self.canonicalize_term_key_operand(&key.lhs)?,
-            rhs: self.canonicalize_term_key_operand(&key.rhs)?,
-        })
-    }
-
-    fn canonicalize_term_key_operand(&self, op: &TermKeyOperand) -> Option<TermKeyOperand> {
-        match op {
-            TermKeyOperand::Const(c) => Some(TermKeyOperand::Const(*c)),
-            TermKeyOperand::Var(v) => self.canonical_abstract_value_term_operand(*v),
-        }
-    }
-
     /// Read-only lookup for the existing representative value for a BinOp
     /// `op(lhs, rhs)` in the reverse `term_value_index`. Returns the
     /// canonical `AbstractValue` if a previous evaluation in the same
@@ -245,62 +223,6 @@ impl Phi {
     fn find_term_value_by_key(&self, key: &TermKey) -> Option<AbstractValue> {
         let stored = self.term_value_index.get(key).copied()?;
         Some(self.get_repr(stored))
-    }
-
-    /// Returns whether a direct miss may be due to stale `term_value_index`
-    /// keys rather than a genuinely new term.
-    pub fn term_value_index_maybe_stale(&self) -> bool {
-        self.term_value_index_maybe_stale
-    }
-
-    /// Mutating lookup that repairs stale term-value keys at most once per
-    /// dirty period. Direct callers should use `find_term_value`; this is
-    /// for the explicit direct-miss/dirty slow path.
-    pub fn find_term_value_after_repair(
-        &mut self,
-        op: &sil::binop::Binop,
-        lhs: &super::Operand,
-        rhs: &super::Operand,
-    ) -> Option<AbstractValue> {
-        let Some(key) = self.canonical_term_key(op, lhs, rhs) else {
-            if self.term_value_index_maybe_stale {
-                self.repair_stale_term_value_index();
-            }
-            return None;
-        };
-        if let Some(stored) = self.find_term_value_by_key(&key) {
-            return Some(stored);
-        }
-        if !self.term_value_index_maybe_stale {
-            return None;
-        }
-
-        self.repair_stale_term_value_index();
-        self.find_term_value_by_key(&key)
-    }
-
-    /// Rebuild `term_value_index` under the current canonicalization. This
-    /// converts stale keys from before equality/constant propagation into
-    /// current keys and canonicalizes stored result values. Duplicate stale
-    /// entries that now denote the same canonical term keep the first value
-    /// in deterministic `BTreeMap` order; future `and_equal_binop` calls will
-    /// unify fresh results with that chosen representative.
-    fn repair_stale_term_value_index(&mut self) {
-        if !self.term_value_index_maybe_stale {
-            return;
-        }
-
-        let old_index = std::mem::take(&mut self.term_value_index);
-        for (key, result) in old_index {
-            let Some(canonical_key) = self.canonicalize_term_key(&key) else {
-                continue;
-            };
-            let canonical_result = self.get_repr(result);
-            self.term_value_index
-                .entry(canonical_key)
-                .or_insert(canonical_result);
-        }
-        self.term_value_index_maybe_stale = false;
     }
 
     /// Record that `result` is the canonical value for `op(lhs, rhs)` in
@@ -321,34 +243,12 @@ impl Phi {
         self.term_value_index.entry(key).or_insert(canonical_result);
     }
 
-    fn mark_term_value_index_maybe_stale(&mut self) {
-        if !self.term_value_index.is_empty() {
-            self.term_value_index_maybe_stale = true;
-        }
-    }
-
-    fn term_value_index_mentions_var(&self, v: AbstractValue) -> bool {
-        if self.term_value_index.is_empty() {
-            return false;
-        }
-        let repr = self.get_repr(v);
-        let operand_mentions_var = |op: &TermKeyOperand| match op {
-            TermKeyOperand::Const(_) => false,
-            TermKeyOperand::Var(var) => self.get_repr(*var) == repr,
-        };
-        self.term_value_index
-            .iter()
-            .any(|(key, _)| operand_mentions_var(&key.lhs) || operand_mentions_var(&key.rhs))
-    }
-
     /// Record that two variables are equal: v1 = v2.
     pub fn and_var_equal(&mut self, v1: AbstractValue, v2: AbstractValue) -> SatUnsat<Vec<NewEq>> {
         // Merge equality classes
         let Some((merged, kept)) = self.var_eqs.union(v1, v2) else {
             return SatUnsat::Sat(Vec::new()); // already equal
         };
-        self.mark_term_value_index_maybe_stale();
-
         let mut new_eqs = vec![NewEq::Equal(merged, kept)];
 
         // Propagate through linear_eqs: substitute merged → kept
@@ -741,7 +641,6 @@ impl Phi {
 
     /// Simplify: remove constraints mentioning unreachable variables.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
-        self.mark_term_value_index_maybe_stale();
         let var_eqs = &self.var_eqs;
         let is_reachable = |v: AbstractValue| reachable.contains(&var_eqs.find_immut(v));
         let operand_is_reachable = |operand: &super::Operand| match operand {
@@ -799,8 +698,6 @@ impl Phi {
         if ignored.is_empty() {
             return;
         }
-        self.mark_term_value_index_maybe_stale();
-
         let touches_ignored = |v: AbstractValue| ignored.contains(&self.var_eqs.find_immut(v));
         let operand_touches_ignored = |operand: &super::Operand| match operand {
             super::Operand::AbstractValue(v) => touches_ignored(*v),
@@ -848,8 +745,6 @@ impl Phi {
         if ignored.is_empty() {
             return;
         }
-        self.mark_term_value_index_maybe_stale();
-
         let touches_ignored = |v: AbstractValue| ignored.contains(&self.var_eqs.find_immut(v));
         let operand_touches_ignored = |operand: &super::Operand| match operand {
             super::Operand::AbstractValue(v) => touches_ignored(*v),
@@ -913,9 +808,6 @@ impl Phi {
 
         // Check if solution is just a constant
         if let Some(q) = solution.get_as_const() {
-            if self.term_value_index_mentions_var(x) {
-                self.mark_term_value_index_maybe_stale();
-            }
             if q.is_zero() {
                 new_eqs.push(NewEq::EqZero(x));
             }
@@ -1443,169 +1335,6 @@ mod tests {
             .and_atom(Atom::LessThan(t1.clone(), t2.clone()))
             .is_sat());
         assert!(phi.and_atom(Atom::Equal(t1.clone(), t2.clone())).is_unsat());
-    }
-
-    #[test]
-    fn test_find_term_value_rekeys_stale_key_after_equality() {
-        let mut phi = Phi::ttrue();
-        let x = AbstractValue::of_raw(2);
-        let x_prime = AbstractValue::of_raw(1);
-        let y = AbstractValue::of_raw(3);
-        let result = AbstractValue::of_raw(10);
-        let op = sil::binop::Binop::PlusA(None);
-
-        phi.register_term_value(
-            &op,
-            &super::super::Operand::AbstractValue(x),
-            &super::super::Operand::AbstractValue(y),
-            result,
-        );
-        assert_eq!(
-            phi.find_term_value(
-                &op,
-                &super::super::Operand::AbstractValue(x),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            Some(result),
-            "direct lookup should find the freshly registered term value"
-        );
-        assert!(!phi.term_value_index_maybe_stale());
-
-        assert!(phi.and_var_equal(x, x_prime).is_sat());
-        assert!(phi.term_value_index_maybe_stale());
-        assert_eq!(
-            phi.find_term_value(
-                &op,
-                &super::super::Operand::AbstractValue(x_prime),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            None,
-            "read-only direct lookup should not repair stale keys"
-        );
-
-        assert_eq!(
-            phi.find_term_value_after_repair(
-                &op,
-                &super::super::Operand::AbstractValue(x_prime),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            Some(result),
-            "lookup via the new representative should reuse the existing term result after repair"
-        );
-        assert!(!phi.term_value_index_maybe_stale());
-        assert_eq!(
-            phi.find_term_value(
-                &op,
-                &super::super::Operand::AbstractValue(x_prime),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            Some(result),
-            "the stale-key hit should re-key the entry for future direct hits"
-        );
-        assert_eq!(
-            phi.term_value_index.len(),
-            1,
-            "re-keying should move the stale entry instead of duplicating it"
-        );
-    }
-
-    #[test]
-    fn test_find_term_value_rekeys_stale_key_after_constant_folding() {
-        let mut phi = Phi::ttrue();
-        let x = AbstractValue::of_raw(2);
-        let y = AbstractValue::of_raw(3);
-        let result = AbstractValue::of_raw(10);
-        let op = sil::binop::Binop::PlusA(None);
-
-        phi.register_term_value(
-            &op,
-            &super::super::Operand::AbstractValue(x),
-            &super::super::Operand::AbstractValue(y),
-            result,
-        );
-        assert!(phi.and_const_eq(x, 5).is_sat());
-        assert!(phi.term_value_index_maybe_stale());
-        assert_eq!(
-            phi.find_term_value(
-                &op,
-                &super::super::Operand::ConstOperand(5),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            None,
-            "read-only direct lookup should miss before stale constant key repair"
-        );
-
-        assert_eq!(
-            phi.find_term_value_after_repair(
-                &op,
-                &super::super::Operand::ConstOperand(5),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            Some(result),
-            "repair should canonicalize the old variable key to the known constant key"
-        );
-        assert!(!phi.term_value_index_maybe_stale());
-        assert_eq!(
-            phi.find_term_value(
-                &op,
-                &super::super::Operand::ConstOperand(5),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            Some(result),
-            "constant-folded key should be direct after repair"
-        );
-    }
-
-    #[test]
-    fn test_term_value_repair_miss_clears_dirty_and_does_not_repeat() {
-        let mut phi = Phi::ttrue();
-        let x = AbstractValue::of_raw(2);
-        let x_prime = AbstractValue::of_raw(1);
-        let y = AbstractValue::of_raw(3);
-        let result = AbstractValue::of_raw(10);
-        let op = sil::binop::Binop::PlusA(None);
-        let missing_op = sil::binop::Binop::MinusA(None);
-
-        phi.register_term_value(
-            &op,
-            &super::super::Operand::AbstractValue(x),
-            &super::super::Operand::AbstractValue(y),
-            result,
-        );
-        assert!(phi.and_var_equal(x, x_prime).is_sat());
-        assert!(phi.term_value_index_maybe_stale());
-
-        assert_eq!(
-            phi.find_term_value_after_repair(
-                &missing_op,
-                &super::super::Operand::AbstractValue(x_prime),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            None,
-            "repair should not invent a value for a genuinely missing term"
-        );
-        assert!(!phi.term_value_index_maybe_stale());
-        assert_eq!(
-            phi.find_term_value(
-                &op,
-                &super::super::Operand::AbstractValue(x_prime),
-                &super::super::Operand::AbstractValue(y)
-            ),
-            Some(result),
-            "the one repair should still rebuild stale entries for future direct hits"
-        );
-
-        let repaired_index = phi.term_value_index.clone();
-        assert_eq!(
-            phi.find_term_value_after_repair(
-                &missing_op,
-                &super::super::Operand::AbstractValue(y),
-                &super::super::Operand::AbstractValue(x_prime)
-            ),
-            None,
-            "after dirty=false, another miss should not trigger another rebuild"
-        );
-        assert_eq!(phi.term_value_index, repaired_index);
     }
 
     #[test]

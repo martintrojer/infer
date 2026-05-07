@@ -8,21 +8,22 @@ Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, fou
 
 | metric                | OCaml (-j 1) | Rust (latest, -j 4)                                      |
 |-----------------------|--------------|-----------------------------------------------------------|
-| wall time             | `42.9s`      | `235.19s` repeated median after stale-key repair         |
-| max RSS               | `~1.17 GB`   | `~13.9 GB` max RSS (`~9.2 GB` peak footprint)           |
+| wall time             | `42.9s`      | `226.63s` repeated default median                        |
+| max RSS               | `~1.17 GB`   | `~13.4 GB` max RSS (`~9.2 GB` peak footprint)           |
 | procs analyzed        | `570 / 570`  | `570 / 570`                                              |
-| heap+wall aborts      | n/a          | `18 / 570` (`~3.2%`)                                     |
+| heap+wall aborts      | n/a          | `20 / 570` (`~3.5%`)                                     |
 | max visit count       | n/a          | `4`                                                       |
 | exit                  | clean (0)    | clean (0)                                                |
 
-Whole-program slowdown vs OCaml in the latest repeated median:
-**`~5.5×`**, down from `~70×` and OOM-killed at the start of the
-perf sessions. The previous pre-stale-key-repair repeated default median
-was `226.63s`, so the latest run is slightly slower overall but with fewer
-aborts and a modest improvement on `DES_ede3_cbcm_encrypt` (`86s` → `81s`
-median). The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no
-longer the dominant OpenSSL story; the long tail remains bounded-visit
-DES-family / `OBJ_obj2txt` large-state cost. Defaults:
+Whole-program slowdown vs OCaml in the latest repeated default median:
+**`~5.3×`**, down from `~70×` and OOM-killed at the start of the
+perf sessions. A stale-key repair experiment for `term_value_index` improved
+`DES_ede3_cbcm_encrypt` (`86s` → `81s` median) but made the whole-program
+median slower (`235.19s`) and was disabled as a default path after counters
+showed `0 / 443` dirty repairs produced a hit on the focused DES run. The
+`OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer the dominant
+OpenSSL story; the long tail remains bounded-visit DES-family / `OBJ_obj2txt`
+large-state cost. Defaults:
 `pulse-max-heap-mb = 2048`, `pulse-max-wall-secs = 60`; pass `0` to
 disable each cap. Memory-sensitive runs can also enable
 `--pulse-intermediate-formula-gc` to prune unreachable interval/is-int facts in
