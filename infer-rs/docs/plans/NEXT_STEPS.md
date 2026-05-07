@@ -388,7 +388,7 @@ sessions have been about.
 ### C — cap defaults landed (commit `b8d102ae72`)
 
 `pulse-max-heap-mb` now defaults to `2048` (2 GB) and
-`pulse-max-wall-secs` defaults to `120s`. The 74-file partial
+`pulse-max-wall-secs` defaults to `60s`. The 74-file partial
 OpenSSL run completes cleanly out of the box with no flag tuning
 (`570 / 570` procs, `~9 min` wall, `~20 GB` max RSS, `~20`
 aborts). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`

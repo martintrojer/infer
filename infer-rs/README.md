@@ -19,7 +19,7 @@ OOM-killed at the start of the perf sessions). On the single
 `whirlpool_block` slice we are now **`~32%` faster than OCaml**
 (`~82s` vs OCaml `~120s`, with peak memory `~503 MB` vs OCaml
 `~10 GB`). Defaults: `pulse-max-heap-mb = 2048`,
-`pulse-max-wall-secs = 120`; pass `0` to disable each cap. Full
+`pulse-max-wall-secs = 60`; pass `0` to disable each cap. Full
 summary in `docs/STATUS.md` and `docs/plans/`.
 
 Historical OpenSSL benchmark notes follow.

@@ -36,7 +36,7 @@ cap, and per-instruction-cost-reduction commits documented in
   `Formula.phi`, plus the outer `BTreeMap` of the first two.
 - `WHOLE_PROGRAM_OPENSSL_FINDINGS.md`: per-procedure heap cap
   (`pulse-max-heap-mb`, default `2048`) and wall cap
-  (`pulse-max-wall-secs`, default `120`); empty-on-abort short-
+  (`pulse-max-wall-secs`, default `60`); empty-on-abort short-
   circuit in `exec_node`; `AbductiveDomain::shrink_for_storage` for
   cached summaries.
 - `CONVERGENCE_8D4V_FINDINGS.md`: drop-dead-logical-vars cleanup

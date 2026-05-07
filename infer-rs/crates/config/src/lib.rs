@@ -275,14 +275,14 @@ fn default_pulse_max_heap_mb() -> Option<usize> {
     Some(2048)
 }
 
-/// Default `pulse-max-wall-secs`: 120s. Most procedures complete in
+/// Default `pulse-max-wall-secs`: 60s. Most procedures complete in
 /// well under a second; the long-tail (`DES_ofb_encrypt`,
-/// `OBJ_bsearch_ex_`, etc.) takes minutes to many minutes without
-/// the cap. Setting this to `120s` matches the order of magnitude of
-/// the slowest procedures that *do* converge cleanly while letting
-/// pathological ones get aborted.
+/// `DES_ede3_cbcm_encrypt`, etc.) takes minutes without the cap.
+/// Setting this to `60s` keeps the binary usable out of the box on
+/// whole-program OpenSSL-sized corpora while still giving ordinary
+/// procedures ample time to converge.
 fn default_pulse_max_wall_secs() -> Option<u64> {
-    Some(120)
+    Some(60)
 }
 
 impl Default for InferConfig {
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(config.pulse_widen_threshold, 3);
         assert_eq!(config.pulse_max_cfg_size, 15_000);
         assert_eq!(config.pulse_max_heap_mb, Some(2048));
-        assert_eq!(config.pulse_max_wall_secs, Some(120));
+        assert_eq!(config.pulse_max_wall_secs, Some(60));
         assert_eq!(config.max_widens, 10_000);
         assert!(!config.pulse_intraprocedural_only);
         assert_eq!(config.pulse_recency_limit, None);
