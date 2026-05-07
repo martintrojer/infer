@@ -313,6 +313,34 @@ seen on the B-track, but not a CPU/convergence fix. The remaining
 problem is still that the WTO worklist keeps revisiting stopped
 states; we are just doing less work per revisit.
 
+### B-pass 8 (commit `3c1a720e78`): post-stable WTO convergence
+
+The remaining failure pattern was pre-only churn: node pre-states
+kept changing enough to fail `new_pre.leq(old_pre)`, but executing
+the node and joining with the retained post produced no new outgoing
+post-state. Since successors depend on a node's post-state, not its
+stored pre-state, re-running the enclosing WTO component solely for
+pre-only churn cannot affect downstream states.
+
+Change `exec_wto_node` to update the invariant map with the new pre
+(for future delta filtering) and the joined post, but report
+`ReachedFixPoint` when `post.leq(old_post)` holds even if
+`new_pre.leq(old_pre)` failed.
+
+OpenSSL 74-file `-j 4` probe after this change:
+
+| metric          | result |
+|-----------------|--------|
+| wall            | 486s   |
+| max RSS         | 12.3GB |
+| aborts          | 19     |
+| max_visit_count | **4**  |
+
+This removes the `OBJ_bsearch_ex_` `max_visit_count=10001` safety-cap
+pathology in this probe. Wall time remains noisy/worse, dominated by
+large DES-family states and abort behavior, but the WTO convergence
+bug is gone on this run.
+
 ## C. Set sensible cap defaults
 
 Currently both `--pulse-max-heap-mb` and `--pulse-max-wall-secs`
