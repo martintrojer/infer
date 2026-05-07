@@ -8,16 +8,19 @@ Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, fou
 
 | metric                | OCaml (-j 1) | Rust (latest, -j 4)                                      |
 |-----------------------|--------------|-----------------------------------------------------------|
-| wall time             | `42.9s`      | `226.63s` repeated default median                        |
-| max RSS               | `~1.17 GB`   | `~13.4 GB` max RSS (`~9.2 GB` peak footprint)           |
+| wall time             | `42.9s`      | `239.67s` repeated current-HEAD median                  |
+| max RSS               | `~1.17 GB`   | `13.17 GB` median (`13.79 GB` max run)                  |
 | procs analyzed        | `570 / 570`  | `570 / 570`                                              |
-| heap+wall aborts      | n/a          | `20 / 570` (`~3.5%`)                                     |
+| heap+wall aborts      | n/a          | `18 / 570` (`~3.2%`)                                     |
 | max visit count       | n/a          | `4`                                                       |
 | exit                  | clean (0)    | clean (0)                                                |
 
-Whole-program slowdown vs OCaml in the latest repeated default median:
-**`~5.3×`**, down from `~70×` and OOM-killed at the start of the
-perf sessions. A stale-key repair experiment for `term_value_index` improved
+Whole-program slowdown vs OCaml in the latest repeated current-HEAD median:
+**`~5.6×`**, down from `~70×` and OOM-killed at the start of the
+perf sessions. The best pre-cache repeated default median remains `226.63s`;
+the current cached-comparison fix reduces aborts (`20` → `18`) and restores
+comparison-prune correctness, but its current whole-program median is slower
+(`239.67s`). A stale-key repair experiment for `term_value_index` improved
 `DES_ede3_cbcm_encrypt` (`86s` → `81s` median) but made the whole-program
 median slower (`235.19s`) and was disabled as a default path after counters
 showed `0 / 443` dirty repairs produced a hit on the focused DES run. The

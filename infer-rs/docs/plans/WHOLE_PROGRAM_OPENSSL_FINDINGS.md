@@ -406,22 +406,23 @@ Key fixes:
 
 Latest no-explicit-cap out-of-box 74-file checkpoint (`-j 4`, defaults
 `pulse-max-heap-mb=2048`, `pulse-max-wall-secs=60`, formula GC off), using
-three-run medians on the default path:
+three-run medians on current HEAD (`5f82b3f88b`, cached-comparison pruning):
 
 | metric                | OCaml (-j 1) | Rust latest default (-j 4) |
 |-----------------------|--------------|-----------------------------|
-| wall time             | `42.9s`      | **`226.63s`**               |
-| max RSS               | `~1.17 GB`   | `~13.4 GB`                  |
-| peak memory footprint | `~1.10 GB`   | `~9.2 GB`                   |
+| wall time             | `42.9s`      | **`239.67s`**               |
+| max RSS               | `~1.17 GB`   | `13.17 GB` median (`13.79 GB` max) |
+| peak memory footprint | `~1.10 GB`   | `8.33 GB` median (`12.25 GB` max) |
 | procs analyzed        | `570 / 570`  | `570 / 570`                 |
-| heap+wall aborts      | n/a          | `20 / 570`                  |
+| heap+wall aborts      | n/a          | `18 / 570`                  |
 | max visit count       | n/a          | **`4`**                     |
 | exit                  | clean (`0`)  | clean (`0`)                 |
 
-Current slowdown vs OCaml: `226.63 / 42.9 ~= 5.3×` (down from
-`~70×`/OOM-killed at the start of the scaling sessions). A stale-key repair
-experiment later improved one DES slow proc but was disabled for the default
-path after counters showed no repair hits on the focused target. The old
+Current slowdown vs OCaml on current HEAD: `239.67 / 42.9 ~= 5.6×` (down
+from `~70×`/OOM-killed at the start of the scaling sessions). The best
+pre-cache repeated default median remains `226.63s` (`~5.3×`). A stale-key
+repair experiment later improved one DES slow proc but was disabled for the
+default path after counters showed no repair hits on the focused target. The old
 `OBJ_bsearch_ex_ max_visit_count=10001` symptom is not present in the
 latest convergence probes; the remaining long tail is bounded-visit
 large-state cost.
@@ -452,19 +453,23 @@ whole-program OpenSSL on this host.
 The benchmark helper now gives comparable medians across default,
 formula-GC, and stale-key-repair runs:
 
-| metric | default median | opt-in formula GC | stale-key repair |
-|--------|----------------|-------------------|------------------|
-| wall | `226.63s` | `238.49s` | `235.19s` |
-| max RSS | `13.41 GB` | `11.42 GB` | `13.90 GB` |
-| peak footprint | `9.19 GB` | `10.07 GB` | `9.20 GB` |
-| aborts | `20` | `18` | `18` |
-| max_visit_count | `4` | `4` | `4` |
+| metric | pre-cache default median | opt-in formula GC | stale-key repair | current HEAD |
+|--------|--------------------------|-------------------|------------------|--------------|
+| wall | `226.63s` | `238.49s` | `235.19s` | `239.67s` |
+| max RSS | `13.41 GB` | `11.42 GB` | `13.90 GB` | `13.17 GB` median (`13.79 GB` max) |
+| peak footprint | `9.19 GB` | `10.07 GB` | `9.20 GB` | `8.33 GB` median (`12.25 GB` max) |
+| aborts | `20` | `18` | `18` | `18` |
+| max_visit_count | `4` | `4` | `4` | `4` |
 
 The stale-key repair moved the selected DES target in the right direction
 (`DES_ede3_cbcm_encrypt` median `86s` → `81s`), but focused counters showed
 that the slow path did not pay for itself on that procedure: `443` repairs
-scanned `54,110` index entries and produced `0` repair hits. Keep direct
-term-value reuse, but leave stale-key repair disabled by default. Formula GC
+scanned `54,110` index entries and produced `0` repair hits. The retained
+cached-comparison pruning fix reaches the same focused capped DES target
+median (`~81s`) without repair and reduces full-corpus aborts to `18`, but
+current whole-program wall is still slower than the pre-cache default median.
+A cheap `TermKey` normalization prototype was measured on focused DES and
+rejected as inert (bit-identical fixpoint shape/formula counts). Formula GC
 remains an opt-in memory-headroom knob: it lowers max RSS but is not a
 wall-time win.
 
@@ -473,5 +478,5 @@ Next work should target:
 1. profiling bounded-visit DES-family procedures after heap/attr GC,
 2. cheaper/incremental formula cleanup for the remaining linear-equality
    residue, and
-3. alternative term-value/cache strategies that do not scan stale keys on
-   misses.
+3. direct formula-volume/state-retention reductions rather than more
+   term-key shape normalization.

@@ -6,15 +6,20 @@ State after the B-track fixes through commit `a709280c22`:
   (`~97%` reduction).
 - Multi-procedure 74-file OpenSSL: OOM-killed at `~30 / 570` procs
   before the perf/scaling sessions, now completes `570 / 570` clean.
-- Latest no-explicit-cap 74-file OpenSSL `-j 4` repeated default median:
-  `226.63s`, `~13.4 GB` max RSS (`~9.2 GB` peak footprint), `20 / 570`
-  aborts, `max_visit_count=4`.
+- Latest no-explicit-cap 74-file OpenSSL `-j 4` repeated current-HEAD median
+  (`5f82b3f88b`, cached-comparison pruning): `239.67s`, `13.17 GB` median
+  max RSS (`13.79 GB` max run), `8.33 GB` median peak footprint
+  (`12.25 GB` max run), `18 / 570` aborts, `max_visit_count=4`.
+- Best pre-cache repeated default median remains `226.63s`, so the
+  cached-comparison fix is a correctness/abort-count improvement rather than
+  a whole-program wall-time win on this host.
 - A stale-key repair experiment for `term_value_index` improved the target
   `DES_ede3_cbcm_encrypt` slow-proc median `86s` → `81s`, but worsened the
   whole-program median (`235.19s`) and was disabled for the default path after
   counters showed `0 / 443` dirty repairs produced a hit.
 - Wall-time gap vs OCaml on the 74-file OpenSSL corpus: `~70×`/OOM-killed
-  at the start of the sessions → out-of-box `~5.3×` now (`226.63s / 42.9s`).
+  at the start of the sessions → out-of-box `~5.6×` now (`239.67s / 42.9s`)
+  on current HEAD; the best pre-cache checkpoint was `~5.3×`.
 - `OBJ_bsearch_ex_` `max_visit_count=10001` is no longer the dominant story
   in the latest convergence probe; the long tail has shifted to bounded-visit
   DES-family / `OBJ_obj2txt` large-state cost.
@@ -482,11 +487,18 @@ Follow-up correctness fix: pruning a cached comparison result now finds
 its original `term_eqs` through the canonical representative when needed,
 so direct term-value reuse does not lose operand refinements. This is a
 constant-time lookup only; it does not revive dirty repair or index scans.
+Focused capped DES matches the stale-repair target result (`~81s`) without
+repair, but the full 74-file repeated median is `239.67s` vs the previous
+`226.63s` default median. A cheap `TermKey` normalization prototype
+(commutative operand sorting + `Gt/Ge` dual rewrite) was measured on focused
+DES and rejected as inert: the fixpoint shape and formula counts were
+bit-identical.
 
 **Pros:** structural correctness improvement; preserves the cheap direct
-cache path without dirty repair.
-**Cons:** not benchmarked yet; likely a small wall-time effect on its own
-unless cached comparisons materially affect downstream pruning.
+cache path without dirty repair; reduces aborts in the full corpus (`20` →
+`18`).
+**Cons:** not a whole-program wall-time win on this host; term-key shape
+normalization did not move the DES target.
 
 ## E. Sweep the OCaml parity gaps in `TODO.md`
 
@@ -509,9 +521,10 @@ sessions have been about.
    edges were **dead/unreachable** from post stack. Formula also grew
    to `~5.25M` linear equations / `~7.60M` intervals. This points to
    retained-state storage/GC, not WTO convergence.
-2. **Term-value cache follow-up** — benchmark the cached-comparison prune
-   metadata fix on the focused DES probe, then evaluate cheap `TermKey`
-   normalization for commutative/equivalent BinOps without stale-key scans.
+2. **DES/formula-volume reduction after cache follow-up** — cached-comparison
+   pruning is correct and measured, while cheap `TermKey` normalization was
+   inert on focused DES. Next experiments should target formula-volume and
+   state-retention costs directly.
 3. **OBJ_obj2txt straight-line state explosion** — large retained totals
    with `max_visit_count=1`; likely formula/materialization rather than
    loop convergence.

@@ -175,11 +175,12 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 **Current state:** The whole-program OpenSSL run is no longer a
 categorical scaling blocker. On the 74-file partial corpus at
-`-j 4`, the latest no-explicit-cap repeated default median completed
-cleanly in `226.63s` (`570 / 570` procs, `~13.4 GB` max RSS,
-`~9.2 GB` peak footprint, `20 / 570` heap+wall aborts,
+`-j 4`, the latest no-explicit-cap repeated current-HEAD median completed
+cleanly in `239.67s` (`570 / 570` procs, `13.17 GB` median max RSS,
+`8.33 GB` median peak footprint, `18 / 570` heap+wall aborts,
 `max_visit_count=4`). Whole-program slowdown vs OCaml's `42.9s`:
-`~5.3×` out-of-box. A stale-key repair experiment improved the target
+`~5.6×` out-of-box. The best pre-cache repeated default median remains
+`226.63s`. A stale-key repair experiment improved the target
 `DES_ede3_cbcm_encrypt` slow-proc median (`86s` → `81s`) and reduced
 aborts, but worsened the whole-program median (`235.19s`) and was
 rejected for the default path after counters showed `0 / 443` dirty
@@ -192,9 +193,12 @@ bounded-visit DES-family / `OBJ_obj2txt` large-state cost. See
 Latest cache follow-up: pruning a cached comparison result now looks up
 `term_eqs` through the direct key first and the canonical representative
 second, preserving operand refinement without stale-key scans or index
-repair. Next benchmark task: measure the effect on the focused DES probe
-and evaluate cheap `TermKey` normalization (for commutative/equivalent
-BinOps) without reintroducing the rejected stale-key repair slow path.
+repair. Focused capped DES matches the rejected stale-repair target result
+(`~81s`) without the repair path, but current whole-program wall regresses to
+`239.67s` while aborts improve to `18`. A cheap `TermKey` normalization
+prototype was measured on focused DES and rejected as inert (bit-identical
+fixpoint shape). Next work should target DES/formula-volume reduction rather
+than more term-key shape normalization.
 
 Below: historical `whirlpool_block` notes still useful as context.
 

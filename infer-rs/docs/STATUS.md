@@ -14,16 +14,19 @@ blocker. Headline numbers on the 74-file partial capture under
 
 | metric                      | OCaml (-j 1)    | Rust (latest, -j 4)                                      |
 |-----------------------------|-----------------|-----------------------------------------------------------|
-| wall time                   | `42.9s`         | `226.63s` repeated default median                        |
-| max RSS                     | `~1.17 GB`      | `~13.4 GB` max RSS (`~9.2 GB` peak footprint)           |
+| wall time                   | `42.9s`         | `239.67s` repeated current-HEAD median                  |
+| max RSS                     | `~1.17 GB`      | `13.17 GB` median (`13.79 GB` max run)                  |
 | procs analyzed              | `570 / 570`     | `570 / 570`                                              |
-| heap+wall aborts            | n/a             | `20 / 570` (`~3.5%`)                                     |
+| heap+wall aborts            | n/a             | `18 / 570` (`~3.2%`)                                     |
 | max visit count             | n/a             | `4`                                                       |
 | exit                        | clean (`0`)     | clean (`0`)                                              |
 
-Whole-program slowdown vs OCaml in the latest repeated default median:
-**`~5.3×`**, down from `~70×` and OOM-killed at the start of the
-perf sessions. A stale-key repair experiment for `term_value_index` improved
+Whole-program slowdown vs OCaml in the latest repeated current-HEAD median:
+**`~5.6×`**, down from `~70×` and OOM-killed at the start of the
+perf sessions. The best pre-cache repeated default median remains `226.63s`;
+the current cached-comparison fix reduces aborts (`20` → `18`) and restores
+comparison-prune correctness, but its current whole-program median is slower
+(`239.67s`). A stale-key repair experiment for `term_value_index` improved
 the target DES proc (`DES_ede3_cbcm_encrypt`: `86s` → `81s` median) but made
 the whole-program median slower (`235.19s`) and was disabled as a default path
 after counters showed `0 / 443` dirty repairs produced a hit on the focused DES
@@ -69,10 +72,12 @@ disable each cap (escape hatches for benchmarking).
   /usr/bin/time -l target/release/infer-rs --pulse-only --quiet \
     --trace-ondemand -j 4 textual-out/*.sil
 
-The no-explicit-cap out-of-box repeated default checkpoint is `226.63s` /
-`~13.4 GB` max RSS / `~9.2 GB` peak footprint / `20` aborts /
-`max_visit_count=4`. Use `scripts/bench_openssl_partial.sh` for repeated
-runs and slow-proc summaries.
+The latest no-explicit-cap out-of-box repeated current-HEAD checkpoint is
+`239.67s` / `13.17 GB` median max RSS (`13.79 GB` max run) / `8.33 GB`
+median peak footprint (`12.25 GB` max run) / `18` aborts /
+`max_visit_count=4`. The best pre-cache repeated default checkpoint remains
+`226.63s`. Use `scripts/bench_openssl_partial.sh` for repeated runs and
+slow-proc summaries.
 
 Older historical OpenSSL benchmark notes follow.
 
