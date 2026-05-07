@@ -8,22 +8,25 @@ Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, fou
 
 | metric                | OCaml (-j 1) | Rust (latest, -j 4)                                      |
 |-----------------------|--------------|-----------------------------------------------------------|
-| wall time             | `42.9s`      | `294.94s` latest out-of-box rebaseline |
-| max RSS               | `~1.17 GB`   | `~12.6 GB` max RSS (`~8.55 GB` peak footprint)          |
+| wall time             | `42.9s`      | `226.86s` latest out-of-box rebaseline |
+| max RSS               | `~1.17 GB`   | `~14.0 GB` max RSS (`~8.8 GB` peak footprint)          |
 | procs analyzed        | `570 / 570`  | `570 / 570`                                              |
-| heap+wall aborts      | n/a          | `19 / 570` (`~3.3%`)                                       |
+| heap+wall aborts      | n/a          | `20 / 570` (`~3.5%`)                                       |
 | max visit count       | n/a          | `4`                                                       |
 | exit                  | clean (0)    | clean (0)                                                |
 
 Whole-program slowdown vs OCaml in the latest out-of-box rebaseline:
-**`~6.9×`**, down from `~70×` and
+**`~5.3×`**, down from `~70×` and
 OOM-killed at the start of the perf sessions. The `OBJ_bsearch_ex_`
 `max_visit_count=10001` pathology is no longer the dominant OpenSSL
 story in the latest convergence probe; the long tail has shifted to
 bounded-visit DES-family large-state procedures. Defaults:
 `pulse-max-heap-mb = 2048`, `pulse-max-wall-secs = 60`; pass `0` to
-disable each cap. Full summary in `docs/STATUS.md` and `docs/plans/`.
-Use `scripts/bench_openssl_partial.sh` for repeated runs/medians.
+disable each cap. Memory-sensitive runs can also enable
+`--pulse-intermediate-formula-gc` to prune unreachable interval/is-int facts in
+large intermediate states, trading wall time for lower RSS. Full summary in
+`docs/STATUS.md` and `docs/plans/`. Use `scripts/bench_openssl_partial.sh` for
+repeated runs/medians.
 
 Historical OpenSSL benchmark notes follow.
 

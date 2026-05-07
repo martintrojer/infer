@@ -1222,8 +1222,10 @@ impl AbductiveDomain {
             .retain(|addr| canonical_reachable.contains(addr));
         self.dynamic_types
             .retain(|addr, _| canonical_reachable.contains(addr));
-        self.path_condition
-            .prune_unreachable_simple_facts(&formula_reachable);
+        if config::get().pulse_intermediate_formula_gc {
+            self.path_condition
+                .prune_unreachable_simple_facts(&formula_reachable);
+        }
     }
 
     /// Add a prune constraint (from a branch condition).

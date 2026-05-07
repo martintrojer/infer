@@ -109,6 +109,15 @@ pub struct InferConfig {
     #[serde(rename = "pulse-drop-dead-logical-vars", default = "default_true")]
     pub pulse_drop_dead_logical_vars: bool,
 
+    /// In large stored intermediate Pulse states, also prune high-volume
+    /// unary formula facts (`intervals`, `is_int`) whose values are no
+    /// longer reachable from the retained post graph. Defaults to `false`:
+    /// it reduces memory on DES-family procedures but costs wall time on
+    /// capped whole-program OpenSSL runs. Enable when memory headroom is
+    /// more important than wall time.
+    #[serde(rename = "pulse-intermediate-formula-gc")]
+    pub pulse_intermediate_formula_gc: bool,
+
     /// Maximum delta in process peak RSS (megabytes) that a single Pulse
     /// procedure analysis is allowed to consume before being aborted with
     /// the partial state retained as a summary. Defaults to `2048` (2 GB)
@@ -292,6 +301,7 @@ impl Default for InferConfig {
             pulse_widen_threshold: 3,
             pulse_max_cfg_size: 15_000,
             pulse_drop_dead_logical_vars: true,
+            pulse_intermediate_formula_gc: false,
             pulse_max_heap_mb: default_pulse_max_heap_mb(),
             pulse_max_wall_secs: default_pulse_max_wall_secs(),
             pulse_intraprocedural_only: false,
@@ -395,6 +405,7 @@ mod tests {
         assert_eq!(config.pulse_max_disjuncts, 20);
         assert_eq!(config.pulse_widen_threshold, 3);
         assert_eq!(config.pulse_max_cfg_size, 15_000);
+        assert!(!config.pulse_intermediate_formula_gc);
         assert_eq!(config.pulse_max_heap_mb, Some(2048));
         assert_eq!(config.pulse_max_wall_secs, Some(60));
         assert_eq!(config.max_widens, 10_000);
@@ -538,6 +549,12 @@ mod tests {
     fn test_from_json_debug_fixpoint_nodes() {
         let config = InferConfig::from_json(r#"{"debug-fixpoint-nodes": [18, 20, 22]}"#);
         assert_eq!(config.debug_fixpoint_nodes, vec![18, 20, 22]);
+    }
+
+    #[test]
+    fn test_from_json_pulse_intermediate_formula_gc() {
+        let config = InferConfig::from_json(r#"{"pulse-intermediate-formula-gc": true}"#);
+        assert!(config.pulse_intermediate_formula_gc);
     }
 
     #[test]

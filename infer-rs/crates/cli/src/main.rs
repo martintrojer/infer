@@ -137,6 +137,12 @@ struct Cli {
     #[arg(long = "pulse-max-cfg-size")]
     pulse_max_cfg_size: Option<usize>,
 
+    /// Prune unreachable interval/is-int formula facts in large intermediate
+    /// Pulse states. Reduces memory on DES-family procedures but can cost wall
+    /// time on capped whole-program runs.
+    #[arg(long = "pulse-intermediate-formula-gc")]
+    pulse_intermediate_formula_gc: bool,
+
     /// Maximum delta in process peak RSS (megabytes) that a single Pulse
     /// procedure analysis is allowed to consume before being aborted.
     /// Defaults to `2048` (2 GB) when unset; pass `0` to disable the cap
@@ -145,7 +151,7 @@ struct Cli {
     pulse_max_heap_mb: Option<usize>,
 
     /// Maximum wall-clock seconds a single Pulse procedure analysis is
-    /// allowed to consume before being aborted. Defaults to `120` when
+    /// allowed to consume before being aborted. Defaults to `60` when
     /// unset; pass `0` to disable the cap entirely. Complements
     /// `--pulse-max-heap-mb` for procedures whose fixpoint does not
     /// converge quickly but whose RSS stays low.
@@ -265,6 +271,9 @@ impl Cli {
         }
         if let Some(v) = self.pulse_max_cfg_size {
             c.pulse_max_cfg_size = v;
+        }
+        if self.pulse_intermediate_formula_gc {
+            c.pulse_intermediate_formula_gc = true;
         }
         if let Some(v) = self.pulse_max_heap_mb {
             // `--pulse-max-heap-mb 0` is the documented escape hatch to

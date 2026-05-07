@@ -7,9 +7,9 @@ State after the B-track fixes through commit `a709280c22`:
 - Multi-procedure 74-file OpenSSL: OOM-killed at `~30 / 570` procs
   before the perf/scaling sessions, now completes `570 / 570` clean.
 - Latest no-explicit-cap 74-file OpenSSL `-j 4` rebaseline:
-  `294.94s`, `~12.6 GB` max RSS (`~8.55 GB` peak footprint), `19 / 570` aborts, `max_visit_count=4`.
+  `226.86s`, `~14.0 GB` max RSS (`~8.8 GB` peak footprint), `20 / 570` aborts, `max_visit_count=4`.
 - Wall-time gap vs OCaml on the 74-file OpenSSL corpus: `~70×`/OOM-killed
-  at the start of the sessions → out-of-box `~6.9×` now (`294.94s / 42.9s`).
+  at the start of the sessions → out-of-box `~5.3×` now (`226.86s / 42.9s`).
 - `OBJ_bsearch_ex_` `max_visit_count=10001` is no longer the dominant story
   in the latest convergence probe; the long tail has shifted to bounded-visit
   DES-family / `OBJ_obj2txt` large-state cost.
@@ -436,16 +436,16 @@ Focused uncapped `DES_ede3_cbcm_encrypt`:
 | formula intervals | ~8.26M | ~3.38M | ~3.38M |
 | formula is_int | ~6.76M | ~0.88M | ~0.88M |
 
-Whole-program default OpenSSL with targeted unary pruning:
+Whole-program default OpenSSL with targeted unary pruning enabled:
 
 - `294.94s`, `~12.6GB` max RSS, `~8.55GB` peak footprint
 - `19` aborts, `max_visit_count=4`
 
 Interpretation: targeted unary pruning is a memory-oriented win and avoids the
 severe whole-program regression from full formula simplification, but costs more
-wall time than heap/attr-only GC on this noisy capped workload. Keep for now if
-memory headroom is the priority; consider making it configurable if wall time is
-preferred.
+wall time than heap/attr-only GC on this noisy capped workload. It is now
+available via `--pulse-intermediate-formula-gc` (default off) so users can trade
+wall time for memory headroom explicitly.
 
 ## C. Set sensible cap defaults
 
@@ -509,8 +509,8 @@ sessions have been about.
 `pulse-max-heap-mb` now defaults to `2048` (2 GB) and
 `pulse-max-wall-secs` defaults to `60s`. The 74-file partial
 OpenSSL run completes cleanly out of the box with no flag tuning
-(`570 / 570` procs; out-of-box rebaseline: `294.94s`, `~12.6 GB` max
-RSS, `~8.55 GB` peak footprint, `19` aborts, `max_visit_count=4`). Pass
+(`570 / 570` procs; out-of-box rebaseline: `226.86s`, `~14.0 GB` max
+RSS, `~8.8 GB` peak footprint, `20` aborts, `max_visit_count=4`). Pass
 `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
 to disable each cap (escape hatch documented in CLI help).
 
