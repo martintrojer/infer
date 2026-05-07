@@ -945,6 +945,15 @@ impl AbductiveDomain {
         self.dynamic_types.get(&repr)
     }
 
+    /// Iterate over all known dynamic-type bindings (canonical-value
+    /// representative -> type). Used by `state_cmp::canonicalize` so that
+    /// dynamic-type bindings participate in `alpha_equivalent`, mirroring
+    /// the way OCaml's `path_condition.type_constraints` participates in
+    /// `PulseAbductiveDomain.leq`.
+    pub fn iter_dynamic_types(&self) -> impl Iterator<Item = (AbstractValue, &Typ)> {
+        self.dynamic_types.iter().map(|(addr, typ)| (*addr, typ))
+    }
+
     /// Record a known dynamic type for an abstract value.
     ///
     /// Cross-ref: OCaml `PulseArithmetic.and_dynamic_type_is_unsafe`.

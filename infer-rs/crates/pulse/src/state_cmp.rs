@@ -78,6 +78,13 @@ struct CanonicalState {
     pre_attrs: Vec<String>,
     post_attrs: Vec<String>,
     formula: Vec<String>,
+    /// Cross-ref: OCaml `path_condition.type_constraints` participates in
+    /// `PulseAbductiveDomain.leq`. We track dynamic-type bindings
+    /// separately on `AbductiveDomain.dynamic_types`, but they affect
+    /// downstream analysis (specialization, function-pointer
+    /// resolution), so they must participate in `alpha_equivalent` for
+    /// the fixpoint to converge.
+    dynamic_types: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,13 +97,14 @@ pub(crate) struct DebugSignature {
     pre_attrs: usize,
     post_attrs: usize,
     formula: usize,
+    dynamic_types: usize,
 }
 
 impl std::fmt::Display for DebugSignature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "hash={:016x} pre[s={} h={} a={}] post[s={} h={} a={}] formula={}",
+            "hash={:016x} pre[s={} h={} a={}] post[s={} h={} a={}] formula={} dyn={}",
             self.hash,
             self.pre_stack,
             self.pre_heap,
@@ -105,6 +113,7 @@ impl std::fmt::Display for DebugSignature {
             self.post_heap,
             self.post_attrs,
             self.formula,
+            self.dynamic_types,
         )
     }
 }
@@ -121,6 +130,7 @@ pub(crate) fn debug_signature(state: &AbductiveDomain) -> DebugSignature {
         pre_attrs: canonical.state.pre_attrs.len(),
         post_attrs: canonical.state.post_attrs.len(),
         formula: canonical.state.formula.len(),
+        dynamic_types: canonical.state.dynamic_types.len(),
     }
 }
 
@@ -147,6 +157,7 @@ pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
         pre_attrs,
         post_attrs,
         formula,
+        dynamic_types,
     } = canonicalize(state).state;
 
     let mut out = String::new();
@@ -157,6 +168,7 @@ pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
     append_debug_section(&mut out, "pre_attrs", pre_attrs);
     append_debug_section(&mut out, "post_attrs", post_attrs);
     append_debug_section(&mut out, "formula", formula);
+    append_debug_section(&mut out, "dynamic_types", dynamic_types);
     out.pop();
     out
 }
@@ -221,6 +233,7 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
             pre_attrs: canonical_attrs(&state.pre.attrs, &pre_reachable, &canon),
             post_attrs: canonical_attrs(&state.post.attrs, &post_reachable, &canon),
             formula: canonical_formula(state, &canon),
+            dynamic_types: canonical_dynamic_types(state, &canon),
         },
         canon,
     }
@@ -235,7 +248,20 @@ fn stable_hash_state(state: &CanonicalState) -> u64 {
     hash_section(&mut hash, &state.pre_attrs);
     hash_section(&mut hash, &state.post_attrs);
     hash_section(&mut hash, &state.formula);
+    hash_section(&mut hash, &state.dynamic_types);
     hash
+}
+
+fn canonical_dynamic_types(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<String> {
+    let mut entries: Vec<_> = state
+        .iter_dynamic_types()
+        .filter_map(|(addr, typ)| canon.get(addr).map(|label| (label, typ)))
+        .collect();
+    entries.sort_by_key(|(label, _)| *label);
+    entries
+        .into_iter()
+        .map(|(label, typ)| format!("dyn:{label}={typ:?}"))
+        .collect()
 }
 
 fn hash_section(hash: &mut u64, lines: &[String]) {
@@ -1092,7 +1118,8 @@ mod tests {
     use sil::procdesc::Procdesc;
     use sil::procname::Procname;
     use sil::pvar::Pvar;
-    use sil::typ::Typ;
+    use sil::qualified_cpp_name::QualifiedCppName;
+    use sil::typ::{Typ, TypeName};
     use sil::var::Var;
 
     use super::*;
@@ -1303,6 +1330,41 @@ mod tests {
             exec2.leq(&exec1),
             "states differing only in attribute timestamps should be leq"
         );
+    }
+
+    #[test]
+    fn test_dynamic_types_participate_in_alpha_equivalence() {
+        fn add_same_dynamic_type(state: &mut AbductiveDomain) {
+            let formal_addr = state
+                .post
+                .stack
+                .iter()
+                .next()
+                .map(|(_var, addr)| *addr)
+                .expect("formal should exist");
+            state.add_dynamic_type_unsafe(
+                formal_addr,
+                Typ::mk_struct(TypeName::CStruct(QualifiedCppName::from_string("Callable"))),
+            );
+        }
+
+        AbstractValue::reset_counters();
+        let mut state1 = make_state(0, false);
+        add_same_dynamic_type(&mut state1);
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(2, false);
+        add_same_dynamic_type(&mut state2);
+
+        let exec1 = ExecutionDomain::ContinueProgram(state1.clone());
+        let exec2 = ExecutionDomain::ContinueProgram(state2.clone());
+        assert!(exec1.leq(&exec2));
+        assert!(exec2.leq(&exec1));
+
+        let exec_with_dyn = ExecutionDomain::ContinueProgram(state1);
+        AbstractValue::reset_counters();
+        let exec_without_dyn = ExecutionDomain::ContinueProgram(make_state(0, false));
+        assert!(!exec_with_dyn.leq(&exec_without_dyn));
+        assert!(!exec_without_dyn.leq(&exec_with_dyn));
     }
 
     #[test]
