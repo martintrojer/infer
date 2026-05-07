@@ -378,6 +378,44 @@ Concrete next probe: compare OCaml's retained invariant storage for the same pro
 (or inspect `PulseAbductiveDomain.get_unreachable_attributes` / leak filtering) to
 understand when it is safe to drop dead post graph without losing leak diagnostics.
 
+### DES-family storage GC (commit `00f73c1e6d`): dead post heap/attrs pruned
+
+Implemented large-state-only intermediate invariant GC:
+
+- non-exit nodes only (exit states still feed summaries/leak diagnostics)
+- active Continue/Exit/Exception states only (diagnostic stopped snapshots untouched)
+- thresholded to large states (`>=10k` post heap cells) to avoid perturbing small
+  order-sensitive correctness fixtures
+- prunes post heap/attrs to values reachable from post stack; `state_cmp` already
+  ignored this disconnected storage semantically
+
+Focused uncapped `DES_ede3_cbcm_encrypt` after heap/attr GC completed cleanly:
+
+| metric | before GC probe | after heap/attr GC |
+|--------|-----------------|--------------------|
+| completion | stopped at 13m40s | completed 11m04s |
+| max RSS | ~6.3GB at stop | ~3.99GB |
+| retained post heap nodes | ~28.1M | ~2.88M |
+| retained post heap edges | ~55.2M | ~5.58M |
+| dead post heap nodes/edges | ~25.6M / ~50.3M | 276 / 276 |
+| max_visit_count | 4 | 4 |
+
+Whole-program default OpenSSL after this change: `226.86s`, `~14.0GB` max RSS,
+`~8.8GB` peak footprint, `20` aborts, `max_visit_count=4`.
+
+### Formula-GC experiment (commit `cb10724b14`, reverted by `13085f2dd3`)
+
+Tried extending the same GC pass to call `Formula::simplify` over post-stack-
+reachable values plus retained array-index values. It improved the focused uncapped
+DES run (`11m04s` -> `7m35s`, max RSS `~3.99GB` -> `~3.04GB`, formula lin
+`~5.73M` -> `~0.66M`) but regressed the capped whole-program default probe
+(`226.86s` -> `372s`) because simplification is too expensive when many large
+procedures are going to hit heap/wall caps anyway.
+
+Conclusion: formula GC is promising for uncapped single-procedure completeness but
+should not run unconditionally in the whole-program capped path. Future version
+needs a cheaper trigger, incremental simplification, or cap-aware gating.
+
 ## C. Set sensible cap defaults
 
 Currently both `--pulse-max-heap-mb` and `--pulse-max-wall-secs`
