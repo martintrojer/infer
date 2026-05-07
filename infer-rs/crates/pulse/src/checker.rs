@@ -1272,6 +1272,16 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             }
         }
 
+        // If no active ContinueProgram disjunct remains, instruction transfer
+        // is the identity: `exec_instr` just clones Abort/Latent/Exit/Exception
+        // disjuncts through every instruction. Short-circuit here to avoid
+        // repeatedly deep-cloning large latent-invalid states on hot fixpoint
+        // nodes such as OpenSSL `OBJ_bsearch_ex_` node 44, where pathological
+        // runs can revisit all-latent nodes thousands of times.
+        if !input.disjuncts.iter().any(ExecutionDomain::is_continue) {
+            return current_post.join(&input);
+        }
+
         let mut state = input;
         if reverse_instrs {
             for (idx, instr) in node.instrs.iter().enumerate().rev() {
