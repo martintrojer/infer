@@ -6,24 +6,24 @@ Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, fou
 
 **OpenSSL whole-program benchmark (74-file partial corpus, latest B-track):**
 
-| metric                | OCaml (-j 1) | Rust (latest, -j 4)       |
-|-----------------------|--------------|----------------------------|
-| wall time             | `42.9s`      | `257s` best verified probe |
-| max RSS               | `~1.17 GB`   | `~10.8 GB`                 |
-| procs analyzed        | `570 / 570`  | `570 / 570`                |
-| heap+wall aborts      | n/a          | `18 / 570` (`~3%`)         |
-| max visit count       | n/a          | `4`                        |
-| exit                  | clean (0)    | clean (0)                  |
+| metric                | OCaml (-j 1) | Rust (latest, -j 4)                                      |
+|-----------------------|--------------|-----------------------------------------------------------|
+| wall time             | `42.9s`      | `498s` out-of-box rebaseline; `257s` best observed probe |
+| max RSS               | `~1.17 GB`   | `~13.3 GB` out-of-box; `~10.8 GB` best observed          |
+| procs analyzed        | `570 / 570`  | `570 / 570`                                              |
+| heap+wall aborts      | n/a          | `18 / 570` (`~3%`)                                       |
+| max visit count       | n/a          | `4`                                                       |
+| exit                  | clean (0)    | clean (0)                                                |
 
-Whole-program slowdown vs OCaml in the latest best probe: **`~6.0×`**
-(down from `~70×` and OOM-killed at the start of the perf sessions).
-The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer
-the dominant OpenSSL story in the latest convergence probe; the long
-tail has shifted to bounded-visit DES-family large-state procedures.
-Defaults: `pulse-max-heap-mb = 2048`, `pulse-max-wall-secs = 60`; pass
-`0` to disable each cap. Full summary in `docs/STATUS.md` and
-`docs/plans/`. The best probe used explicit `--pulse-max-wall-secs 60`;
-re-baseline without explicit cap flags after the default change.
+Whole-program slowdown vs OCaml in the latest out-of-box rebaseline:
+**`~11.6×`** (`~6.0×` best observed probe), down from `~70×` and
+OOM-killed at the start of the perf sessions. The `OBJ_bsearch_ex_`
+`max_visit_count=10001` pathology is no longer the dominant OpenSSL
+story in the latest convergence probe; the long tail has shifted to
+bounded-visit DES-family large-state procedures. Defaults:
+`pulse-max-heap-mb = 2048`, `pulse-max-wall-secs = 60`; pass `0` to
+disable each cap. Full summary in `docs/STATUS.md` and `docs/plans/`.
+Use `scripts/bench_openssl_partial.sh` for repeated runs/medians.
 
 Historical OpenSSL benchmark notes follow.
 

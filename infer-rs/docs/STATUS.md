@@ -12,22 +12,22 @@ The whole-program OpenSSL run is no longer a categorical scaling
 blocker. Headline numbers on the 74-file partial capture under
 `~/infer-rs-bench/openssl-20260501-084151/`:
 
-| metric                      | OCaml (-j 1)    | Rust (latest, -j 4)       |
-|-----------------------------|-----------------|----------------------------|
-| wall time                   | `42.9s`         | `257s` best verified probe |
-| max RSS                     | `~1.17 GB`      | `~10.8 GB`                 |
-| procs analyzed              | `570 / 570`     | `570 / 570`                |
-| heap+wall aborts            | n/a             | `18 / 570` (`~3%`)         |
-| max visit count             | n/a             | `4`                        |
-| exit                        | clean (`0`)     | clean (`0`)                |
+| metric                      | OCaml (-j 1)    | Rust (latest, -j 4)                                      |
+|-----------------------------|-----------------|-----------------------------------------------------------|
+| wall time                   | `42.9s`         | `498s` out-of-box rebaseline; `257s` best observed probe |
+| max RSS                     | `~1.17 GB`      | `~13.3 GB` out-of-box; `~10.8 GB` best observed          |
+| procs analyzed              | `570 / 570`     | `570 / 570`                                              |
+| heap+wall aborts            | n/a             | `18 / 570` (`~3%`)                                       |
+| max visit count             | n/a             | `4`                                                       |
+| exit                        | clean (`0`)     | clean (`0`)                                              |
 
-Whole-program slowdown vs OCaml in the latest best probe: **`~6.0×`**
-(down from `~70×` and OOM-killed at the start of the perf sessions).
-The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer
-the dominant OpenSSL story in the latest convergence probe; the long
-tail has shifted to bounded-visit DES-family large-state procedures.
-The best probe used explicit `--pulse-max-wall-secs 60`; re-baseline
-without explicit cap flags after the default change.
+Whole-program slowdown vs OCaml in the latest out-of-box rebaseline:
+**`~11.6×`** (`~6.0×` best observed probe), down from `~70×` and
+OOM-killed at the start of the perf sessions. The `OBJ_bsearch_ex_`
+`max_visit_count=10001` pathology is no longer the dominant OpenSSL
+story in the latest convergence probe; the long tail has shifted to
+bounded-visit DES-family large-state procedures. Use
+`scripts/bench_openssl_partial.sh` for repeated runs/medians.
 
 The wins came from a series of structural-sharing, per-procedure
 cap, and per-instruction-cost-reduction commits documented in
@@ -63,8 +63,10 @@ disable each cap (escape hatches for benchmarking).
   /usr/bin/time -l target/release/infer-rs --pulse-only --quiet \
     --trace-ondemand -j 4 textual-out/*.sil
 
-The latest best probe used `--pulse-max-wall-secs 60`, now the default.
-Use a no-explicit-cap rerun as the next out-of-box checkpoint.
+The no-explicit-cap out-of-box checkpoint is `498s` / `~13.3 GB` max
+RSS / `18` aborts / `max_visit_count=4`. Use
+`scripts/bench_openssl_partial.sh` for repeated runs and slow-proc
+summaries.
 
 Older historical OpenSSL benchmark notes follow.
 

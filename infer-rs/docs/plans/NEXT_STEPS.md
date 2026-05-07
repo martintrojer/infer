@@ -6,18 +6,19 @@ State after the B-track fixes through commit `a709280c22`:
   (`~97%` reduction).
 - Multi-procedure 74-file OpenSSL: OOM-killed at `~30 / 570` procs
   before the perf/scaling sessions, now completes `570 / 570` clean.
-- Best latest 74-file OpenSSL `-j 4` probe with `--pulse-max-wall-secs 60`:
-  `257s`, `~10.8 GB` max RSS, `18 / 570` aborts, `max_visit_count=4`.
+- Latest no-explicit-cap 74-file OpenSSL `-j 4` rebaseline:
+  `498s`, `~13.3 GB` max RSS, `18 / 570` aborts, `max_visit_count=4`.
+- Best observed explicit-60s probe: `257s`, `~10.8 GB` max RSS.
 - Wall-time gap vs OCaml on the 74-file OpenSSL corpus: `~70×`/OOM-killed
-  at the start of the sessions → best observed `~6.0×` now (`257s / 42.9s`).
+  at the start of the sessions → out-of-box `~11.6×` now (`498s / 42.9s`),
+  best observed `~6.0×` (`257s / 42.9s`).
 - `OBJ_bsearch_ex_` `max_visit_count=10001` is no longer the dominant story
   in the latest convergence probe; the long tail has shifted to bounded-visit
   DES-family / `OBJ_obj2txt` large-state cost.
 
-Immediate next step: re-baseline with no explicit cap flags now that
-`pulse-max-wall-secs=60` is the default, then update the out-of-box
-checkpoint. After that, focus on DES-family large-state procedures rather
-than more `OBJ_bsearch_ex_` convergence work.
+Default re-baseline is done; next step is to use the benchmark helper for
+repeated runs/medians and then focus on DES-family large-state procedures
+rather than more `OBJ_bsearch_ex_` convergence work.
 
 ## A. Close the remaining `~6×` wall-time gap
 
@@ -405,8 +406,9 @@ sessions have been about.
 `pulse-max-heap-mb` now defaults to `2048` (2 GB) and
 `pulse-max-wall-secs` defaults to `60s`. The 74-file partial
 OpenSSL run completes cleanly out of the box with no flag tuning
-(`570 / 570` procs; latest explicit-60s probe: `257s`, `~10.8 GB`
-max RSS, `18` aborts, `max_visit_count=4`). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
+(`570 / 570` procs; out-of-box rebaseline: `498s`, `~13.3 GB` max RSS,
+`18` aborts, `max_visit_count=4`; best observed explicit-60s probe:
+`257s`, `~10.8 GB`). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
 to disable each cap (escape hatch documented in CLI help).
 
 ### A second pass — remaining sort_by_key sites converted (commit `d5d0488bd2`)
