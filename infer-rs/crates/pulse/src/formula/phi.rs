@@ -675,6 +675,19 @@ impl Phi {
         });
     }
 
+    /// Cheap intermediate-state GC: remove unary facts for unreachable
+    /// variables. This deliberately avoids the full `simplify()` pass (which
+    /// scans and rewrites all linear equations/atoms and is too expensive on
+    /// large capped whole-program runs) while dropping two high-volume fact
+    /// classes that do not affect future transfer once their value is
+    /// unreachable from the retained post graph.
+    pub fn prune_unreachable_simple_facts(&mut self, reachable: &HashSet<AbstractValue>) {
+        let var_eqs = &self.var_eqs;
+        let is_reachable = |v: AbstractValue| reachable.contains(&var_eqs.find_immut(v));
+        self.intervals.retain(|v, _| is_reachable(*v));
+        self.is_int_vars.retain(|v| is_reachable(*v));
+    }
+
     /// Forget pure constraints mentioning the given canonical values while
     /// preserving the remaining heap-facing equality classes.
     pub fn forget_constraints_involving(&mut self, ignored: &HashSet<AbstractValue>) {

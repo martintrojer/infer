@@ -1198,6 +1198,22 @@ impl AbductiveDomain {
             .collect();
         let mut heap_reachable = reachable;
         heap_reachable.extend(canonical_reachable.iter().copied());
+
+        // Formula facts over retained ArrayAccess index values may still be
+        // needed to canonicalize/find those retained edges, even when the
+        // index value itself is not stack-reachable.
+        let mut formula_reachable = canonical_reachable.clone();
+        for (addr, edges) in self.post.heap.iter() {
+            if !heap_reachable.contains(addr) {
+                continue;
+            }
+            for (access, _target) in edges.iter() {
+                if let Access::ArrayAccess(_, index) = access {
+                    formula_reachable.insert(self.path_condition.get_var_repr(*index));
+                }
+            }
+        }
+
         self.post.heap.retain_reachable(&heap_reachable);
         self.post.attrs.retain_reachable(&canonical_reachable);
         self.must_be_valid
@@ -1206,6 +1222,8 @@ impl AbductiveDomain {
             .retain(|addr| canonical_reachable.contains(addr));
         self.dynamic_types
             .retain(|addr, _| canonical_reachable.contains(addr));
+        self.path_condition
+            .prune_unreachable_simple_facts(&formula_reachable);
     }
 
     /// Add a prune constraint (from a branch condition).

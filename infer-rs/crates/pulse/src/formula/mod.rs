@@ -622,6 +622,12 @@ impl Formula {
         }
     }
 
+    /// Cheap intermediate-state GC: remove high-volume unary facts for
+    /// unreachable values without running the full formula simplifier.
+    pub fn prune_unreachable_simple_facts(&mut self, reachable: &HashSet<AbstractValue>) {
+        self.phi_mut().prune_unreachable_simple_facts(reachable);
+    }
+
     /// Simplify the formula.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
         self.phi_mut().simplify(reachable);
