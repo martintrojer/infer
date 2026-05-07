@@ -235,21 +235,58 @@ equivalent, but downstream behavior differs. So the analysis
 genuinely produces different per-iteration results, and the
 fixpoint can't converge.
 
-Next probe ideas for B-pass 6:
-- Add `dynamic_types` to `canonicalize` keys -- if iterations
-  truly produce different bindings, we'll see structural
-  inequality (correct) and the worklist will keep iterating;
-  but maybe widen will then catch them.
-- Inspect what specifically changes between runs of
-  `OBJ_bsearch_ex_` analysis -- dump the `linear_eqs` of all
-  20 disjuncts at `node=44` and compare across iterations.
-- Check OCaml's behavior: does OCaml's `dynamic_types` /
-  `type_constraints` participate in `leq`?
+### B-pass 6 (commit `7bf86fd5c9`): dynamic types now participate in canonicalization
 
-Slowdown vs OCaml `42.9s`: `~8.7x` (run 1) / `~10x` (run 2/3).
-Was `~11.3x`, OOM-killed at start of session.
+OCaml's corresponding dynamic-type constraints live in the path
+condition and participate in `PulseAbductiveDomain.leq`. Rust kept
+known dynamic types separately on `AbductiveDomain.dynamic_types`,
+and `state_cmp::canonicalize` ignored them. That meant two states
+that can resolve function pointers differently could be treated as
+alpha-equivalent even though downstream transfer behavior differs.
 
-Regression test: `test_alpha_equivalent_states_ignore_attribute_timestamps`.
+Added `AbductiveDomain::iter_dynamic_types()` and included
+canonical value->type bindings in `CanonicalState`, stable hashes,
+`debug_canonical_dump`, and `DebugSignature`. New regression test:
+`test_dynamic_types_participate_in_alpha_equivalence`:
+
+- same dynamic-type binding under different raw `AbstractValue` IDs
+  remains alpha-equivalent
+- presence vs absence of a dynamic-type binding is not
+  alpha-equivalent
+
+One OpenSSL 74-file `-j 4` probe after this change:
+
+| metric          | result |
+|-----------------|--------|
+| wall            | 301s   |
+| max RSS         | 17.7GB |
+| aborts          | 16     |
+| max_visit_count | 10001  |
+
+This is the best wall time seen on the B-track but still hits the
+`OBJ_bsearch_ex_` safety cap in some runs. Treat as semantic
+correctness + partial stabilization, **not** the final bsearch fix.
+
+Next probe ideas for B-pass 7:
+
+- Inspect what specifically changes between bad iterations of
+  `OBJ_bsearch_ex_` -- dump canonical sections (`pre/post attrs`,
+  `formula`, `dynamic_types`) for all 20 disjuncts at `node=44` and
+  compare across iterations.
+- Add a fixed-seed / deterministic scheduling mode for the 74-file
+  benchmark so we can stop chasing host/scheduler noise.
+- Check OCaml's behavior on `OBJ_bsearch_ex_` specifically: confirm
+  whether its loop-head states include the same dynamic-type surface
+  and whether `PulseAbductiveDomain.leq` reaches fixpoint via
+  `phys_equal` or graph isomorphism.
+
+Slowdown vs OCaml `42.9s`: best observed `~7.0x` (301s) but flaky;
+more stable runs are `~8.7x-10x`. Was `~11.3x`, OOM-killed at
+start of session.
+
+Regression tests:
+- `test_alpha_equivalent_states_ignore_attribute_timestamps`
+- `test_dynamic_types_participate_in_alpha_equivalence`
 
 ## C. Set sensible cap defaults
 
