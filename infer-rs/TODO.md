@@ -189,8 +189,12 @@ bounded-visit DES-family / `OBJ_obj2txt` large-state cost. See
 `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
 `docs/plans/NEXT_STEPS.md` for the headline tables and B-track notes.
 
-Immediate next benchmark task: measure cheaper term-value/cache strategies
-without the rejected stale-key repair slow path.
+Latest cache follow-up: pruning a cached comparison result now looks up
+`term_eqs` through the direct key first and the canonical representative
+second, preserving operand refinement without stale-key scans or index
+repair. Next benchmark task: measure the effect on the focused DES probe
+and evaluate cheap `TermKey` normalization (for commutative/equivalent
+BinOps) without reintroducing the rejected stale-key repair slow path.
 
 Below: historical `whirlpool_block` notes still useful as context.
 

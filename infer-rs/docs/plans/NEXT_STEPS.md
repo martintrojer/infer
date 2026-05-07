@@ -478,10 +478,15 @@ overhead: `443` repairs scanned `54,110` index entries and produced `0`
 repair hits. Keep direct term-value reuse, but leave stale-key repair
 disabled by default.
 
-**Pros:** structural correctness improvement; closes the last
-identified semantic gap.
-**Cons:** invasive; may not yield much wall-time win on its own
-since the cap acts as a safety net.
+Follow-up correctness fix: pruning a cached comparison result now finds
+its original `term_eqs` through the canonical representative when needed,
+so direct term-value reuse does not lose operand refinements. This is a
+constant-time lookup only; it does not revive dirty repair or index scans.
+
+**Pros:** structural correctness improvement; preserves the cheap direct
+cache path without dirty repair.
+**Cons:** not benchmarked yet; likely a small wall-time effect on its own
+unless cached comparisons materially affect downstream pruning.
 
 ## E. Sweep the OCaml parity gaps in `TODO.md`
 
@@ -504,10 +509,13 @@ sessions have been about.
    edges were **dead/unreachable** from post stack. Formula also grew
    to `~5.25M` linear equations / `~7.60M` intervals. This points to
    retained-state storage/GC, not WTO convergence.
-2. **OBJ_obj2txt straight-line state explosion** — large retained totals
+2. **Term-value cache follow-up** — benchmark the cached-comparison prune
+   metadata fix on the focused DES probe, then evaluate cheap `TermKey`
+   normalization for commutative/equivalent BinOps without stale-key scans.
+3. **OBJ_obj2txt straight-line state explosion** — large retained totals
    with `max_visit_count=1`; likely formula/materialization rather than
    loop convergence.
-3. **D/E** — per-disjunct value-count residue and OCaml parity/reporting
+4. **D/E** — per-disjunct value-count residue and OCaml parity/reporting
    gaps are deeper investments / different tracks.
 
 ## Done so far

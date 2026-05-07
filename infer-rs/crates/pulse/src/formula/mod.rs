@@ -397,9 +397,25 @@ impl Formula {
         // (truthy) or v = 0 (falsy), resolve back to the comparison and add
         // the appropriate atom. This matches OCaml's prune_binop which looks
         // up term_eqs to derive constraints from boolean results.
+        //
+        // Prefer the direct key, then fall back to the canonical
+        // representative. Direct lookup preserves existing term_eqs if a
+        // comparison result is later merged into a simpler value. The
+        // canonical fallback handles the term_value_index cache-hit path:
+        // the freshly minted `v` is unified with the cached representative,
+        // but `term_eqs` is only keyed under that representative. We
+        // deliberately do not scan `term_value_index` or repair stale keys.
         let mut comparison_condition_atom = None;
         if c == 0 {
-            if let Some(teq) = self.phi.term_eqs.get(&v).cloned() {
+            let teq = self.phi.term_eqs.get(&v).or_else(|| {
+                let repr = self.phi.get_repr(v);
+                if repr == v {
+                    None
+                } else {
+                    self.phi.term_eqs.get(&repr)
+                }
+            });
+            if let Some(teq) = teq.cloned() {
                 comparison_condition_atom = if negated {
                     // prune(v ≠ 0) i.e. v is truthy → the comparison is true
                     comparison_to_atom(teq.op, &teq.lhs, &teq.rhs, false, &self.phi)
@@ -1271,6 +1287,114 @@ mod tests {
             f.get_var_repr(second_result),
             f.get_var_repr(first_result),
             "repeated BinOps on the same canonical operands should reuse the first result"
+        );
+    }
+
+    #[test]
+    fn test_prune_cached_comparison_refines_operands_via_canonical_term_eq() {
+        // Build two `Lt` comparisons on the same canonical operands.
+        // The second `and_equal_binop` should hit the `term_value_index`
+        // cache and unify its result with the first comparison's result.
+        // Pruning the cached result must still resolve back to the
+        // original comparison's `term_eqs` entry (via the canonical repr)
+        // so the operands get refined just like the first prune would.
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+        let first_cmp = AbstractValue::of_raw(3);
+        let second_cmp = AbstractValue::of_raw(4);
+        let op = sil::binop::Binop::Lt;
+
+        assert!(f
+            .and_equal_binop(
+                first_cmp,
+                op.clone(),
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+        assert!(f
+            .and_equal_binop(
+                second_cmp,
+                op,
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+
+        // Sanity: cache hit unified the two comparison results.
+        assert_eq!(
+            f.get_var_repr(second_cmp),
+            f.get_var_repr(first_cmp),
+            "repeated comparison should reuse the cached representative"
+        );
+        // Sanity: term_eqs is only keyed under the canonical repr (the
+        // first comparison's value), not under the freshly minted second
+        // result.
+        let cmp_repr = f.get_var_repr(first_cmp);
+        assert!(
+            f.phi().term_eqs.contains_key(&cmp_repr),
+            "term_eqs should still be keyed under the canonical comparison value"
+        );
+        assert_ne!(
+            cmp_repr, second_cmp,
+            "the test only exercises the canonical lookup if the second result is not itself the repr"
+        );
+
+        // Prune the cached (second) result truthy: x < y should follow.
+        let truthy = f.prune_eq_const(second_cmp, 0, true);
+        assert!(
+            truthy.is_sat(),
+            "pruning the cached comparison truthy must remain Sat"
+        );
+        assert!(
+            f.conditions()
+                .contains_key(&Atom::LessThan(Term::Var(x), Term::Var(y))),
+            "pruning the cached comparison result truthy must record the original `x < y` refinement, \
+             not collapse to a generic `v != 0` atom"
+        );
+    }
+
+    #[test]
+    fn test_prune_comparison_keeps_direct_term_eq_after_result_merge() {
+        // Direct lookup must still win when a comparison value keeps its
+        // term_eq entry under the original key but is later merged into a
+        // simpler representative.
+        let mut f = Formula::ttrue();
+        let alias = AbstractValue::of_raw(1);
+        let cmp = AbstractValue::of_raw(10);
+        let x = AbstractValue::of_raw(20);
+        let y = AbstractValue::of_raw(21);
+
+        assert!(f
+            .and_equal_binop(
+                cmp,
+                sil::binop::Binop::Lt,
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+        assert!(
+            f.phi().term_eqs.contains_key(&cmp),
+            "the comparison's term_eq starts under the raw comparison value"
+        );
+
+        assert!(f.and_equal_vars(cmp, alias).is_sat());
+        assert_eq!(f.get_var_repr(cmp), alias);
+        assert!(
+            !f.phi().term_eqs.contains_key(&alias),
+            "and_var_equal does not re-key term_eqs to the simpler representative"
+        );
+
+        let truthy = f.prune_eq_const(cmp, 0, true);
+        assert!(
+            truthy.is_sat(),
+            "pruning the merged comparison truthy must remain Sat"
+        );
+        assert!(
+            f.conditions()
+                .contains_key(&Atom::LessThan(Term::Var(x), Term::Var(y))),
+            "direct term_eq lookup should preserve the original comparison refinement"
         );
     }
 
