@@ -288,6 +288,31 @@ Regression tests:
 - `test_alpha_equivalent_states_ignore_attribute_timestamps`
 - `test_dynamic_types_participate_in_alpha_equivalence`
 
+### B-pass 7 (commit `c9876741d2`): identity-transfer shortcut for stopped states
+
+Observation from bad `OBJ_bsearch_ex_` runs: hot nodes such as
+node 44 are repeatedly visited with `20` `LatentInvalidAccess`
+disjuncts and `0` `ContinueProgram` disjuncts. Instruction
+transfer on such a domain is the identity: `exec_instr` simply
+clones Abort/Latent/Exit/Exception disjuncts through every
+instruction. Short-circuit `PulseTransferFunctions::exec_node` so
+when no active `ContinueProgram` remains it returns
+`current_post.join(input)` directly.
+
+OpenSSL 74-file `-j 4` probe after this change:
+
+| metric          | result |
+|-----------------|--------|
+| wall            | 460s   |
+| max RSS         | 10.7GB |
+| aborts          | 15     |
+| max_visit_count | 10001  |
+
+Interpretation: safe identity-transfer optimization and best RSS
+seen on the B-track, but not a CPU/convergence fix. The remaining
+problem is still that the WTO worklist keeps revisiting stopped
+states; we are just doing less work per revisit.
+
 ## C. Set sensible cap defaults
 
 Currently both `--pulse-max-heap-mb` and `--pulse-max-wall-secs`
