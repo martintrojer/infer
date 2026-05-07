@@ -1176,6 +1176,38 @@ impl AbductiveDomain {
         self.reachable_from(root)
     }
 
+    /// Shrink the current post heap/attrs to values reachable from the post
+    /// stack. This is intended only for stored intermediate fixpoint states,
+    /// not for exit states used to build summaries and leak diagnostics.
+    ///
+    /// Rationale: successor transfer can only access values reachable from
+    /// the post stack (and their heap edges). Values disconnected from the
+    /// post stack cannot become reachable again without an instruction naming
+    /// their abstract value, which SIL cannot do. `state_cmp` already ignores
+    /// disconnected retained post heap/attrs for semantic comparison; this
+    /// drops the same dead storage physically from invariant maps.
+    pub fn shrink_post_to_stack_reachable(&mut self) {
+        let roots: Vec<_> = self.post.stack.iter().map(|(_, addr)| *addr).collect();
+        let mut reachable = std::collections::HashSet::new();
+        for root in roots {
+            reachable.extend(self.reachable_from(root));
+        }
+        let canonical_reachable: std::collections::HashSet<_> = reachable
+            .iter()
+            .map(|addr| self.path_condition.get_var_repr(*addr))
+            .collect();
+        let mut heap_reachable = reachable;
+        heap_reachable.extend(canonical_reachable.iter().copied());
+        self.post.heap.retain_reachable(&heap_reachable);
+        self.post.attrs.retain_reachable(&canonical_reachable);
+        self.must_be_valid
+            .retain(|addr| canonical_reachable.contains(addr));
+        self.need_dynamic_type_specialization
+            .retain(|addr| canonical_reachable.contains(addr));
+        self.dynamic_types
+            .retain(|addr, _| canonical_reachable.contains(addr));
+    }
+
     /// Add a prune constraint (from a branch condition).
     pub fn prune_eq(
         &mut self,

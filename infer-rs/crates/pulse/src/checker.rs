@@ -360,6 +360,44 @@ fn log_disjunctive_canonical_dump(
 ///   end-of-life. The textual exporter does not preserve those metadata
 ///   markers, so on a textual-SIL re-analyze we synthesize the equivalent
 ///   cleanup at every CFG node exit using our own backward liveness.
+fn shrink_intermediate_post_to_stack_reachable(state: &mut DisjunctiveDomain<ExecutionDomain>) {
+    // Avoid perturbing ordering/shape of small correctness fixtures. The
+    // storage problem this targets is specific to large retained invariant
+    // maps (DES-family OpenSSL procedures), where a single node can retain
+    // tens of thousands of post heap cells per disjunct.
+    const MIN_POST_HEAP_CELLS_FOR_GC: usize = 10_000;
+    let post_heap_cells: usize = state
+        .disjuncts
+        .iter()
+        .map(|disjunct| match disjunct {
+            ExecutionDomain::ContinueProgram(astate)
+            | ExecutionDomain::ExitProgram(astate)
+            | ExecutionDomain::ExceptionRaised(astate) => astate.post.heap.len(),
+            ExecutionDomain::AbortProgram { .. }
+            | ExecutionDomain::LatentAbortProgram { .. }
+            | ExecutionDomain::LatentInvalidAccess { .. } => 0,
+        })
+        .sum();
+    if post_heap_cells < MIN_POST_HEAP_CELLS_FOR_GC {
+        return;
+    }
+
+    for disjunct in &mut state.disjuncts {
+        match disjunct {
+            ExecutionDomain::ContinueProgram(astate)
+            | ExecutionDomain::ExitProgram(astate)
+            | ExecutionDomain::ExceptionRaised(astate) => {
+                astate.shrink_post_to_stack_reachable();
+            }
+            // Error/latent variants carry snapshots used in diagnostics;
+            // leave them untouched.
+            ExecutionDomain::AbortProgram { .. }
+            | ExecutionDomain::LatentAbortProgram { .. }
+            | ExecutionDomain::LatentInvalidAccess { .. } => {}
+        }
+    }
+}
+
 fn drop_dead_logical_vars(
     state: &mut DisjunctiveDomain<ExecutionDomain>,
     node_id: NodeId,
@@ -1311,7 +1349,11 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             );
         }
 
-        current_post.join(&state)
+        let mut joined = current_post.join(&state);
+        if node_id != pdesc.exit_node {
+            shrink_intermediate_post_to_stack_reachable(&mut joined);
+        }
+        joined
     }
 
     fn observe_fixpoint(&self, node_id: NodeId, inv_map: &interp::InvariantMap<Self::Domain>) {
