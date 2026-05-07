@@ -355,7 +355,7 @@ where
             return Convergence::ReachedFixPoint;
         }
 
-        // Not converged: execute instructions and update
+        // Not converged on the pre-state: execute instructions and update.
         let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &new_pre, Some(old_state));
         // Cross-ref: OCaml `AbstractInterpreter.exec_node_instrs` keeps the
         // existing node post and joins newly produced disjuncts into it.
@@ -363,6 +363,7 @@ where
         // discovered on earlier visits, which in turn hides under-approximation
         // metadata from summary export.
         let post = old_state.post.join(&post);
+        let post_reached_fixpoint = post.leq(&old_state.post);
         let visit_count = old_state.visit_count + 1;
         inv_map.insert(
             node_id,
@@ -373,7 +374,17 @@ where
             },
         );
         tf.observe_fixpoint(node_id, inv_map);
-        Convergence::DidNotReachFixPoint
+        if post_reached_fixpoint {
+            // The node pre-state changed in a way that did not change the
+            // outgoing post-state. Successors only depend on the post-state,
+            // so there is no point re-running the WTO component solely for
+            // pre-only churn (for instance, latent/stopped-state metadata that
+            // does not affect transfer). Keep the updated pre for future delta
+            // filtering, but report convergence to the enclosing WTO loop.
+            Convergence::ReachedFixPoint
+        } else {
+            Convergence::DidNotReachFixPoint
+        }
     } else {
         // First visit
         let post = exec_node::<Dir, TF>(tf, data, node_id, pdesc, &pre, None);
