@@ -176,10 +176,10 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 **Current state:** The whole-program OpenSSL run is no longer a
 categorical scaling blocker. On the 74-file partial corpus at
 `-j 4`, the latest no-explicit-cap out-of-box rebaseline completed
-cleanly in `226.86s` (`570 / 570` procs, `~14.0 GB` max RSS,
-`~8.8 GB` peak footprint, `20 / 570` heap+wall aborts,
+cleanly in `294.94s` (`570 / 570` procs, `~12.6 GB` max RSS,
+`~8.55 GB` peak footprint, `19 / 570` heap+wall aborts,
 `max_visit_count=4`). Whole-program slowdown
-vs OCaml's `42.9s`: `~5.3×` out-of-box. The
+vs OCaml's `42.9s`: `~6.9×` out-of-box. The
 `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer the
 dominant story in the latest convergence probe; the remaining wall
 time is bounded-visit DES-family / `OBJ_obj2txt` large-state cost.
