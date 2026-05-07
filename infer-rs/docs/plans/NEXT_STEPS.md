@@ -6,17 +6,21 @@ State after the B-track fixes through commit `a709280c22`:
   (`~97%` reduction).
 - Multi-procedure 74-file OpenSSL: OOM-killed at `~30 / 570` procs
   before the perf/scaling sessions, now completes `570 / 570` clean.
-- Latest no-explicit-cap 74-file OpenSSL `-j 4` rebaseline:
-  `226.86s`, `~14.0 GB` max RSS (`~8.8 GB` peak footprint), `20 / 570` aborts, `max_visit_count=4`.
+- Latest no-explicit-cap 74-file OpenSSL `-j 4` repeated median after the
+  `term_value_index` stale-key repair: `235.19s`, `~13.9 GB` max RSS
+  (`~9.2 GB` peak footprint), `18 / 570` aborts, `max_visit_count=4`.
+  The previous default repeated median was `226.63s`, so this is not a
+  whole-program median win on this host, though the target
+  `DES_ede3_cbcm_encrypt` slow-proc median improved `86s` → `81s`.
 - Wall-time gap vs OCaml on the 74-file OpenSSL corpus: `~70×`/OOM-killed
-  at the start of the sessions → out-of-box `~5.3×` now (`226.86s / 42.9s`).
+  at the start of the sessions → out-of-box `~5.5×` now (`235.19s / 42.9s`).
 - `OBJ_bsearch_ex_` `max_visit_count=10001` is no longer the dominant story
   in the latest convergence probe; the long tail has shifted to bounded-visit
   DES-family / `OBJ_obj2txt` large-state cost.
 
-Default re-baseline is done; next step is to use the benchmark helper for
-repeated runs/medians and then focus on DES-family large-state procedures
-rather than more `OBJ_bsearch_ex_` convergence work.
+Default repeated re-baselines are done; next step is to profile the
+DES-family large-state path and the stale-key repair overhead rather than
+more `OBJ_bsearch_ex_` convergence work.
 
 ## A. Close the remaining `~6×` wall-time gap
 
@@ -463,6 +467,16 @@ Per `CONVERGENCE_8D4V_FINDINGS.md`, candidates: per-iteration formula
 GC, fold `mark_is_int` into `find_term_value` short-circuit, redesign
 value minting around `LinArith` / `Term` interning.
 
+First stale-key repair probe: after making `term_value_index` repair
+stale keys, the 74-file repeated median was `235.19s` vs the previous
+`226.63s` default median and `238.49s` with opt-in formula GC. Aborts
+improved `20` → `18`, max visit stayed `4`, and
+`DES_ede3_cbcm_encrypt` improved `86s` → `81s` median, but an outlier
+run (`OBJ_obj2txt=95s`, `private_AES_set_decrypt_key=75s`) kept the
+whole-program median from improving. Treat the patch as a targeted DES
+sharing improvement that still needs scan/Arc-clone cost profiling, not
+as a headline whole-program speedup.
+
 **Pros:** structural correctness improvement; closes the last
 identified semantic gap.
 **Cons:** invasive; may not yield much wall-time win on its own
@@ -481,10 +495,9 @@ sessions have been about.
 
 ## Recommended order
 
-1. **Re-baseline defaults** — run the 74-file OpenSSL corpus without
-   explicit `--pulse-max-*` flags now that `pulse-max-wall-secs=60` is
-   the default. Confirm wall/RSS/abort/max-visit numbers and update the
-   out-of-box docs.
+1. **Profile stale-key repair overhead** — the repair improves the target
+   DES slow proc but not whole-program medians yet. Measure miss-scan and
+   `Arc::make_mut` costs before relying on it as a default speedup.
 2. **DES-family large-state investigation** — first probe done on
    `DES_ede3_cbcm_encrypt` with caps disabled. Visits are bounded
    (`max_visit_count=4`), but retained storage grows for minutes:
@@ -493,13 +506,10 @@ sessions have been about.
    edges were **dead/unreachable** from post stack. Formula also grew
    to `~5.25M` linear equations / `~7.60M` intervals. This points to
    retained-state storage/GC, not WTO convergence.
-3. **Benchmark plumbing** — add a helper script that runs the 74-file
-   benchmark N times and extracts wall, max RSS, abort count,
-   max_visit_count, and slow-proc tables to stop chasing host noise.
-4. **OBJ_obj2txt straight-line state explosion** — large retained totals
+3. **OBJ_obj2txt straight-line state explosion** — large retained totals
    with `max_visit_count=1`; likely formula/materialization rather than
    loop convergence.
-5. **D/E** — per-disjunct value-count residue and OCaml parity/reporting
+4. **D/E** — per-disjunct value-count residue and OCaml parity/reporting
    gaps are deeper investments / different tracks.
 
 ## Done so far
@@ -570,6 +580,25 @@ throttling). The whole-program measurement dropped from `~195s` to
 vs noise. Reverted for now; the workspace dep was also removed.
 Will revisit with a quieter host or after more reliable
 benchmarking infrastructure.
+
+### D first pass — stale `term_value_index` repair probe
+
+A local repair for stale `term_value_index` keys was applied and
+re-baselined with `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh`:
+
+| metric | previous default median | stale-key repair median | delta |
+|--------|-------------------------|--------------------------|-------|
+| wall | `226.63s` | `235.19s` | `+3.8%` |
+| max RSS | `13.41 GB` | `13.90 GB` | `+3.6%` |
+| peak footprint | `9.19 GB` | `9.20 GB` | `+0.1%` |
+| aborts | `20` | `18` | `-2` |
+| max_visit_count | `4` | `4` | unchanged |
+
+Slow-proc impact is mixed: `DES_ede3_cbcm_encrypt` improved from
+`86s` to `81s` median, but whole-program wall was noisy and an outlier
+run had `OBJ_obj2txt=95s`. Next step is to profile the repair overhead
+(linear scan on cache miss / `Arc::make_mut` clone risk) before treating
+it as an out-of-box speedup.
 
 ### A third-pass candidates (next)
 

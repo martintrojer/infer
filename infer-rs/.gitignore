@@ -3,3 +3,8 @@
 Cargo.lock
 *.o
 *.sil
+
+# Generated local analysis/benchmark artifacts
+/bench-out
+/infer-rs-out
+/profiles

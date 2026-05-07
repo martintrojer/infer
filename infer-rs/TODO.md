@@ -175,19 +175,22 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 **Current state:** The whole-program OpenSSL run is no longer a
 categorical scaling blocker. On the 74-file partial corpus at
-`-j 4`, the latest no-explicit-cap out-of-box rebaseline completed
-cleanly in `226.86s` (`570 / 570` procs, `~14.0 GB` max RSS,
-`~8.8 GB` peak footprint, `20 / 570` heap+wall aborts,
-`max_visit_count=4`). Whole-program slowdown
-vs OCaml's `42.9s`: `~5.3×` out-of-box. The
-`OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer the
-dominant story in the latest convergence probe; the remaining wall
-time is bounded-visit DES-family / `OBJ_obj2txt` large-state cost.
-See `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
+`-j 4`, the latest no-explicit-cap repeated median after the
+`term_value_index` stale-key repair completed cleanly in `235.19s`
+(`570 / 570` procs, `~13.9 GB` max RSS, `~9.2 GB` peak footprint,
+`18 / 570` heap+wall aborts, `max_visit_count=4`). Whole-program
+slowdown vs OCaml's `42.9s`: `~5.5×` out-of-box. The previous
+default repeated median was `226.63s`, so the latest patch is not a
+whole-program median win on this noisy host, but it improved the target
+`DES_ede3_cbcm_encrypt` slow-proc median (`86s` → `81s`) and reduced
+aborts. The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no
+longer the dominant story; the remaining wall time is bounded-visit
+DES-family / `OBJ_obj2txt` large-state cost. See
+`docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
 `docs/plans/NEXT_STEPS.md` for the headline tables and B-track notes.
 
-Immediate next benchmark task: use `scripts/bench_openssl_partial.sh`
-for repeated runs and compare medians.
+Immediate next benchmark task: profile/measure the stale-key repair overhead
+before relying on it as a whole-program win.
 
 Below: historical `whirlpool_block` notes still useful as context.
 
