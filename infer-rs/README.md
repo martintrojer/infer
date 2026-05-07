@@ -4,23 +4,26 @@ Rust port of [Infer](https://fbinfer.com/)'s Pulse analysis engine for memory sa
 
 Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, found 134. Leaks: expected 20, found 20. UAF: expected 7, found 7.
 
-**OpenSSL whole-program benchmark (74-file partial corpus, post perf sessions):**
+**OpenSSL whole-program benchmark (74-file partial corpus, latest B-track):**
 
-| metric                | OCaml (-j 1) | Rust (now, -j 4)     |
-|-----------------------|---------------|----------------------|
-| wall time             | `42.9s`       | `~195s` (`~3m15s`)   |
-| max RSS               | `~1.17 GB`    | `~19 GB`             |
-| procs analyzed        | `570 / 570`   | `570 / 570`          |
-| heap+wall aborts      | n/a           | `~17 / 570` (`~3%`)  |
-| exit                  | clean (0)     | clean (0)            |
+| metric                | OCaml (-j 1) | Rust (latest, -j 4)       |
+|-----------------------|--------------|----------------------------|
+| wall time             | `42.9s`      | `257s` best verified probe |
+| max RSS               | `~1.17 GB`   | `~10.8 GB`                 |
+| procs analyzed        | `570 / 570`  | `570 / 570`                |
+| heap+wall aborts      | n/a          | `18 / 570` (`~3%`)         |
+| max visit count       | n/a          | `4`                        |
+| exit                  | clean (0)    | clean (0)                  |
 
-Whole-program slowdown vs OCaml: **`~4.5×`** (down from `~70×` and
-OOM-killed at the start of the perf sessions). On the single
-`whirlpool_block` slice we are now **`~32%` faster than OCaml**
-(`~82s` vs OCaml `~120s`, with peak memory `~503 MB` vs OCaml
-`~10 GB`). Defaults: `pulse-max-heap-mb = 2048`,
-`pulse-max-wall-secs = 60`; pass `0` to disable each cap. Full
-summary in `docs/STATUS.md` and `docs/plans/`.
+Whole-program slowdown vs OCaml in the latest best probe: **`~6.0×`**
+(down from `~70×` and OOM-killed at the start of the perf sessions).
+The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer
+the dominant OpenSSL story in the latest convergence probe; the long
+tail has shifted to bounded-visit DES-family large-state procedures.
+Defaults: `pulse-max-heap-mb = 2048`, `pulse-max-wall-secs = 60`; pass
+`0` to disable each cap. Full summary in `docs/STATUS.md` and
+`docs/plans/`. The best probe used explicit `--pulse-max-wall-secs 60`;
+re-baseline without explicit cap flags after the default change.
 
 Historical OpenSSL benchmark notes follow.
 

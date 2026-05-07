@@ -1,19 +1,25 @@
 # Next steps after the perf / scaling sessions
 
-State as of commit `88e02e7af9`:
+State after the B-track fixes through commit `a709280c22`:
 
-- Per-procedure peak: `~16.7 GB` \u2192 `~0.5 GB` on `whirlpool_block`
+- Per-procedure peak: `~16.7 GB` → `~0.5 GB` on `whirlpool_block`
   (`~97%` reduction).
 - Multi-procedure 74-file OpenSSL: OOM-killed at `~30 / 570` procs
-  before this session, now completes `570 / 570` in `~4m25s` clean.
-- Wall-time gap vs OCaml on whole-program OpenSSL: `~40\u00d7` slower
-  before this session \u2192 `~6.2\u00d7` slower now.
+  before the perf/scaling sessions, now completes `570 / 570` clean.
+- Best latest 74-file OpenSSL `-j 4` probe with `--pulse-max-wall-secs 60`:
+  `257s`, `~10.8 GB` max RSS, `18 / 570` aborts, `max_visit_count=4`.
+- Wall-time gap vs OCaml on the 74-file OpenSSL corpus: `~70×`/OOM-killed
+  at the start of the sessions → best observed `~6.0×` now (`257s / 42.9s`).
+- `OBJ_bsearch_ex_` `max_visit_count=10001` is no longer the dominant story
+  in the latest convergence probe; the long tail has shifted to bounded-visit
+  DES-family / `OBJ_obj2txt` large-state cost.
 
-The remaining gaps are first-order CPU efficiency on per-disjunct
-analysis work, not categorical scaling problems. The major candidate
-tracks below are listed by leverage and concrete actionability.
+Immediate next step: re-baseline with no explicit cap flags now that
+`pulse-max-wall-secs=60` is the default, then update the out-of-box
+checkpoint. After that, focus on DES-family large-state procedures rather
+than more `OBJ_bsearch_ex_` convergence work.
 
-## A. Close the remaining `~6.2\u00d7` wall-time gap
+## A. Close the remaining `~6×` wall-time gap
 
 **Concrete next step:** profile a representative slow procedure (or
 the whole-program run) with `cargo flamegraph` / `samply` to find
@@ -375,13 +381,22 @@ sessions have been about.
 
 ## Recommended order
 
-1. **C** — trivial change, immediate user benefit.
-2. **A** — the single biggest remaining user-facing problem;
-   profiling will likely uncover small fixes that compound into a
-   `~2-3×` speedup.
-3. **B** — surgical fixpoint fix; small risk of getting stuck in
-   debugging.
-4. **D** and **E** are deeper investments / different tracks.
+1. **Re-baseline defaults** — run the 74-file OpenSSL corpus without
+   explicit `--pulse-max-*` flags now that `pulse-max-wall-secs=60` is
+   the default. Confirm wall/RSS/abort/max-visit numbers and update the
+   out-of-box docs.
+2. **DES-family large-state investigation** — start with
+   `DES_ede3_cbcm_encrypt` or `DES_ofb_encrypt`. Visits are bounded
+   (`max_visit_count <= 4`), so the next gap is per-state/per-disjunct
+   heap/attrs/formula cost, not WTO convergence.
+3. **Benchmark plumbing** — add a helper script that runs the 74-file
+   benchmark N times and extracts wall, max RSS, abort count,
+   max_visit_count, and slow-proc tables to stop chasing host noise.
+4. **OBJ_obj2txt straight-line state explosion** — large retained totals
+   with `max_visit_count=1`; likely formula/materialization rather than
+   loop convergence.
+5. **D/E** — per-disjunct value-count residue and OCaml parity/reporting
+   gaps are deeper investments / different tracks.
 
 ## Done so far
 
@@ -390,8 +405,8 @@ sessions have been about.
 `pulse-max-heap-mb` now defaults to `2048` (2 GB) and
 `pulse-max-wall-secs` defaults to `60s`. The 74-file partial
 OpenSSL run completes cleanly out of the box with no flag tuning
-(`570 / 570` procs, `~9 min` wall, `~20 GB` max RSS, `~20`
-aborts). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
+(`570 / 570` procs; latest explicit-60s probe: `257s`, `~10.8 GB`
+max RSS, `18` aborts, `max_visit_count=4`). Pass `--pulse-max-heap-mb 0` / `--pulse-max-wall-secs 0`
 to disable each cap (escape hatch documented in CLI help).
 
 ### A second pass — remaining sort_by_key sites converted (commit `d5d0488bd2`)

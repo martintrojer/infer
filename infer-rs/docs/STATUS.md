@@ -6,26 +6,28 @@
 
 ## OpenSSL Benchmark
 
-### Current state (74-file partial capture, post perf sessions)
+### Current state (74-file partial capture, latest B-track)
 
 The whole-program OpenSSL run is no longer a categorical scaling
 blocker. Headline numbers on the 74-file partial capture under
 `~/infer-rs-bench/openssl-20260501-084151/`:
 
-| metric                      | OCaml (-j 1)    | Rust (now, -j 4)         |
-|-----------------------------|-----------------|---------------------------|
-| wall time                   | `42.9s`         | `~195s` / `~3m15s`        |
-| max RSS                     | `~1.17 GB`      | `~19 GB`                  |
-| peak memory footprint       | `~1.10 GB`      | `~5.7 - 7.5 GB`           |
-| procs analyzed              | `570 / 570`     | `570 / 570`               |
-| heap+wall aborts            | n/a             | `~17 / 570` (`~3%`)       |
-| exit                        | clean (`0`)     | clean (`0`)               |
+| metric                      | OCaml (-j 1)    | Rust (latest, -j 4)       |
+|-----------------------------|-----------------|----------------------------|
+| wall time                   | `42.9s`         | `257s` best verified probe |
+| max RSS                     | `~1.17 GB`      | `~10.8 GB`                 |
+| procs analyzed              | `570 / 570`     | `570 / 570`                |
+| heap+wall aborts            | n/a             | `18 / 570` (`~3%`)         |
+| max visit count             | n/a             | `4`                        |
+| exit                        | clean (`0`)     | clean (`0`)                |
 
-Whole-program slowdown vs OCaml: **`~4.5×`** (down from `~70×` and
-OOM-killed at the start of the perf sessions). On the single
-`whirlpool_block` slice we are now **`~32%` faster than OCaml**
-(`~82s` vs OCaml `~120s`, with peak memory `~503 MB` vs OCaml
-`~10 GB`).
+Whole-program slowdown vs OCaml in the latest best probe: **`~6.0×`**
+(down from `~70×` and OOM-killed at the start of the perf sessions).
+The `OBJ_bsearch_ex_` `max_visit_count=10001` pathology is no longer
+the dominant OpenSSL story in the latest convergence probe; the long
+tail has shifted to bounded-visit DES-family large-state procedures.
+The best probe used explicit `--pulse-max-wall-secs 60`; re-baseline
+without explicit cap flags after the default change.
 
 The wins came from a series of structural-sharing, per-procedure
 cap, and per-instruction-cost-reduction commits documented in
@@ -48,7 +50,9 @@ cap, and per-instruction-cost-reduction commits documented in
   sort keys in `Canonicalizer::propagate_*` (the single biggest
   per-procedure CPU win).
 - `NEXT_STEPS.md`: A / B / C / D / E candidate work list and what's
-  done so far.
+  done so far, including B-pass fixes for widen semantics, attribute
+  timestamp canonicalization, dynamic-type canonicalization,
+  stopped-state identity transfer, and post-stable WTO convergence.
 
 Use `--pulse-max-heap-mb 0` and `--pulse-max-wall-secs 0` to
 disable each cap (escape hatches for benchmarking).
@@ -58,6 +62,9 @@ disable each cap (escape hatches for benchmarking).
   cd ~/infer-rs-bench/openssl-20260501-084151
   /usr/bin/time -l target/release/infer-rs --pulse-only --quiet \
     --trace-ondemand -j 4 textual-out/*.sil
+
+The latest best probe used `--pulse-max-wall-secs 60`, now the default.
+Use a no-explicit-cap rerun as the next out-of-box checkpoint.
 
 Older historical OpenSSL benchmark notes follow.
 

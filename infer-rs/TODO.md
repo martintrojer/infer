@@ -175,15 +175,19 @@ cluster above. Do not try to "fix" `sizeof.c` in Pulse or suppress `FN_nullptr_d
 
 **Current state:** The whole-program OpenSSL run is no longer a
 categorical scaling blocker. On the 74-file partial corpus at
-`-j 4` with default caps, the run completes cleanly in `~3m15s`
-(`570 / 570` procs, `~19 GB` max RSS, `~17 / 570` heap+wall
-aborts). Whole-program slowdown vs OCaml's `42.9s`: `~4.5×`. On
-`whirlpool_block` alone we are now `~32%` faster than OCaml. See
+`-j 4`, the latest best probe with `--pulse-max-wall-secs 60`
+completed cleanly in `257s` (`570 / 570` procs, `~10.8 GB` max RSS,
+`18 / 570` heap+wall aborts, `max_visit_count=4`). Whole-program
+slowdown vs OCaml's `42.9s`: `~6.0×`. The `OBJ_bsearch_ex_`
+`max_visit_count=10001` pathology is no longer the dominant story in
+the latest convergence probe; the remaining wall time is bounded-visit
+DES-family / `OBJ_obj2txt` large-state cost. See
 `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
-`docs/plans/NEXT_STEPS.md` for the headline tables and the third-
-pass perf candidates that remain (FxHashMap on `Procname`-keyed
-maps, `OBJ_bsearch_ex_` fixpoint convergence bug, per-disjunct
-value-count residue).
+`docs/plans/NEXT_STEPS.md` for the headline tables and B-track notes.
+
+Immediate next benchmark task: re-run the 74-file corpus with no
+explicit cap flags now that `pulse-max-wall-secs=60` is the default,
+then update the out-of-box checkpoint.
 
 Below: historical `whirlpool_block` notes still useful as context.
 

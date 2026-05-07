@@ -298,26 +298,22 @@ Most of the older `whirlpool_block` retained-state probes are
 resolved by the perf sessions documented in `docs/plans/`. Current
 live candidates (full ranked list in `docs/plans/NEXT_STEPS.md`):
 
-- **A third pass (next):** the previous `samply` profile residue
-  pointed at `<TemplateSpecInfo as Hash>::hash` (`~3.6%` self-time,
-  presumably from `Procname` HashMap lookups) and `Vec::clone`
-  (`~3.5%` across multiple sources). Tried switching
-  `SummaryStore`'s `DashMap<Procname, ...>` to `FxHasher` once but
-  measurements were too noisy on this host to attribute the change
-  vs noise; reverted. Next attempt should be on a quieter host or
-  with better benchmark plumbing.
-- **B (open):** `OBJ_bsearch_ex_` shows `max_visit_count = 6450`
-  even though `pulse_widen_threshold = 3` should stop revisiting
-  after `~3` widening iterations. Likely a real fixpoint-
-  convergence bug in our WTO scheduler or `widen` impl. Bounded
-  via `pulse-max-wall-secs` for now; clean fix would remove a
-  long-tail wall-time source.
-- **D (open):** per-disjunct value-count residue (`+637 / tier`
-  vs OCaml's `+0 / tier`) on `whirlpool_block`. Open candidates
-  are per-iteration formula GC and folding `mark_is_int` into the
-  `find_term_value` short-circuit — invasive but real.
-- **E (open):** OCaml parity gaps in `TODO.md` (mostly compliance
-  / message detail; different track from the perf work).
+- **Re-baseline defaults (next):** run the 74-file OpenSSL corpus
+  without explicit `--pulse-max-*` flags now that
+  `pulse-max-wall-secs=60` is the default. Confirm wall/RSS/abort/
+  max-visit numbers and update the out-of-box checkpoint.
+- **DES-family large-state investigation:** the latest B-track probe
+  removes the `OBJ_bsearch_ex_` `max_visit_count=10001` pathology
+  (`max_visit_count=4`), but the wall-time long tail is now bounded-
+  visit DES-family procedures (`DES_ede3_cbcm_encrypt`,
+  `DES_ofb_encrypt`, `DES_cfb_encrypt`, etc.) plus `OBJ_obj2txt`.
+  Focus on per-state/per-disjunct heap/attrs/formula cost, not WTO
+  convergence.
+- **Benchmark plumbing:** add a helper script to run the OpenSSL
+  partial benchmark N times and extract wall, max RSS, abort count,
+  max_visit_count, and slow-proc tables. Host noise is still large.
+- **D/E (open):** per-disjunct value-count residue and OCaml parity
+  gaps in `TODO.md` are deeper investments / different tracks.
 
 ### Resolved (for reference)
 
@@ -333,6 +329,7 @@ live candidates (full ranked list in `docs/plans/NEXT_STEPS.md`):
   cleanly with default caps now.
 - The old "continue whole-program OpenSSL work on the publishable
   surfaces" line: published, see
-  `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md`. Headline:
-  `~70× / OOM-killed` → `~4.5× / clean` vs OCaml on the 74-file
-  partial corpus.
+  `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
+  `docs/plans/NEXT_STEPS.md`. Headline now: `~70× / OOM-killed`
+  → best observed `~6.0× / clean` vs OCaml on the 74-file partial
+  corpus, with `max_visit_count=4` in the latest convergence probe.
