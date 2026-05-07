@@ -348,6 +348,38 @@ pathology in this probe. Wall time remains noisy/worse, dominated by
 large DES-family states and abort behavior, but the WTO convergence
 bug is gone on this run.
 
+
+### DES-family first probe: uncapped `DES_ede3_cbcm_encrypt`
+
+Ran a focused isolated probe with caps disabled:
+
+```sh
+RUST_LOG=warn,ondemand=info target/release/infer-rs   --pulse-only --quiet --trace-ondemand -j 1   --procedures-filter DES_ede3_cbcm_encrypt   --pulse-max-wall-secs 0 --pulse-max-heap-mb 0   ~/infer-rs-bench/openssl-20260501-084151/textual-out/*.sil
+```
+
+Stopped manually after `13m40s` to avoid a long uncapped run. Key snapshot:
+
+- analyzed dependencies: `__infer_globals_initializer_DES_SPtrans`, `DES_encrypt1`,
+  `DES_ede3_cbcm_encrypt`
+- `max_visit_count=4`, `max_node_disjuncts=20` — convergence is bounded
+- retained states: `3241` disjuncts across `201` nodes
+- retained post total: `~28.1M` heap nodes / `~55.2M` heap edges
+- retained post **dead** total: `~25.6M` heap nodes / `~50.3M` heap edges
+- retained post live total: `~2.5M` heap nodes / `~4.85M` heap edges
+- formula total: `~5.25M` linear equations / `~7.60M` intervals /
+  `~6.18M` is-int facts / `~2.57M` equalities
+- process RSS at manual stop: `~6.3GB`
+
+Interpretation: the DES long tail is not a widen/WTO visit-count problem. It is
+retained-state storage dominated by dead/unreachable post graph and formula volume.
+`state_cmp` already ignores disconnected retained heap/attrs for comparison, but
+we still physically store and clone them in invariant maps. The next real lever is
+safe retained-state GC / storage shrinking that preserves leak reporting semantics.
+
+Concrete next probe: compare OCaml's retained invariant storage for the same proc
+(or inspect `PulseAbductiveDomain.get_unreachable_attributes` / leak filtering) to
+understand when it is safe to drop dead post graph without losing leak diagnostics.
+
 ## C. Set sensible cap defaults
 
 Currently both `--pulse-max-heap-mb` and `--pulse-max-wall-secs`
@@ -386,10 +418,14 @@ sessions have been about.
    explicit `--pulse-max-*` flags now that `pulse-max-wall-secs=60` is
    the default. Confirm wall/RSS/abort/max-visit numbers and update the
    out-of-box docs.
-2. **DES-family large-state investigation** — start with
-   `DES_ede3_cbcm_encrypt` or `DES_ofb_encrypt`. Visits are bounded
-   (`max_visit_count <= 4`), so the next gap is per-state/per-disjunct
-   heap/attrs/formula cost, not WTO convergence.
+2. **DES-family large-state investigation** — first probe done on
+   `DES_ede3_cbcm_encrypt` with caps disabled. Visits are bounded
+   (`max_visit_count=4`), but retained storage grows for minutes:
+   after `13m40s`, retained post totals reached `~28.1M` heap nodes /
+   `~55.2M` heap edges, of which `~25.6M` heap nodes and `~50.3M`
+   edges were **dead/unreachable** from post stack. Formula also grew
+   to `~5.25M` linear equations / `~7.60M` intervals. This points to
+   retained-state storage/GC, not WTO convergence.
 3. **Benchmark plumbing** — add a helper script that runs the 74-file
    benchmark N times and extracts wall, max RSS, abort count,
    max_visit_count, and slow-proc tables to stop chasing host noise.
