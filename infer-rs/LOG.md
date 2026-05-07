@@ -298,7 +298,7 @@ Most of the older `whirlpool_block` retained-state probes are
 resolved by the perf sessions documented in `docs/plans/`. Current
 live candidates (full ranked list in `docs/plans/NEXT_STEPS.md`):
 
-- **Re-baseline defaults (next):** use `scripts/bench_openssl_partial.sh` for repeated 74-file OpenSSL runs. The one-shot no-explicit-cap checkpoint is `498s` / `13.3GB` / `18` aborts / `max_visit_count=4`, but host noise is still large.
+- **Re-baseline defaults (next):** use `scripts/bench_openssl_partial.sh` for repeated 74-file OpenSSL runs. The one-shot no-explicit-cap checkpoint is `226.86s` / `14.0GB` max RSS / `20` aborts / `max_visit_count=4`, but host noise is still large.
 - **DES-family large-state investigation:** the latest B-track probe
   removes the `OBJ_bsearch_ex_` `max_visit_count=10001` pathology
   (`max_visit_count=4`), but the wall-time long tail is now bounded-
@@ -328,6 +328,6 @@ live candidates (full ranked list in `docs/plans/NEXT_STEPS.md`):
   surfaces" line: published, see
   `docs/plans/WHOLE_PROGRAM_OPENSSL_FINDINGS.md` and
   `docs/plans/NEXT_STEPS.md`. Headline now: `~70× / OOM-killed`
-  → out-of-box `~11.6× / clean` and best observed `~6.0× / clean`
-  vs OCaml on the 74-file partial corpus, with `max_visit_count=4`
+  → out-of-box `~5.3× / clean` vs OCaml on the 74-file partial
+  corpus, with `max_visit_count=4`
   in the latest convergence probes.

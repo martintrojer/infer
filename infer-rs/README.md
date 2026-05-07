@@ -8,15 +8,15 @@ Current authoritative store-textual sweep: 52/55 C files. NPE: expected 131, fou
 
 | metric                | OCaml (-j 1) | Rust (latest, -j 4)                                      |
 |-----------------------|--------------|-----------------------------------------------------------|
-| wall time             | `42.9s`      | `498s` out-of-box rebaseline; `257s` best observed probe |
-| max RSS               | `~1.17 GB`   | `~13.3 GB` out-of-box; `~10.8 GB` best observed          |
+| wall time             | `42.9s`      | `226.86s` latest out-of-box rebaseline |
+| max RSS               | `~1.17 GB`   | `~14.0 GB` max RSS (`~8.8 GB` peak footprint)          |
 | procs analyzed        | `570 / 570`  | `570 / 570`                                              |
-| heap+wall aborts      | n/a          | `18 / 570` (`~3%`)                                       |
+| heap+wall aborts      | n/a          | `20 / 570` (`~3.5%`)                                       |
 | max visit count       | n/a          | `4`                                                       |
 | exit                  | clean (0)    | clean (0)                                                |
 
 Whole-program slowdown vs OCaml in the latest out-of-box rebaseline:
-**`~11.6×`** (`~6.0×` best observed probe), down from `~70×` and
+**`~5.3×`**, down from `~70×` and
 OOM-killed at the start of the perf sessions. The `OBJ_bsearch_ex_`
 `max_visit_count=10001` pathology is no longer the dominant OpenSSL
 story in the latest convergence probe; the long tail has shifted to
