@@ -367,3 +367,86 @@ Observed suspicious patterns to investigate next:
 
 This file is the artifact of the first whole-program OpenSSL pass.
 Future passes should append findings here rather than overwriting.
+
+## Update: B-track convergence and DES retained-state GC (commits `0a4cd8437b` through `64b6e23b87`)
+
+Follow-on B-track work after the `ValueSortKey` wins resolved the
+`OBJ_bsearch_ex_` WTO safety-cap pathology and shifted the OpenSSL
+long tail to bounded-visit large-state procedures.
+
+Key fixes:
+
+- `0a4cd8437b`: match OCaml widen semantics in `DisjunctiveDomain`.
+  The over-iteration branch now returns `prev` exactly, and the
+  within-threshold branch returns `prev` when the joined state makes no
+  semantic progress. This avoids `had_dropped_disjuncts` metadata
+  preventing outer fixpoint convergence.
+- `ab871f0b50`: strip trace-ordering timestamps from
+  `state_cmp::canonical_attr` for `MustBeValid`, `MustBeInitialized`,
+  and `WrittenTo`. These timestamps are not semantic, and including them
+  caused fresh-but-equivalent fixpoint iterations to compare unequal.
+- `7bf86fd5c9`: include dynamic-type bindings in `state_cmp`
+  canonicalization. Rust stores these outside `Phi`, while OCaml's
+  corresponding type constraints participate in the path condition and
+  `leq`.
+- `c9876741d2`: short-circuit `exec_node` when no `ContinueProgram`
+  disjunct remains. Transfer is the identity for stopped states, so this
+  avoids cloning latent/abort states through every instruction.
+- `3c1a720e78`: treat stable post-state as WTO node convergence even when
+  pre-state churn remains. Successors depend on post-state, so if
+  `post.leq(old_post)` holds, re-running the component solely for
+  pre-only churn is unnecessary.
+- `00f73c1e6d`: prune unreachable post heap/attrs from large
+  intermediate invariant-map states. `state_cmp` already ignores this
+  disconnected storage; we now stop storing most of it physically.
+- `64b6e23b87`: make targeted intermediate formula GC opt-in via
+  `--pulse-intermediate-formula-gc`. It prunes unreachable `intervals`
+  and `is_int` facts, reducing RSS on DES-style procedures at a wall-time
+  cost on capped whole-program runs.
+
+Latest no-explicit-cap out-of-box 74-file checkpoint (`-j 4`, defaults
+`pulse-max-heap-mb=2048`, `pulse-max-wall-secs=60`, formula GC off):
+
+| metric                | OCaml (-j 1) | Rust latest default (-j 4) |
+|-----------------------|--------------|-----------------------------|
+| wall time             | `42.9s`      | **`226.86s`**               |
+| max RSS               | `~1.17 GB`   | `~14.0 GB`                  |
+| peak memory footprint | `~1.10 GB`   | `~8.8 GB`                   |
+| procs analyzed        | `570 / 570`  | `570 / 570`                 |
+| heap+wall aborts      | n/a          | `20 / 570`                  |
+| max visit count       | n/a          | **`4`**                     |
+| exit                  | clean (`0`)  | clean (`0`)                 |
+
+Current slowdown vs OCaml: `226.86 / 42.9 ~= 5.3×` (down from
+`~70×`/OOM-killed at the start of the scaling sessions). The old
+`OBJ_bsearch_ex_ max_visit_count=10001` symptom is not present in the
+latest convergence probes; the remaining long tail is bounded-visit
+large-state cost.
+
+Focused DES-family probe (`DES_ede3_cbcm_encrypt`, caps disabled):
+
+| metric | before retained-state GC | after heap/attr GC | with opt-in formula GC |
+|--------|---------------------------|--------------------|-------------------------|
+| completion | stopped at `13m40s` | completed `11m04s` | completed `8m50s` |
+| max RSS | `~6.3 GB` at stop | `~3.99 GB` | `~3.69 GB` |
+| peak footprint | n/a | `~4.01 GB` | `~3.20 GB` |
+| retained post heap nodes | `~28.1M` | `~2.88M` | `~2.88M` |
+| retained post heap edges | `~55.2M` | `~5.58M` | `~5.58M` |
+| dead post heap nodes/edges | `~25.6M / ~50.3M` | `276 / 276` | `276 / 276` |
+| formula lin | `~5.25M` at stop | `~5.73M` final | `~5.73M` final |
+| formula intervals | `~7.60M` at stop | `~8.26M` final | `~3.38M` final |
+| formula is_int | n/a | `~6.76M` final | `~0.88M` final |
+| max_visit_count | `4` | `4` | `4` |
+
+Interpretation: DES-family costs are no longer WTO convergence issues.
+They are retained-state storage and formula-volume issues. Heap/attr GC
+is a clear default win; formula GC is useful for memory-sensitive or
+uncapped focused runs but remains opt-in because it slows capped
+whole-program OpenSSL on this host.
+
+Next work should target:
+
+1. repeated-run benchmark medians via `scripts/bench_openssl_partial.sh`,
+2. profiling bounded-visit DES-family procedures after heap/attr GC, and
+3. cheaper/incremental formula cleanup for the remaining linear-equality
+   residue.
