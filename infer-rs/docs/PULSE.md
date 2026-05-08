@@ -113,4 +113,4 @@ void uaf() {
 - **Taint analysis**: separate concern, can be added later if needed.
 - **TOPL**: temporal property language — orthogonal to Pulse core.
 
-See [TODO.md](../TODO.md) for remaining gaps and backlog.
+See [`STATUS.md`](STATUS.md) for current status and `mu task list -w infer-rs --status OPEN` for the active backlog.

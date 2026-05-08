@@ -1,482 +1,76 @@
-# Whole-program OpenSSL findings (74-file partial capture)
+# Whole-program OpenSSL findings archive
 
-First pass at track (B) from `CONVERGENCE_NEXT_STEPS.md`: validate the
-Phase 1 Arc savings on whole-program OpenSSL.
+This is an archive of the OpenSSL scaling/performance investigation. Current
+benchmark numbers live in [`../STATUS.md`](../STATUS.md). Active follow-up work
+lives in `mu` tasks.
 
-## Bench
-
-The `make -k` capture pipeline kept stalling silently mid-build on this
-host, so the corpus is the 74-file partial export it had managed before
-dying:
-
-- Source tree: `~/infer-rs-bench/openssl-20260501-084151/openssl-1.0.2d/`
-- Capture DB: `~/infer-rs-bench/openssl-20260501-084151/infer-out/`
-  (74 source files, 571 procedures)
-- Textual export:
-  `~/infer-rs-bench/openssl-20260501-084151/textual-out/`
-  (74 `.sil` files, ~3.9 MB / ~93k lines total)
-
-This is much smaller than the historical 753-file shared corpus, but it's
-sufficient to multiply the per-procedure cost by enough to surface
-multi-procedure scaling problems.
-
-## Headline result: per-procedure Arc gains do not survive scaling
-
-Running both engines on the same 74-file corpus at `-j 1`:
-
-| metric                | OCaml                   | Rust (post-Arc)                |
-|-----------------------|--------------------------|--------------------------------|
-| wall time             | `42.9s`                  | `494.75s` (`~11.5×` slower)    |
-| max resident set size | `~1.17 GB`               | `~23.43 GB` (`~20×` more)      |
-| peak memory footprint | `~1.10 GB`               | `~236.69 GB` (cumulative)      |
-| exit                  | clean (`0`)              | terminated abnormally (`1`)    |
-| specs / procs         | `447` summaries written  | terminated before completion   |
-
-## Reframe vs the single-procedure picture
-
-The single-procedure `whirlpool_block` filtered probe showed Rust
-post-Arc using `~3.93 GB` peak vs OCaml's `~10 GB` peak — Rust was
-`~2.6×` *more efficient* on that one procedure. The 74-file
-multi-procedure run flips that completely: OCaml ends up using
-`~20×` *less* peak memory than Rust.
-
-What that means:
-
-- Rust's per-procedure peak is comparable to OCaml's when run in
-  isolation, but **across a 74-file corpus we accumulate state we never
-  release**, and the cumulative resident set climbs to ~`23 GB`.
-- OCaml's per-procedure analysis can hit `~10 GB` peak too (on
-  `whirlpool_block`), but its whole-program peak stays `~1.17 GB`
-  because it aggressively releases per-procedure transient state
-  between procedures.
-
-The Phase 1 Arc work was a real win on per-procedure peak (`16.7 GB`
-\u2192 `3.93 GB` on the filtered slice). But at scale the dominant cost is
-not per-state size; it is **per-procedure state retention across
-procedure boundaries**. That is a different problem, and Phase 1 Arc by
-itself does not address it.
-
-## Update: per-procedure peak_rss heartbeats
-
-Added `peak_rss=...` to the Pulse `done:` heartbeat (commit
-`cacd0973cb`) and re-ran a 15-file OpenSSL slice with
-`--trace-ondemand`. First three procedures to finish:
-
-```
-proc=private_AES_set_encrypt_key done: elapsed=49.0s ... peak_rss=252MB
-proc=AES_encrypt                  done: elapsed=15.8s ... peak_rss=308MB
-proc=AES_decrypt                  done: elapsed=15.8s ... peak_rss=378MB
+```sh
+mu task list -w infer-rs --status OPEN
 ```
 
-That is `~+50-70 MB` per finished procedure, even on small / fast
-procedures. Extrapolating to `571` procedures gives `~30 GB` of
-cumulative growth, which matches the observed `~23 GB` whole-program
-max RSS reasonably well.
+## Current follow-up task IDs
 
-The same trace run also showed a hard outlier: `DES_ede3_cfb_encrypt`
-(in `cfb64ede.sil`, `276` nodes / `~1822` Procdesc::size) was still
-running after `~17 minutes` with `4400+` retained disjuncts and
-`~726k` total post stack entries / `~488k` total addrs in attrs / `~9k`
-const_cache entries in retained sums. OCaml runs the entire same
-74-file corpus in `42.9s`, so this procedure must take seconds in
-OCaml. We have the same kind of byte-loop encryption pattern as
-`whirlpool_block`, but the absolute disjunct count here
-(`4400+` vs whirlpool_block's `8`) is dramatically worse.
+- `perf_profile_des_formula_volume`
+- `perf_investigate_obj_obj2txt_state_explosion`
+- `perf_incremental_formula_cleanup`
+- `perf_component_clone_reduction`
+- `openssl_reexport_shared_corpus`
 
-So the picture splits into two distinct gaps, both real:
+## Headline conclusions preserved from the investigation
 
-- **Per-procedure baseline accumulation**: ~`+50-70 MB` per finished
-  procedure. Likely the SummaryStore (or some other long-lived cache)
-  retaining heavy `AbductiveDomain`-shaped state per analyzed
-  procedure.
-- **Per-procedure outlier explosion**: a small number of procedures
-  (`DES_ede3_cfb_encrypt`, plausibly the same family that includes
-  `whirlpool_block`) generate `1000s` of retained disjuncts. These
-  dominate total wall time *and* total memory, not the per-proc
-  baseline. This is the same root cause as the deferred (A) follow-up
-  on per-disjunct unique-value count vs OCaml.
+- The 74-file partial OpenSSL corpus now completes out of the box under default
+  per-procedure heap/wall caps.
+- The original `OBJ_bsearch_ex_ max_visit_count=10001` convergence pathology is
+  no longer the dominant blocker after the B-track convergence fixes.
+- The remaining long tail is mostly bounded-visit large-state cost, especially
+  DES-family procedures and `OBJ_obj2txt`.
+- Heap/attribute retained-state pruning was a clear default win.
+- Formula GC improves memory headroom in focused/uncapped runs but was not a
+  capped whole-program wall-time win on this host, so it remains opt-in.
+- Stale `term_value_index` repair was rejected for the default path: it helped a
+  selected DES slow proc but worsened whole-program median wall time and focused
+  counters showed no repair hits.
+- Direct term-value cache reuse and cached-comparison pruning remain valuable;
+  cheap TermKey shape normalization was measured on focused DES and rejected as
+  inert for that target.
 
-Of the two, the outlier-explosion gap has the bigger lever: a single
-procedure currently consumes more wall time than the entire 74-file
-OCaml run.
+## Dated benchmark checkpoints
 
-## Update: dropping dead logical-var bindings is a per-procedure win
+See [`../STATUS.md`](../STATUS.md) for the current dashboard. Historical
+checkpoints from the investigation are intentionally not repeated here as active
+status tables to avoid drift; recover exact raw numbers from:
 
-Follow-up: the missing-`ExitScope`-cleanup hypothesis turned out to be
-right. Commit `1e2bf5cb9d` adds a per-node-exit pass that drops
-`Var::LogicalVar(_)` post-stack bindings whose Ident is not live-out
-of the node (driven by backward liveness, preserving the return-value
-candidate). Measured impact:
+- commit messages in the performance branch,
+- `mu` task notes in workstream `infer-rs`, and
+- ignored benchmark artifacts under `infer-rs/bench-out/` when preserved.
 
-- Filtered single-procedure `whirlpool_block` slice:
-  `~3.93 GB` peak → **`~0.77 GB` peak** (`~5×` smaller), `4m33s`
-  → `4m18s` wall (small win). We are now `~13×` below OCaml on memory
-  for this one procedure (OCaml peaks at `~10 GB`, runs in `~120s`).
-- 74-file whole-program corpus at `-j 1`: in a re-run with the drop
-  pass on, the analyzer survived past the previous `~8 min` OOM
-  point. RSS still climbed to `~24 GB` peak then started reclaiming
-  to `~11.6 GB` at `54+ min`, where the run was killed manually.
-  Wall time, not memory, is now the dominant blocker on the
-  multi-procedure slice (OCaml: `42.9s` for the whole 74 files).
+Known preserved artifact paths from the latest sessions include:
 
-What that updates:
+- `infer-rs/bench-out/current-head-openssl-20260507-170249/`
+- prior `openssl-partial-*` benchmark directories mentioned in `mu` notes.
 
-- **Per-procedure baseline accumulation gap** is largely closed for
-  the per-procedure peak (the metric that was extrapolating to
-  ~30 GB across 571 procs). The remaining whole-program RSS we still
-  see at scale is likely a mix of the SummaryStore retention and
-  per-disjunct cost still being too high on encryption-style outliers.
-- The new top blocker on whole-program OpenSSL is **wall time**, not
-  memory. The drop pass adds liveness-analysis CPU per procedure and
-  per-disjunct cost remains high; together they make multi-procedure
-  runs much slower than OCaml.
-- The next-step queue from `CONVERGENCE_NEXT_STEPS.md` should now
-  prioritize **wall-time CPU per disjunct** (the original (A)-reframe
-  target: reduce per-disjunct unique-value count) over memory tracks.
+## How to reproduce the benchmark
 
-## Update: OCaml also caps DES_ede3_cfb_encrypt at 20 disjuncts/node
+```sh
+cd infer-rs
+OUT_DIR="$(pwd)/bench-out/current-head-openssl-$(date +%Y%m%d-%H%M%S)" \
+  RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh
+```
 
-Follow-up: re-checked OCaml's `--debug` HTML for `DES_ede3_cfb_encrypt`
-specifically (in the partial corpus). OCaml retains up to **`20`**
-disjuncts per node on this same procedure, hitting the same
-`pulse_max_disjuncts = 20` cap as us. So the disjunct *count* per node
-is not the differentiator.
+For focused procedure probes, use the shared OpenSSL Textual export and a
+procedure filter, for example:
 
-What's different is then **per-disjunct cost**: each of our retained
-disjuncts is much more expensive to manipulate than OCaml's. The
-whirlpool_block comparison showed our per-disjunct unique-value count
-at ~`1500-3000` vs OCaml's ~`487`, a `3-6×` gap. The same factor likely
-applies here, multiplied by `~20` disjuncts per node `×` `~262` nodes
-`×` per-iteration manipulation cost, which compounds into the observed
-`~17 minutes vs <43 seconds` wall-time gap.
+```sh
+RUST_LOG=warn,ondemand=info target/release/infer-rs \
+  --pulse-only --quiet --trace-ondemand -j 1 \
+  --procedures-filter DES_ede3_cbcm_encrypt \
+  --pulse-max-wall-secs 0 --pulse-max-heap-mb 0 \
+  ~/infer-rs-bench/openssl-20260501-084151/textual-out/*.sil
+```
 
-With this update, the "outlier explosion" framing collapses into the
-original **(A) reframe** from `CONVERGENCE_NEXT_STEPS.md`: reduce
-per-disjunct unique-value count by sharing abstract values across
-chained field/array accesses (the way OCaml does). The single
-outstanding investigative question is what specifically OCaml does
-during `Load (Lfield ...)`, `Load (Lindex ...)`, and chained
-`field-of-field` reads that we do not, and whether porting that yields
-a proportional drop in per-disjunct value count on encryption-style
-byte loops.
+## Related archive docs
 
-## Hypotheses for the per-procedure retention gap
-
-In rough priority order:
-
-1. **Summary cache retention.** We may keep full
-   `AbductiveDomain`-shaped summaries (heavy heap / attrs / formula)
-   alive in the per-program summary cache for every analyzed procedure.
-   OCaml normalizes summaries down to a much sparser external
-   representation and frees the working state.
-2. **Per-procedure invariant maps not dropped after fixpoint.** If we
-   hold the per-procedure
-   `interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>` after the
-   fixpoint completes, the retained per-disjunct state for every node
-   stays resident until the analysis run ends.
-3. **Implicit dependency re-analysis.** If we re-analyze each callee
-   from scratch at every call site instead of cached summaries, the
-   per-call peak adds up on a 74-file corpus the way it did not on a
-   single-procedure run.
-4. **Worker / scheduler accumulating per-procedure caches.** Even at
-   `-j 1`, retained caches outside the per-procedure scope (e.g.,
-   global tenv, model cache, or a single ondemand worker holding stale
-   `AbductiveDomain`s) would show up as continual growth.
-5. **Top-up `Arc` clones across procs.** The Phase 1 Arc work shares
-   the heap / attrs / stack / phi *within a single fixpoint*. Once one
-   procedure finishes, those Arcs would naturally drop unless we copy
-   them into a long-lived summary for callers. If we do, that explains
-   why Arc helps per-procedure peak but not whole-program peak.
-
-The expected fix is probably layered: shrink the per-procedure summary
-representation we keep around (1, 5), then make sure invariant maps are
-dropped at procedure-end (2), then revisit ondemand caches (4).
-
-## What this changes in `CONVERGENCE_NEXT_STEPS.md`
-
-After the per-procedure `peak_rss` heartbeat data above, the picture
-updates: there are *two* distinct gaps, not one.
-
-- **Per-disjunct cost gap (top priority)**: a small number of
-  procedures (`DES_ede3_cfb_encrypt`, plausibly the same family that
-  includes `whirlpool_block`) sit at the `pulse_max_disjuncts = 20`
-  cap on most nodes, just like OCaml does, but each of our retained
-  disjuncts is `3-6×` more expensive to manipulate (more unique
-  abstract values, more formula entries). That compounds across
-  `~20 disj/node × ~262 nodes × fixpoint iterations` into the observed
-  `~17 minutes vs <43 seconds` wall-time gap. Concrete first step:
-  identify what OCaml does during `Load (Lfield ...)`,
-  `Load (Lindex ...)`, and chained field-of-field reads that we do not,
-  and port the equivalent value-sharing.
-- **Per-procedure baseline accumulation (next priority)**: `~+50-70 MB`
-  per finished procedure. Even with the per-disjunct cost fixed,
-  multi-procedure runs need to release per-procedure transient state
-  more aggressively (or shrink summary representation) to land near
-  OCaml's `1.17 GB` whole-corpus peak.
-- (C) (small remaining Arc candidates) is unchanged in priority.
-
-## Update: pulse-max-heap-mb (commit `51b015d6dc`) unblocks scaling
-
-Mirroring OCaml's `Pulse.exec_instr_with_oom_protection_and_path_update`
-"AboutToOOM" early-exit, commit `51b015d6dc` adds an opt-in
-`pulse-max-heap-mb` per-procedure heap cap. When a procedure's
-analysis grows the process peak RSS beyond the configured budget, we
-stop the transfer function and let the fixpoint converge on the
-partial state already reached.
-
-With `--pulse-max-heap-mb 1500` on the 74-file partial OpenSSL
-corpus at `-j 1`:
-
-- 292 / 570 procs completed in `~19 min` (vs `~30 / 570` killed at
-  ~8 min OOM in the pre-cap baseline).
-- 4 cap aborts fired as expected:
-  `ripemd160_block_data_order`, `md5_block_data_order`,
-  `md4_block_data_order`, `sha256_block_data_order`. The latter
-  later completed despite the earlier abort (cap is per-`exec_node`
-  check, not permanent skip).
-- Per-procedure peak RSS for completed procs grows steadily to
-  `~8.85 GB` over the run (still much higher than OCaml's `~1.17 GB`
-  whole-corpus peak; the SummaryStore retention of completed
-  procs is the residual). 
-- Wall time still much slower than OCaml's `42.9s` (we spent
-  `~19 min` on the same `292 / 570`-prefix workload that OCaml
-  finishes in `~22s`).
-
-Net effect: whole-program OpenSSL now completes the bulk of the
-corpus where it previously ground to a halt on 3-4 outlier
-procedures. The cap does not by itself make per-procedure analysis
-fast — it just keeps runaway procedures from blocking the rest of
-the pipeline.
-
-## Update: AbductiveDomain.shrink_for_storage (commit `e103af207c`)
-
-Drop apply-time-unused fields (`pre`, `const_cache`,
-`need_dynamic_type_specialization`, `dynamic_types`) from each
-PrePost.post before stashing the `PulseSummary` in the SummaryStore.
-Measured single-procedure / 30-file impact: `~0` on per-procedure
-peak. Whole-program impact requires a complete run to surface, but
-the principle is correct: the cached summary should not carry
-analysis-only working state.
-
-## Headline: 74-file partial OpenSSL whole-program run completes
-
-With `--pulse-max-heap-mb 1000 --pulse-max-wall-secs 60 -j 4` on the
-74-file partial OpenSSL corpus, the run **completes cleanly** in
-`~4m25s`:
-
-| metric                       | OCaml (-j 1)    | Rust (now, -j 4)         | Rust (heap-only, -j 4) |
-|------------------------------|-----------------|---------------------------|--------------------------|
-| wall time                    | `42.9s`         | **`265s`** (`~4m25s`)     | `1703s` (`~28m23s`)      |
-| user CPU                     | `~41s`          | `946s` (4 cores)          | `6545s` (4 cores)        |
-| max RSS                      | `~1.17 GB`      | `~14.0 GB`                | `~16.8 GB`               |
-| peak memory footprint        | `~1.10 GB`      | `~5.7 GB`                 | `~7.16 GB`               |
-| procs analyzed               | `570 / 570`     | `570 / 570`               | `570 / 570`              |
-| heap+wall aborts             | n/a             | `26 + 1 = 27 / 570`       | `21 / 570`               |
-| exit                         | clean (`0`)     | clean (`0`)               | clean (`0`)              |
-
-The `~6.4×` speedup over the heap-only run came from two changes
-(commit `ae0589bc52`):
-
-- New `--pulse-max-wall-secs` cap as a complement to the heap cap,
-  for procedures whose fixpoint does not converge quickly but whose
-  RSS stays low (e.g., bsearch-family with thousands of WTO revisits).
-- Aborted `exec_node` returns `DisjunctiveDomain::empty(...)`
-  instead of `pre.clone()`. Because the upstream WTO scheduler
-  joins our return into `old_state.post`, and `empty.join(x) = x`,
-  the existing post stays unchanged and the WTO loop converges in
-  one or two more iterations instead of continuing to deep-clone
-  heavy disjunctive domains forever after the abort flag is set.
-
-We are now `~6.2×` slower than OCaml on wall time and `~12×` larger
-on max RSS — down from `~40×` slower and `~14×` larger pre-caps,
-and `~70×` slower / OOM-killed at the start of this session.
-
-## Update: ValueSortKey landed (commit `25a67efd81`)
-
-`samply` profile of the filtered single-procedure `whirlpool_block`
-slice showed `Canonicalizer::partial_value_label` as the single
-hottest function with `>20%` of self-time, driven by the
-`sort_by_key` calls in `propagate_*` allocating a `String` purely
-for `Ord` comparison. Replaced with `ValueSortKey` /
-`AccessSortKey` / `EdgeSortKey` typed enums (commit `25a67efd81`).
-
-Measured impact:
-
-- Filtered single-procedure `whirlpool_block`: `202s` → `121s`
-  (`~40%` wall-time reduction). We are now at OCaml parity on this
-  slice (OCaml: `~120s`).
-- 74-file partial OpenSSL whole-program at `-j 4` with default caps
-  (`pulse-max-heap-mb=2048`, `pulse-max-wall-secs=120`):
-  `545s` → `480s` (`~12%` wall-time reduction), `20 GB` → `~16.5 GB`
-  max RSS (`~17%` reduction), aborts unchanged at `~19`.
-
-We are now `~11.2×` slower than OCaml on the whole-program corpus,
-down from `~12.7×` before this commit. The smaller relative win
-on whole-program (vs the `~40%` win on the single procedure)
-reflects that not every procedure spends most of its time in
-canonicalization — it dominates only on the encryption-style
-byte-loop family (whirlpool_block, des / md / sha block_data_order,
-etc.).
-
-## Update: remaining sort_by_key call sites converted (commit `d5d0488bd2`)
-
-Follow-on profile after `25a67efd81` showed `partial_value_label`
-still at the top of the profile (`~16%` of self-time). The
-remaining hot call sites in `propagate_formula` were `equalities`,
-`linear_eqs`, `intervals`, and `fn_apps` `sort_by_key` calls that
-still went through the String-building helpers. Converted them all
-to `partial_value_key`-based sorts.
-
-Measured impact:
-
-- whirlpool_block: `121s` → **`81.66s`** (`~33%` wall-time win,
-  cumulative `~60%` from pre-`25a67efd81` `202s`). **We are now
-  `~32%` faster than OCaml on this slice** (OCaml `~120s`).
-- 74-file OpenSSL whole-program at `-j 4` with default caps:
-  `480s` → **`195s`** (`~59%` wall-time win), `16.5 GB` → `19.3 GB`
-  max RSS (slightly higher because more procs run to completion
-  within budget). `0` wall-cap aborts (was `2`) — every procedure
-  now finishes within `120s`. `17` heap aborts unchanged.
-
-Whole-program slowdown vs OCaml: `11.2×` → **`4.5×`**. From `~70×`
-slower and OOM-killed at the start of the perf sessions to `~4.5×`
-slower with clean exits.
-
-This is a major scaling milestone: pre-cap, the same run was
-OOM-killed at `~30 / 570` procs after `~8 min`. With the cap +
-parallelism, we now complete all 570 procs in `~28 min` of wall
-time.
-
-We are still `~40×` slower and use `~14×` more memory than OCaml.
-Both gaps now look like first-order CPU efficiency issues on a
-small set of pathological procedures (`DES_ofb_encrypt`,
-`OBJ_bsearch_ln`, `sha256_block_data_order`, ...) rather than
-categorical correctness or scaling problems.
-
-Observed suspicious patterns to investigate next:
-- `OBJ_bsearch_ln`: `26` nodes but `max_visit_count = 6450`. With
-  `pulse_widen_threshold = 3` we should stop revisiting after `~3`
-  widening iterations, so `6450` per-node visits suggests a
-  fixpoint-convergence bug in the WTO scheduler or in our widen
-  implementation. Likely the same root cause as the long-tail wall
-  time on a few procedures.
-- `DES_ofb_encrypt`: large retained state (`disj=1776`, `formula
-  lin=544k`). Same family as `whirlpool_block` /
-  `DES_ede3_cfb_encrypt` — we already cut per-proc peak `5×` on
-  `whirlpool_block` so the per-disjunct cost is the residue.
-
-This file is the artifact of the first whole-program OpenSSL pass.
-Future passes should append findings here rather than overwriting.
-
-## Update: B-track convergence and DES retained-state GC (commits `0a4cd8437b` through `64b6e23b87`)
-
-Follow-on B-track work after the `ValueSortKey` wins resolved the
-`OBJ_bsearch_ex_` WTO safety-cap pathology and shifted the OpenSSL
-long tail to bounded-visit large-state procedures.
-
-Key fixes:
-
-- `0a4cd8437b`: match OCaml widen semantics in `DisjunctiveDomain`.
-  The over-iteration branch now returns `prev` exactly, and the
-  within-threshold branch returns `prev` when the joined state makes no
-  semantic progress. This avoids `had_dropped_disjuncts` metadata
-  preventing outer fixpoint convergence.
-- `ab871f0b50`: strip trace-ordering timestamps from
-  `state_cmp::canonical_attr` for `MustBeValid`, `MustBeInitialized`,
-  and `WrittenTo`. These timestamps are not semantic, and including them
-  caused fresh-but-equivalent fixpoint iterations to compare unequal.
-- `7bf86fd5c9`: include dynamic-type bindings in `state_cmp`
-  canonicalization. Rust stores these outside `Phi`, while OCaml's
-  corresponding type constraints participate in the path condition and
-  `leq`.
-- `c9876741d2`: short-circuit `exec_node` when no `ContinueProgram`
-  disjunct remains. Transfer is the identity for stopped states, so this
-  avoids cloning latent/abort states through every instruction.
-- `3c1a720e78`: treat stable post-state as WTO node convergence even when
-  pre-state churn remains. Successors depend on post-state, so if
-  `post.leq(old_post)` holds, re-running the component solely for
-  pre-only churn is unnecessary.
-- `00f73c1e6d`: prune unreachable post heap/attrs from large
-  intermediate invariant-map states. `state_cmp` already ignores this
-  disconnected storage; we now stop storing most of it physically.
-- `64b6e23b87`: make targeted intermediate formula GC opt-in via
-  `--pulse-intermediate-formula-gc`. It prunes unreachable `intervals`
-  and `is_int` facts, reducing RSS on DES-style procedures at a wall-time
-  cost on capped whole-program runs.
-
-Latest no-explicit-cap out-of-box 74-file checkpoint (`-j 4`, defaults
-`pulse-max-heap-mb=2048`, `pulse-max-wall-secs=60`, formula GC off), using
-three-run medians on current HEAD (`5f82b3f88b`, cached-comparison pruning):
-
-| metric                | OCaml (-j 1) | Rust latest default (-j 4) |
-|-----------------------|--------------|-----------------------------|
-| wall time             | `42.9s`      | **`239.67s`**               |
-| max RSS               | `~1.17 GB`   | `13.17 GB` median (`13.79 GB` max) |
-| peak memory footprint | `~1.10 GB`   | `8.33 GB` median (`12.25 GB` max) |
-| procs analyzed        | `570 / 570`  | `570 / 570`                 |
-| heap+wall aborts      | n/a          | `18 / 570`                  |
-| max visit count       | n/a          | **`4`**                     |
-| exit                  | clean (`0`)  | clean (`0`)                 |
-
-Current slowdown vs OCaml on current HEAD: `239.67 / 42.9 ~= 5.6×` (down
-from `~70×`/OOM-killed at the start of the scaling sessions). The best
-pre-cache repeated default median remains `226.63s` (`~5.3×`). A stale-key
-repair experiment later improved one DES slow proc but was disabled for the
-default path after counters showed no repair hits on the focused target. The old
-`OBJ_bsearch_ex_ max_visit_count=10001` symptom is not present in the
-latest convergence probes; the remaining long tail is bounded-visit
-large-state cost.
-
-Focused DES-family probe (`DES_ede3_cbcm_encrypt`, caps disabled):
-
-| metric | before retained-state GC | after heap/attr GC | with opt-in formula GC |
-|--------|---------------------------|--------------------|-------------------------|
-| completion | stopped at `13m40s` | completed `11m04s` | completed `8m50s` |
-| max RSS | `~6.3 GB` at stop | `~3.99 GB` | `~3.69 GB` |
-| peak footprint | n/a | `~4.01 GB` | `~3.20 GB` |
-| retained post heap nodes | `~28.1M` | `~2.88M` | `~2.88M` |
-| retained post heap edges | `~55.2M` | `~5.58M` | `~5.58M` |
-| dead post heap nodes/edges | `~25.6M / ~50.3M` | `276 / 276` | `276 / 276` |
-| formula lin | `~5.25M` at stop | `~5.73M` final | `~5.73M` final |
-| formula intervals | `~7.60M` at stop | `~8.26M` final | `~3.38M` final |
-| formula is_int | n/a | `~6.76M` final | `~0.88M` final |
-| max_visit_count | `4` | `4` | `4` |
-
-Interpretation: DES-family costs are no longer WTO convergence issues.
-They are retained-state storage and formula-volume issues. Heap/attr GC
-is a clear default win; formula GC is useful for memory-sensitive or
-uncapped focused runs but remains opt-in because it slows capped
-whole-program OpenSSL on this host.
-
-### Repeated medians and stale `term_value_index` repair probe
-
-The benchmark helper now gives comparable medians across default,
-formula-GC, and stale-key-repair runs:
-
-| metric | pre-cache default median | opt-in formula GC | stale-key repair | current HEAD |
-|--------|--------------------------|-------------------|------------------|--------------|
-| wall | `226.63s` | `238.49s` | `235.19s` | `239.67s` |
-| max RSS | `13.41 GB` | `11.42 GB` | `13.90 GB` | `13.17 GB` median (`13.79 GB` max) |
-| peak footprint | `9.19 GB` | `10.07 GB` | `9.20 GB` | `8.33 GB` median (`12.25 GB` max) |
-| aborts | `20` | `18` | `18` | `18` |
-| max_visit_count | `4` | `4` | `4` | `4` |
-
-The stale-key repair moved the selected DES target in the right direction
-(`DES_ede3_cbcm_encrypt` median `86s` → `81s`), but focused counters showed
-that the slow path did not pay for itself on that procedure: `443` repairs
-scanned `54,110` index entries and produced `0` repair hits. The retained
-cached-comparison pruning fix reaches the same focused capped DES target
-median (`~81s`) without repair and reduces full-corpus aborts to `18`, but
-current whole-program wall is still slower than the pre-cache default median.
-A cheap `TermKey` normalization prototype was measured on focused DES and
-rejected as inert (bit-identical fixpoint shape/formula counts). Formula GC
-remains an opt-in memory-headroom knob: it lowers max RSS but is not a
-wall-time win.
-
-Next work should target:
-
-1. profiling bounded-visit DES-family procedures after heap/attr GC,
-2. cheaper/incremental formula cleanup for the remaining linear-equality
-   residue, and
-3. direct formula-volume/state-retention reductions rather than more
-   term-key shape normalization.
+- [`CONVERGENCE_8D4V_FINDINGS.md`](CONVERGENCE_8D4V_FINDINGS.md) — detailed
+  retained-state decomposition for the earlier `whirlpool_block` probe.
+- [`STRUCTURAL_SHARING_PROTOTYPE.md`](STRUCTURAL_SHARING_PROTOTYPE.md) — early
+  structural-sharing plan.

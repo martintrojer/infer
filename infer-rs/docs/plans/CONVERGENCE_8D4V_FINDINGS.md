@@ -115,8 +115,8 @@ canonicalization.
   `pulse_widen_threshold = 3`, four tiers is exactly the post-cap shape we
   expect from one initial state plus three widening iterations.
 - **Recency limit is not the culprit.** Forcing `pulse-recency-limit = 32`
-  to match OCaml's default left this slice essentially identical (already
-  documented in `TODO.md`).
+  to match OCaml's default left this slice essentially identical (the active
+  follow-up is tracked in `mu`, not in a checked-in TODO file).
 - **There is a real partial canonicalization gap** in Rust:
   `PRE#0`/`PRE#2` should canonicalize to the same form on the pre subgraph
   modulo the `u417 ↔ u418` rename, and currently they do not. That is at
