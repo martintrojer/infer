@@ -409,11 +409,7 @@ impl Formula {
         if c == 0 {
             let teq = self.phi.term_eqs.get(&v).or_else(|| {
                 let repr = self.phi.get_repr(v);
-                if repr == v {
-                    None
-                } else {
-                    self.phi.term_eqs.get(&repr)
-                }
+                (repr != v).then(|| self.phi.term_eqs.get(&repr)).flatten()
             });
             if let Some(teq) = teq.cloned() {
                 comparison_condition_atom = if negated {
@@ -825,21 +821,20 @@ fn comparison_to_atom(
     phi: &phi::Phi,
 ) -> Option<Atom> {
     use sil::binop::Binop;
-    let (effective_op, effective_negated) = if negated {
+    let effective_op = if negated {
         // Negate the comparison
         match op {
-            Binop::Eq => (Binop::Ne, false),
-            Binop::Ne => (Binop::Eq, false),
-            Binop::Lt => (Binop::Ge, false),
-            Binop::Ge => (Binop::Lt, false),
-            Binop::Gt => (Binop::Le, false),
-            Binop::Le => (Binop::Gt, false),
+            Binop::Eq => Binop::Ne,
+            Binop::Ne => Binop::Eq,
+            Binop::Lt => Binop::Ge,
+            Binop::Ge => Binop::Lt,
+            Binop::Gt => Binop::Le,
+            Binop::Le => Binop::Gt,
             _ => return None,
         }
     } else {
-        (op, false)
+        op
     };
-    let _ = effective_negated; // negation already applied above
     let lt = operand_to_term(lhs, phi);
     let rt = operand_to_term(rhs, phi);
     match effective_op {
@@ -1291,6 +1286,96 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_term_value_index_after_alias_mints_fresh_consistent_value() {
+        let mut f = Formula::ttrue();
+        let alias = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+        let x = AbstractValue::of_raw(10);
+        let first_result = AbstractValue::of_raw(20);
+        let second_result = AbstractValue::of_raw(21);
+        let op = sil::binop::Binop::Lt;
+
+        assert!(f
+            .and_equal_binop(
+                first_result,
+                op.clone(),
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+        assert!(f.and_equal_vars(x, alias).is_sat());
+        assert_eq!(
+            f.get_var_repr(x),
+            alias,
+            "the alias must become x's representative to make the old term_value_index key stale"
+        );
+
+        assert!(f
+            .and_equal_binop(
+                second_result,
+                op,
+                &Operand::AbstractValue(alias),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+        assert_ne!(
+            f.get_var_repr(second_result),
+            f.get_var_repr(first_result),
+            "stale alias misses should not repair/reuse the old term_value_index entry"
+        );
+
+        assert!(f.prune_eq_const(first_result, 0, true).is_sat());
+        assert!(f.prune_eq_const(second_result, 0, true).is_sat());
+        assert!(
+            f.conditions()
+                .contains_key(&Atom::LessThan(Term::Var(alias), Term::Var(y))),
+            "both stale and fresh comparison values should prune to the same consistent alias < y fact"
+        );
+    }
+
+    #[test]
+    fn test_stale_term_value_index_after_constant_folding_mints_fresh_consistent_value() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+        let first_result = AbstractValue::of_raw(3);
+        let second_result = AbstractValue::of_raw(4);
+        let op = sil::binop::Binop::Lt;
+
+        assert!(f
+            .and_equal_binop(
+                first_result,
+                op.clone(),
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+        assert!(f.and_equal_const(x, 3).is_sat());
+
+        assert!(f
+            .and_equal_binop(
+                second_result,
+                op,
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+        assert_ne!(
+            f.get_var_repr(second_result),
+            f.get_var_repr(first_result),
+            "stale constant-folding misses should not repair/reuse the old term_value_index entry"
+        );
+
+        assert!(f.prune_eq_const(first_result, 0, true).is_sat());
+        assert!(f.prune_eq_const(second_result, 0, true).is_sat());
+        assert!(
+            f.conditions()
+                .contains_key(&Atom::LessThan(Term::Const(3), Term::Var(y))),
+            "both stale and fresh comparison values should prune to the same consistent 3 < y fact"
+        );
+    }
+
+    #[test]
     fn test_prune_cached_comparison_refines_operands_via_canonical_term_eq() {
         // Build two `Lt` comparisons on the same canonical operands.
         // The second `and_equal_binop` should hit the `term_value_index`
@@ -1330,8 +1415,13 @@ mod tests {
         );
         // Sanity: term_eqs is only keyed under the canonical repr (the
         // first comparison's value), not under the freshly minted second
-        // result.
+        // result. Union-find keeps the lower raw id as representative, so
+        // first_cmp is the stable representative here.
         let cmp_repr = f.get_var_repr(first_cmp);
+        assert_eq!(
+            cmp_repr, first_cmp,
+            "the first comparison should be the representative that owns the term_eq"
+        );
         assert!(
             f.phi().term_eqs.contains_key(&cmp_repr),
             "term_eqs should still be keyed under the canonical comparison value"
@@ -1380,10 +1470,10 @@ mod tests {
         );
 
         assert!(f.and_equal_vars(cmp, alias).is_sat());
-        assert_eq!(f.get_var_repr(cmp), alias);
-        assert!(
-            !f.phi().term_eqs.contains_key(&alias),
-            "and_var_equal does not re-key term_eqs to the simpler representative"
+        assert_eq!(
+            f.get_var_repr(cmp),
+            alias,
+            "union-find keeps the lower raw id as the representative, so pruning cmp exercises the direct term_eq lookup"
         );
 
         let truthy = f.prune_eq_const(cmp, 0, true);
@@ -1395,6 +1485,39 @@ mod tests {
             f.conditions()
                 .contains_key(&Atom::LessThan(Term::Var(x), Term::Var(y))),
             "direct term_eq lookup should preserve the original comparison refinement"
+        );
+    }
+
+    #[test]
+    fn test_prune_eq_const_nonzero_skips_comparison_term_eq() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+        let cmp = AbstractValue::of_raw(3);
+
+        assert!(f
+            .and_equal_binop(
+                cmp,
+                sil::binop::Binop::Lt,
+                &Operand::AbstractValue(x),
+                &Operand::AbstractValue(y),
+            )
+            .is_sat());
+
+        let result = f.prune_eq_const(cmp, 1, false);
+        assert!(
+            result.is_sat(),
+            "pruning comparison result to a non-zero const should stay Sat"
+        );
+        assert!(
+            f.conditions()
+                .contains_key(&Atom::Equal(Term::Var(cmp), Term::Const(1))),
+            "non-zero constants should use the generic equality condition rather than the comparison term_eq path"
+        );
+        assert!(
+            !f.conditions()
+                .contains_key(&Atom::LessThan(Term::Var(x), Term::Var(y))),
+            "the comparison term_eq path should only run for zero pruning"
         );
     }
 

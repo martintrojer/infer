@@ -91,9 +91,9 @@ pub struct Phi {
     ///
     /// Keys are computed at insert time using `Phi::canonical_term_key`,
     /// which goes through `get_repr` for `AbstractValue` operands and
-    /// folds known constants out of `linear_eqs`. We intentionally do not
-    /// repair stale keys on misses by default: a focused DES probe showed
-    /// stale-key repair rebuilt the index frequently without producing hits.
+    /// folds known constants out of `linear_eqs`. Later equality merges or
+    /// constant propagation can make an old key stale; stale misses are
+    /// tolerated and only lose a sharing opportunity for that lookup.
     term_value_index: BTreeMap<TermKey, AbstractValue>,
 }
 
@@ -191,19 +191,17 @@ impl Phi {
     fn canonical_term_operand(&self, op: &super::Operand) -> Option<TermKeyOperand> {
         match op {
             super::Operand::ConstOperand(c) => Some(TermKeyOperand::Const(*c)),
-            super::Operand::AbstractValue(v) => self.canonical_abstract_value_term_operand(*v),
-        }
-    }
-
-    fn canonical_abstract_value_term_operand(&self, v: AbstractValue) -> Option<TermKeyOperand> {
-        let repr = self.get_repr(v);
-        if let Some(q) = self.get_known_const(repr) {
-            if q.is_integer() {
-                return Some(TermKeyOperand::Const(*q.numer() / *q.denom()));
+            super::Operand::AbstractValue(v) => {
+                let repr = self.get_repr(*v);
+                if let Some(q) = self.get_known_const(repr) {
+                    if q.is_integer() {
+                        return Some(TermKeyOperand::Const(*q.numer() / *q.denom()));
+                    }
+                    return None;
+                }
+                Some(TermKeyOperand::Var(repr))
             }
-            return None;
         }
-        Some(TermKeyOperand::Var(repr))
     }
 
     /// Read-only lookup for the existing representative value for a BinOp
@@ -217,12 +215,10 @@ impl Phi {
         rhs: &super::Operand,
     ) -> Option<AbstractValue> {
         let key = self.canonical_term_key(op, lhs, rhs)?;
-        self.find_term_value_by_key(&key)
-    }
-
-    fn find_term_value_by_key(&self, key: &TermKey) -> Option<AbstractValue> {
-        let stored = self.term_value_index.get(key).copied()?;
-        Some(self.get_repr(stored))
+        self.term_value_index
+            .get(&key)
+            .copied()
+            .map(|stored| self.get_repr(stored))
     }
 
     /// Record that `result` is the canonical value for `op(lhs, rhs)` in
@@ -249,6 +245,7 @@ impl Phi {
         let Some((merged, kept)) = self.var_eqs.union(v1, v2) else {
             return SatUnsat::Sat(Vec::new()); // already equal
         };
+
         let mut new_eqs = vec![NewEq::Equal(merged, kept)];
 
         // Propagate through linear_eqs: substitute merged → kept
@@ -698,6 +695,7 @@ impl Phi {
         if ignored.is_empty() {
             return;
         }
+
         let touches_ignored = |v: AbstractValue| ignored.contains(&self.var_eqs.find_immut(v));
         let operand_touches_ignored = |operand: &super::Operand| match operand {
             super::Operand::AbstractValue(v) => touches_ignored(*v),
@@ -745,6 +743,7 @@ impl Phi {
         if ignored.is_empty() {
             return;
         }
+
         let touches_ignored = |v: AbstractValue| ignored.contains(&self.var_eqs.find_immut(v));
         let operand_touches_ignored = |operand: &super::Operand| match operand {
             super::Operand::AbstractValue(v) => touches_ignored(*v),
