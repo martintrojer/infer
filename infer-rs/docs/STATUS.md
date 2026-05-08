@@ -44,7 +44,10 @@ Default Rust caps:
 - pass `0` to disable either cap
 
 Latest repeated current-HEAD checkpoint (`5f82b3f88b`, cached-comparison
-pruning; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh`):
+pruning; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh`) used the original
+`textual-out/` export. A fresh patched-exporter re-export also exists at
+`textual-out-reexport-20260508-102338/` (`74` `.sil` files; DES and OBJ targets
+present) but has not yet been re-baselined for whole-program wall time:
 
 | metric | OCaml (`-j 1`) | Rust current HEAD (`-j 4`) |
 |---|---:|---:|
