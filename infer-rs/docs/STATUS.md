@@ -43,28 +43,32 @@ Default Rust caps:
 - `pulse-max-wall-secs = 60`
 - pass `0` to disable either cap
 
-Latest repeated current-HEAD checkpoint (`5f82b3f88b`, cached-comparison
-pruning; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh`) used the original
-`textual-out/` export. A fresh patched-exporter re-export also exists at
-`textual-out-reexport-20260508-102338/` (`74` `.sil` files; DES and OBJ targets
-present) but has not yet been re-baselined for whole-program wall time:
+Latest repeated current-HEAD checkpoint on the fresh patched-exporter re-export
+(`textual-out-reexport-20260508-102338/`, `74` `.sil` files; DES and OBJ targets
+present; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh` with
+`TEXTUAL_DIR=.../textual-out-reexport-20260508-102338`):
 
-| metric | OCaml (`-j 1`) | Rust current HEAD (`-j 4`) |
+| metric | OCaml old baseline (`-j 1`) | Rust fresh export (`-j 4`) |
 |---|---:|---:|
-| wall time | `42.9s` | `239.67s` median |
-| max RSS | `~1.17 GB` | `13.17 GB` median (`13.79 GB` max run) |
-| peak footprint | `~1.10 GB` | `8.33 GB` median (`12.25 GB` max run) |
-| procs analyzed | `570 / 570` | `570 / 570` |
-| heap+wall aborts | n/a | `18 / 570` |
+| wall time | `42.9s` | `344.03s` median |
+| max RSS | `~1.17 GB` | `11.44 GB` median (`13.69 GB` max run) |
+| peak footprint | `~1.10 GB` | `9.86 GB` median (`10.33 GB` max run) |
+| procs analyzed | old export: `570 / 570` | `446 / 446` |
+| heap+wall aborts | n/a | `20 / 446` |
 | max visit count | n/a | `4` |
-| exit | clean (`0`) | clean (`0`) |
+| process exit | clean (`0`) | `2` due reported leaks despite full analysis |
+
+Previous repeated checkpoint on the original `textual-out/` export was
+`239.67s` median wall, `13.17 GB` median max RSS, `18 / 570` aborts, and clean
+exit. Do not compare old-export and fresh-export wall times without noting the
+input changed: the fresh export has fewer procedure definitions (`446` analyzed
+instead of `570`) but includes newer cleanup/nullify/exit-scope metadata.
 
 Interpretation:
 
-- Current slowdown vs OCaml: `239.67 / 42.9 ~= 5.6×`.
-- Best pre-cache default repeated median remains `226.63s`; cached-comparison
-  pruning is a correctness/abort-count improvement, not a wall-time win on this
-  host.
+- Fresh-export slowdown vs the old OCaml baseline: `344.03 / 42.9 ~= 8.0×`.
+- The fresh export changes the benchmark input enough that the old `239.67s`
+  dashboard is now historical, not the current fresh-export baseline.
 - Stale `term_value_index` repair was rejected for the default path: it improved
   selected DES target wall time but made whole-program median slower and produced
   no repair hits in the focused counter run.
