@@ -334,7 +334,7 @@ impl ValueHistory {
                                     let mut events = prefix.0.clone();
                                     events.push(HistoryEvent::ActualArgument(
                                         pvar.clone(),
-                                        formal_loc.clone().or_else(|| callsite.clone()),
+                                        callsite.clone().or_else(|| formal_loc.clone()),
                                     ));
                                     events.extend(suffix.0.clone());
                                     next.push(HistoryPath(events));
@@ -453,5 +453,61 @@ pub struct ValueWithHistory {
 impl ValueWithHistory {
     pub fn new(addr: AbstractValue, history: ValueHistory) -> Self {
         Self { addr, history }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use sil::location::Location;
+    use sil::mangled::Mangled;
+    use sil::procname::Procname;
+    use sil::pvar::Pvar;
+    use sil::source_file::SourceFile;
+
+    use super::{HistoryEvent, ValueHistory};
+
+    fn loc(line: i32) -> Location {
+        Location {
+            file: SourceFile::new("test.c"),
+            line,
+            col: 0,
+            macro_file_opt: None,
+            macro_line: -1,
+        }
+    }
+
+    #[test]
+    fn test_map_formals_prefers_callsite_for_actual_argument_location() {
+        let callee = Procname::c_from_string("callee");
+        let formal = Pvar::mk(Mangled::from_string("x"), callee);
+        let formal_decl = loc(3);
+        let callsite = loc(20);
+        let caller_assignment = loc(18);
+
+        let history = ValueHistory::from_event(HistoryEvent::FormalArgument(
+            formal.clone(),
+            Some(formal_decl),
+        ));
+        let formal_histories = BTreeMap::from([(
+            formal.clone(),
+            ValueHistory::assignment(caller_assignment.clone()),
+        )]);
+
+        let mapped = history.map_formals_with_callsite(&formal_histories, Some(callsite.clone()));
+
+        assert_eq!(
+            mapped.signature(),
+            format!("actual({formal}) -> assign@{caller_assignment}"),
+            "caller diagnostics should point the actual-argument step at the callsite, not the callee formal declaration"
+        );
+        let path = mapped
+            .primary_path()
+            .expect("mapped history should be non-empty");
+        assert!(matches!(
+            path.events().first(),
+            Some(HistoryEvent::ActualArgument(_, Some(location))) if location == &callsite
+        ));
     }
 }
