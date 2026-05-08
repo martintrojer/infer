@@ -148,6 +148,7 @@ fn exec_load(
             if typ.is_int() {
                 state.path_condition.and_is_int(value.addr);
             }
+            record_more_precise_formal_dynamic_type(pdesc, rhs_exp, typ, value.addr, &mut state);
             vec![ExecutionDomain::ContinueProgram(state)]
         }
         PulseResult::Recoverable(value, errors) => {
@@ -155,6 +156,7 @@ fn exec_load(
             if typ.is_int() {
                 state.path_condition.and_is_int(value.addr);
             }
+            record_more_precise_formal_dynamic_type(pdesc, rhs_exp, typ, value.addr, &mut state);
             stopped_results_from_recoverable_errors(pdesc, state, errors)
         }
         PulseResult::FatalError(diag, _) => {
@@ -162,6 +164,36 @@ fn exec_load(
                 state: Box::new(state),
                 diagnostic: Box::new(diag),
             }]
+        }
+    }
+}
+
+fn record_more_precise_formal_dynamic_type(
+    pdesc: Option<&Procdesc>,
+    rhs_exp: &Exp,
+    load_typ: &sil::typ::Typ,
+    value: crate::abstract_value::AbstractValue,
+    state: &mut AbductiveDomain,
+) {
+    if state.get_dynamic_type(value).is_some() {
+        return;
+    }
+    let (Some(pdesc), Exp::Lvar(pvar)) = (pdesc, rhs_exp) else {
+        return;
+    };
+    let Some((_mangled, formal_typ, _annot)) = pdesc
+        .formals
+        .iter()
+        .find(|(mangled, _typ, _annot)| mangled == &pvar.name)
+    else {
+        return;
+    };
+    if formal_typ == load_typ {
+        return;
+    }
+    if let sil::typ::TypeDesc::Tptr(pointee, _) = formal_typ.desc.as_ref() {
+        if matches!(pointee.desc.as_ref(), sil::typ::TypeDesc::Tstruct(_)) {
+            state.add_dynamic_type_unsafe(value, (**pointee).clone());
         }
     }
 }

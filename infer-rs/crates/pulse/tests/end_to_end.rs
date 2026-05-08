@@ -783,17 +783,9 @@ fn test_e2e_ocaml_model() {
 /// method call inside a load expression. Requires virtual dispatch
 /// resolution via type hierarchy.
 /// OCaml expects: with_dyntype_bad, with_statictype_bad → NULL_DEREFERENCE.
-/// We currently miss both — virtual method calls in load expressions
-/// are not yet resolved.
 #[test]
 fn test_e2e_static_types() {
-    assert_ocaml_pulse_test(
-        "static_types.sil",
-        &[
-            "with_dyntype_bad",    // chained virtual call in load
-            "with_statictype_bad", // chained virtual call in load
-        ],
-    );
+    assert_ocaml_pulse_test("static_types.sil", &[]);
 }
 
 /// virt.sil: devirtualization and dynamic type specialization (references OCaml source).
