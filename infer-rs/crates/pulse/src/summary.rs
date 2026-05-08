@@ -3261,25 +3261,40 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
         return Some(addr);
     }
 
-    // Fallback: find the last Load/Call ret_id in the procedure and look it up
-    // in the stack. This handles the common pattern of "n0 = <expr>; ret n0".
-    let mut last_id = None;
-    for node in &pdesc.nodes {
-        for instr in &node.instrs {
-            match instr {
-                sil::instr::Instr::Load { id, .. } => last_id = Some(id.clone()),
-                sil::instr::Instr::Call { ret: (id, _), .. } => last_id = Some(id.clone()),
-                _ => {}
-            }
+    // Fallback: some hand-built/direct SIL tests do not materialize the
+    // `__return` pvar. In that case, only trust a Load/Call result when every
+    // direct exit predecessor ends with the same candidate logical variable.
+    // This avoids making unrelated temporaries summary-reachable just because
+    // they appear later in `pdesc.nodes` than the actual return path.
+    fallback_return_id_from_exit_predecessors(pdesc)
+        .and_then(|id| astate.post.stack.find(&Var::LogicalVar(id)))
+}
+
+fn fallback_return_id_from_exit_predecessors(pdesc: &Procdesc) -> Option<sil::ident::Ident> {
+    let mut candidate = None;
+    let mut saw_pred = false;
+
+    for pred_id in pdesc.get_preds(pdesc.exit_node) {
+        saw_pred = true;
+        let pred_candidate = pdesc
+            .get_node(*pred_id)
+            .and_then(last_load_or_call_result_in_node)?;
+        match &candidate {
+            Some(existing) if existing != &pred_candidate => return None,
+            Some(_) => {}
+            None => candidate = Some(pred_candidate),
         }
     }
 
-    if let Some(id) = last_id {
-        let var = Var::LogicalVar(id);
-        return astate.post.stack.find(&var);
-    }
+    saw_pred.then_some(candidate).flatten()
+}
 
-    None
+fn last_load_or_call_result_in_node(node: &sil::procdesc::Node) -> Option<sil::ident::Ident> {
+    node.instrs.iter().rev().find_map(|instr| match instr {
+        sil::instr::Instr::Load { id, .. } => Some(id.clone()),
+        sil::instr::Instr::Call { ret: (id, _), .. } => Some(id.clone()),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -3350,11 +3365,73 @@ mod tests {
         pdesc.set_succs(load_node, vec![1]);
     }
 
+    fn add_load_node_with_id(pdesc: &mut Procdesc, id: Ident) -> sil::procdesc::NodeId {
+        let loc = Location::dummy();
+        pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::ReturnStmt),
+            vec![sil::instr::Instr::Load {
+                id,
+                e: sil::exp::Exp::zero(),
+                typ: Typ::int(sil::typ::IKind::IInt),
+                loc: loc.clone(),
+            }],
+            loc,
+        )
+    }
+
     fn retain_named_procs(tm: &mut textual_utils::TestModule, proc_names: &[&str]) {
         let keep: std::collections::HashSet<_> = proc_names.iter().copied().collect();
         tm.cfg
             .proc_descs
             .retain(|pname, _| keep.contains(format!("{pname}").as_str()));
+    }
+
+    #[test]
+    fn test_find_return_value_fallback_uses_exit_predecessor_not_later_dead_load() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+        let return_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        let dead_id = Ident::create_normal(IdentName::from_string("dead"), 1);
+        let return_node = add_load_node_with_id(&mut pdesc, return_id.clone());
+        let _dead_node = add_load_node_with_id(&mut pdesc, dead_id.clone());
+        pdesc.set_succs(0, vec![return_node]);
+        pdesc.set_succs(return_node, vec![1]);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_value = AbstractValue::of_raw(10);
+        let dead_value = AbstractValue::of_raw(20);
+        astate
+            .post
+            .stack
+            .add(Var::LogicalVar(return_id), return_value);
+        astate.post.stack.add(Var::LogicalVar(dead_id), dead_value);
+
+        assert_eq!(find_return_value(&astate, &pdesc), Some(return_value));
+    }
+
+    #[test]
+    fn test_find_return_value_fallback_rejects_ambiguous_exit_predecessors() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+        let left_id = Ident::create_normal(IdentName::from_string("left"), 0);
+        let right_id = Ident::create_normal(IdentName::from_string("right"), 1);
+        let left_node = add_load_node_with_id(&mut pdesc, left_id.clone());
+        let right_node = add_load_node_with_id(&mut pdesc, right_id.clone());
+        pdesc.set_succs(0, vec![left_node, right_node]);
+        pdesc.set_succs(left_node, vec![1]);
+        pdesc.set_succs(right_node, vec![1]);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        astate
+            .post
+            .stack
+            .add(Var::LogicalVar(left_id), AbstractValue::of_raw(10));
+        astate
+            .post
+            .stack
+            .add(Var::LogicalVar(right_id), AbstractValue::of_raw(20));
+
+        assert_eq!(find_return_value(&astate, &pdesc), None);
     }
 
     fn make_abort_pre_post_with_formal(name: &str) -> (Procdesc, PrePost, AbstractValue) {
