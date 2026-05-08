@@ -181,6 +181,12 @@ fn record_more_precise_formal_dynamic_type(
     let (Some(pdesc), Exp::Lvar(pvar)) = (pdesc, rhs_exp) else {
         return;
     };
+    if !matches!(
+        &pvar.kind,
+        sil::pvar::PvarKind::Local { proc_name, .. } if *proc_name == pdesc.proc_name
+    ) {
+        return;
+    }
     let Some((_mangled, formal_typ, _annot)) = pdesc
         .formals
         .iter()
@@ -888,6 +894,99 @@ mod tests {
             state.check_initialized(addr).is_ok(),
             "structured bindings should skip the uninitialized mark like OCaml"
         );
+    }
+
+    #[test]
+    fn test_load_directly_from_formal_records_formal_pointee_dynamic_type() {
+        let pname = Procname::c_from_string("formal_load");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        let precise_type = Typ::mk_struct(sil::typ::TypeName::HackClass(sil::typ::HackClassName(
+            "A".to_string(),
+        )));
+        let load_type = Typ::mk_ptr(Typ::mk_struct(sil::typ::TypeName::HackClass(
+            sil::typ::HackClassName("Base".to_string()),
+        )));
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(precise_type.clone()),
+            Default::default(),
+        )];
+
+        let state = AbductiveDomain::mk_initial(&pdesc);
+        let id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let instr = Instr::Load {
+            id: id.clone(),
+            e: Exp::Lvar(Pvar::mk(Mangled::from_string("x"), pname)),
+            typ: load_type,
+            loc: Location::dummy(),
+        };
+        let state = exec_instr_with_pdesc(Some(&pdesc), &instr, state)
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("formal load should continue");
+        let value = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(id))
+            .expect("load result should be written");
+
+        assert_eq!(state.get_dynamic_type(value), Some(&precise_type));
+    }
+
+    #[test]
+    fn test_load_from_nonlocal_pvar_with_formal_name_does_not_record_dynamic_type() {
+        let pname = Procname::c_from_string("formal_load");
+        let other_pname = Procname::c_from_string("other_proc");
+        let mut pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        let precise_type = Typ::mk_struct(sil::typ::TypeName::HackClass(sil::typ::HackClassName(
+            "A".to_string(),
+        )));
+        let load_type = Typ::mk_ptr(Typ::mk_struct(sil::typ::TypeName::HackClass(
+            sil::typ::HackClassName("Base".to_string()),
+        )));
+        pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(precise_type),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let other_pvar = Pvar::mk(Mangled::from_string("x"), other_pname);
+        let stack_addr = AbstractValue::mk_fresh();
+        let value = AbstractValue::mk_fresh();
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(other_pvar.clone())), stack_addr);
+        state
+            .post
+            .heap
+            .add_edge(stack_addr, Access::Dereference, value);
+
+        let id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let instr = Instr::Load {
+            id: id.clone(),
+            e: Exp::Lvar(other_pvar),
+            typ: load_type,
+            loc: Location::dummy(),
+        };
+        let state = exec_instr_with_pdesc(Some(&pdesc), &instr, state)
+            .into_iter()
+            .find_map(|result| match result {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("nonlocal pvar load should continue");
+        let value = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(id))
+            .expect("load result should be written");
+
+        assert!(state.get_dynamic_type(value).is_none());
     }
 
     #[test]
