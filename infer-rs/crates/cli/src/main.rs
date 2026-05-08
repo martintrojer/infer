@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -846,7 +846,7 @@ fn main() {
                     );
                 }
             } else {
-                let checker = PulseInterChecker;
+                let checker = PulseInterChecker::new();
                 let pulse_start = Instant::now();
                 if trace_ondemand {
                     log::info!(
@@ -1334,9 +1334,14 @@ fn parse_file(
 }
 
 /// Collect Cfun summaries from all expressions in an instruction.
+///
+/// `vt_index` is a per-Cfg precomputed virtual-target index; see
+/// `pulse::virtual_targets`. It replaces the previous O(num_procs) scan
+/// over `ctx.cfg.iter_proc_descs()` per virtual call site.
 fn collect_cfun_summaries(
     instr: &sil::instr::Instr,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    vt_index: &pulse::virtual_targets::VirtualTargetIndex,
     depth: usize,
     summaries: &mut std::collections::HashMap<
         sil::procname::Procname,
@@ -1380,6 +1385,7 @@ fn collect_cfun_summaries(
     fn collect_virtual_targets(
         callee: &sil::procname::Procname,
         ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+        vt_index: &pulse::virtual_targets::VirtualTargetIndex,
         depth: usize,
         summaries: &mut std::collections::HashMap<
             sil::procname::Procname,
@@ -1390,11 +1396,35 @@ fn collect_cfun_summaries(
         if depth >= MAX_VIRTUAL_TARGET_DEPTH {
             return;
         }
-        for pdesc in ctx.cfg.iter_proc_descs() {
-            if virtual_target_name_matches(callee, &pdesc.proc_name) {
-                let summary = Arc::new(analyze_with_spec_loop(pdesc, ctx, None, depth + 1));
-                summaries.entry(pdesc.proc_name.clone()).or_insert(summary);
+        // Cross-ref: review note #344, follow-up
+        // `sil_virtual_target_summary_cache`. Reusing the global summary store
+        // here lets the runner's bottom-up analysis result win when it has
+        // already produced a summary for the candidate target, avoiding a
+        // duplicate analyze_with_spec_loop invocation per (caller, vcall,
+        // candidate) tuple. We use the non-blocking `get_arc` rather than
+        // `get_or_compute_arc` because virtual candidates are not syntactic
+        // callees (they may be in-flight on another worker, scheduled into
+        // the same SCC), and blocking here could invert the lock ordering
+        // already enforced by the bottom-up scheduler.
+        for target_pname in vt_index.candidates_for(callee) {
+            if summaries.contains_key(target_pname) {
+                continue;
             }
+            if let Some(summary) = ctx.summaries.get_arc(target_pname) {
+                summaries.insert(target_pname.clone(), summary);
+                continue;
+            }
+            let Some(pdesc) = ctx.cfg.get_proc_desc(target_pname) else {
+                continue;
+            };
+            let summary = Arc::new(analyze_with_spec_loop(
+                pdesc,
+                ctx,
+                vt_index,
+                None,
+                depth + 1,
+            ));
+            summaries.insert(target_pname.clone(), summary);
         }
     }
 
@@ -1413,7 +1443,7 @@ fn collect_cfun_summaries(
             collect_from_exp(fun_exp, ctx, summaries);
             if flags.cf_virtual {
                 if let Exp::Const(Const::Cfun(callee)) = fun_exp {
-                    collect_virtual_targets(callee, ctx, depth, summaries);
+                    collect_virtual_targets(callee, ctx, vt_index, depth, summaries);
                 }
             }
             for (arg, _) in args {
@@ -1422,24 +1452,6 @@ fn collect_cfun_summaries(
         }
         Instr::Prune { exp, .. } => collect_from_exp(exp, ctx, summaries),
         _ => {}
-    }
-}
-
-fn virtual_target_name_matches(
-    callee: &sil::procname::Procname,
-    target: &sil::procname::Procname,
-) -> bool {
-    match (callee, target) {
-        (sil::procname::Procname::Hack(callee), sil::procname::Procname::Hack(target)) => {
-            callee.function_name == target.function_name && callee.arity == target.arity
-        }
-        (sil::procname::Procname::Java(callee), sil::procname::Procname::Java(target)) => {
-            callee.method_name == target.method_name && callee.parameters == target.parameters
-        }
-        (sil::procname::Procname::Python(callee), sil::procname::Procname::Python(target)) => {
-            callee.function_name == target.function_name && callee.arity == target.arity
-        }
-        _ => false,
     }
 }
 
@@ -1492,6 +1504,7 @@ fn collect_summary_closure_summaries(
 fn analyze_with_spec_loop(
     pdesc: &sil::procdesc::Procdesc,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    vt_index: &pulse::virtual_targets::VirtualTargetIndex,
     specialization: Option<&sil::specialization::PulseSpecialization>,
     depth: usize,
 ) -> pulse::summary::PulseSummary {
@@ -1503,7 +1516,7 @@ fn analyze_with_spec_loop(
     > = std::collections::HashMap::new();
     let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
-        collect_cfun_summaries(instr, ctx, depth, &mut callee_summaries);
+        collect_cfun_summaries(instr, ctx, vt_index, depth, &mut callee_summaries);
         collect_global_initializer_refs(instr, &mut global_initializers);
     }
     for init_pname in global_initializers {
@@ -1511,7 +1524,7 @@ fn analyze_with_spec_loop(
             continue;
         };
         let summary = ctx.summaries.get_or_compute_arc(&init_pname, || {
-            analyze_with_spec_loop(init_pdesc, ctx, None, depth + 1)
+            analyze_with_spec_loop(init_pdesc, ctx, vt_index, None, depth + 1)
         });
         collect_summary_closure_summaries(summary.as_ref(), ctx, &mut callee_summaries);
         callee_summaries.entry(init_pname).or_insert(summary);
@@ -1545,7 +1558,8 @@ fn analyze_with_spec_loop(
                 continue;
             }
             if let Some(callee_pdesc) = ctx.cfg.get_proc_desc(callee_pname) {
-                let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
+                let spec_summary =
+                    analyze_with_spec_loop(callee_pdesc, ctx, vt_index, Some(spec), depth + 1);
                 let spec_summary_for_store = spec_summary.clone();
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
                     Arc::make_mut(existing).add_specialized_summary(spec.clone(), spec_summary);
@@ -1573,7 +1587,29 @@ fn analyze_with_spec_loop(
 }
 
 /// Adapter: implements `ondemand::InterChecker` for Pulse.
-struct PulseInterChecker;
+///
+/// Holds a lazily-built `VirtualTargetIndex` so we only walk
+/// `cfg.iter_proc_descs()` once per `run_inter` invocation, no matter how
+/// many virtual call sites we encounter.
+struct PulseInterChecker {
+    vt_index: OnceLock<Arc<pulse::virtual_targets::VirtualTargetIndex>>,
+}
+
+impl PulseInterChecker {
+    fn new() -> Self {
+        Self {
+            vt_index: OnceLock::new(),
+        }
+    }
+
+    fn vt_index_for<'a>(
+        &'a self,
+        cfg: &sil::cfg::Cfg,
+    ) -> &'a Arc<pulse::virtual_targets::VirtualTargetIndex> {
+        self.vt_index
+            .get_or_init(|| Arc::new(pulse::virtual_targets::VirtualTargetIndex::build(cfg)))
+    }
+}
 
 impl ondemand::checker::InterChecker for PulseInterChecker {
     type Summary = pulse::summary::PulseSummary;
@@ -1587,7 +1623,8 @@ impl ondemand::checker::InterChecker for PulseInterChecker {
         pdesc: &sil::procdesc::Procdesc,
         ctx: &ondemand::checker::AnalysisContext<Self::Summary>,
     ) -> Self::Summary {
-        analyze_with_spec_loop(pdesc, ctx, None, 0)
+        let vt_index = self.vt_index_for(ctx.cfg);
+        analyze_with_spec_loop(pdesc, ctx, vt_index.as_ref(), None, 0)
     }
 }
 

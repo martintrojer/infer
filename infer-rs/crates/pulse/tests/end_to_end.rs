@@ -18,7 +18,26 @@ static ANALYZE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEST_RUN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Adapter for running Pulse through the ondemand interprocedural runner.
-struct PulseInterChecker;
+struct PulseInterChecker {
+    vt_index: std::sync::OnceLock<std::sync::Arc<pulse::virtual_targets::VirtualTargetIndex>>,
+}
+
+impl PulseInterChecker {
+    fn new() -> Self {
+        Self {
+            vt_index: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn vt_index_for(
+        &self,
+        cfg: &sil::cfg::Cfg,
+    ) -> &std::sync::Arc<pulse::virtual_targets::VirtualTargetIndex> {
+        self.vt_index.get_or_init(|| {
+            std::sync::Arc::new(pulse::virtual_targets::VirtualTargetIndex::build(cfg))
+        })
+    }
+}
 
 impl ondemand::checker::InterChecker for PulseInterChecker {
     type Summary = pulse::summary::PulseSummary;
@@ -33,7 +52,8 @@ impl ondemand::checker::InterChecker for PulseInterChecker {
         let _guard = ANALYZE_LOCK
             .lock()
             .expect("end-to-end analyze lock poisoned");
-        analyze_with_spec_loop(pdesc, ctx, None, 0)
+        let vt_index = self.vt_index_for(ctx.cfg).clone();
+        analyze_with_spec_loop(pdesc, ctx, &vt_index, None, 0)
     }
 }
 
@@ -48,7 +68,7 @@ fn run_pulse_inter(
     let _guard = TEST_RUN_LOCK
         .lock()
         .expect("end-to-end test-run lock poisoned");
-    let checker = PulseInterChecker;
+    let checker = PulseInterChecker::new();
     let (store, _) = ondemand::runner::run_inter(&checker, cfg, tenv);
     store
 }
@@ -62,6 +82,7 @@ fn run_pulse_inter(
 fn analyze_with_spec_loop(
     pdesc: &sil::procdesc::Procdesc,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    vt_index: &pulse::virtual_targets::VirtualTargetIndex,
     specialization: Option<&sil::specialization::PulseSpecialization>,
     depth: usize,
 ) -> pulse::summary::PulseSummary {
@@ -70,7 +91,7 @@ fn analyze_with_spec_loop(
     let mut callee_summaries = std::collections::HashMap::new();
     let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
-        collect_cfun_refs(instr, ctx, depth, &mut callee_summaries);
+        collect_cfun_refs(instr, ctx, vt_index, depth, &mut callee_summaries);
         collect_global_initializer_refs(instr, &mut global_initializers);
     }
     for init_pname in global_initializers {
@@ -78,7 +99,7 @@ fn analyze_with_spec_loop(
             continue;
         };
         let summary = ctx.summaries.get_or_compute(&init_pname, || {
-            analyze_with_spec_loop(init_pdesc, ctx, None, depth + 1)
+            analyze_with_spec_loop(init_pdesc, ctx, vt_index, None, depth + 1)
         });
         let mut closure_targets = std::collections::HashSet::new();
         collect_summary_closure_pnames(&summary, &mut closure_targets);
@@ -91,10 +112,9 @@ fn analyze_with_spec_loop(
             // same summary through `InterChecker::analyze`, which would invert
             // the lock order and deadlock. A direct recursive analysis keeps
             // the harness deterministic without relying on store timing.
-            let closure_summary = ctx
-                .summaries
-                .get(&closure_pname)
-                .unwrap_or_else(|| analyze_with_spec_loop(closure_pdesc, ctx, None, depth + 1));
+            let closure_summary = ctx.summaries.get(&closure_pname).unwrap_or_else(|| {
+                analyze_with_spec_loop(closure_pdesc, ctx, vt_index, None, depth + 1)
+            });
             callee_summaries
                 .entry(closure_pname)
                 .or_insert(closure_summary);
@@ -135,7 +155,8 @@ fn analyze_with_spec_loop(
             if let Some(callee_pdesc) = ctx.cfg.get_proc_desc(callee_pname) {
                 // RECURSIVE: re-analyze callee with specialization AND the
                 // specialization loop, so sub-callees can also be specialized.
-                let spec_summary = analyze_with_spec_loop(callee_pdesc, ctx, Some(spec), depth + 1);
+                let spec_summary =
+                    analyze_with_spec_loop(callee_pdesc, ctx, vt_index, Some(spec), depth + 1);
                 let spec_summary_for_store = spec_summary.clone();
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
                     existing.add_specialized_summary(spec.clone(), spec_summary);
@@ -222,6 +243,7 @@ fn run_infer_rs_cli_report(
 fn collect_cfun_refs(
     instr: &sil::instr::Instr,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    vt_index: &pulse::virtual_targets::VirtualTargetIndex,
     depth: usize,
     out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
 ) {
@@ -237,11 +259,29 @@ fn collect_cfun_refs(
                 if let sil::exp::Exp::Const(sil::const_val::Const::Cfun(callee)) = fun_exp {
                     const MAX_VIRTUAL_TARGET_DEPTH: usize = 5;
                     if depth < MAX_VIRTUAL_TARGET_DEPTH {
-                        for pdesc in ctx.cfg.iter_proc_descs() {
-                            if virtual_target_name_matches(callee, &pdesc.proc_name) {
-                                let summary = analyze_with_spec_loop(pdesc, ctx, None, depth + 1);
-                                out.entry(pdesc.proc_name.clone()).or_insert(summary);
+                        // Cross-ref: review note #344. The candidate index
+                        // turns the previous O(num_procs) scan per virtual
+                        // call site into an O(1) hash lookup.
+                        for target_pname in vt_index.candidates_for(callee) {
+                            if out.contains_key(target_pname) {
+                                continue;
                             }
+                            // Reuse the runner's cached summary when available
+                            // to avoid a redundant analyze_with_spec_loop pass.
+                            // We deliberately use the non-blocking `get`
+                            // instead of `get_or_compute` to preserve the
+                            // existing harness lock invariant (the analyze
+                            // lock is held while this runs).
+                            if let Some(summary) = ctx.summaries.get(target_pname) {
+                                out.insert(target_pname.clone(), summary);
+                                continue;
+                            }
+                            let Some(pdesc) = ctx.cfg.get_proc_desc(target_pname) else {
+                                continue;
+                            };
+                            let summary =
+                                analyze_with_spec_loop(pdesc, ctx, vt_index, None, depth + 1);
+                            out.insert(target_pname.clone(), summary);
                         }
                     }
                 }
@@ -293,24 +333,6 @@ fn collect_summary_closure_pnames(
                 out.insert(pname.clone());
             }
         }
-    }
-}
-
-fn virtual_target_name_matches(
-    callee: &sil::procname::Procname,
-    target: &sil::procname::Procname,
-) -> bool {
-    match (callee, target) {
-        (sil::procname::Procname::Hack(callee), sil::procname::Procname::Hack(target)) => {
-            callee.function_name == target.function_name && callee.arity == target.arity
-        }
-        (sil::procname::Procname::Java(callee), sil::procname::Procname::Java(target)) => {
-            callee.method_name == target.method_name && callee.parameters == target.parameters
-        }
-        (sil::procname::Procname::Python(callee), sil::procname::Procname::Python(target)) => {
-            callee.function_name == target.function_name && callee.arity == target.arity
-        }
-        _ => false,
     }
 }
 
