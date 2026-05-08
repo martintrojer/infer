@@ -249,6 +249,40 @@ define .static caller_bad(): void {
 }
 
 #[test]
+fn test_ocaml_sil_companion_file_resolves_cross_file_call() {
+    test_harness::skip_without_ocaml_sil!();
+    let pulse_dir = ocaml_sil_dir().join("pulse");
+    let caller = pulse_dir.join("npe.sil");
+    let companion = pulse_dir.join("externals.sil");
+    assert!(caller.exists(), "fixture missing: {}", caller.display());
+    assert!(
+        companion.exists(),
+        "fixture missing: {}",
+        companion.display()
+    );
+
+    let out_dir = TempDir::new();
+    let (code, stdout, stderr) = run_infer_rs(&[
+        "--pulse-only",
+        "--pulse-report-issues-for-tests",
+        "-o",
+        out_dir.to_str().unwrap(),
+        caller.to_str().unwrap(),
+        companion.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        code, 2,
+        "cross-file fixture should surface issues. stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("external_call_and_npe_bad")
+            && stdout.contains(IssueTypeId::NullptrDereference.id()),
+        "expected companion-defined callee to make external_call_and_npe_bad report: {stdout}"
+    );
+}
+
+#[test]
 fn test_quiet_mode() {
     let fixture = test_data_dir().join("c-liveness/dead_stores_simple.sil");
     let tmp_dir = TempDir::new();
