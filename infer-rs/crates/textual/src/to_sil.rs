@@ -653,6 +653,14 @@ fn procdesc_to_sil(
     }
 }
 
+fn textual_prune_is_then_branch(exp: &ast::Exp) -> bool {
+    !matches!(
+        exp,
+        ast::Exp::Call { proc, args, .. }
+            if proc.name.value == "__sil_lnot" && args.len() == 1
+    )
+}
+
 /// Convert a single Textual instruction to a SIL instruction.
 fn instr_to_sil(
     lang: Lang,
@@ -715,7 +723,7 @@ fn instr_to_sil(
             Ok(Some(instr::Instr::Prune {
                 exp: sil_exp,
                 loc: loc(l),
-                is_then_branch: true,
+                is_then_branch: textual_prune_is_then_branch(exp),
                 if_kind: instr::IfKind::If,
             }))
         }
@@ -1505,6 +1513,38 @@ define f(x: int) : void {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_prune_then_branch_metadata_tracks_textual_negation() {
+        let src = r#".source_language = "c"
+
+define f(x: int) : void {
+  #entry:
+    n0: int = load &x
+    prune n0
+    prune ! n0
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, decl_errors) = DeclEnv::from_module(&module);
+        assert!(decl_errors.is_empty());
+
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        let branch_metadata: Vec<_> = pdesc
+            .iter_instrs()
+            .filter_map(|(_, instr)| match instr {
+                instr::Instr::Prune { is_then_branch, .. } => Some(*is_then_branch),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            branch_metadata,
+            vec![true, false],
+            "plain textual prune should be marked as the then branch and `prune !` as the else branch"
+        );
     }
 
     #[test]
