@@ -737,7 +737,7 @@ fn instr_to_sil(
                 .map(ident_to_sil)
                 .unwrap_or_else(ident::Ident::create_none);
             match exp {
-                ast::Exp::Call { proc, args, .. } => {
+                ast::Exp::Call { proc, args, kind } => {
                     let callee_name = &proc.name.value;
 
                     // Try __sil_* builtin dispatch (BinOp, UnOp, allocate, cast)
@@ -770,12 +770,14 @@ fn instr_to_sil(
                             ))
                         })
                         .collect::<Result<Vec<_>, ConvError>>()?;
+                    let mut flags = CallFlags::default();
+                    flags.cf_virtual = matches!(kind, ast::CallKind::Virtual);
                     Ok(Some(instr::Instr::Call {
                         ret: (ret_id, ret_typ),
                         fun_exp,
                         args: sil_args,
                         loc: loc(l),
-                        flags: CallFlags::default(),
+                        flags,
                     }))
                 }
                 _ => {
@@ -1306,6 +1308,34 @@ define f(x: int, y: int) : int {
             }
             other => panic!("expected call instruction, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_virtual_call_sets_call_flag() {
+        let src = r#".source_language = "hack"
+
+type Num .abstract {}
+declare Num.value(*Num): int
+
+define f(arg: *Num) : int {
+  #entry:
+    n0: *Num = load &arg
+    n1 = n0.Num.value()
+    ret n1
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg
+            .iter_proc_descs()
+            .find(|pdesc| format!("{}", pdesc.proc_name).contains("f#1"))
+            .expect("f proc should exist");
+        let instrs: Vec<_> = pdesc.iter_instrs().collect();
+        assert!(instrs.iter().any(|(_, instr)| matches!(
+            instr,
+            instr::Instr::Call { flags, .. } if flags.cf_virtual
+        )));
     }
 
     #[test]

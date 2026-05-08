@@ -1369,7 +1369,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
 fn exec_instr_with_summaries(
     pdesc: &Procdesc,
     instr: &Instr,
-    state: AbductiveDomain,
+    mut state: AbductiveDomain,
     callee_summaries: &dyn SummaryLookup,
     spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
 ) -> Vec<ExecutionDomain> {
@@ -1397,6 +1397,33 @@ fn exec_instr_with_summaries(
             call_flags: flags,
             spec_requests,
         };
+
+        if flags.cf_virtual {
+            if let Some((receiver_exp, _)) = args.first() {
+                let receiver = crate::operations::eval_or_fresh(receiver_exp, loc, &mut state);
+                if let Some(target_pname) =
+                    resolve_virtual_call_target(callee_pname, &state, receiver)
+                {
+                    let mut direct_flags = flags.clone();
+                    direct_flags.cf_virtual = false;
+                    let direct_call = Instr::Call {
+                        ret: (ret_id.clone(), ret_typ.clone()),
+                        fun_exp: Exp::Const(Const::Cfun(target_pname)),
+                        args: args.clone(),
+                        loc: loc.clone(),
+                        flags: direct_flags,
+                    };
+                    return exec_instr_with_summaries(
+                        pdesc,
+                        &direct_call,
+                        state,
+                        callee_summaries,
+                        spec_requests,
+                    );
+                }
+                state.add_need_dynamic_type_specialization(receiver);
+            }
+        }
 
         // __call_c_function_ptr(funptr, args...): resolve the function
         // pointer to a procname via Closure attribute, then dispatch.
@@ -1444,6 +1471,36 @@ fn exec_instr_with_summaries(
     }
 
     transfer::exec_instr_with_pdesc(Some(pdesc), instr, state)
+}
+
+fn resolve_virtual_call_target(
+    callee_pname: &Procname,
+    state: &AbductiveDomain,
+    receiver: crate::abstract_value::AbstractValue,
+) -> Option<Procname> {
+    let dynamic_type = state.get_dynamic_type(receiver)?;
+    let sil::typ::TypeDesc::Tstruct(type_name) = dynamic_type.desc.as_ref() else {
+        return None;
+    };
+
+    match (callee_pname, type_name) {
+        (Procname::Hack(callee), sil::typ::TypeName::HackClass(class_name)) => {
+            let mut target = callee.clone();
+            target.class_name = Some(class_name.clone());
+            Some(Procname::Hack(target))
+        }
+        (Procname::Java(callee), sil::typ::TypeName::JavaClass(class_name)) => {
+            let mut target = callee.clone();
+            target.class_name = class_name.clone();
+            Some(Procname::Java(target))
+        }
+        (Procname::Python(callee), sil::typ::TypeName::PythonClass(class_name)) => {
+            let mut target = callee.clone();
+            target.class_name = Some(class_name.0.clone());
+            Some(Procname::Python(target))
+        }
+        _ => None,
+    }
 }
 
 fn maybe_inline_global_initializer_load(

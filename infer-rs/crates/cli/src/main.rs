@@ -1337,6 +1337,7 @@ fn parse_file(
 fn collect_cfun_summaries(
     instr: &sil::instr::Instr,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    depth: usize,
     summaries: &mut std::collections::HashMap<
         sil::procname::Procname,
         Arc<pulse::summary::PulseSummary>,
@@ -1376,20 +1377,69 @@ fn collect_cfun_summaries(
         }
     }
 
+    fn collect_virtual_targets(
+        callee: &sil::procname::Procname,
+        ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+        depth: usize,
+        summaries: &mut std::collections::HashMap<
+            sil::procname::Procname,
+            Arc<pulse::summary::PulseSummary>,
+        >,
+    ) {
+        const MAX_VIRTUAL_TARGET_DEPTH: usize = 5;
+        if depth >= MAX_VIRTUAL_TARGET_DEPTH {
+            return;
+        }
+        for pdesc in ctx.cfg.iter_proc_descs() {
+            if virtual_target_name_matches(callee, &pdesc.proc_name) {
+                let summary = Arc::new(analyze_with_spec_loop(pdesc, ctx, None, depth + 1));
+                summaries.entry(pdesc.proc_name.clone()).or_insert(summary);
+            }
+        }
+    }
+
     match instr {
         Instr::Load { e, .. } => collect_from_exp(e, ctx, summaries),
         Instr::Store { e1, e2, .. } => {
             collect_from_exp(e1, ctx, summaries);
             collect_from_exp(e2, ctx, summaries);
         }
-        Instr::Call { fun_exp, args, .. } => {
+        Instr::Call {
+            fun_exp,
+            args,
+            flags,
+            ..
+        } => {
             collect_from_exp(fun_exp, ctx, summaries);
+            if flags.cf_virtual {
+                if let Exp::Const(Const::Cfun(callee)) = fun_exp {
+                    collect_virtual_targets(callee, ctx, depth, summaries);
+                }
+            }
             for (arg, _) in args {
                 collect_from_exp(arg, ctx, summaries);
             }
         }
         Instr::Prune { exp, .. } => collect_from_exp(exp, ctx, summaries),
         _ => {}
+    }
+}
+
+fn virtual_target_name_matches(
+    callee: &sil::procname::Procname,
+    target: &sil::procname::Procname,
+) -> bool {
+    match (callee, target) {
+        (sil::procname::Procname::Hack(callee), sil::procname::Procname::Hack(target)) => {
+            callee.function_name == target.function_name && callee.arity == target.arity
+        }
+        (sil::procname::Procname::Java(callee), sil::procname::Procname::Java(target)) => {
+            callee.method_name == target.method_name && callee.parameters == target.parameters
+        }
+        (sil::procname::Procname::Python(callee), sil::procname::Procname::Python(target)) => {
+            callee.function_name == target.function_name && callee.arity == target.arity
+        }
+        _ => false,
     }
 }
 
@@ -1453,7 +1503,7 @@ fn analyze_with_spec_loop(
     > = std::collections::HashMap::new();
     let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
-        collect_cfun_summaries(instr, ctx, &mut callee_summaries);
+        collect_cfun_summaries(instr, ctx, depth, &mut callee_summaries);
         collect_global_initializer_refs(instr, &mut global_initializers);
     }
     for init_pname in global_initializers {

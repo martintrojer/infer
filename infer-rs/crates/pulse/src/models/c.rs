@@ -97,7 +97,7 @@ fn dispatch_with_config(
     if builtin_decl::match_builtin(&builtin_decl::__new(), callee)
         || builtin_decl::match_builtin(&builtin_decl::__new_array(), callee)
     {
-        return Some(new_model(caller, ret_id, loc, state));
+        return Some(new_model(caller, ret_id, args, loc, state));
     }
     if builtin_decl::match_builtin(&builtin_decl::__delete(), callee)
         || builtin_decl::match_builtin(&builtin_decl::__delete_array(), callee)
@@ -481,20 +481,33 @@ fn free(
 fn new_model(
     caller: Option<&Procname>,
     ret_id: &Ident,
+    args: &[(sil::exp::Exp, sil::typ::Typ)],
     loc: &Location,
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
+    let allocated_type = args.first().and_then(|(exp, _)| match exp {
+        sil::exp::Exp::Sizeof(data) => Some(data.typ.clone()),
+        _ => None,
+    });
     if caller_uses_no_leak_new(caller) {
-        return new_no_leak(ret_id, loc, state);
+        return new_no_leak(ret_id, allocated_type, loc, state);
     }
-    cpp_new(ret_id, loc, state)
+    cpp_new(ret_id, allocated_type, loc, state)
 }
 
 /// OCaml `internal_new_`: Java/Hack/C#/Python `__new` is non-null but not a
 /// C/C++ leak-tracked allocation.
-fn new_no_leak(ret_id: &Ident, loc: &Location, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
+fn new_no_leak(
+    ret_id: &Ident,
+    allocated_type: Option<sil::typ::Typ>,
+    loc: &Location,
+    mut state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
     let addr = AbstractValue::mk_fresh();
     let _ = state.and_positive(addr);
+    if let Some(typ) = allocated_type {
+        state.add_dynamic_type_unsafe(addr, typ);
+    }
     operations::write_id_with_history(
         ret_id,
         crate::value_history::ValueWithHistory::new(addr, ValueHistory::assignment(loc.clone())),
@@ -504,9 +517,17 @@ fn new_no_leak(ret_id: &Ident, loc: &Location, mut state: AbductiveDomain) -> Ve
 }
 
 /// Model: `ret = new T` / `ret = new T[]` — tracked C++ allocation.
-fn cpp_new(ret_id: &Ident, loc: &Location, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
+fn cpp_new(
+    ret_id: &Ident,
+    allocated_type: Option<sil::typ::Typ>,
+    loc: &Location,
+    mut state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
     let addr = AbstractValue::mk_fresh();
     let _ = state.and_positive(addr);
+    if let Some(typ) = allocated_type {
+        state.add_dynamic_type_unsafe(addr, typ);
+    }
     operations::allocate(addr, Allocator::CppNew, loc.clone(), &mut state);
     operations::write_id_with_history(
         ret_id,
@@ -1056,6 +1077,57 @@ mod tests {
             ..config::InferConfig::default()
         };
         assert!(matches_configured_wrapper(&callee, &cfg));
+    }
+
+    #[test]
+    fn test_builtin_new_records_allocated_dynamic_type() {
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let caller = Procname::Hack(sil::procname::HackProcname {
+            class_name: None,
+            function_name: "f".into(),
+            arity: Some(0),
+        });
+        let callee = builtin_decl::__new();
+        let allocated_type = Typ::mk_struct(sil::typ::TypeName::HackClass(
+            sil::typ::HackClassName("Int".into()),
+        ));
+        let args = [(
+            Exp::Sizeof(sil::exp::SizeofData {
+                typ: allocated_type.clone(),
+                nbytes: None,
+                dynamic_length: None,
+                nullable: false,
+            }),
+            Typ::void(),
+        )];
+
+        let result = dispatch(
+            Some(&caller),
+            &callee,
+            &ret_id,
+            &args,
+            &Location::dummy(),
+            state,
+        )
+        .expect("__new should dispatch");
+
+        let continue_state = result
+            .into_iter()
+            .find_map(|exec| match exec {
+                ExecutionDomain::ContinueProgram(state) => Some(state),
+                _ => None,
+            })
+            .expect("__new should continue");
+        let ret_addr = continue_state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return should be bound");
+        assert_eq!(
+            continue_state.get_dynamic_type(ret_addr),
+            Some(&allocated_type)
+        );
     }
 
     #[test]

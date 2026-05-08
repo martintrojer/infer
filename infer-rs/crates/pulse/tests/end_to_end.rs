@@ -70,7 +70,7 @@ fn analyze_with_spec_loop(
     let mut callee_summaries = std::collections::HashMap::new();
     let mut global_initializers = std::collections::HashSet::new();
     for (_node_id, instr) in pdesc.iter_instrs() {
-        collect_cfun_refs(instr, ctx.summaries, &mut callee_summaries);
+        collect_cfun_refs(instr, ctx, depth, &mut callee_summaries);
         collect_global_initializer_refs(instr, &mut global_initializers);
     }
     for init_pname in global_initializers {
@@ -221,22 +221,41 @@ fn run_infer_rs_cli_report(
 /// Collect all Cfun procname references from an instruction and look up summaries.
 fn collect_cfun_refs(
     instr: &sil::instr::Instr,
-    store: &ondemand::summary::SummaryStore<pulse::summary::PulseSummary>,
+    ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    depth: usize,
     out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
 ) {
     match instr {
-        sil::instr::Instr::Call { fun_exp, args, .. } => {
-            collect_cfun_refs_exp(fun_exp, store, out);
+        sil::instr::Instr::Call {
+            fun_exp,
+            args,
+            flags,
+            ..
+        } => {
+            collect_cfun_refs_exp(fun_exp, ctx.summaries, out);
+            if flags.cf_virtual {
+                if let sil::exp::Exp::Const(sil::const_val::Const::Cfun(callee)) = fun_exp {
+                    const MAX_VIRTUAL_TARGET_DEPTH: usize = 5;
+                    if depth < MAX_VIRTUAL_TARGET_DEPTH {
+                        for pdesc in ctx.cfg.iter_proc_descs() {
+                            if virtual_target_name_matches(callee, &pdesc.proc_name) {
+                                let summary = analyze_with_spec_loop(pdesc, ctx, None, depth + 1);
+                                out.entry(pdesc.proc_name.clone()).or_insert(summary);
+                            }
+                        }
+                    }
+                }
+            }
             for (arg_exp, _) in args {
-                collect_cfun_refs_exp(arg_exp, store, out);
+                collect_cfun_refs_exp(arg_exp, ctx.summaries, out);
             }
         }
         sil::instr::Instr::Store { e1, e2, .. } => {
-            collect_cfun_refs_exp(e1, store, out);
-            collect_cfun_refs_exp(e2, store, out);
+            collect_cfun_refs_exp(e1, ctx.summaries, out);
+            collect_cfun_refs_exp(e2, ctx.summaries, out);
         }
         sil::instr::Instr::Load { e, .. } => {
-            collect_cfun_refs_exp(e, store, out);
+            collect_cfun_refs_exp(e, ctx.summaries, out);
         }
         _ => {}
     }
@@ -274,6 +293,24 @@ fn collect_summary_closure_pnames(
                 out.insert(pname.clone());
             }
         }
+    }
+}
+
+fn virtual_target_name_matches(
+    callee: &sil::procname::Procname,
+    target: &sil::procname::Procname,
+) -> bool {
+    match (callee, target) {
+        (sil::procname::Procname::Hack(callee), sil::procname::Procname::Hack(target)) => {
+            callee.function_name == target.function_name && callee.arity == target.arity
+        }
+        (sil::procname::Procname::Java(callee), sil::procname::Procname::Java(target)) => {
+            callee.method_name == target.method_name && callee.parameters == target.parameters
+        }
+        (sil::procname::Procname::Python(callee), sil::procname::Procname::Python(target)) => {
+            callee.function_name == target.function_name && callee.arity == target.arity
+        }
+        _ => false,
     }
 }
 
@@ -765,21 +802,19 @@ fn test_e2e_static_types() {
 /// inference, and summary specialization. Exercises `extends`, `.abstract`,
 /// `.final`, and `$static` type modifiers.
 /// OCaml expects: 5 _bad procs, 4 _good procs clean.
-/// We detect 4/5 _bad (missing plusBad which needs virtual dispatch through
-/// interprocedural call chains). We have false positives on _good procs
-/// because we don't yet evaluate return values from devirtualized calls
-/// in prune conditions.
+/// We detect the dynamic-type-specialized allocated-Int cases, including
+/// pruning good branches after devirtualized return values flow back to the
+/// caller. Remaining gaps are plusBad (suppressed), declared-final receiver
+/// precision, and static-class virtual dispatch.
 #[test]
 fn test_e2e_virt() {
     assert_ocaml_pulse_test(
         "virt.sil",
         &[
-            "plusBad",                                      // virtual dispatch through call chain
-            "plusOk", // FP: biabduction pre-check on virtual dispatch
-            "test_dyntype_specialization_good", // FP: needs devirt return value
-            "test_dyntype_specialization_from_caller_good", // FP: needs devirt return value
-            "devirtualize_with_final_good", // FP: needs devirt return value
-            "devirtualize_with_static_call_good", // FP: needs devirt return value
+            "plusBad",                            // suppressed latent report in this port
+            "plusOk",                             // FP: biabduction pre-check on virtual dispatch
+            "devirtualize_with_final_good",       // FP: declared-final receiver dynamic type
+            "devirtualize_with_static_call_good", // FP: static-class virtual dispatch
         ],
     );
 }
