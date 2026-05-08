@@ -1401,9 +1401,24 @@ fn exec_instr_with_summaries(
         if flags.cf_virtual {
             if let Some((receiver_exp, _)) = args.first() {
                 let receiver = crate::operations::eval_or_fresh(receiver_exp, loc, &mut state);
-                if let Some(target_pname) =
-                    resolve_virtual_call_target(callee_pname, &state, receiver)
-                {
+                // Only devirtualize through the name-swapped target when we
+                // actually have something callable for it (a summary, a model,
+                // or self-recursion). Without that proof, the synthesized
+                // class-qualified procname is essentially a guess: silently
+                // falling through to unknown-call semantics would lose the
+                // chance for the caller to supply a more precise dynamic type
+                // that does have a summary.
+                //
+                // Cross-ref: OCaml `Pulse.lookup_virtual_method_info` adds
+                // `need_dynamic_type_specialization` on `ApproxDevirtualization`
+                // whenever the override lookup did not yield a real method.
+                let resolved_target = resolve_virtual_call_target(callee_pname, &state, receiver)
+                    .filter(|target_pname| {
+                        callee_summaries.contains_key(target_pname)
+                            || crate::models::has_model(target_pname)
+                            || *target_pname == pdesc.proc_name
+                    });
+                if let Some(target_pname) = resolved_target {
                     let mut direct_flags = flags.clone();
                     direct_flags.cf_virtual = false;
                     let direct_call = Instr::Call {
@@ -5372,6 +5387,103 @@ mod tests {
                 .iter()
                 .map(|pp| format!("{:?}", pp.kind))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// When `resolve_virtual_call_target` synthesizes a class-qualified
+    /// procname that has no summary (and no model, and is not the caller
+    /// itself), we must still ask the caller for dynamic type specialization
+    /// rather than silently falling through to unknown-call semantics under
+    /// the synthesized name. Cross-ref: the `ApproxDevirtualization` branch
+    /// of OCaml's `Pulse.lookup_virtual_method_info`.
+    #[test]
+    fn test_devirtualized_target_without_summary_requests_specialization() {
+        let caller_pname = Procname::Hack(sil::procname::HackProcname {
+            class_name: Some(sil::typ::HackClassName("Caller".into())),
+            function_name: "call_foo".into(),
+            arity: Some(1),
+        });
+        let virt_callee = Procname::Hack(sil::procname::HackProcname {
+            class_name: Some(sil::typ::HackClassName("Base".into())),
+            function_name: "foo".into(),
+            arity: Some(1),
+        });
+        let resolved_target = Procname::Hack(sil::procname::HackProcname {
+            class_name: Some(sil::typ::HackClassName("Sub".into())),
+            function_name: "foo".into(),
+            arity: Some(1),
+        });
+
+        let mut pdesc = Procdesc::new(
+            caller_pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let recv_typ = Typ::mk_ptr(Typ::mk_struct(sil::typ::TypeName::HackClass(
+            sil::typ::HackClassName("Base".into()),
+        )));
+        pdesc.formals = vec![(
+            Mangled::from_string("recv"),
+            recv_typ.clone(),
+            Default::default(),
+        )];
+
+        let mut state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let recv_pvar = Pvar::mk(Mangled::from_string("recv"), caller_pname.clone());
+        let recv_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(recv_pvar)))
+            .unwrap();
+        let recv_val = state.read_heap(recv_addr, Access::Dereference);
+        // Receiver dynamic type resolves: caller-known `Sub` overrides
+        // SIL-level `Base.foo`. But we have no summary for `Sub.foo`.
+        state.add_dynamic_type_unsafe(
+            recv_val,
+            Typ::mk_struct(sil::typ::TypeName::HackClass(sil::typ::HackClassName(
+                "Sub".into(),
+            ))),
+        );
+
+        // Sanity check: the resolver does build the synthesized target name.
+        assert_eq!(
+            resolve_virtual_call_target(&virt_callee, &state, recv_val),
+            Some(resolved_target.clone()),
+        );
+
+        let recv_id = Ident::create_normal(IdentName::from_string("recv"), 0);
+        crate::operations::write_id(&recv_id, recv_val, &mut state);
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+
+        let mut flags = sil::call_flags::CallFlags::default();
+        flags.cf_virtual = true;
+        let instr = Instr::Call {
+            ret: (ret_id.clone(), Typ::int(sil::typ::IKind::IInt)),
+            fun_exp: Exp::Const(Const::Cfun(virt_callee)),
+            args: vec![(Exp::Var(recv_id), recv_typ)],
+            loc: Location::dummy(),
+            flags,
+        };
+
+        let summaries: HashMap<Procname, PulseSummary> = HashMap::new();
+        assert!(
+            !summaries.contains_key(&resolved_target),
+            "test precondition: resolved target must have no summary"
+        );
+
+        let results = exec_instr_with_summaries(&pdesc, &instr, state, &summaries, None);
+
+        let mut continues = results.iter().filter_map(|r| match r {
+            ExecutionDomain::ContinueProgram(s) => Some(s),
+            _ => None,
+        });
+        let post = continues
+            .next()
+            .expect("missing-target devirtualization should keep at least one ContinueProgram");
+        assert!(
+            post.need_dynamic_type_specialization.contains(&recv_val),
+            "missing-target devirtualization should request dynamic type specialization on the receiver, got {:?}",
+            post.need_dynamic_type_specialization
         );
     }
 }
