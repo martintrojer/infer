@@ -676,17 +676,60 @@ impl Phi {
         });
     }
 
-    /// Cheap intermediate-state GC: remove unary facts for unreachable
+    /// Cheap intermediate-state GC: remove high-volume facts for unreachable
     /// variables. This deliberately avoids the full `simplify()` pass (which
-    /// scans and rewrites all linear equations/atoms and is too expensive on
-    /// large capped whole-program runs) while dropping two high-volume fact
-    /// classes that do not affect future transfer once their value is
-    /// unreachable from the retained post graph.
+    /// scans and rewrites all linear equations/term_eqs and is too expensive
+    /// on large capped whole-program runs) while dropping fact classes that
+    /// do not affect future transfer once their value is unreachable from the
+    /// retained post graph.
+    ///
+    /// IMPORTANT: callers MUST pass an expanded reachable set (e.g. from
+    /// `crate::formula::expand_formula_reachable`) so that values transitively
+    /// linked to reachable values via `linear_eqs` / `fn_app_eqs` are kept
+    /// alive for canonicalization.
+    ///
+    /// Pruned families (safe per scout brief perf_explore_linear_const_audit
+    /// 2026-05-10):
+    /// - `intervals`, `is_int_vars` (unary facts on dead vars)
+    /// - `term_value_index` (cache; stale misses are tolerated)
+    /// - `fn_app_eqs` whose ret/actuals are all unreachable in the expanded
+    ///   set (intermediate states only — exit-state summary path uses the
+    ///   stricter `simplify_for_summary` flow)
+    /// - `atoms` whose vars are ALL unreachable in the expanded set (atoms
+    ///   over a mix of reachable/unreachable vars are kept since they still
+    ///   constrain reachable values).
+    ///
+    /// Deliberately NOT pruned (load-bearing canonicalization):
+    /// - `var_eqs` (VarUF reprs; partial pruning would re-bind reprs)
+    /// - `linear_eqs` (primary store consulted by `get_known_const`)
+    /// - `term_eqs` (consulted by `prune_eq_const` for boolean-recovery)
     pub fn prune_unreachable_simple_facts(&mut self, reachable: &HashSet<AbstractValue>) {
         let var_eqs = &self.var_eqs;
         let is_reachable = |v: AbstractValue| reachable.contains(&var_eqs.find_immut(v));
         self.intervals.retain(|v, _| is_reachable(*v));
         self.is_int_vars.retain(|v| is_reachable(*v));
+        self.fn_app_eqs.retain(|key, ret| {
+            is_reachable(*ret)
+                && key.actuals.iter().all(|actual| match actual {
+                    FnAppActual::Const(_) => true,
+                    FnAppActual::Var(v) => is_reachable(*v),
+                })
+        });
+        let term_key_operand_is_reachable = |op: &TermKeyOperand| match op {
+            TermKeyOperand::Const(_) => true,
+            TermKeyOperand::Var(v) => is_reachable(*v),
+        };
+        self.term_value_index.retain(|key, ret| {
+            is_reachable(*ret)
+                && term_key_operand_is_reachable(&key.lhs)
+                && term_key_operand_is_reachable(&key.rhs)
+        });
+        self.atoms.retain(|atom| {
+            let vars = atom.all_vars();
+            // Keep atoms that mention any reachable variable so they continue
+            // to constrain it; drop only atoms whose variables are ALL dead.
+            vars.is_empty() || vars.iter().any(|v| is_reachable(*v))
+        });
     }
 
     /// Forget pure constraints mentioning the given canonical values while
@@ -1431,6 +1474,90 @@ mod tests {
         assert!(
             phi.is_int_vars.contains(&fn_actual),
             "reachable is_int facts should survive simplification"
+        );
+    }
+
+    /// Scout brief perf_explore_linear_const_audit (2026-05-10) FIRST
+    /// EXPERIMENT: prune_unreachable_simple_facts must drop term_value_index,
+    /// fn_app_eqs, and atoms whose vars are all unreachable, while leaving
+    /// reachable linear_eqs / term_eqs / var_eqs untouched (they are
+    /// load-bearing canonicalization).
+    #[test]
+    fn test_prune_unreachable_simple_facts_drops_index_fn_app_and_dead_atoms() {
+        let mut phi = Phi::ttrue();
+        let keep_a = AbstractValue::of_raw(1);
+        let keep_b = AbstractValue::of_raw(2);
+        let dead_actual = AbstractValue::of_raw(3);
+        let dead_fn_ret = AbstractValue::of_raw(4);
+        let dead_atom_var = AbstractValue::of_raw(5);
+
+        // Reachable linear equation: keep_a = keep_b + 1. Must survive.
+        let lin = LinArith::of_var(keep_b).add(&LinArith::of_int(1));
+        assert!(phi.and_linear_eq(keep_a, lin).is_sat());
+
+        // Atom mentioning a reachable var (keep_a != 0) must survive even
+        // though it is in the atoms set.
+        assert!(phi
+            .and_atom(Atom::NotEqual(Term::Var(keep_a), Term::Const(0)))
+            .is_sat());
+
+        // Dead fn_app fact: __infer_skip(dead_actual) -> dead_fn_ret.
+        assert!(phi.and_const_eq(dead_actual, 0).is_sat());
+        assert!(phi
+            .and_fn_app(dead_fn_ret, "__infer_skip", &[dead_actual])
+            .is_sat());
+
+        // Dead atom: dead_atom_var != 0 — mentions only an unreachable var.
+        assert!(phi
+            .and_atom(Atom::NotEqual(Term::Var(dead_atom_var), Term::Const(0)))
+            .is_sat());
+
+        // Plant a stale term_value_index entry whose result is dead.
+        phi.term_value_index.insert(
+            TermKey {
+                op: sil::binop::Binop::PlusA(None),
+                lhs: TermKeyOperand::Var(dead_atom_var),
+                rhs: TermKeyOperand::Const(1),
+            },
+            dead_fn_ret,
+        );
+
+        // Reachable set: only keep_a and keep_b. Caller is expected to have
+        // already passed this through expand_formula_reachable.
+        let reachable = HashSet::from([keep_a, keep_b]);
+        phi.prune_unreachable_simple_facts(&reachable);
+
+        // term_value_index over dead_fn_ret/dead_atom_var must be gone.
+        assert!(
+            phi.term_value_index.is_empty(),
+            "dead term_value_index entries should be pruned"
+        );
+        // fn_app entries with unreachable ret/actuals must be gone.
+        assert!(
+            phi.iter_fn_app_eqs().next().is_none(),
+            "dead fn_app_eqs should be pruned"
+        );
+        // The dead-only atom is gone, but the atom mentioning keep_a
+        // survives.
+        assert!(
+            !phi.atoms
+                .contains(&Atom::NotEqual(Term::Var(dead_atom_var), Term::Const(0))),
+            "atoms with all-unreachable vars should be pruned"
+        );
+        assert!(
+            phi.atoms
+                .contains(&Atom::NotEqual(Term::Var(keep_a), Term::Const(0))),
+            "atoms mentioning reachable vars must be kept"
+        );
+        // The reachable linear equation must NOT have been touched (this is
+        // the load-bearing canonicalization invariant).
+        assert!(
+            phi.linear_eqs.contains_key(&keep_a)
+                || phi
+                    .linear_eqs
+                    .values()
+                    .any(|lin| lin.vars.contains_key(&keep_a)),
+            "reachable linear_eq must survive prune_unreachable_simple_facts"
         );
     }
 }

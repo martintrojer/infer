@@ -110,11 +110,16 @@ pub struct InferConfig {
     pub pulse_drop_dead_logical_vars: bool,
 
     /// In large stored intermediate Pulse states, also prune high-volume
-    /// unary formula facts (`intervals`, `is_int`) whose values are no
-    /// longer reachable from the retained post graph. Defaults to `false`:
-    /// it reduces memory on DES-family procedures but costs wall time on
-    /// capped whole-program OpenSSL runs. Enable when memory headroom is
-    /// more important than wall time.
+    /// formula facts (`intervals`, `is_int`, `term_value_index`,
+    /// `fn_app_eqs`, atoms over only-unreachable vars) and dead
+    /// `const_cache` entries whose values are no longer reachable from the
+    /// retained post graph (after transitive expansion across
+    /// `linear_eqs` / `fn_app_eqs`). Load-bearing canonicalization
+    /// families (`var_eqs`, `linear_eqs`, `term_eqs`) are deliberately
+    /// preserved. Defaults to `false`: it reduces memory on DES-family
+    /// procedures but costs wall time on capped whole-program OpenSSL
+    /// runs. Enable when memory headroom is more important than wall
+    /// time.
     #[serde(rename = "pulse-intermediate-formula-gc")]
     pub pulse_intermediate_formula_gc: bool,
 

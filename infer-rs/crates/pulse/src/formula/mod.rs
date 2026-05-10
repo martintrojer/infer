@@ -97,7 +97,87 @@ impl Formula {
     pub fn get_var_repr(&self, v: AbstractValue) -> AbstractValue {
         self.phi.get_repr(v)
     }
+}
 
+/// Transitively expand a seed reachability set across the formula's
+/// `linear_eqs` (in both directions) and `fn_app_eqs` (ret ↔ actuals)
+/// graph. The returned set is a superset of `seed_reachable` containing
+/// every variable connected to a seed via at least one canonicalization
+/// edge.
+///
+/// Used to (a) drive the summary-time `simplify_for_summary` keep set
+/// (in `summary.rs`), and (b) gate intermediate-state
+/// `prune_unreachable_simple_facts` cleanup so that values transitively
+/// linked to retained values stay alive for `get_known_const` /
+/// `canonical_term_operand` (see `abductive.rs::shrink_post_to_stack_reachable`).
+///
+/// Cross-ref: OCaml `PulseFormula.DeadVariables.build_var_graph` /
+/// `get_reachable_from` (PulseFormula.ml:802-830).
+pub fn expand_formula_reachable(
+    formula: &Formula,
+    seed_reachable: &std::collections::HashSet<AbstractValue>,
+) -> std::collections::HashSet<AbstractValue> {
+    let phi = formula.phi();
+    let mut reachable = seed_reachable.clone();
+    let mut worklist: Vec<_> = seed_reachable.iter().copied().collect();
+
+    while let Some(v) = worklist.pop() {
+        let repr = phi.get_repr(v);
+        if let Some(lin) = phi.linear_eqs.get(&repr) {
+            for dep in lin.vars.keys() {
+                let dep_repr = phi.get_repr(*dep);
+                if reachable.insert(dep_repr) {
+                    worklist.push(dep_repr);
+                }
+            }
+        }
+
+        for (&lhs, lin) in &phi.linear_eqs {
+            let lhs_repr = phi.get_repr(lhs);
+            if lhs_repr != repr
+                && lin.vars.keys().any(|dep| phi.get_repr(*dep) == repr)
+                && reachable.insert(lhs_repr)
+            {
+                worklist.push(lhs_repr);
+            }
+        }
+
+        // Cross-ref: OCaml PulseFormula.DeadVariables.build_var_graph keeps
+        // function-application results connected to their actual arguments.
+        // Without this, imported conditions on pure-call results can be
+        // dropped during summary normalization even when the actuals are
+        // caller-visible formals, which makes latent caller-dependent errors
+        // look manifest.
+        for (key, ret) in phi.iter_fn_app_eqs() {
+            let ret_repr = phi.get_repr(*ret);
+            let mut connected = ret_repr == repr;
+            let mut actual_reprs = Vec::new();
+            for actual in &key.actuals {
+                let phi::FnAppActual::Var(actual) = actual else {
+                    continue;
+                };
+                let actual_repr = phi.get_repr(*actual);
+                connected |= actual_repr == repr;
+                actual_reprs.push(actual_repr);
+            }
+            if !connected {
+                continue;
+            }
+            if reachable.insert(ret_repr) {
+                worklist.push(ret_repr);
+            }
+            for actual_repr in actual_reprs {
+                if reachable.insert(actual_repr) {
+                    worklist.push(actual_repr);
+                }
+            }
+        }
+    }
+
+    reachable
+}
+
+impl Formula {
     /// Check if a variable is known to equal zero.
     pub fn is_known_zero(&self, v: AbstractValue) -> bool {
         self.phi.is_known_zero(v)

@@ -1392,4 +1392,100 @@ mod tests {
 
         assert_ne!(debug_signature(&state1), debug_signature(&state2));
     }
+
+    /// Scout brief perf_explore_linear_const_audit (2026-05-10) FIRST
+    /// EXPERIMENT: dropping `intervals`, `is_int`, `term_value_index`,
+    /// `fn_app_eqs`, and dead atoms must NOT alter the canonical formula
+    /// fingerprint that `state_cmp::alpha_equivalent` derives for the
+    /// stack-reachable subgraph. If this drifts, the GC has eaten
+    /// load-bearing equality info and we must STOP per the scope guards.
+    ///
+    /// Two perspectives are checked:
+    ///   (a) For a state that contains ONLY reachable formula facts, the
+    ///       canonical_formula fingerprint is identical before and after
+    ///       running the intermediate GC — it has nothing to drop.
+    ///   (b) For a state that ALSO contains unreachable formula facts,
+    ///       running the GC produces a state that is alpha-equivalent to
+    ///       the GC of an identical companion state — i.e. the GC is
+    ///       deterministic and only touches the dead subgraph.
+    #[test]
+    fn test_intermediate_formula_gc_preserves_alpha_equivalent_fingerprint() {
+        // (a) Reachable-only fixture: GC must be a no-op for canonical
+        // formula fingerprints.
+        AbstractValue::reset_counters();
+        let mut state_reachable_only = make_state(0, false);
+        let formal_addr = state_reachable_only
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+        let pointee = state_reachable_only.read_heap(formal_addr, Access::Dereference);
+        assert!(state_reachable_only.and_equal_const(pointee, 5).is_sat());
+
+        let signature_before = debug_signature(&state_reachable_only);
+        state_reachable_only.shrink_post_to_stack_reachable_with_formula_gc();
+        let signature_after = debug_signature(&state_reachable_only);
+        assert_eq!(
+            signature_before, signature_after,
+            "intermediate GC must not change canonical_formula fingerprint when every fact is reachable"
+        );
+
+        // (b) States with the same reachable subgraph but different dead
+        // formula facts must collapse to the same fingerprint after GC.
+        AbstractValue::reset_counters();
+        let mut state_with_dead = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut state_with_more_dead = make_state(0, false);
+
+        let inject_reachable = |state: &mut AbductiveDomain| {
+            let formal_addr = state
+                .post
+                .stack
+                .iter()
+                .next()
+                .map(|(_var, addr)| *addr)
+                .expect("formal should exist");
+            let pointee = state.read_heap(formal_addr, Access::Dereference);
+            assert!(state.and_equal_const(pointee, 5).is_sat());
+        };
+        inject_reachable(&mut state_with_dead);
+        inject_reachable(&mut state_with_more_dead);
+
+        // Differently-sized dead vocabularies, all unreachable from the
+        // post stack. We use only fact families that
+        // `prune_unreachable_simple_facts` actually drops in the FIRST
+        // EXPERIMENT (is_int, fn_app_eqs); we deliberately do NOT plant
+        // linear_eqs / term_eqs here because they are not pruned and would
+        // survive into the canonical fingerprint.
+        for i in 0..3u32 {
+            let dead_actual = AbstractValue::mk_fresh();
+            let dead_ret = AbstractValue::mk_fresh();
+            state_with_dead.path_condition.and_is_int(dead_actual);
+            assert!(state_with_dead
+                .path_condition
+                .and_fn_app(dead_ret, &format!("__dead_a_{i}"), &[dead_actual])
+                .is_sat());
+        }
+        for i in 0..6u32 {
+            let dead_actual = AbstractValue::mk_fresh();
+            let dead_ret = AbstractValue::mk_fresh();
+            state_with_more_dead.path_condition.and_is_int(dead_actual);
+            assert!(state_with_more_dead
+                .path_condition
+                .and_fn_app(dead_ret, &format!("__dead_b_{i}"), &[dead_actual])
+                .is_sat());
+        }
+
+        state_with_dead.shrink_post_to_stack_reachable_with_formula_gc();
+        state_with_more_dead.shrink_post_to_stack_reachable_with_formula_gc();
+
+        let exec_a = ExecutionDomain::ContinueProgram(state_with_dead);
+        let exec_b = ExecutionDomain::ContinueProgram(state_with_more_dead);
+        assert!(
+            exec_a.leq(&exec_b) && exec_b.leq(&exec_a),
+            "states differing only in dead formula facts must be alpha-equivalent after GC"
+        );
+    }
 }

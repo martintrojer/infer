@@ -24,6 +24,7 @@ use crate::access::Access;
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::formula::atom::Atom;
+use crate::formula::expand_formula_reachable;
 use crate::formula::term::Term;
 use crate::formula::Operand;
 use crate::value_history::HistoryEvent;
@@ -3071,69 +3072,10 @@ fn atom_is_benign_manifest_constraint(
     }
 }
 
-fn expand_formula_reachable(
-    formula: &crate::formula::Formula,
-    seed_reachable: &std::collections::HashSet<AbstractValue>,
-) -> std::collections::HashSet<AbstractValue> {
-    let phi = formula.phi();
-    let mut reachable = seed_reachable.clone();
-    let mut worklist: Vec<_> = seed_reachable.iter().copied().collect();
-
-    while let Some(v) = worklist.pop() {
-        let repr = phi.get_repr(v);
-        if let Some(lin) = phi.linear_eqs.get(&repr) {
-            for dep in lin.vars.keys() {
-                let dep_repr = phi.get_repr(*dep);
-                if reachable.insert(dep_repr) {
-                    worklist.push(dep_repr);
-                }
-            }
-        }
-
-        for (&lhs, lin) in &phi.linear_eqs {
-            let lhs_repr = phi.get_repr(lhs);
-            if lhs_repr != repr
-                && lin.vars.keys().any(|dep| phi.get_repr(*dep) == repr)
-                && reachable.insert(lhs_repr)
-            {
-                worklist.push(lhs_repr);
-            }
-        }
-
-        // Cross-ref: OCaml PulseFormula.DeadVariables.build_var_graph keeps
-        // function-application results connected to their actual arguments.
-        // Without this, imported conditions on pure-call results can be
-        // dropped during summary normalization even when the actuals are
-        // caller-visible formals, which makes latent caller-dependent errors
-        // look manifest.
-        for (key, ret) in phi.iter_fn_app_eqs() {
-            let ret_repr = phi.get_repr(*ret);
-            let mut connected = ret_repr == repr;
-            let mut actual_reprs = Vec::new();
-            for actual in &key.actuals {
-                let crate::formula::phi::FnAppActual::Var(actual) = actual else {
-                    continue;
-                };
-                let actual_repr = phi.get_repr(*actual);
-                connected |= actual_repr == repr;
-                actual_reprs.push(actual_repr);
-            }
-            if !connected {
-                continue;
-            }
-            if reachable.insert(ret_repr) {
-                worklist.push(ret_repr);
-            }
-            for actual_repr in actual_reprs {
-                if reachable.insert(actual_repr) {
-                    worklist.push(actual_repr);
-                }
-            }
-        }
-    }
-
-    reachable
-}
+// `expand_formula_reachable` lives in `crate::formula` so that
+// intermediate-state cleanup in `abductive.rs::shrink_post_to_stack_reachable`
+// can use the same canonicalization-aware oracle. See the use-statement at
+// the top of this file for the import.
 
 /// Check if an allocator and invalidation are a matching pair (alloc then free).
 ///

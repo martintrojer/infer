@@ -1187,6 +1187,18 @@ impl AbductiveDomain {
     /// disconnected retained post heap/attrs for semantic comparison; this
     /// drops the same dead storage physically from invariant maps.
     pub fn shrink_post_to_stack_reachable(&mut self) {
+        self.shrink_post_to_stack_reachable_inner(config::get().pulse_intermediate_formula_gc);
+    }
+
+    /// Test seam: equivalent to `shrink_post_to_stack_reachable` but lets
+    /// callers force the formula-GC path without flipping the global config
+    /// `pulse_intermediate_formula_gc` flag (which is a `OnceLock` shared
+    /// across the test process).
+    pub fn shrink_post_to_stack_reachable_with_formula_gc(&mut self) {
+        self.shrink_post_to_stack_reachable_inner(true);
+    }
+
+    fn shrink_post_to_stack_reachable_inner(&mut self, formula_gc: bool) {
         let roots: Vec<_> = self.post.stack.iter().map(|(_, addr)| *addr).collect();
         let mut reachable = std::collections::HashSet::new();
         for root in roots {
@@ -1222,10 +1234,43 @@ impl AbductiveDomain {
             .retain(|addr| canonical_reachable.contains(addr));
         self.dynamic_types
             .retain(|addr, _| canonical_reachable.contains(addr));
-        if config::get().pulse_intermediate_formula_gc {
-            self.path_condition
-                .prune_unreachable_simple_facts(&formula_reachable);
+        if formula_gc {
+            self.apply_intermediate_formula_gc(formula_reachable);
         }
+    }
+
+    /// Intermediate-state formula cleanup: prune high-volume formula facts
+    /// and dead `const_cache` entries whose canonical values are not in the
+    /// transitively-expanded `formula_reachable` set.
+    ///
+    /// Pulled out of `shrink_post_to_stack_reachable` so unit and integration
+    /// tests can exercise it without flipping the global
+    /// `pulse_intermediate_formula_gc` flag (which is a `OnceLock` and would
+    /// interact with other tests).
+    pub fn apply_intermediate_formula_gc(
+        &mut self,
+        formula_reachable: std::collections::HashSet<AbstractValue>,
+    ) {
+        // Transitively expand `formula_reachable` across linear_eqs and
+        // fn_app_eqs so that values whose only role is to canonicalize a
+        // reachable value (e.g. `v_dead = 2*v_live + 1` linking the live
+        // representative to a constant) survive intermediate cleanup.
+        // Without this, dropping the wrong unary fact would silently
+        // de-canonicalize a live value. Cross-ref: scout brief
+        // perf_explore_linear_const_audit (2026-05-10) and OCaml
+        // PulseFormula.DeadVariables.get_reachable_from.
+        let formula_reachable =
+            crate::formula::expand_formula_reachable(&self.path_condition, &formula_reachable);
+        self.path_condition
+            .prune_unreachable_simple_facts(&formula_reachable);
+        // Drop const_cache entries whose canonical value is no longer
+        // reachable. Loses only canonicalization sharing (a future load
+        // of the same constant mints a fresh AV); shrink_for_storage
+        // already clears const_cache wholesale at summary time, so no
+        // summary contract depends on these entries.
+        let path_condition = &self.path_condition;
+        self.const_cache
+            .retain(|_, value| formula_reachable.contains(&path_condition.get_var_repr(*value)));
     }
 
     /// Add a prune constraint (from a branch condition).
@@ -1573,5 +1618,59 @@ mod tests {
         // After p = null_val, p should also be known-zero
         state.and_equal(p, null_val);
         assert!(state.is_known_zero(p));
+    }
+
+    /// Scout brief perf_explore_linear_const_audit (2026-05-10) FIRST
+    /// EXPERIMENT: const_cache entries whose canonical value is unreachable
+    /// from the post stack must be dropped; entries whose representative is
+    /// stack-reachable must survive.
+    #[test]
+    fn test_intermediate_gc_drops_unreachable_const_cache_entries() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
+            Mangled::from_string("p"),
+            Procname::c_from_string("test"),
+        )));
+        let formal_addr = state.post.stack.find(&formal_var).unwrap();
+
+        // Reachable constant: the formal points at a value known to equal 7.
+        // canonicalize_for_access populates const_cache[7] with that value.
+        let reachable_val = state.read_heap(formal_addr, Access::Dereference);
+        assert!(state.and_equal_const(reachable_val, 7).is_sat());
+        let _ = state.canonicalize_for_access(reachable_val);
+
+        // Unreachable constant: a fresh value known to equal 99, never
+        // referenced from the post stack.
+        let dead_val = AbstractValue::mk_fresh();
+        assert!(state.and_equal_const(dead_val, 99).is_sat());
+        let _ = state.canonicalize_for_access(dead_val);
+
+        assert!(state.const_cache.contains_key(&7));
+        assert!(state.const_cache.contains_key(&99));
+
+        // Compute the same formula_reachable that
+        // shrink_post_to_stack_reachable would compute, then run only the
+        // formula-GC step (bypasses the global flag, which other tests share).
+        let roots: Vec<_> = state.post.stack.iter().map(|(_, addr)| *addr).collect();
+        let mut reachable = std::collections::HashSet::new();
+        for root in roots {
+            reachable.extend(state.reachable_from(root));
+        }
+        let formula_reachable: std::collections::HashSet<_> = reachable
+            .iter()
+            .map(|addr| state.path_condition.get_var_repr(*addr))
+            .collect();
+
+        state.apply_intermediate_formula_gc(formula_reachable);
+
+        assert!(
+            state.const_cache.contains_key(&7),
+            "const_cache entry whose representative is stack-reachable must survive"
+        );
+        assert!(
+            !state.const_cache.contains_key(&99),
+            "const_cache entry whose representative is unreachable must be dropped"
+        );
     }
 }

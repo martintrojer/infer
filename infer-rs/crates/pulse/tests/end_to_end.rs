@@ -4286,3 +4286,113 @@ fn test_store_textual_sweep() {
     eprintln!("  {total_procs} procs analyzed, {total_issues} issues found");
     assert!(ok > 0, "should have at least one passing file");
 }
+
+/// Scout brief perf_explore_linear_const_audit (2026-05-10) FIRST EXPERIMENT
+/// regression: with the (otherwise default-OFF) intermediate formula GC
+/// forced on at the API level, an array-index canonicalization scenario must
+/// produce exactly the same diagnostics as the default flag-OFF analysis.
+///
+/// The full per-CFG-node GC trigger only fires above a 10k-cell heap
+/// threshold (see `MIN_POST_HEAP_CELLS_FOR_GC`), which is well beyond what
+/// any e2e fixture reaches. Instead, this test pins the safety contract at
+/// the boundary: after analysis produces a state with ArrayAccess edges over
+/// constant indices, force-running the formula GC must NOT invalidate the
+/// canonicalization that subsequent reads rely on.
+#[test]
+fn test_intermediate_formula_gc_preserves_array_index_canonicalization() {
+    use pulse::abductive::AbductiveDomain;
+    use pulse::abstract_value::AbstractValue;
+    use pulse::access::Access;
+    use sil::location::Location;
+    use sil::mangled::Mangled;
+    use sil::procdesc::Procdesc;
+    use sil::procname::Procname;
+    use sil::pvar::Pvar;
+    use sil::typ::Typ;
+    use sil::var::Var;
+
+    let _guard = ANALYZE_LOCK
+        .lock()
+        .expect("array-index canonicalization test analyze lock poisoned");
+
+    // Baseline: analyze an array fixture with the default flag-OFF path. We
+    // expect at least one NULL_DEREFERENCE in array_bad and zero in array_ok.
+    let fixture = test_harness::fixtures::test_data_dir().join("pulse/npe_branching.sil");
+    assert!(fixture.exists());
+    let tm = textual_utils::parse_file_and_convert(&fixture);
+
+    let mut baseline_array_bad_diags = 0usize;
+    let mut baseline_array_ok_diags = 0usize;
+    for pdesc in tm.cfg.iter_proc_descs() {
+        let proc_name = format!("{}", pdesc.proc_name);
+        if !(proc_name.contains("array_bad") || proc_name.contains("array_ok")) {
+            continue;
+        }
+        let summary = pulse::checker::analyze(pdesc);
+        let count = summary
+            .diagnostics
+            .iter()
+            .filter(|d| d.get_issue_type_id() == IssueTypeId::NullptrDereference)
+            .count();
+        if proc_name.contains("array_bad") {
+            baseline_array_bad_diags = count;
+        } else {
+            baseline_array_ok_diags = count;
+        }
+    }
+    assert!(
+        baseline_array_bad_diags >= 1,
+        "baseline array_bad should report at least one NULL_DEREFERENCE; got {baseline_array_bad_diags}"
+    );
+    assert_eq!(
+        baseline_array_ok_diags, 0,
+        "baseline array_ok should be clean"
+    );
+
+    // Lower-level safety pin: simulate an array-index canonicalization state
+    // and force the intermediate formula GC. After the GC, a fresh load of
+    // the same constant index must still resolve to the same edge target,
+    // proving that the GC did not de-canonicalize the live array index.
+    let pname = Procname::c_from_string("array_canon_test");
+    let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+    pdesc.formals = vec![(Mangled::from_string("a"), Typ::void(), Default::default())];
+    let mut state = AbductiveDomain::mk_initial(&pdesc);
+
+    let formal_var = Var::ProgramVar(Box::new(Pvar::mk(Mangled::from_string("a"), pname.clone())));
+    let formal_addr = state.post.stack.find(&formal_var).unwrap();
+    let arr = state.read_heap(formal_addr, Access::Dereference);
+
+    // Index value known to equal 0; canonicalize as an array index.
+    let idx0 = AbstractValue::mk_fresh();
+    assert!(state.and_equal_const(idx0, 0).is_sat());
+    let canon_idx0 = state.canonicalize_for_access(idx0);
+    let stored = AbstractValue::mk_fresh();
+    state.write_heap(arr, Access::ArrayAccess(Typ::void(), canon_idx0), stored);
+
+    // A second, distinct AV also known to equal 0 should canonicalize back
+    // to the same edge (this is exactly the property the const_cache + the
+    // surviving linear/term equalities provide).
+    let idx0_alias = AbstractValue::mk_fresh();
+    assert!(state.and_equal_const(idx0_alias, 0).is_sat());
+    let canon_alias_pre = state.canonicalize_for_access(idx0_alias);
+    assert_eq!(
+        state.path_condition.get_var_repr(canon_alias_pre),
+        state.path_condition.get_var_repr(canon_idx0),
+        "const_cache should canonicalize two AVs known to equal 0 to the same repr before GC"
+    );
+
+    // Force the intermediate formula GC (analogous to flag-on at runtime).
+    state.shrink_post_to_stack_reachable_with_formula_gc();
+
+    // After GC, a third constant-0 load must still canonicalize to the same
+    // representative; otherwise the array edge would be unreachable through
+    // load-side canonicalization.
+    let idx0_post = AbstractValue::mk_fresh();
+    assert!(state.and_equal_const(idx0_post, 0).is_sat());
+    let canon_post = state.canonicalize_for_access(idx0_post);
+    assert_eq!(
+        state.path_condition.get_var_repr(canon_post),
+        state.path_condition.get_var_repr(canon_idx0),
+        "const_cache canonicalization must survive intermediate formula GC for reachable indices"
+    );
+}
