@@ -67,37 +67,39 @@ Latest repeated current-HEAD checkpoint on the fresh patched-exporter re-export
 present; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh` with
 `TEXTUAL_DIR=.../textual-out-reexport-20260508-102338`):
 
-| metric | OCaml old baseline (`-j 1`) | Rust fresh export (`-j 4`) |
-|---|---:|---:|
-| wall time | `42.9s` | `344.03s` median |
-| max RSS | `~1.17 GB` | `11.44 GB` median (`13.69 GB` max run) |
-| peak footprint | `~1.10 GB` | `9.86 GB` median (`10.33 GB` max run) |
-| procs analyzed | old export: `570 / 570` | `446 / 446` |
-| heap+wall aborts | n/a | `20 / 446` |
-| max visit count | n/a | `4` |
-| process exit | clean (`0`) | `2` due reported leaks despite full analysis |
+| metric | OCaml old baseline (`-j 1`) | Rust default (`-j 4`) | Rust + formula-gc (`-j 4`) |
+|---|---:|---:|---:|
+| wall time | `42.9s` | `289.57s` median | `234.79s` median |
+| max RSS | `~1.17 GB` | `15.42 GB` median | `19.06 GB` median |
+| peak footprint | `~1.10 GB` | `7.41 GB` median | `6.67 GB` median |
+| procs analyzed | `570 / 570` | `446 / 446` | `446 / 446` |
+| heap+wall aborts | n/a | `21 / 446` median | `22 / 446` median |
+| max visit count | n/a | `4` | `4` |
+| process exit | clean (`0`) | `2` due reported leaks | `2` |
 
-Previous repeated checkpoint on the original `textual-out/` export was
-`239.67s` median wall, `13.17 GB` median max RSS, `18 / 570` aborts, and clean
-exit. Do not compare old-export and fresh-export wall times without noting the
-input changed: the fresh export has fewer procedure definitions (`446` analyzed
-instead of `570`) but includes newer cleanup/nullify/exit-scope metadata.
+Default Rust = current main with the perf cleanup landed (`01a51f99ed`); the
+formula-gc column adds `--pulse-intermediate-formula-gc`. Both columns are 3
+runs each on the same fresh export; old-export historical numbers (`239.67s`
+median wall, `13.17 GB` median max RSS, `18 / 570` aborts, clean exit) are
+from the original `textual-out/` and are not directly comparable — the fresh
+export has fewer procedure definitions (`446` analyzed instead of `570`) but
+includes newer cleanup/nullify/exit-scope metadata.
 
 Interpretation:
 
-- Fresh-export slowdown vs the old OCaml baseline: `344.03 / 42.9 ~= 8.0×`.
-- The fresh export changes the benchmark input enough that the old `239.67s`
-  dashboard is now historical, not the current fresh-export baseline.
+- Default Rust vs OCaml old baseline: `289.57 / 42.9 ~= 6.7×` (was `8.0×`
+  before the perf cleanup landed; `~16%` wall improvement on the same input).
+- `--pulse-intermediate-formula-gc` remains opt-in. Trade-off: `~19%` wall and
+  `~10%` peak-footprint win, at the cost of `+24%` max RSS and `+1` heap-cap
+  abort. The cleanup pass was expanded (commit `01a51f99ed`) to also prune
+  `term_value_index`, `fn_app_eqs`, `atoms`, and `const_cache` entries that
+  become unreachable after the formula-variable GC.
 - Stale `term_value_index` repair was rejected for the default path: it improved
   selected DES target wall time but made whole-program median slower and produced
   no repair hits in the focused counter run.
-- `--pulse-intermediate-formula-gc` remains opt-in (default OFF). The cleanup
-  pass was expanded (commit `01a51f99ed`) to also prune `term_value_index`,
-  `fn_app_eqs`, `atoms`, and `const_cache` entries that become unreachable
-  after the formula-variable GC. Useful for memory headroom; whole-program
-  wall-time impact on capped OpenSSL has not been remeasured yet — tracked
-  under `perf_track_walltime_gap_vs_ocaml` and the in-flight
-  `perf_remeasure_fresh_openssl_after_formula_cleanup` run.
+- The remaining wall-time gap to OCaml is tracked under
+  `perf_track_walltime_gap_vs_ocaml`; first follow-up is profiling a hot DES/OBJ
+  proc on the new baseline.
 
 Benchmark artifacts from the latest run are under ignored `bench-out/` in the
 main checkout. Historical OpenSSL archaeology is in
@@ -106,7 +108,7 @@ main checkout. Historical OpenSSL archaeology is in
 ## Current active work
 
 `mu` is the source of truth; this section is a coarse map only and may lag the
-DAG between gated docs refreshes (`docs_refresh_status_after_parallel_stack`).
+DAG between gated docs refreshes.
 
 ```sh
 mu state -w infer-rs            # tracks + ready set + agents
