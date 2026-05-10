@@ -825,9 +825,7 @@ fn test_e2e_virt() {
     assert_ocaml_pulse_test(
         "virt.sil",
         &[
-            "plusBad",                            // suppressed latent report in this port
-            "plusOk",                             // FP: biabduction pre-check on virtual dispatch
-            "devirtualize_with_final_good",       // FP: declared-final receiver dynamic type
+            "devirtualize_with_final_good", // FP: declared-final receiver dynamic type
             "devirtualize_with_static_call_good", // FP: static-class virtual dispatch
         ],
     );
