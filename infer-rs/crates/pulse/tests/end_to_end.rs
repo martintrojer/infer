@@ -3178,38 +3178,40 @@ fn test_e2e_latent_real_bug_trace_matches_ocaml_subset() {
         .as_array()
         .expect("report.json should be a JSON array");
 
-    let expected = [
+    use test_harness::bug_trace::{assert_bug_trace, TraceStep};
+
+    let expected: &[(&str, &str, &[TraceStep<'_>])] = &[
         (
             "manifest_use_after_free",
             "The call to `latent_use_after_free` may trigger the following issue: call to `latent_use_after_free()` eventually accesses `x` that was invalidated by call to `free()` during the call to `latent_use_after_free()` on line 17.",
-            vec![
-                (1u64, 16u64, "invalidation part of the trace starts here"),
-                (2, 16, "parameter `x` of latent_use_after_free"),
-                (2, 17, "when calling `conditional_free2` here"),
-                (3, 10, "parameter `x` of conditional_free2"),
-                (3, 12, "was invalidated by call to `free()`"),
-                (1, 25, "use-after-lifetime part of the trace starts here"),
-                (2, 25, "parameter `x` of manifest_use_after_free"),
-                (2, 25, "when calling `latent_use_after_free` here"),
-                (3, 16, "parameter `x` of latent_use_after_free"),
-                (3, 18, "invalid access occurs here"),
+            &[
+                TraceStep::new(1, 16, "invalidation part of the trace starts here"),
+                TraceStep::new(2, 16, "parameter `x` of latent_use_after_free"),
+                TraceStep::new(2, 17, "when calling `conditional_free2` here"),
+                TraceStep::new(3, 10, "parameter `x` of conditional_free2"),
+                TraceStep::new(3, 12, "was invalidated by call to `free()`"),
+                TraceStep::new(1, 25, "use-after-lifetime part of the trace starts here"),
+                TraceStep::new(2, 25, "parameter `x` of manifest_use_after_free"),
+                TraceStep::new(2, 25, "when calling `latent_use_after_free` here"),
+                TraceStep::new(3, 16, "parameter `x` of latent_use_after_free"),
+                TraceStep::new(3, 18, "invalid access occurs here"),
             ],
         ),
         (
             "main",
             "The call to `latent_use_after_free` may trigger the following issue: call to `latent_use_after_free()` eventually accesses `x` that was invalidated by call to `free()` during the call to `latent_use_after_free()` on line 17.",
-            vec![
-                (1u64, 16u64, "invalidation part of the trace starts here"),
-                (2, 16, "parameter `x` of latent_use_after_free"),
-                (2, 17, "when calling `conditional_free2` here"),
-                (3, 10, "parameter `x` of conditional_free2"),
-                (3, 12, "was invalidated by call to `free()`"),
-                (1, 57, "use-after-lifetime part of the trace starts here"),
-                (2, 57, "allocated by call to `malloc` (modelled)"),
-                (2, 57, "assigned"),
-                (2, 59, "when calling `latent_use_after_free` here"),
-                (3, 16, "parameter `x` of latent_use_after_free"),
-                (3, 18, "invalid access occurs here"),
+            &[
+                TraceStep::new(1, 16, "invalidation part of the trace starts here"),
+                TraceStep::new(2, 16, "parameter `x` of latent_use_after_free"),
+                TraceStep::new(2, 17, "when calling `conditional_free2` here"),
+                TraceStep::new(3, 10, "parameter `x` of conditional_free2"),
+                TraceStep::new(3, 12, "was invalidated by call to `free()`"),
+                TraceStep::new(1, 57, "use-after-lifetime part of the trace starts here"),
+                TraceStep::new(2, 57, "allocated by call to `malloc` (modelled)"),
+                TraceStep::new(2, 57, "assigned"),
+                TraceStep::new(2, 59, "when calling `latent_use_after_free` here"),
+                TraceStep::new(3, 16, "parameter `x` of latent_use_after_free"),
+                TraceStep::new(3, 18, "invalid access occurs here"),
             ],
         ),
     ];
@@ -3218,40 +3220,79 @@ fn test_e2e_latent_real_bug_trace_matches_ocaml_subset() {
         let issue = issues
             .iter()
             .find(|issue| {
-                issue["procedure"].as_str() == Some(proc_name)
+                issue["procedure"].as_str() == Some(*proc_name)
                     && issue["bug_type"].as_str() == Some("USE_AFTER_FREE")
             })
             .unwrap_or_else(|| panic!("missing USE_AFTER_FREE issue for {proc_name}: {report}"));
         assert_eq!(
             issue["qualifier"].as_str(),
-            Some(expected_qualifier),
+            Some(*expected_qualifier),
             "unexpected qualifier for {proc_name}: {report}"
         );
-        let bug_trace = issue["bug_trace"]
-            .as_array()
-            .unwrap_or_else(|| panic!("missing bug_trace for {proc_name}: {report}"));
-        let actual_trace: Vec<_> = bug_trace
-            .iter()
-            .map(|entry| {
-                (
-                    entry["level"].as_u64().unwrap_or_default(),
-                    entry["line_number"].as_u64().unwrap_or_default(),
-                    entry["description"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            })
-            .collect();
-        let expected_trace: Vec<_> = expected_trace
-            .into_iter()
-            .map(|(level, line, desc)| (level, line, desc.to_string()))
-            .collect();
-        assert_eq!(
-            actual_trace, expected_trace,
-            "unexpected bug_trace for {proc_name}: {report}"
-        );
+        assert_bug_trace(&parsed, proc_name, "USE_AFTER_FREE", expected_trace);
     }
+}
+
+/// Opt-in trace-step assertion on a virt.sil interprocedural fixture.
+///
+/// Pinned because the rest of the virt.sil fixture only checks issue
+/// types via [`assert_ocaml_pulse_test`], so trace-location regressions
+/// in `pulse::ValueHistory` (e.g. when interprocedural call-site lines
+/// drift) would otherwise slip through. We assert on
+/// `devirtualize_with_static_call_bad#0` because its trace mixes lines
+/// 173 and 175 across both the invalidation- and access-history
+/// branches — a non-trivial shape that a line-number regression would
+/// disturb.
+///
+/// `#[ignore]` (matches the precedent set by
+/// `test_e2e_latent_real_bug_trace_matches_ocaml_subset`) because the
+/// CLI invocation is heavier than the in-process pipeline used by the
+/// default fixtures. Run with:
+///
+/// ```text
+/// cargo test -p pulse --test end_to_end \
+///     test_e2e_virt_static_call_bad_trace_pinned -- --ignored
+/// ```
+#[test]
+#[ignore]
+fn test_e2e_virt_static_call_bad_trace_pinned() {
+    use test_harness::bug_trace::{assert_bug_trace, TraceStep};
+
+    test_harness::skip_without_ocaml_sil!();
+
+    let sil_path = test_harness::fixtures::ocaml_sil_test_dir()
+        .join("pulse")
+        .join("virt.sil");
+    if !sil_path.exists() {
+        eprintln!("skipping: virt.sil not found at {}", sil_path.display());
+        return;
+    }
+
+    let cwd = sil_path.parent().unwrap();
+    let report = run_infer_rs_cli_report(
+        &sil_path,
+        Some("infer/tests/codetoanalyze/sil/pulse/virt.sil"),
+        cwd,
+    )
+    .expect("infer-rs CLI should analyze virt.sil");
+    let parsed: serde_json::Value = serde_json::from_str(&report)
+        .unwrap_or_else(|e| panic!("report.json must parse ({e}): {report}"));
+
+    assert_bug_trace(
+        &parsed,
+        "devirtualize_with_static_call_bad#0",
+        "NULLPTR_DEREFERENCE",
+        &[
+            TraceStep::new(1, 173, "invalidation part of the trace starts here"),
+            TraceStep::new(2, 173, "is assigned to the null pointer"),
+            TraceStep::new(2, 173, "assigned"),
+            TraceStep::new(2, 175, "is assigned to the null pointer"),
+            TraceStep::new(1, 173, "access part of the trace starts here"),
+            TraceStep::new(2, 173, "is assigned to the null pointer"),
+            TraceStep::new(2, 173, "assigned"),
+            TraceStep::new(2, 175, "invalid access occurs here"),
+        ],
+    );
 }
 
 #[test]

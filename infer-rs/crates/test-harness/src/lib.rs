@@ -10,7 +10,9 @@
 //! - [`textual_utils`] — Parse `.sil` text and convert to SIL for analysis testing
 //! - [`infer_runner`] — Run OCaml `infer` on `.sil` files and collect results
 //! - [`fixtures`] — Load `.sil` test fixture files from disk
+//! - [`bug_trace`] — Opt-in matchers for structured `bug_trace` events on a single issue
 
+pub mod bug_trace;
 pub mod fixtures;
 pub mod infer_runner;
 pub mod summary_compare;
