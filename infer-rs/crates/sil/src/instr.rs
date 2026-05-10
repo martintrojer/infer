@@ -145,7 +145,7 @@ impl Instr {
 }
 
 /// A static dummy location for metadata instructions that lack one.
-static DUMMY_LOCATION: std::sync::LazyLock<Location> = std::sync::LazyLock::new(Location::dummy);
+static DUMMY_LOCATION: Location = Location::dummy();
 
 impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

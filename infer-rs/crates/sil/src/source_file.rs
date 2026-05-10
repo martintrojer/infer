@@ -25,7 +25,7 @@ impl SourceFile {
         &self.path
     }
 
-    pub fn invalid() -> Self {
+    pub const fn invalid() -> Self {
         Self {
             path: PathBuf::new(),
         }

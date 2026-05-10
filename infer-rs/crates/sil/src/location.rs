@@ -27,7 +27,7 @@ pub struct Location {
 }
 
 impl Location {
-    pub fn dummy() -> Self {
+    pub const fn dummy() -> Self {
         Self {
             file: SourceFile::invalid(),
             line: -1,
