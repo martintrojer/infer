@@ -13,25 +13,43 @@ mu task list -w infer-rs --status OPEN
 
 | area | current status |
 |---|---|
-| Store-textual C Pulse sweep | `52 / 55` files analyzed; 3 skipped for fixpoint exhaustion |
-| NPE count | expected `131`, found `134` |
-| Leak count | expected `20`, found `20` |
+| Store-textual C Pulse sweep | `501` procs analyzed; `185` issues; `51` OK / `0` FAIL_ANALYZE / `1` TIMEOUT (known recursion hang) |
+| NPE count | expected `127`, found `130` |
+| Leak count | expected `20`, found `16` (see baseline note below) |
 | UAF count | expected `7`, found `7` |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
 | specialization summary harness | `21 / 21` procedures match; specialized-summary checkpoint has no diffs |
+| `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
 
-Accepted current count deltas:
+Accepted current count deltas (NPE, +3 over expected):
 
+- `fopen.c`: `-3`
 - `nullptr.c`: `+1` real-bug divergence (`FN_nullptr_deref_old_bad`).
 - `sizeof.c`: `+2` exported-Textual fidelity limit, not a Pulse workaround target.
+- `struct_values.c`: `+1`
+- `var_arg.c`: `+2`
+
+Leak count deltas (-4 vs expected):
+
+- `memory_leak.c`: `-3`
+- `nullptr.c`: `-1`
+
+LEAK baseline note: the previous `expected 20` figure was stale/aspirational —
+`worker-leak-1`'s bisect across 50+ commits (5 sample points) showed the actual
+sweep result has been ~`12-16` for the entire window. The dashboard now uses
+the actual sweep number as baseline.
 
 Recent correctness work that should stay in place mirrors OCaml's dynamic-type
 specialization path, direct known-call unknown fallback for resolved
 `__call_c_function_ptr` targets without summaries, caller-visible pre-edge
 materialization, latent-invalid-access export/import parity, latent.c trace
 detail (callee formal anchoring on synthesized actual-argument trace steps),
-and comparator normalizations for semantic noise only.
+and comparator normalizations for semantic noise only. The recent SIL virtual
+dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
+`virt.sil` skips: `plus_formal` / `plus_ok`,
+`devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
+now analyze.
 
 ## OpenSSL benchmark dashboard
 
@@ -73,8 +91,13 @@ Interpretation:
 - Stale `term_value_index` repair was rejected for the default path: it improved
   selected DES target wall time but made whole-program median slower and produced
   no repair hits in the focused counter run.
-- `--pulse-intermediate-formula-gc` remains opt-in: useful for memory headroom,
-  not a default wall-time win on capped whole-program OpenSSL.
+- `--pulse-intermediate-formula-gc` remains opt-in (default OFF). The cleanup
+  pass was expanded (commit `01a51f99ed`) to also prune `term_value_index`,
+  `fn_app_eqs`, `atoms`, and `const_cache` entries that become unreachable
+  after the formula-variable GC. Useful for memory headroom; whole-program
+  wall-time impact on capped OpenSSL has not been remeasured yet — tracked
+  under `perf_track_walltime_gap_vs_ocaml` and the in-flight
+  `perf_remeasure_fresh_openssl_after_formula_cleanup` run.
 
 Benchmark artifacts from the latest run are under ignored `bench-out/` in the
 main checkout. Historical OpenSSL archaeology is in
@@ -93,14 +116,15 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **SIL virtual dispatch follow-ups** — `virt.sil` still skips four procedures
-  after the recent dispatch landings (`a5c380e6`, `d32cce40`, `46e1a11`,
-  `afecba07`); see `sil_virtual_plus_formal_dispatch` and its successors.
-  Gates `test_full_check_current_stack` and the docs refresh.
-- **OpenSSL perf** — formula-cleanup exploration
-  (`perf_explore_linear_const_cleanup`) gates a one-shot remeasurement
-  (`perf_remeasure_fresh_openssl_after_formula_cleanup`). Wall-time gap
-  tracked separately under `perf_track_walltime_gap_vs_ocaml`.
+- **SIL virtual dispatch** — all `virt.sil` cases pass after the recent
+  dispatch stack landed (`902b2deb50`, `cda27f6239`, `70365d047b`); the
+  `test_full_check_current_stack` gate closed green. New regressions in this
+  area should reopen the relevant follow-ups in `mu`.
+- **OpenSSL perf** — formula-cleanup expansion has landed behind the opt-in
+  flag; a one-shot remeasurement
+  (`perf_remeasure_fresh_openssl_after_formula_cleanup`) is in flight. The
+  ~`8×` wall-time gap vs OCaml on whole-program OpenSSL is tracked under
+  `perf_track_walltime_gap_vs_ocaml`.
 - **Test infrastructure** — opt-in trace-step assertions
   (`test_trace_step_assertions`).
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative perf
