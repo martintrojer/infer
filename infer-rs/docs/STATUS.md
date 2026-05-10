@@ -69,29 +69,32 @@ present; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh` with
 
 | metric | OCaml old baseline (`-j 1`) | Rust default (`-j 4`) | Rust + formula-gc (`-j 4`) |
 |---|---:|---:|---:|
-| wall time | `42.9s` | `289.57s` median | `234.79s` median |
-| max RSS | `~1.17 GB` | `15.42 GB` median | `19.06 GB` median |
-| peak footprint | `~1.10 GB` | `7.41 GB` median | `6.67 GB` median |
+| wall time | `42.9s` | `244.70s` median | `238.56s` median |
+| max RSS | `~1.17 GB` | `16.79 GB` median | `16.60 GB` median |
+| peak footprint | `~1.10 GB` | `7.66 GB` median | `7.42 GB` median |
 | procs analyzed | `570 / 570` | `446 / 446` | `446 / 446` |
-| heap+wall aborts | n/a | `21 / 446` median | `22 / 446` median |
+| heap+wall aborts | n/a | `21 / 446` median | `20 / 446` median |
 | max visit count | n/a | `4` | `4` |
 | process exit | clean (`0`) | `2` due reported leaks | `2` |
 
-Default Rust = current main with the perf cleanup landed (`01a51f99ed`); the
-formula-gc column adds `--pulse-intermediate-formula-gc`. Both columns are 3
-runs each on the same fresh export; old-export historical numbers (`239.67s`
-median wall, `13.17 GB` median max RSS, `18 / 570` aborts, clean exit) are
-from the original `textual-out/` and are not directly comparable — the fresh
-export has fewer procedure definitions (`446` analyzed instead of `570`) but
+Default Rust = current main with the textual parser O(N²) fix landed
+(`2a17574854`) on top of the perf cleanup (`01a51f99ed`); the formula-gc
+column adds `--pulse-intermediate-formula-gc`. Both columns are 3 runs each
+on the same fresh export; old-export historical numbers (`239.67s` median
+wall, `13.17 GB` median max RSS, `18 / 570` aborts, clean exit) are from the
+original `textual-out/` and are not directly comparable — the fresh export
+has fewer procedure definitions (`446` analyzed instead of `570`) but
 includes newer cleanup/nullify/exit-scope metadata.
 
 Interpretation:
 
-- Default Rust vs OCaml old baseline: `289.57 / 42.9 ~= 6.7×` (was `8.0×`
-  before the perf cleanup landed; `~16%` wall improvement on the same input).
-- `--pulse-intermediate-formula-gc` remains opt-in. Trade-off: `~19%` wall and
-  `~10%` peak-footprint win, at the cost of `+24%` max RSS and `+1` heap-cap
-  abort. The cleanup pass was expanded (commit `01a51f99ed`) to also prune
+- Default Rust vs OCaml old baseline: `244.70 / 42.9 ≈ 5.7×` (was `6.7×`
+  before the parser fix and `8.0×` before the perf cleanup; `~30%` cumulative
+  wall improvement on the same input).
+- `--pulse-intermediate-formula-gc` is now roughly neutral on this corpus
+  (`~2.5%` wall win; max RSS and peak footprint within noise of the default
+  column). Worth keeping opt-in until we see another win condition. The
+  cleanup pass was expanded (commit `01a51f99ed`) to also prune
   `term_value_index`, `fn_app_eqs`, `atoms`, and `const_cache` entries that
   become unreachable after the formula-variable GC.
 - Stale `term_value_index` repair was rejected for the default path: it improved
