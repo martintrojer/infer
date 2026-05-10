@@ -82,35 +82,31 @@ main checkout. Historical OpenSSL archaeology is in
 
 ## Current active work
 
-Use `mu`, not this document, as the source of truth:
+`mu` is the source of truth; this section is a coarse map only and may lag the
+DAG between gated docs refreshes (`docs_refresh_status_after_parallel_stack`).
 
 ```sh
-mu task list -w infer-rs --status OPEN
+mu state -w infer-rs            # tracks + ready set + agents
+mu task list -w infer-rs --status OPEN --sort roi
+mu task list -w infer-rs --status DEFERRED
 ```
 
-Important task clusters migrated from the old ad-hoc backlog docs:
+Live themes (track headlines, not exhaustive task lists):
 
-- OpenSSL/DES performance:
-  - `perf_profile_des_formula_volume`
-  - `perf_investigate_obj_obj2txt_state_explosion`
-  - `perf_incremental_formula_cleanup`
-  - `perf_component_clone_reduction`
-  - `openssl_reexport_shared_corpus`
-- Correctness/parity:
-  - `parity_sizeof_type_eval`
-- SIL/Textual gaps:
-  - `sil_virtual_dispatch_loads`
-  - `sil_devirtualization_return_values`
-  - `sil_cross_file_resolution`
-  - `textual_declenv_enhancements`
-- Code cleanup:
-  - `code_find_return_value_fallback`
-  - `code_prune_branch_metadata`
-  - `code_declenv_typed_keys`
-  - `code_annotation_default_cleanup`
-  - `code_procdesc_vec_edges`
-  - `code_tenv_get_supers_borrow`
-  - `code_dummy_location_const`
+- **SIL virtual dispatch follow-ups** — `virt.sil` still skips four procedures
+  after the recent dispatch landings (`a5c380e6`, `d32cce40`, `46e1a11`,
+  `afecba07`); see `sil_virtual_plus_formal_dispatch` and its successors.
+  Gates `test_full_check_current_stack` and the docs refresh.
+- **OpenSSL perf** — formula-cleanup exploration
+  (`perf_explore_linear_const_cleanup`) gates a one-shot remeasurement
+  (`perf_remeasure_fresh_openssl_after_formula_cleanup`). Wall-time gap
+  tracked separately under `perf_track_walltime_gap_vs_ocaml`.
+- **Test infrastructure** — opt-in trace-step assertions
+  (`test_trace_step_assertions`).
+- **Deferred backlog** — micro-cleanups (`code_*`), speculative perf
+  (`perf_component_clone_reduction`), and accepted parity limits
+  (`parity_sizeof_type_eval`) are parked with explicit reopen-when-... notes.
+  Run `mu task list -w infer-rs --status DEFERRED` for the live set.
 
 ## Test commands
 
