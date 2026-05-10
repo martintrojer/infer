@@ -8,39 +8,54 @@
 //! Mirrors the intent of OCaml's `PulseAbductiveDomain.leq`, which compares
 //! states modulo abstract-value renaming rather than raw identifier equality.
 //!
-//! ### Design note: structural canonical formula entries
+//! ### Design note: structural canonical state
 //!
 //! Earlier iterations of this module spelled the canonical state with
-//! `Vec<String>` for every section, with the per-entry `String` produced
-//! by recursively `format!`-ing nested `partial_*_label` helpers. Profiling
-//! `OBJ_bsearch_ex_` (worker-subsume-1, post-`sort_by_cached_key` fix)
-//! showed ~36% of the worker-thread inclusive time still in `core::fmt::write`
-//! / `format_inner` / `String::write_str` from those `partial_*_label`
-//! helpers, with `partial_atom_label` (15%), `partial_term_label` (10%),
-//! and `partial_value_label` (4%) the dominant contributors.
+//! `Vec<String>` for every section. Profiling `OBJ_bsearch_ex_`
+//! (worker-perf-6, post-formula-structural-fix) showed the residual
+//! `core::fmt::write` / `format_inner` / `String::write_str` cost was
+//! coming from `canonical_heap` / `canonical_attrs` / `canonical_stack` /
+//! `canonical_dynamic_types`, plus the byte-wise `String::cmp` driving
+//! `smallsort::insert_tail` (15.6% self-time) when sorting those
+//! `Vec<String>`s.
 //!
-//! The hot formula path (atoms, term_eqs, linear_eqs, intervals, is_int_vars,
-//! fn_apps, var_eqs) is therefore now spelled in a structural enum tree
-//! (`CanonFormulaEntry` / `CanonAtom` / `CanonTerm` / `CanonOperand` /
-//! `CanonLinArith` / `CanonFnApp` / ...). Derived `Ord`/`Eq`/`Hash` on these
-//! enums replace the per-entry `format!` allocation that the legacy path
-//! used purely to drive `sort_by_cached_key` and `==`.
+//! Every section of `CanonicalState` is therefore now a structural enum
+//! tree:
+//!   - `CanonFormulaEntry` for the formula (landed in 6e9e4fa56c).
+//!   - `CanonStackEntry` for `pre_stack` / `post_stack`.
+//!   - `CanonHeapEdge` for `pre_heap` / `post_heap`.
+//!   - `CanonAttrEntry` (wrapping `CanonAttribute`) for `pre_attrs` /
+//!     `post_attrs`.
+//!   - `CanonDynamicType` for `dynamic_types`.
 //!
-//! The legacy `String`-shaped sections (`pre_stack`, `post_stack`,
-//! `pre_heap`, `post_heap`, `pre_attrs`, `post_attrs`, `dynamic_types`) are
-//! retained as `Vec<String>` for now: they are not on the hot path
-//! (per the profile) and the per-entry strings are short and dominated by
-//! one outer `format!` whose cost is negligible.
+//! Derived `Ord`/`Eq`/`Hash` on these enums replace the per-entry
+//! `format!` allocation that the legacy path used purely to drive
+//! `sort` / `==`. `AbstractValue`s are mapped through `ValueSortKey`
+//! (a small `Copy` enum), so structural keys are alpha-invariant.
 //!
-//! The legacy `partial_*_label` helpers and `canonical_*` String formatters
-//! are kept behind `#[cfg(test)]` as a debug helper so that the
-//! cross-validation test in `tests::structural_canonical_matches_string_form`
-//! can verify the structural form, when formatted to legacy strings,
-//! reproduces the old `Vec<String>` exactly.
+//! Timestamps on `Attribute::MustBeValid` / `MustBeInitialized` /
+//! `WrittenTo` are stripped at the structural-key boundary because the
+//! per-state `next_attr_timestamp` counter is bumped by intervening work
+//! between fixpoint iterations and is therefore not alpha-invariant.
+//! This matches the long-standing behaviour of the legacy `canonical_attr`
+//! formatter (see the cross-ref comment there) and is exercised by
+//! `test_alpha_equivalent_states_ignore_attribute_timestamps`.
+//!
+//! `debug_canonical_dump` renders the structural form back to the legacy
+//! sorted `Vec<String>` shape so the [pulse-progress] log line shape is
+//! byte-for-byte unchanged. The cross-check tests
+//! `structural_canonical_matches_*_string_form` assert that this
+//! rendering reproduces the pre-structural `String`-only output exactly
+//! on a small fixture, so any future drift between the two
+//! representations is caught at test time.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
+use sil::fieldname::Fieldname;
+use sil::location::Location;
+use sil::typ::Typ;
+use sil::var::Var;
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
@@ -54,6 +69,7 @@ use crate::formula::lin_arith::{LinArith, Q};
 use crate::formula::phi::{FnAppActual, FnAppKey, TermEq};
 use crate::formula::term::Term;
 use crate::formula::Operand;
+use crate::invalidation::MustBeValidReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CanonValue {
@@ -79,10 +95,15 @@ enum ValueSortKey {
 }
 
 /// Allocation-free sort key for `Access` during canonicalization.
+///
+/// `Field` carries the full `Fieldname` (class + field name) so that the
+/// structural form is round-trip-faithful to the legacy `canonical_heap`
+/// String shape, which formatted edges via `Display for Fieldname`
+/// (`"{class}.{field}"`).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AccessSortKey {
     Dereference,
-    Field(String),
+    Field(Fieldname),
     Array { typ: String, index: ValueSortKey },
 }
 
@@ -91,6 +112,69 @@ enum AccessSortKey {
 struct EdgeSortKey {
     access: AccessSortKey,
     target: ValueSortKey,
+}
+
+// ---------------------------------------------------------------------------
+// Structural canonical entries for the non-formula sections.
+//
+// `Vec<CanonStackEntry>` etc. replace `Vec<String>`. Derived `Ord`/`Eq`/`Hash`
+// drive the hot fixpoint comparisons / hashes without going through `format!`.
+// `AbstractValue`s are mapped through `ValueSortKey` so the structural form
+// is alpha-invariant.
+// ---------------------------------------------------------------------------
+
+/// One stack binding in canonical form: `var -> canonical addr`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonStackEntry {
+    /// `Var` already derives `Ord`/`Hash`/`Eq`, no `format!` needed.
+    var: Var,
+    addr: ValueSortKey,
+}
+
+/// One outgoing heap edge in canonical form.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonHeapEdge {
+    src: ValueSortKey,
+    access: AccessSortKey,
+    target: ValueSortKey,
+}
+
+/// One attribute on a canonical address.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonAttrEntry {
+    addr: ValueSortKey,
+    attr: CanonAttribute,
+}
+
+/// Structural canonical attribute.
+///
+/// Variants that carry `AbstractValue`s (`ReturnedFromUnknown`) are
+/// mapped through `ValueSortKey` so the result is alpha-invariant.
+/// Variants that carry a `Timestamp` (`MustBeValid` / `MustBeInitialized`
+/// / `WrittenTo`) drop the timestamp — the per-state
+/// `next_attr_timestamp` counter is bumped by intervening work between
+/// fixpoint iterations, so two iterations of the same procedure can
+/// assign different timestamps to the same logical attribute. Mirrors
+/// the long-standing behaviour of the legacy `canonical_attr` formatter
+/// and is covered by `test_alpha_equivalent_states_ignore_attribute_timestamps`.
+///
+/// All other variants carry no `AbstractValue` and no `Timestamp`, so
+/// they participate as-is via the `Other` arm; the wrapped `Attribute`
+/// already derives `Ord`/`Hash`/`Eq`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonAttribute {
+    ReturnedFromUnknown(Vec<ValueSortKey>),
+    MustBeValid(Location, Option<MustBeValidReason>),
+    MustBeInitialized(Location),
+    WrittenTo(Location),
+    Other(Attribute),
+}
+
+/// One dynamic-type binding in canonical form.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonDynamicType {
+    addr: ValueSortKey,
+    typ: Typ,
 }
 
 // ---------------------------------------------------------------------------
@@ -260,15 +344,17 @@ impl std::fmt::Display for CanonValue {
     }
 }
 
+/// Structural canonical state — every section is a `Vec` of structural
+/// entries with derived `Ord`/`Eq`/`Hash`. See the module-level
+/// "Design note".
 #[derive(Debug, PartialEq, Eq)]
 struct CanonicalState {
-    pre_stack: Vec<String>,
-    post_stack: Vec<String>,
-    pre_heap: Vec<String>,
-    post_heap: Vec<String>,
-    pre_attrs: Vec<String>,
-    post_attrs: Vec<String>,
-    /// Structural canonical formula. See the module-level "Design note".
+    pre_stack: Vec<CanonStackEntry>,
+    post_stack: Vec<CanonStackEntry>,
+    pre_heap: Vec<CanonHeapEdge>,
+    post_heap: Vec<CanonHeapEdge>,
+    pre_attrs: Vec<CanonAttrEntry>,
+    post_attrs: Vec<CanonAttrEntry>,
     formula: Vec<CanonFormulaEntry>,
     /// Cross-ref: OCaml `path_condition.type_constraints` participates in
     /// `PulseAbductiveDomain.leq`. We track dynamic-type bindings
@@ -276,7 +362,7 @@ struct CanonicalState {
     /// downstream analysis (specialization, function-pointer
     /// resolution), so they must participate in `alpha_equivalent` for
     /// the fixpoint to converge.
-    dynamic_types: Vec<String>,
+    dynamic_types: Vec<CanonDynamicType>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,21 +438,32 @@ pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
         dynamic_types,
     } = canonicalize(state).state;
 
-    // Render the structural formula via the legacy String form so the
-    // [pulse-progress] / debug dump shape is byte-identical to the
-    // pre-structural-key implementation. This is a debug surface; the
-    // formatting cost is irrelevant outside of `--debug` runs.
-    let formula_lines = format_canon_formula_legacy(&formula);
-
+    // Render the structural sections back into the legacy sorted
+    // `Vec<String>` shape so the [pulse-progress] / debug dump shape is
+    // byte-identical to the pre-structural-key implementation. This is a
+    // debug surface; the formatting cost is irrelevant outside of
+    // `--debug` runs.
     let mut out = String::new();
-    append_debug_section(&mut out, "pre_stack", pre_stack);
-    append_debug_section(&mut out, "post_stack", post_stack);
-    append_debug_section(&mut out, "pre_heap", pre_heap);
-    append_debug_section(&mut out, "post_heap", post_heap);
-    append_debug_section(&mut out, "pre_attrs", pre_attrs);
-    append_debug_section(&mut out, "post_attrs", post_attrs);
-    append_debug_section(&mut out, "formula", formula_lines);
-    append_debug_section(&mut out, "dynamic_types", dynamic_types);
+    append_debug_section(&mut out, "pre_stack", format_canon_stack_legacy(&pre_stack));
+    append_debug_section(
+        &mut out,
+        "post_stack",
+        format_canon_stack_legacy(&post_stack),
+    );
+    append_debug_section(&mut out, "pre_heap", format_canon_heap_legacy(&pre_heap));
+    append_debug_section(&mut out, "post_heap", format_canon_heap_legacy(&post_heap));
+    append_debug_section(&mut out, "pre_attrs", format_canon_attrs_legacy(&pre_attrs));
+    append_debug_section(
+        &mut out,
+        "post_attrs",
+        format_canon_attrs_legacy(&post_attrs),
+    );
+    append_debug_section(&mut out, "formula", format_canon_formula_legacy(&formula));
+    append_debug_section(
+        &mut out,
+        "dynamic_types",
+        format_canon_dynamic_types_legacy(&dynamic_types),
+    );
     out.pop();
     out
 }
@@ -439,32 +536,27 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
 
 /// Stable per-state hash used by `debug_signature`.
 ///
-/// Folds an FNV-1a state (constant-time per byte) over each section. The
-/// formula section runs through `Hash` on the structural enums rather
-/// than through any `String` representation — see the module-level
-/// design note.
+/// Every section is now structural; we feed each entry through its
+/// derived `Hash` impl. Section boundaries are marked with a `0xff`
+/// sentinel so two states that differ only in where one section ends
+/// and the next begins do not alias.
 fn stable_hash_state(state: &CanonicalState) -> u64 {
     let mut h = FnvHasher::new();
-    hash_string_section(&mut h, &state.pre_stack);
-    hash_string_section(&mut h, &state.post_stack);
-    hash_string_section(&mut h, &state.pre_heap);
-    hash_string_section(&mut h, &state.post_heap);
-    hash_string_section(&mut h, &state.pre_attrs);
-    hash_string_section(&mut h, &state.post_attrs);
-    // Structural formula — feed the typed `Hash` impls, no String alloc.
-    h.write_u64(state.formula.len() as u64);
-    for entry in &state.formula {
-        entry.hash(&mut h);
-        h.write_u8(0xff);
-    }
-    hash_string_section(&mut h, &state.dynamic_types);
+    hash_section(&mut h, &state.pre_stack);
+    hash_section(&mut h, &state.post_stack);
+    hash_section(&mut h, &state.pre_heap);
+    hash_section(&mut h, &state.post_heap);
+    hash_section(&mut h, &state.pre_attrs);
+    hash_section(&mut h, &state.post_attrs);
+    hash_section(&mut h, &state.formula);
+    hash_section(&mut h, &state.dynamic_types);
     h.finish()
 }
 
-fn hash_string_section(h: &mut FnvHasher, lines: &[String]) {
-    h.write_u64(lines.len() as u64);
-    for line in lines {
-        h.write_bytes(line.as_bytes());
+fn hash_section<T: Hash>(h: &mut FnvHasher, entries: &[T]) {
+    h.write_u64(entries.len() as u64);
+    for entry in entries {
+        entry.hash(h);
         h.write_u8(0xff);
     }
 }
@@ -505,16 +597,21 @@ impl Hasher for FnvHasher {
     }
 }
 
-fn canonical_dynamic_types(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<String> {
-    let mut entries: Vec<_> = state
+fn canonical_dynamic_types(
+    state: &AbductiveDomain,
+    canon: &Canonicalizer,
+) -> Vec<CanonDynamicType> {
+    let mut entries: Vec<CanonDynamicType> = state
         .iter_dynamic_types()
-        .filter_map(|(addr, typ)| canon.get(addr).map(|label| (label, typ)))
+        .filter_map(|(addr, typ)| {
+            canon.get(addr).map(|_| CanonDynamicType {
+                addr: canon.partial_value_key(addr),
+                typ: typ.clone(),
+            })
+        })
         .collect();
-    entries.sort_by_key(|(label, _)| *label);
+    entries.sort();
     entries
-        .into_iter()
-        .map(|(label, typ)| format!("dyn:{label}={typ:?}"))
-        .collect()
 }
 
 struct CanonicalizedState {
@@ -790,9 +887,8 @@ impl Canonicalizer {
         let phi = state.path_condition.phi();
 
         let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-        equalities.sort_by_key(|(lhs, rhs)| {
-            (self.partial_value_key(*lhs), self.partial_value_key(*rhs))
-        });
+        equalities
+            .sort_by_key(|(lhs, rhs)| (self.partial_value_key(*lhs), self.partial_value_key(*rhs)));
         for (lhs, rhs) in equalities {
             self.map_value(lhs);
             self.map_value(rhs);
@@ -829,7 +925,10 @@ impl Canonicalizer {
 
         let mut intervals: Vec<_> = phi.intervals.iter().collect();
         intervals.sort_by_cached_key(|(value, interval)| {
-            (self.partial_value_key(**value), CanonCItv::from_citv(interval))
+            (
+                self.partial_value_key(**value),
+                CanonCItv::from_citv(interval),
+            )
         });
         for (value, _) in intervals {
             self.map_value(*value);
@@ -879,7 +978,7 @@ impl Canonicalizer {
     fn partial_access_key(&self, access: &Access) -> AccessSortKey {
         match access {
             Access::Dereference => AccessSortKey::Dereference,
-            Access::FieldAccess(field) => AccessSortKey::Field(field.field_name.clone()),
+            Access::FieldAccess(field) => AccessSortKey::Field(field.clone()),
             Access::ArrayAccess(typ, index) => AccessSortKey::Array {
                 typ: format!("{typ}"),
                 index: self.partial_value_key(*index),
@@ -977,12 +1076,37 @@ impl Canonicalizer {
             ret: self.partial_value_key(ret),
         }
     }
+
+    /// Map an `Attribute` to its structural canonical form.
+    ///
+    /// `AbstractValue`s in payloads are mapped through `ValueSortKey` so
+    /// the result is alpha-invariant. `Timestamp`s on `MustBeValid` /
+    /// `MustBeInitialized` / `WrittenTo` are dropped — see the
+    /// `CanonAttribute` doc comment.
+    fn partial_attribute_key(&self, attr: &Attribute) -> CanonAttribute {
+        match attr {
+            Attribute::ReturnedFromUnknown(values) => CanonAttribute::ReturnedFromUnknown(
+                values.iter().map(|v| self.partial_value_key(*v)).collect(),
+            ),
+            Attribute::MustBeValid(_ts, loc, reason) => {
+                CanonAttribute::MustBeValid(loc.clone(), reason.clone())
+            }
+            Attribute::MustBeInitialized(_ts, loc) => {
+                CanonAttribute::MustBeInitialized(loc.clone())
+            }
+            Attribute::WrittenTo(_ts, loc) => CanonAttribute::WrittenTo(loc.clone()),
+            other => CanonAttribute::Other(other.clone()),
+        }
+    }
 }
 
-fn canonical_stack(stack: &BaseStack, canon: &Canonicalizer) -> Vec<String> {
-    let mut entries: Vec<_> = stack
+fn canonical_stack(stack: &BaseStack, canon: &Canonicalizer) -> Vec<CanonStackEntry> {
+    let mut entries: Vec<CanonStackEntry> = stack
         .iter()
-        .map(|(var, addr)| format!("{var}={}", canon.get(*addr).unwrap()))
+        .map(|(var, addr)| CanonStackEntry {
+            var: var.clone(),
+            addr: canon.partial_value_key(*addr),
+        })
         .collect();
     entries.sort();
     entries
@@ -992,19 +1116,19 @@ fn canonical_heap(
     memory: &BaseMemory,
     reachable: &std::collections::HashSet<AbstractValue>,
     canon: &Canonicalizer,
-) -> Vec<String> {
-    let mut edges = Vec::new();
+) -> Vec<CanonHeapEdge> {
+    let mut edges: Vec<CanonHeapEdge> = Vec::new();
     for (src, accesses) in memory.iter() {
         if !reachable.contains(src) {
             continue;
         }
+        let src_key = canon.partial_value_key(*src);
         for (access, target) in accesses.iter() {
-            edges.push(format!(
-                "{}:{}->{}",
-                canon.get(*src).unwrap(),
-                canonical_access(access, canon),
-                canon.get(*target).unwrap()
-            ));
+            edges.push(CanonHeapEdge {
+                src: src_key,
+                access: canon.partial_access_key(access),
+                target: canon.partial_value_key(*target),
+            });
         }
     }
     edges.sort();
@@ -1015,18 +1139,18 @@ fn canonical_attrs(
     attrs: &BaseAddressAttributes,
     reachable: &std::collections::HashSet<AbstractValue>,
     canon: &Canonicalizer,
-) -> Vec<String> {
-    let mut entries = Vec::new();
+) -> Vec<CanonAttrEntry> {
+    let mut entries: Vec<CanonAttrEntry> = Vec::new();
     for (addr, attrs) in attrs.iter() {
         if !reachable.contains(addr) {
             continue;
         }
+        let addr_key = canon.partial_value_key(*addr);
         for attr in attrs.iter() {
-            entries.push(format!(
-                "{}:{}",
-                canon.get(*addr).unwrap(),
-                canonical_attr(attr, canon)
-            ));
+            entries.push(CanonAttrEntry {
+                addr: addr_key,
+                attr: canon.partial_attribute_key(attr),
+            });
         }
     }
     entries.sort();
@@ -1060,8 +1184,8 @@ fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<Cano
 
     for (lhs, term_eq) in phi.term_eqs.iter() {
         parts.push(CanonFormulaEntry::TermEq(
-            canon.partial_term_eq_key(*lhs,            term_eq,
-        )));
+            canon.partial_term_eq_key(*lhs, term_eq),
+        ));
     }
 
     for (lhs, interval) in phi.intervals.iter() {
@@ -1105,47 +1229,6 @@ fn reachable_from_stack(
         }
     }
     reachable
-}
-
-fn canonical_access(access: &Access, canon: &Canonicalizer) -> String {
-    match access {
-        Access::Dereference => "deref".to_string(),
-        Access::FieldAccess(field) => format!("field:{field}"),
-        Access::ArrayAccess(typ, index) => {
-            format!("array:{typ}:{}", canon.get(*index).unwrap())
-        }
-    }
-}
-
-fn canonical_attr(attr: &Attribute, canon: &Canonicalizer) -> String {
-    match attr {
-        Attribute::ReturnedFromUnknown(values) => {
-            let values = values
-                .iter()
-                .map(|value| canon.get(*value).unwrap().to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("ReturnedFromUnknown({values})")
-        }
-        // Cross-ref: OCaml `PulseAttribute` carries `Timestamp.t` on these
-        // attributes for trace ordering, but the timestamp itself is not
-        // semantically meaningful for fixpoint convergence. Two iterations
-        // of the same procedure analysis can assign different timestamps
-        // to the same logical attribute (because `next_attr_timestamp` is
-        // bumped by intervening work), so including the timestamp here
-        // breaks `state_cmp::alpha_equivalent` and forces the worklist to
-        // re-visit nodes long after the analysis is semantically converged.
-        // Drop the timestamp from the canonical key while keeping the
-        // location and reason fields.
-        Attribute::MustBeValid(_ts, loc, reason) => {
-            format!("MustBeValid({loc}, {reason:?})")
-        }
-        Attribute::MustBeInitialized(_ts, loc) => {
-            format!("MustBeInitialized({loc})")
-        }
-        Attribute::WrittenTo(_ts, loc) => format!("WrittenTo({loc})"),
-        _ => format!("{attr:?}"),
-    }
 }
 
 fn operand_values(operand: &Operand) -> Vec<AbstractValue> {
@@ -1292,7 +1375,11 @@ fn format_canon_formula_entry(entry: &CanonFormulaEntry) -> String {
             )
         }
         CanonFormulaEntry::Interval(lhs, citv) => {
-            format!("interval:{}:{}", format_value_key(lhs), format_canon_citv(citv))
+            format!(
+                "interval:{}:{}",
+                format_value_key(lhs),
+                format_canon_citv(citv)
+            )
         }
         CanonFormulaEntry::IsInt(lhs) => format!("is_int:{}", format_value_key(lhs)),
         CanonFormulaEntry::FnApp(fa) => format!("fn_app:{}", format_canon_fn_app(fa)),
@@ -1308,6 +1395,103 @@ fn format_canon_formula_entry(entry: &CanonFormulaEntry) -> String {
 /// byte-identical to the pre-structural-key implementation.
 fn format_canon_formula_legacy(formula: &[CanonFormulaEntry]) -> Vec<String> {
     let mut out: Vec<String> = formula.iter().map(format_canon_formula_entry).collect();
+    out.sort();
+    out
+}
+
+// ---- Legacy String renderers for the structural non-formula sections. ----
+//
+// These reproduce the byte-for-byte shape of the pre-structural
+// `canonical_stack` / `canonical_heap` / `canonical_attrs` /
+// `canonical_dynamic_types` `Vec<String>` forms. They are used by
+// `debug_canonical_dump` (the [pulse-progress] log shape relies on this
+// remaining stable) and by the `structural_canonical_matches_*`
+// cross-check tests. The hot fixpoint path does NOT touch them.
+
+fn format_canon_access(access: &AccessSortKey) -> String {
+    match access {
+        AccessSortKey::Dereference => "deref".to_string(),
+        // Legacy `canonical_access` formatted `FieldAccess(field)` via
+        // `Display for Fieldname` (`"{class}.{field}"`); `AccessSortKey::Field`
+        // now carries the full `Fieldname` so the rendered output is
+        // byte-identical to the pre-structural form.
+        AccessSortKey::Field(field) => format!("field:{field}"),
+        AccessSortKey::Array { typ, index } => {
+            format!("array:{typ}:{}", format_value_key(index))
+        }
+    }
+}
+
+fn format_canon_attribute(attr: &CanonAttribute) -> String {
+    match attr {
+        CanonAttribute::ReturnedFromUnknown(values) => {
+            let values = values
+                .iter()
+                .map(format_value_key)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("ReturnedFromUnknown({values})")
+        }
+        CanonAttribute::MustBeValid(loc, reason) => {
+            format!("MustBeValid({loc}, {reason:?})")
+        }
+        CanonAttribute::MustBeInitialized(loc) => format!("MustBeInitialized({loc})"),
+        CanonAttribute::WrittenTo(loc) => format!("WrittenTo({loc})"),
+        CanonAttribute::Other(attr) => format!("{attr:?}"),
+    }
+}
+
+fn format_canon_stack_legacy(stack: &[CanonStackEntry]) -> Vec<String> {
+    // Legacy `canonical_stack` rendered each entry as `"{var}={addr}"`
+    // and then sorted the resulting `Vec<String>` lexicographically.
+    // The structural `Vec<CanonStackEntry>` is sorted by `(Var, addr)`,
+    // which is NOT the same lexicographic order as the rendered string
+    // form, so we re-sort the output here to preserve the legacy
+    // [pulse-progress] log shape exactly.
+    let mut out: Vec<String> = stack
+        .iter()
+        .map(|e| format!("{}={}", e.var, format_value_key(&e.addr)))
+        .collect();
+    out.sort();
+    out
+}
+
+fn format_canon_heap_legacy(heap: &[CanonHeapEdge]) -> Vec<String> {
+    let mut out: Vec<String> = heap
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{}->{}",
+                format_value_key(&e.src),
+                format_canon_access(&e.access),
+                format_value_key(&e.target)
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn format_canon_attrs_legacy(attrs: &[CanonAttrEntry]) -> Vec<String> {
+    let mut out: Vec<String> = attrs
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{}",
+                format_value_key(&e.addr),
+                format_canon_attribute(&e.attr)
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn format_canon_dynamic_types_legacy(dyn_types: &[CanonDynamicType]) -> Vec<String> {
+    let mut out: Vec<String> = dyn_types
+        .iter()
+        .map(|e| format!("dyn:{}={:?}", format_value_key(&e.addr), e.typ))
+        .collect();
     out.sort();
     out
 }
@@ -1704,6 +1888,115 @@ mod tests {
     /// sections lexicographically by their `"uf:"` / `"lin:"` / `"atom:"`
     /// / `"term_eq:"` / `"interval:"` / `"is_int:"` / `"fn_app:"`
     /// prefix).
+    /// Pre-structural `canonical_stack` shape, kept inline as a debug
+    /// helper for `structural_canonical_matches_non_formula_string_form`.
+    fn legacy_canonical_stack_strings(
+        stack: &crate::base_stack::BaseStack,
+        canon: &Canonicalizer,
+    ) -> Vec<String> {
+        let mut entries: Vec<_> = stack
+            .iter()
+            .map(|(var, addr)| format!("{var}={}", canon.get(*addr).unwrap()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Pre-structural `canonical_heap` shape, kept inline as a debug
+    /// helper for `structural_canonical_matches_non_formula_string_form`.
+    fn legacy_canonical_heap_strings(
+        memory: &crate::base_memory::BaseMemory,
+        reachable: &std::collections::HashSet<AbstractValue>,
+        canon: &Canonicalizer,
+    ) -> Vec<String> {
+        fn legacy_access(access: &Access, canon: &Canonicalizer) -> String {
+            match access {
+                Access::Dereference => "deref".to_string(),
+                Access::FieldAccess(field) => format!("field:{field}"),
+                Access::ArrayAccess(typ, index) => {
+                    format!("array:{typ}:{}", canon.get(*index).unwrap())
+                }
+            }
+        }
+        let mut edges = Vec::new();
+        for (src, accesses) in memory.iter() {
+            if !reachable.contains(src) {
+                continue;
+            }
+            for (access, target) in accesses.iter() {
+                edges.push(format!(
+                    "{}:{}->{}",
+                    canon.get(*src).unwrap(),
+                    legacy_access(access, canon),
+                    canon.get(*target).unwrap()
+                ));
+            }
+        }
+        edges.sort();
+        edges
+    }
+
+    /// Pre-structural `canonical_attrs` shape, kept inline as a debug
+    /// helper for `structural_canonical_matches_non_formula_string_form`.
+    /// Reproduces the timestamp-stripping behaviour of the production
+    /// `canonical_attr` formatter.
+    fn legacy_canonical_attrs_strings(
+        attrs: &crate::base_attrs::BaseAddressAttributes,
+        reachable: &std::collections::HashSet<AbstractValue>,
+        canon: &Canonicalizer,
+    ) -> Vec<String> {
+        fn legacy_attr(attr: &Attribute, canon: &Canonicalizer) -> String {
+            match attr {
+                Attribute::ReturnedFromUnknown(values) => {
+                    let values = values
+                        .iter()
+                        .map(|v| canon.get(*v).unwrap().to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("ReturnedFromUnknown({values})")
+                }
+                Attribute::MustBeValid(_ts, loc, reason) => {
+                    format!("MustBeValid({loc}, {reason:?})")
+                }
+                Attribute::MustBeInitialized(_ts, loc) => format!("MustBeInitialized({loc})"),
+                Attribute::WrittenTo(_ts, loc) => format!("WrittenTo({loc})"),
+                _ => format!("{attr:?}"),
+            }
+        }
+        let mut entries = Vec::new();
+        for (addr, addr_attrs) in attrs.iter() {
+            if !reachable.contains(addr) {
+                continue;
+            }
+            for attr in addr_attrs.iter() {
+                entries.push(format!(
+                    "{}:{}",
+                    canon.get(*addr).unwrap(),
+                    legacy_attr(attr, canon)
+                ));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Pre-structural `canonical_dynamic_types` shape, kept inline as a
+    /// debug helper for `structural_canonical_matches_non_formula_string_form`.
+    fn legacy_canonical_dynamic_types_strings(
+        state: &AbductiveDomain,
+        canon: &Canonicalizer,
+    ) -> Vec<String> {
+        let mut entries: Vec<_> = state
+            .iter_dynamic_types()
+            .filter_map(|(addr, typ)| canon.get(addr).map(|label| (label, typ)))
+            .collect();
+        entries.sort_by_key(|(label, _)| *label);
+        entries
+            .into_iter()
+            .map(|(label, typ)| format!("dyn:{label}={typ:?}"))
+            .collect()
+    }
+
     fn legacy_canonical_formula_strings(state: &AbductiveDomain) -> Vec<String> {
         let canonical = canonicalize(state);
         let canon = &canonical.canon;
@@ -1754,13 +2047,25 @@ mod tests {
                 Term::Var(v) => canon.get(*v).unwrap().to_string(),
                 Term::Const(v) => format!("const:{v}"),
                 Term::Add(l, r) => {
-                    format!("add({},{})", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "add({},{})",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
                 Term::Sub(l, r) => {
-                    format!("sub({},{})", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "sub({},{})",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
                 Term::Mult(l, r) => {
-                    format!("mul({},{})", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "mul({},{})",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
                 Term::Neg(t) => format!("neg({})", legacy_term_str(t, canon)),
                 Term::Not(t) => format!("not({})", legacy_term_str(t, canon)),
@@ -1770,16 +2075,32 @@ mod tests {
         for atom in phi.atoms.iter() {
             let s = match atom {
                 Atom::Equal(l, r) => {
-                    format!("eq:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "eq:{}:{}",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
                 Atom::NotEqual(l, r) => {
-                    format!("neq:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "neq:{}:{}",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
                 Atom::LessEqual(l, r) => {
-                    format!("le:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "le:{}:{}",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
                 Atom::LessThan(l, r) => {
-                    format!("lt:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                    format!(
+                        "lt:{}:{}",
+                        legacy_term_str(l, canon),
+                        legacy_term_str(r, canon)
+                    )
                 }
             };
             parts.push(format!("atom:{s}"));
@@ -1865,6 +2186,81 @@ mod tests {
         assert_eq!(
             structural_strings, legacy_strings,
             "structural canonical formula (formatted) must match legacy String-form output"
+        );
+    }
+
+    /// Cross-check: the structural canonical stack/heap/attrs/dynamic_types
+    /// sections, when formatted via the legacy `String` shape, must match
+    /// what the pre-structural `String`-only `canonical_*` helpers would
+    /// have produced byte-for-byte. Guards against drift in the rendered
+    /// `[pulse-progress]` log shape.
+    #[test]
+    fn structural_canonical_matches_non_formula_string_form() {
+        // Fixture exercises every non-formula section:
+        //   stack:        the formal `x`
+        //   heap:         deref + field edges
+        //   attrs:        Allocated (Other), MustBeValid (timestamp-stripped)
+        //   dynamic_types: Callable on the formal pointee
+        AbstractValue::reset_counters();
+        let mut state = make_state(0, false);
+        let formal_addr = state
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+        state.mark_must_be_valid(formal_addr);
+        state.add_dynamic_type_unsafe(
+            formal_addr,
+            Typ::mk_struct(TypeName::CStruct(QualifiedCppName::from_string("Callable"))),
+        );
+
+        let canonical = canonicalize(&state);
+        let pre_reachable = reachable_from_stack(&state.pre.stack, &state.pre.heap);
+        let post_reachable = reachable_from_stack(&state.post.stack, &state.post.heap);
+
+        // Stack: legacy form was `"{var}={addr}"`, sorted lexicographically.
+        let legacy_post_stack = legacy_canonical_stack_strings(&state.post.stack, &canonical.canon);
+        assert_eq!(
+            format_canon_stack_legacy(&canonical.state.post_stack),
+            legacy_post_stack,
+            "structural post_stack rendering must match legacy String form"
+        );
+
+        // Heap.
+        let legacy_post_heap =
+            legacy_canonical_heap_strings(&state.post.heap, &post_reachable, &canonical.canon);
+        assert_eq!(
+            format_canon_heap_legacy(&canonical.state.post_heap),
+            legacy_post_heap,
+            "structural post_heap rendering must match legacy String form"
+        );
+
+        // Attrs (timestamps stripped on both sides, same as production canonical_attr).
+        let legacy_post_attrs =
+            legacy_canonical_attrs_strings(&state.post.attrs, &post_reachable, &canonical.canon);
+        assert_eq!(
+            format_canon_attrs_legacy(&canonical.state.post_attrs),
+            legacy_post_attrs,
+            "structural post_attrs rendering must match legacy String form"
+        );
+
+        // Pre side too — sanity, even though it is empty for this fixture.
+        let legacy_pre_attrs =
+            legacy_canonical_attrs_strings(&state.pre.attrs, &pre_reachable, &canonical.canon);
+        assert_eq!(
+            format_canon_attrs_legacy(&canonical.state.pre_attrs),
+            legacy_pre_attrs,
+            "structural pre_attrs rendering must match legacy String form"
+        );
+
+        // Dynamic types.
+        let legacy_dyn = legacy_canonical_dynamic_types_strings(&state, &canonical.canon);
+        assert_eq!(
+            format_canon_dynamic_types_legacy(&canonical.state.dynamic_types),
+            legacy_dyn,
+            "structural dynamic_types rendering must match legacy String form"
         );
     }
 
