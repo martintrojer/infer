@@ -34,7 +34,13 @@ impl std::error::Error for ParseError {}
 struct TokenStream {
     tokens: Vec<(usize, Tok, usize)>,
     pos: usize,
-    source: String,
+    source_len: usize,
+    /// Byte offsets of the start of each line. `line_starts[0] == 0`, and the
+    /// 1-based line number for byte offset `o` is `partition_point(<= o)`.
+    /// Mirrors the per-line offset table built by `LineMap`. Precomputing this
+    /// turns `offset_to_loc` from O(N) (rescanning source from byte 0 every
+    /// call) into O(log N), avoiding O(N^2) parse times on large files.
+    line_starts: Vec<usize>,
 }
 
 /// Sentinel for end-of-input.
@@ -45,7 +51,8 @@ impl TokenStream {
         Self {
             tokens,
             pos: 0,
-            source: source.to_string(),
+            source_len: source.len(),
+            line_starts: build_line_starts(source),
         }
     }
 
@@ -65,8 +72,8 @@ impl TokenStream {
             .tokens
             .get(self.pos)
             .map(|(s, _, _)| *s)
-            .unwrap_or(self.source.len());
-        offset_to_loc(&self.source, offset)
+            .unwrap_or(self.source_len);
+        offset_to_loc_from_starts(&self.line_starts, offset)
     }
 
     fn advance(&mut self) {
@@ -92,7 +99,37 @@ impl TokenStream {
     }
 }
 
-/// Convert byte offset to line:col location.
+/// Build a sorted vec of byte offsets for the start of each line.
+/// `line_starts[0] == 0`; for each '\n' at byte `i`, push `i + 1`.
+fn build_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(source.len() / 32 + 1);
+    starts.push(0);
+    for (i, b) in source.as_bytes().iter().enumerate() {
+        if *b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// Convert byte offset to line:col location using a precomputed line-start
+/// table. O(log N) via binary search.
+///
+/// `col` is the byte offset from the start of the line (matches the
+/// previous implementation which counted chars but treated bytes; for ASCII
+/// SIL this is identical, and consumers only use line numbers anyway).
+fn offset_to_loc_from_starts(line_starts: &[usize], offset: usize) -> Location {
+    // partition_point returns the index of the first start strictly greater
+    // than `offset`; the line containing `offset` is one before that.
+    let idx = line_starts.partition_point(|&s| s <= offset);
+    let line = idx; // 1-based: idx >= 1 always since line_starts[0] == 0
+    let col = offset - line_starts[idx - 1];
+    Location::known(line, col)
+}
+
+/// Convert byte offset to line:col location by scanning from the start.
+/// Used only for one-off lexer error reporting where building the full
+/// line-start table is unnecessary.
 fn offset_to_loc(source: &str, offset: usize) -> Location {
     let mut line = 1;
     let mut col = 0;
@@ -1378,6 +1415,54 @@ type T = { _: int }"#;
             }
             other => panic!("expected Proc, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_offset_to_loc_from_starts() {
+        // Build the line-start table for a multi-line input and verify lookups.
+        let src = "abc\ndef\n\nghij\n";
+        let starts = build_line_starts(src);
+        // Line starts at byte offsets: 0, 4, 8, 9, 14.
+        assert_eq!(starts, vec![0, 4, 8, 9, 14]);
+        let unwrap = |loc: Location| match loc {
+            Location::Known { line, col } => (line, col),
+            Location::Unknown => panic!("expected Known location"),
+        };
+        assert_eq!(unwrap(offset_to_loc_from_starts(&starts, 0)), (1, 0));
+        assert_eq!(unwrap(offset_to_loc_from_starts(&starts, 2)), (1, 2));
+        assert_eq!(unwrap(offset_to_loc_from_starts(&starts, 4)), (2, 0));
+        // offset 8 -> line 3 col 0 (the empty line)
+        assert_eq!(unwrap(offset_to_loc_from_starts(&starts, 8)), (3, 0));
+        assert_eq!(unwrap(offset_to_loc_from_starts(&starts, 12)), (4, 3));
+    }
+
+    #[test]
+    fn test_parse_large_input_is_fast() {
+        // Synthesize a large textual module and parse it; the precomputed
+        // line-start table should keep this well under a second. Without it
+        // the parse is quadratic in file size and takes many seconds.
+        let n = 5_000usize;
+        let mut src = String::with_capacity(n * 64);
+        src.push_str(".source_language = \"c\"\n");
+        src.push_str("global G : int\n");
+        src.push_str("declare f(int) : int\n");
+        src.push_str("define g() : void {\n  #entry:\n");
+        for i in 0..n {
+            // Emit a simple instruction per line; the parser will call
+            // `loc()` repeatedly, exercising offset_to_loc.
+            use std::fmt::Write;
+            writeln!(&mut src, "    n{i}: int = load &G").unwrap();
+        }
+        src.push_str("    ret null\n}\n");
+        let start = std::time::Instant::now();
+        let m = parse_module(&src, "big.sil").unwrap();
+        let elapsed = start.elapsed();
+        assert!(!m.decls.is_empty());
+        assert!(
+            elapsed.as_secs_f64() < 1.0,
+            "parse of {n}-line input took {elapsed:?}, expected < 1s; \
+             possible regression of O(N^2) offset_to_loc",
+        );
     }
 
     #[test]
