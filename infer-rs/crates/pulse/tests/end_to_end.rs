@@ -133,11 +133,13 @@ fn analyze_with_spec_loop(
         }
     }
 
-    let (mut summary, mut spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
-        pdesc,
-        &callee_summaries,
-        specialization,
-    );
+    let (mut summary, mut spec_requests) =
+        pulse::checker::analyze_with_tenv_and_specialization_and_requests(
+            pdesc,
+            Some(ctx.tenv),
+            &callee_summaries,
+            specialization,
+        );
 
     if depth >= MAX_SPEC_DEPTH {
         return summary;
@@ -174,11 +176,13 @@ fn analyze_with_spec_loop(
         }
         // Re-analyze with the newly added specialized summaries, and collect
         // any follow-up requests from the actual caller states at their calls.
-        (summary, spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
-            pdesc,
-            &callee_summaries,
-            specialization,
-        );
+        (summary, spec_requests) =
+            pulse::checker::analyze_with_tenv_and_specialization_and_requests(
+                pdesc,
+                Some(ctx.tenv),
+                &callee_summaries,
+                specialization,
+            );
         if spec_requests.is_empty() {
             return summary;
         }
@@ -825,7 +829,6 @@ fn test_e2e_virt() {
     assert_ocaml_pulse_test(
         "virt.sil",
         &[
-            "devirtualize_with_final_good", // FP: declared-final receiver dynamic type
             "devirtualize_with_static_call_good", // FP: static-class virtual dispatch
         ],
     );

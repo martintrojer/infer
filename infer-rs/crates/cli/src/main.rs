@@ -1538,11 +1538,13 @@ fn analyze_with_spec_loop(
         }
     }
 
-    let (mut summary, mut spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
-        pdesc,
-        &callee_summaries,
-        specialization,
-    );
+    let (mut summary, mut spec_requests) =
+        pulse::checker::analyze_with_tenv_and_specialization_and_requests(
+            pdesc,
+            Some(ctx.tenv),
+            &callee_summaries,
+            specialization,
+        );
 
     if depth >= MAX_SPEC_DEPTH {
         return summary;
@@ -1575,11 +1577,13 @@ fn analyze_with_spec_loop(
         if !added_any {
             return summary;
         }
-        (summary, spec_requests) = pulse::checker::analyze_with_specialization_and_requests(
-            pdesc,
-            &callee_summaries,
-            specialization,
-        );
+        (summary, spec_requests) =
+            pulse::checker::analyze_with_tenv_and_specialization_and_requests(
+                pdesc,
+                Some(ctx.tenv),
+                &callee_summaries,
+                specialization,
+            );
         if spec_requests.is_empty() {
             return summary;
         }

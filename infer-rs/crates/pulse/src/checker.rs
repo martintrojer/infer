@@ -32,6 +32,8 @@ use sil::location::Location;
 use sil::procdesc::{NodeId, Procdesc};
 use sil::procname::Procname;
 use sil::specialization::PulseSpecialization;
+use sil::tenv::Tenv;
+use sil::typ::TypeDesc;
 
 use crate::abductive::{AbductiveDomain, AstateSizeStats};
 use crate::diagnostic::Diagnostic;
@@ -716,6 +718,53 @@ pub fn analyze(pdesc: &Procdesc) -> PulseSummary {
     analyze_with_summaries(pdesc, &HashMap::<Procname, PulseSummary>::new())
 }
 
+/// Seed dynamic types for formals whose declared static pointee type is
+/// marked `final` in the type environment.
+///
+/// Mirrors OCaml's `Pulse.add_dynamic_type_on_params_with_final_type` /
+/// the Hack/Python branch of `PulseAbductiveDomain.add_static_type` that
+/// promotes a final-class static type to a known dynamic type. Without this,
+/// virtual dispatch on a declared-final receiver type cannot resolve to the
+/// leaf override and Pulse keeps the over-approximation that calls the base
+/// method, returning an arbitrary integer.
+///
+/// The check is intentionally conservative: only formals whose root pvar
+/// resolves to a `*Tstruct` whose `Struct.annots` contain `Annot.final` get a
+/// dynamic type. Every other formal is left untouched.
+fn seed_final_type_formals(tenv: &Tenv, pdesc: &Procdesc, state: &mut AbductiveDomain) {
+    use sil::pvar::Pvar;
+    use sil::var::Var;
+
+    for (mangled, formal_typ, _annot) in &pdesc.formals {
+        let TypeDesc::Tptr(pointee, _) = formal_typ.desc.as_ref() else {
+            continue;
+        };
+        let TypeDesc::Tstruct(type_name) = pointee.desc.as_ref() else {
+            continue;
+        };
+        let Some(strukt) = tenv.lookup(type_name) else {
+            continue;
+        };
+        if !strukt.annots.is_final() {
+            continue;
+        }
+        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar));
+        let Some(formal_addr) = state.post.stack.find(&var) else {
+            continue;
+        };
+        // The formal's stack slot holds the address of the pointee. Walk
+        // through the dereference edge so the dynamic type lands on the
+        // pointee value (matching how virtual dispatch later consults
+        // `state.get_dynamic_type(receiver)` after `n0: *I42 = load &arg`).
+        let pointee_val = state.read_heap(formal_addr, crate::access::Access::Dereference);
+        if state.get_dynamic_type(pointee_val).is_some() {
+            continue;
+        }
+        state.add_dynamic_type_unsafe(pointee_val, (**pointee).clone());
+    }
+}
+
 /// Run Pulse analysis on a procedure with access to callee summaries.
 ///
 /// Uses the WTO fixpoint engine with a disjunctive domain, matching
@@ -751,6 +800,21 @@ pub fn analyze_with_specialization_and_requests(
     callee_summaries: &dyn SummaryLookup,
     specialization: Option<&sil::specialization::PulseSpecialization>,
 ) -> (PulseSummary, Vec<(Procname, PulseSpecialization)>) {
+    analyze_with_tenv_and_specialization_and_requests(pdesc, None, callee_summaries, specialization)
+}
+
+/// Same as [`analyze_with_specialization_and_requests`], but takes an optional
+/// type environment so the analyzer can seed precise dynamic types for
+/// formals whose declared static type is `final`.
+///
+/// Production callers (CLI, end-to-end harness) pass `Some(tenv)`. Unit tests
+/// that build hand-crafted summaries pass `None` and skip the seeding step.
+pub fn analyze_with_tenv_and_specialization_and_requests(
+    pdesc: &Procdesc,
+    tenv: Option<&Tenv>,
+    callee_summaries: &dyn SummaryLookup,
+    specialization: Option<&sil::specialization::PulseSpecialization>,
+) -> (PulseSummary, Vec<(Procname, PulseSpecialization)>) {
     // Reset per-thread counters so each procedure gets deterministic IDs.
     crate::abstract_value::AbstractValue::reset_counters();
 
@@ -770,6 +834,10 @@ pub fn analyze_with_specialization_and_requests(
     let max_widen_iters = cfg.pulse_widen_threshold;
 
     let mut initial_state = AbductiveDomain::mk_initial(pdesc);
+
+    if let Some(tenv) = tenv {
+        seed_final_type_formals(tenv, pdesc, &mut initial_state);
+    }
 
     // Apply specialization to initial state if provided
     if let Some(spec) = specialization {

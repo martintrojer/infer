@@ -27,6 +27,22 @@ pub struct Annot {
     pub parameters: Vec<AnnotParam>,
 }
 
+impl Annot {
+    /// Annotation that marks a class/field as `final`.
+    ///
+    /// Mirrors OCaml's `Annot.final`.
+    pub fn final_() -> Self {
+        Self {
+            class_name: "final".to_string(),
+            parameters: Vec::new(),
+        }
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.class_name == "final" && self.parameters.is_empty()
+    }
+}
+
 /// A list of annotations, representing an annotation item.
 ///
 /// Mirrors OCaml's `Annot.Item.t`.
@@ -40,5 +56,10 @@ impl AnnotItem {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Mirrors OCaml's `Annot.Item.is_final`.
+    pub fn is_final(&self) -> bool {
+        self.0.iter().any(Annot::is_final)
     }
 }

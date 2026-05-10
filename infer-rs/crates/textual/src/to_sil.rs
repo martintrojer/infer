@@ -497,9 +497,22 @@ fn struct_to_sil(lang: Lang, s: &ast::Struct) -> (typ::TypeName, strukt::Struct)
         .map(|sup| type_name_to_sil(lang, sup))
         .collect();
 
+    // Mirrors OCaml `TextualSil.StructBridge.to_sil`: a `.final` attribute on
+    // a struct is recorded as the `Annot.final` annotation in the Tenv entry.
+    // Pulse uses this annotation to know that a declared receiver type is
+    // exact, which lets virtual dispatch resolve to the leaf override.
+    let mut annots = sil::annot::AnnotItem::empty();
+    if s.attributes
+        .iter()
+        .any(|attr| attr.name == "final" && attr.values.is_empty())
+    {
+        annots.0.push(sil::annot::Annot::final_());
+    }
+
     let sil_struct = strukt::Struct {
         fields,
         supers,
+        annots,
         ..strukt::Struct::default()
     };
 
