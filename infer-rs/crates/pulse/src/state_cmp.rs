@@ -396,7 +396,12 @@ impl Canonicalizer {
         }
 
         let mut atoms: Vec<_> = phi.atoms.iter().collect();
-        atoms.sort_by_key(|atom| self.partial_atom_label(atom));
+        // Cross-ref: `partial_atom_label` recursively allocates `String`s
+        // through `format!`. `sort_by_cached_key` evaluates each key exactly
+        // once instead of the O(N log N) re-evaluations a plain
+        // `sort_by_key` would do; this is the bulk of `state_cmp::canonicalize`
+        // self-time (32% inclusive on OBJ_bsearch_ex_ before this change).
+        atoms.sort_by_cached_key(|atom| self.partial_atom_label(atom));
         for atom in atoms {
             let vars = atom.all_vars();
             if vars.iter().any(|value| self.get(*value).is_some()) {
@@ -407,7 +412,7 @@ impl Canonicalizer {
         }
 
         let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-        term_eqs.sort_by_key(|(lhs, term_eq)| self.partial_term_eq_label(**lhs, term_eq));
+        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_label(**lhs, term_eq));
         for (lhs, term_eq) in term_eqs {
             let vars: Vec<_> = std::iter::once(*lhs)
                 .chain(operand_values(&term_eq.lhs))
@@ -560,7 +565,7 @@ impl Canonicalizer {
         }
 
         let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-        linear_eqs.sort_by_key(|(lhs, lin)| self.partial_linear_eq_label(**lhs, lin));
+        linear_eqs.sort_by_cached_key(|(lhs, lin)| self.partial_linear_eq_label(**lhs, lin));
         for (lhs, lin) in linear_eqs {
             self.map_value(*lhs);
             for value in lin.get_variables() {
@@ -569,7 +574,7 @@ impl Canonicalizer {
         }
 
         let mut atoms: Vec<_> = phi.atoms.iter().collect();
-        atoms.sort_by_key(|atom| self.partial_atom_label(atom));
+        atoms.sort_by_cached_key(|atom| self.partial_atom_label(atom));
         for atom in atoms {
             for value in atom.all_vars() {
                 self.map_value(value);
@@ -577,7 +582,7 @@ impl Canonicalizer {
         }
 
         let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-        term_eqs.sort_by_key(|(lhs, term_eq)| self.partial_term_eq_label(**lhs, term_eq));
+        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_label(**lhs, term_eq));
         for (lhs, term_eq) in term_eqs {
             self.map_value(*lhs);
             for value in operand_values(&term_eq.lhs) {
@@ -589,7 +594,7 @@ impl Canonicalizer {
         }
 
         let mut intervals: Vec<_> = phi.intervals.iter().collect();
-        intervals.sort_by_key(|(value, interval)| {
+        intervals.sort_by_cached_key(|(value, interval)| {
             (self.partial_value_label(**value), format!("{interval:?}"))
         });
         for (value, _) in intervals {
@@ -603,7 +608,7 @@ impl Canonicalizer {
         }
 
         let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-        fn_apps.sort_by_key(|(key, ret)| self.partial_fn_app_label(key, **ret));
+        fn_apps.sort_by_cached_key(|(key, ret)| self.partial_fn_app_label(key, **ret));
         for (key, ret) in fn_apps {
             for actual in &key.actuals {
                 if let crate::formula::phi::FnAppActual::Var(value) = actual {
@@ -879,7 +884,7 @@ fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<Stri
     }
 
     let mut atoms: Vec<_> = phi.atoms.iter().collect();
-    atoms.sort_by_key(|atom| canonical_atom(atom, canon));
+    atoms.sort_by_cached_key(|atom| canonical_atom(atom, canon));
     for atom in atoms {
         parts.push(format!("atom:{}", canonical_atom(atom, canon)));
     }
@@ -912,7 +917,7 @@ fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<Stri
     }
 
     let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-    fn_apps.sort_by_key(|(key, ret)| {
+    fn_apps.sort_by_cached_key(|(key, ret)| {
         let actuals = key
             .actuals
             .iter()
