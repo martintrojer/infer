@@ -316,8 +316,12 @@ impl Diagnostic {
                         &access_start_loc,
                         access_trace_start_description(self),
                     ));
-                    let access_entries =
-                        access_history_to_bug_trace(access_history, access_location, 2);
+                    let access_entries = access_history_to_bug_trace(
+                        access_history,
+                        invalidation_history,
+                        access_location,
+                        2,
+                    );
                     let access_depth = access_entries
                         .iter()
                         .map(|entry| entry.level)
@@ -760,6 +764,7 @@ fn invalidation_history_to_bug_trace(
 
 fn access_history_to_bug_trace(
     history: &ValueHistory,
+    invalidation_history: &ValueHistory,
     fallback: &Location,
     base_level: u32,
 ) -> Vec<diagnostics::issue::BugTraceEntry> {
@@ -772,18 +777,40 @@ fn access_history_to_bug_trace(
         }
     }
 
+    fn formal_location_from_invalidation_history(
+        invalidation_history: &ValueHistory,
+        pvar: &Pvar,
+    ) -> Option<Location> {
+        invalidation_history
+            .primary_path()?
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                crate::value_history::HistoryEvent::FormalArgument(candidate, Some(loc))
+                    if candidate == pvar =>
+                {
+                    Some(loc.clone())
+                }
+                _ => None,
+            })
+    }
+
     fn rec(
         events: &[crate::value_history::HistoryEvent],
+        invalidation_history: &ValueHistory,
         fallback: &Location,
         level: u32,
     ) -> Vec<diagnostics::issue::BugTraceEntry> {
         match events {
             [crate::value_history::HistoryEvent::ActualArgument(pvar, location), rest @ ..] => {
-                let mut entries = rec(rest, fallback, level);
+                let mut entries = rec(rest, invalidation_history, fallback, level);
                 let call_loc = fallback.clone();
                 let proc_name = proc_of_pvar(pvar);
                 if let Some(proc_name) = proc_name {
-                    let param_loc = location.clone().unwrap_or_else(|| call_loc.clone());
+                    let param_loc =
+                        formal_location_from_invalidation_history(invalidation_history, pvar)
+                            .or_else(|| location.clone())
+                            .unwrap_or_else(|| call_loc.clone());
                     entries.push(make_bug_trace_entry(
                         level,
                         &call_loc,
@@ -811,7 +838,7 @@ fn access_history_to_bug_trace(
     let Some(path) = history.primary_path() else {
         return Vec::new();
     };
-    rec(path.events(), fallback, base_level)
+    rec(path.events(), invalidation_history, fallback, base_level)
 }
 
 impl fmt::Display for Diagnostic {
@@ -999,6 +1026,43 @@ mod tests {
             .position(|desc| *desc == "parameter `x` of callee")
             .expect("callee parameter entry should exist");
         assert!(caller_idx < call_idx && call_idx < callee_idx);
+    }
+
+    #[test]
+    fn test_actual_argument_access_trace_uses_callee_formal_location_from_invalidation_trace() {
+        let caller = Procname::c_from_string("caller");
+        let callee = Procname::c_from_string("latent_use_after_free");
+        let caller_pvar = Pvar::mk(Mangled::from_string("x"), caller);
+        let callee_pvar = Pvar::mk(Mangled::from_string("x"), callee.clone());
+        let diag = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::mk_fresh(),
+            invalidation: Invalidation::CFree,
+            access_location: loc(25),
+            trace_access_location: Some(loc(18)),
+            access_history: ValueHistory::from_event(HistoryEvent::ActualArgument(
+                callee_pvar.clone(),
+                Some(loc(25)),
+            ))
+            .append_event(HistoryEvent::FormalArgument(caller_pvar, Some(loc(25)))),
+            invalidation_history: ValueHistory::from_event(HistoryEvent::FormalArgument(
+                callee_pvar,
+                Some(loc(16)),
+            ))
+            .append_event(HistoryEvent::Invalidated {
+                invalidation: Invalidation::CFree,
+                location: loc(12),
+            })
+            .wrap_call(&callee, &loc(25)),
+        };
+
+        let issue = diag.to_issue("caller");
+        let trace = issue.bug_trace.expect("expected structured bug trace");
+        assert!(trace.iter().any(|entry| {
+            entry.line_number == 16 && entry.description == "parameter `x` of latent_use_after_free"
+        }));
+        assert!(!trace.iter().any(|entry| {
+            entry.line_number == 25 && entry.description == "parameter `x` of latent_use_after_free"
+        }));
     }
 
     #[test]

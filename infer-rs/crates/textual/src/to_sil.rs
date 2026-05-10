@@ -770,8 +770,10 @@ fn instr_to_sil(
                             ))
                         })
                         .collect::<Result<Vec<_>, ConvError>>()?;
-                    let mut flags = CallFlags::default();
-                    flags.cf_virtual = matches!(kind, ast::CallKind::Virtual);
+                    let flags = CallFlags {
+                        cf_virtual: matches!(kind, ast::CallKind::Virtual),
+                        ..Default::default()
+                    };
                     Ok(Some(instr::Instr::Call {
                         ret: (ret_id, ret_typ),
                         fun_exp,

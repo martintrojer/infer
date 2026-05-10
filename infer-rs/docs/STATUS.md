@@ -29,8 +29,9 @@ Accepted current count deltas:
 Recent correctness work that should stay in place mirrors OCaml's dynamic-type
 specialization path, direct known-call unknown fallback for resolved
 `__call_c_function_ptr` targets without summaries, caller-visible pre-edge
-materialization, latent-invalid-access export/import parity, and comparator
-normalizations for semantic noise only.
+materialization, latent-invalid-access export/import parity, latent.c trace
+detail (callee formal anchoring on synthesized actual-argument trace steps),
+and comparator normalizations for semantic noise only.
 
 ## OpenSSL benchmark dashboard
 
@@ -96,8 +97,6 @@ Important task clusters migrated from the old ad-hoc backlog docs:
   - `perf_component_clone_reduction`
   - `openssl_reexport_shared_corpus`
 - Correctness/parity:
-  - `parity_valuehistory_trace_detail`
-  - `parity_latent_reporting_detail`
   - `parity_sizeof_type_eval`
 - SIL/Textual gaps:
   - `sil_virtual_dispatch_loads`

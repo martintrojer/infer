@@ -94,7 +94,7 @@ impl GlobalKey {
         Self(name.value.clone())
     }
 
-    pub fn from_str(name: &str) -> Self {
+    pub fn from_name(name: &str) -> Self {
         Self(name.to_string())
     }
 }
@@ -164,7 +164,7 @@ impl DeclEnv {
     }
 
     pub fn get_global(&self, name: &str) -> Option<&Global> {
-        self.globals.get(&GlobalKey::from_str(name))
+        self.globals.get(&GlobalKey::from_name(name))
     }
 
     pub fn get_struct(&self, name: &TypeName) -> Option<&Struct> {
