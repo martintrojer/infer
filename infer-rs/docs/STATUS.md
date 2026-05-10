@@ -100,6 +100,15 @@ Interpretation:
 - Stale `term_value_index` repair was rejected for the default path: it improved
   selected DES target wall time but made whole-program median slower and produced
   no repair hits in the focused counter run.
+- Subsequent landings (`e8a10549ea` sort_by_cached_key,
+  `6e9e4fa56c` structural canonical formula keys, `b02a822805` structural
+  canonical stack/heap/attrs/dynamic_types) cumulatively cut isolated
+  `OBJ_bsearch_ex_` wall from `1.91s` to `0.54s` (~`72%` reduction) but a
+  whole-program OpenSSL remeasure has not yet landed in this dashboard
+  because two attempted remeasures were load-contaminated. Tracked under
+  the deferred task `perf_remeasure_quiescent_host`; the next clean run on
+  an idle host should drop the OFF/ON wall medians materially below the
+  `244.70s` / `238.56s` shown here.
 - The remaining wall-time gap to OCaml is tracked under
   `perf_track_walltime_gap_vs_ocaml`; first follow-up is profiling a hot DES/OBJ
   proc on the new baseline.
