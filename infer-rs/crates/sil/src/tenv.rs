@@ -71,19 +71,22 @@ impl Tenv {
     }
 
     /// Get all supertypes of a given type (transitive closure).
-    pub fn get_supers(&self, name: &TypeName) -> Vec<TypeName> {
+    ///
+    /// Returned references borrow from `self`, so no `TypeName` cloning is
+    /// required. Callers that need owned values can `.cloned()` the iterator.
+    pub fn get_supers(&self, name: &TypeName) -> Vec<&TypeName> {
         let mut result = Vec::new();
-        let mut worklist = vec![name.clone()];
+        let mut worklist = vec![name];
         let mut visited = std::collections::HashSet::new();
 
         while let Some(current) = worklist.pop() {
-            if !visited.insert(current.clone()) {
+            if !visited.insert(current) {
                 continue;
             }
-            if let Some(strukt) = self.lookup(&current) {
+            if let Some(strukt) = self.lookup(current) {
                 for super_name in &strukt.supers {
-                    result.push(super_name.clone());
-                    worklist.push(super_name.clone());
+                    result.push(super_name);
+                    worklist.push(super_name);
                 }
             }
         }
