@@ -402,12 +402,14 @@ define f(l: *list) : void {
         // After type inference, the Load in the Let should have typ filled in
         if let Some(Decl::Proc(pdesc)) = module.decls.last() {
             let has_typed_load = pdesc.nodes.iter().any(|n| {
-                n.instrs.iter().any(|i| match i {
-                    Instr::Let {
-                        exp: Exp::Load { typ: Some(_), .. },
-                        ..
-                    } => true,
-                    _ => false,
+                n.instrs.iter().any(|i| {
+                    matches!(
+                        i,
+                        Instr::Let {
+                            exp: Exp::Load { typ: Some(_), .. },
+                            ..
+                        }
+                    )
                 })
             });
             assert!(has_typed_load, "Load typ should be filled in");

@@ -786,11 +786,9 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(200));
                     self.slow_done.store(true, AtomicOrdering::SeqCst);
                 }
-                "top" => {
-                    if !self.slow_done.load(AtomicOrdering::SeqCst) {
-                        self.top_started_before_slow_done
-                            .store(true, AtomicOrdering::SeqCst);
-                    }
+                "top" if !self.slow_done.load(AtomicOrdering::SeqCst) => {
+                    self.top_started_before_slow_done
+                        .store(true, AtomicOrdering::SeqCst);
                 }
                 _ => {}
             }

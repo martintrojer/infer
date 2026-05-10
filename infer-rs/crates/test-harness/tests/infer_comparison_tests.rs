@@ -54,6 +54,7 @@ fn test_ocaml_captures_sil_pulse_files() {
 /// For each .sil file in sil/pulse/:
 /// 1. Parse with Rust textual parser
 /// 2. Capture with OCaml infer (if available)
+///
 /// Both should succeed on the same files.
 #[test]
 fn test_parse_parity_sil_pulse() {

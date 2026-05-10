@@ -1408,16 +1408,18 @@ define f(x: int, y: int) : int {
                 .iter()
                 .rev()
                 .find(|i| matches!(i, Instr::Let { .. }));
-            if let Some(Instr::Let { exp, .. }) = last_let {
-                if let Exp::Call { proc, args, .. } = exp {
-                    assert_eq!(proc.name.value, "__sil_mult_int");
-                    // Both args should be Var (hoisted), not Call
-                    for arg in args {
-                        assert!(
-                            matches!(arg, Exp::Var(_)),
-                            "args to __sil_mult_int should be Var after flattening, got {arg:?}"
-                        );
-                    }
+            if let Some(Instr::Let {
+                exp: Exp::Call { proc, args, .. },
+                ..
+            }) = last_let
+            {
+                assert_eq!(proc.name.value, "__sil_mult_int");
+                // Both args should be Var (hoisted), not Call
+                for arg in args {
+                    assert!(
+                        matches!(arg, Exp::Var(_)),
+                        "args to __sil_mult_int should be Var after flattening, got {arg:?}"
+                    );
                 }
             }
         }

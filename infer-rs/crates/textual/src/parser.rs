@@ -1406,7 +1406,7 @@ type T = { _: int }"#;
         let mut files = Vec::new();
         walk(&sil_dir, &mut files);
         for f in &files {
-            if f.extension().map_or(true, |e| e != "sil") {
+            if f.extension().is_none_or(|e| e != "sil") {
                 continue;
             }
             let name = f.file_name().unwrap().to_str().unwrap_or("");

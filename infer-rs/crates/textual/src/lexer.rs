@@ -683,6 +683,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // literal value comes from lexer input string, not π
     fn test_numbers() {
         let toks = tokens("42 3.14 0 -1");
         assert_eq!(
