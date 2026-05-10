@@ -7,10 +7,40 @@
 //!
 //! Mirrors the intent of OCaml's `PulseAbductiveDomain.leq`, which compares
 //! states modulo abstract-value renaming rather than raw identifier equality.
+//!
+//! ### Design note: structural canonical formula entries
+//!
+//! Earlier iterations of this module spelled the canonical state with
+//! `Vec<String>` for every section, with the per-entry `String` produced
+//! by recursively `format!`-ing nested `partial_*_label` helpers. Profiling
+//! `OBJ_bsearch_ex_` (worker-subsume-1, post-`sort_by_cached_key` fix)
+//! showed ~36% of the worker-thread inclusive time still in `core::fmt::write`
+//! / `format_inner` / `String::write_str` from those `partial_*_label`
+//! helpers, with `partial_atom_label` (15%), `partial_term_label` (10%),
+//! and `partial_value_label` (4%) the dominant contributors.
+//!
+//! The hot formula path (atoms, term_eqs, linear_eqs, intervals, is_int_vars,
+//! fn_apps, var_eqs) is therefore now spelled in a structural enum tree
+//! (`CanonFormulaEntry` / `CanonAtom` / `CanonTerm` / `CanonOperand` /
+//! `CanonLinArith` / `CanonFnApp` / ...). Derived `Ord`/`Eq`/`Hash` on these
+//! enums replace the per-entry `format!` allocation that the legacy path
+//! used purely to drive `sort_by_cached_key` and `==`.
+//!
+//! The legacy `String`-shaped sections (`pre_stack`, `post_stack`,
+//! `pre_heap`, `post_heap`, `pre_attrs`, `post_attrs`, `dynamic_types`) are
+//! retained as `Vec<String>` for now: they are not on the hot path
+//! (per the profile) and the per-entry strings are short and dominated by
+//! one outer `format!` whose cost is negligible.
+//!
+//! The legacy `partial_*_label` helpers and `canonical_*` String formatters
+//! are kept behind `#[cfg(test)]` as a debug helper so that the
+//! cross-validation test in `tests::structural_canonical_matches_string_form`
+//! can verify the structural form, when formatted to legacy strings,
+//! reproduces the old `Vec<String>` exactly.
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
-use num_traits::Zero;
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
@@ -20,7 +50,8 @@ use crate::base_attrs::BaseAddressAttributes;
 use crate::base_memory::BaseMemory;
 use crate::base_stack::BaseStack;
 use crate::formula::atom::Atom;
-use crate::formula::lin_arith::LinArith;
+use crate::formula::lin_arith::{LinArith, Q};
+use crate::formula::phi::{FnAppActual, FnAppKey, TermEq};
 use crate::formula::term::Term;
 use crate::formula::Operand;
 
@@ -30,13 +61,15 @@ enum CanonValue {
     Restricted(u32),
 }
 
-/// Allocation-free sort key for `Canonicalizer::partial_value_label`.
+/// Allocation-free sort key for an `AbstractValue` during canonicalization.
 ///
-/// Variant order intentionally matches the lexicographic ordering of the
-/// `String` form returned by `partial_value_label` (`"r0"` < `"u0"` <
-/// `"?r0"` < `"?u0"`) so that callers that previously sorted by the
-/// `String` see the same iteration order without paying per-key heap
-/// allocations.
+/// Variant declaration order is the comparison order — chosen so that
+/// already-mapped (canonical) values come before still-unmapped values,
+/// matching the legacy lexicographic intuition that mapped names like
+/// `r0` / `u0` are "smaller" than placeholder names like `?r5` / `?u5`.
+/// The exact order is not load-bearing: every consumer is internal to
+/// this module and only requires a deterministic total order to drive
+/// `sort_by_cached_key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ValueSortKey {
     CanonRestricted(u32),
@@ -45,7 +78,7 @@ enum ValueSortKey {
     UnmappedUnrestricted(u64),
 }
 
-/// Allocation-free sort key for `Canonicalizer::partial_access_label`.
+/// Allocation-free sort key for `Access` during canonicalization.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AccessSortKey {
     Dereference,
@@ -53,11 +86,169 @@ enum AccessSortKey {
     Array { typ: String, index: ValueSortKey },
 }
 
-/// Allocation-free sort key for `Canonicalizer::partial_edge_label`.
+/// Allocation-free sort key for an outgoing memory edge.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct EdgeSortKey {
     access: AccessSortKey,
     target: ValueSortKey,
+}
+
+// ---------------------------------------------------------------------------
+// Structural canonical formula entries.
+//
+// These mirror the formula AST but with `ValueSortKey` in place of
+// `AbstractValue`. Derived `Ord`/`Eq`/`Hash` replace the legacy
+// `partial_*_label` String allocation. They participate both as sort
+// keys (during `propagate_*` / `assign_remaining_*` fixpoints) and as the
+// final canonical representation of the formula (`CanonicalState.formula`).
+// ---------------------------------------------------------------------------
+
+/// Structural counterpart of `LinArith` with values replaced by `ValueSortKey`s.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonLinArith {
+    /// Sorted-by-`ValueSortKey`, then by coefficient. `Vec` (not `BTreeMap`)
+    /// so the slice is contiguous and `Ord` derives lexicographic comparison.
+    vars: Vec<(ValueSortKey, CanonQ)>,
+    constant: CanonQ,
+}
+
+/// Comparable wrapper around `Q` (= `Ratio<i64>`).
+///
+/// `Q` is `Eq`/`Ord`/`Hash` already; this newtype just localises the
+/// representation choice in case we want to swap it later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonQ {
+    num: i64,
+    den: i64,
+}
+
+impl CanonQ {
+    fn from_q(q: &Q) -> Self {
+        Self {
+            num: *q.numer(),
+            den: *q.denom(),
+        }
+    }
+}
+
+/// Structural counterpart of `Operand` with values replaced by `ValueSortKey`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonOperand {
+    /// "const:N" in the legacy String form.
+    Const(i64),
+    /// "uN"/"rN"/"?uN"/"?rN" in the legacy String form.
+    Var(ValueSortKey),
+}
+
+/// Structural counterpart of `Term`.
+///
+/// Variant declaration order is irrelevant for correctness; it only
+/// determines tie-breaking between, e.g., `Term::Var(_)` and
+/// `Term::Const(_)` during `sort_by_cached_key`. The order chosen here
+/// places leaves first, then unary, then binary, which keeps short
+/// fingerprints near the top of any sorted output and matches the visual
+/// intuition of the legacy String form well enough for the
+/// `structural_canonical_matches_string_form` cross-check (which only
+/// asserts the unsorted set of formatted entries — not the ordering — is
+/// identical).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonTerm {
+    Var(ValueSortKey),
+    Const(i64),
+    Neg(Box<CanonTerm>),
+    Not(Box<CanonTerm>),
+    IsZero(Box<CanonTerm>),
+    Add(Box<CanonTerm>, Box<CanonTerm>),
+    Sub(Box<CanonTerm>, Box<CanonTerm>),
+    Mult(Box<CanonTerm>, Box<CanonTerm>),
+}
+
+/// Structural counterpart of `Atom`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonAtom {
+    Equal(CanonTerm, CanonTerm),
+    NotEqual(CanonTerm, CanonTerm),
+    LessEqual(CanonTerm, CanonTerm),
+    LessThan(CanonTerm, CanonTerm),
+}
+
+/// Structural counterpart of a (lhs, `TermEq`) pair.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonTermEq {
+    lhs: ValueSortKey,
+    op: sil::binop::Binop,
+    op_lhs: CanonOperand,
+    op_rhs: CanonOperand,
+}
+
+/// Structural counterpart of a (FnAppKey, ret) pair.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonFnApp {
+    callee: String,
+    actuals: Vec<CanonOperand>,
+    ret: ValueSortKey,
+}
+
+/// Structural counterpart of an interval bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonBound {
+    /// Variant order chosen so that finite values fall between the two
+    /// infinities, matching their numerical position on the real line.
+    MinusInfinity,
+    Int(i64),
+    PlusInfinity,
+}
+
+impl CanonBound {
+    fn from_bound(b: &crate::formula::citv::Bound) -> Self {
+        match b {
+            crate::formula::citv::Bound::MinusInfinity => Self::MinusInfinity,
+            crate::formula::citv::Bound::Int(i) => Self::Int(*i),
+            crate::formula::citv::Bound::PlusInfinity => Self::PlusInfinity,
+        }
+    }
+}
+
+/// Structural counterpart of `CItv`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonCItv {
+    Between(CanonBound, CanonBound),
+    Outside(i64, i64),
+}
+
+impl CanonCItv {
+    fn from_citv(c: &crate::formula::citv::CItv) -> Self {
+        match c {
+            crate::formula::citv::CItv::Between(lo, hi) => {
+                Self::Between(CanonBound::from_bound(lo), CanonBound::from_bound(hi))
+            }
+            crate::formula::citv::CItv::Outside(lo, hi) => Self::Outside(*lo, *hi),
+        }
+    }
+}
+
+/// One entry in the canonical formula.
+///
+/// Variant order is irrelevant for correctness — `CanonicalState.formula`
+/// is sorted at the end of `canonical_formula`, then compared
+/// element-wise with derived `Eq`. We keep the `Vec` sorted so the same
+/// formula always serialises to the same `Vec`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonFormulaEntry {
+    /// Union-find equality `lhs -> rhs`.
+    VarEq(ValueSortKey, ValueSortKey),
+    /// Linear equality `lhs = lin`.
+    LinearEq(ValueSortKey, CanonLinArith),
+    /// Boolean atom (eq/neq/le/lt over terms).
+    Atom(CanonAtom),
+    /// `lhs = op(op_lhs, op_rhs)` — recorded by `Phi::term_eqs`.
+    TermEq(CanonTermEq),
+    /// Concrete integer interval for a value.
+    Interval(ValueSortKey, CanonCItv),
+    /// `is_int` predicate.
+    IsInt(ValueSortKey),
+    /// Function application equality.
+    FnApp(CanonFnApp),
 }
 
 impl std::fmt::Display for CanonValue {
@@ -77,7 +268,8 @@ struct CanonicalState {
     post_heap: Vec<String>,
     pre_attrs: Vec<String>,
     post_attrs: Vec<String>,
-    formula: Vec<String>,
+    /// Structural canonical formula. See the module-level "Design note".
+    formula: Vec<CanonFormulaEntry>,
     /// Cross-ref: OCaml `path_condition.type_constraints` participates in
     /// `PulseAbductiveDomain.leq`. We track dynamic-type bindings
     /// separately on `AbductiveDomain.dynamic_types`, but they affect
@@ -160,6 +352,12 @@ pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
         dynamic_types,
     } = canonicalize(state).state;
 
+    // Render the structural formula via the legacy String form so the
+    // [pulse-progress] / debug dump shape is byte-identical to the
+    // pre-structural-key implementation. This is a debug surface; the
+    // formatting cost is irrelevant outside of `--debug` runs.
+    let formula_lines = format_canon_formula_legacy(&formula);
+
     let mut out = String::new();
     append_debug_section(&mut out, "pre_stack", pre_stack);
     append_debug_section(&mut out, "post_stack", post_stack);
@@ -167,7 +365,7 @@ pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
     append_debug_section(&mut out, "post_heap", post_heap);
     append_debug_section(&mut out, "pre_attrs", pre_attrs);
     append_debug_section(&mut out, "post_attrs", post_attrs);
-    append_debug_section(&mut out, "formula", formula);
+    append_debug_section(&mut out, "formula", formula_lines);
     append_debug_section(&mut out, "dynamic_types", dynamic_types);
     out.pop();
     out
@@ -239,17 +437,72 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
     }
 }
 
+/// Stable per-state hash used by `debug_signature`.
+///
+/// Folds an FNV-1a state (constant-time per byte) over each section. The
+/// formula section runs through `Hash` on the structural enums rather
+/// than through any `String` representation — see the module-level
+/// design note.
 fn stable_hash_state(state: &CanonicalState) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    hash_section(&mut hash, &state.pre_stack);
-    hash_section(&mut hash, &state.post_stack);
-    hash_section(&mut hash, &state.pre_heap);
-    hash_section(&mut hash, &state.post_heap);
-    hash_section(&mut hash, &state.pre_attrs);
-    hash_section(&mut hash, &state.post_attrs);
-    hash_section(&mut hash, &state.formula);
-    hash_section(&mut hash, &state.dynamic_types);
-    hash
+    let mut h = FnvHasher::new();
+    hash_string_section(&mut h, &state.pre_stack);
+    hash_string_section(&mut h, &state.post_stack);
+    hash_string_section(&mut h, &state.pre_heap);
+    hash_string_section(&mut h, &state.post_heap);
+    hash_string_section(&mut h, &state.pre_attrs);
+    hash_string_section(&mut h, &state.post_attrs);
+    // Structural formula — feed the typed `Hash` impls, no String alloc.
+    h.write_u64(state.formula.len() as u64);
+    for entry in &state.formula {
+        entry.hash(&mut h);
+        h.write_u8(0xff);
+    }
+    hash_string_section(&mut h, &state.dynamic_types);
+    h.finish()
+}
+
+fn hash_string_section(h: &mut FnvHasher, lines: &[String]) {
+    h.write_u64(lines.len() as u64);
+    for line in lines {
+        h.write_bytes(line.as_bytes());
+        h.write_u8(0xff);
+    }
+}
+
+/// FNV-1a hasher with a stable fixed seed so canonical hashes are
+/// reproducible across runs (unlike `std::collections::hash_map::DefaultHasher`
+/// which uses a randomised seed).
+struct FnvHasher {
+    state: u64,
+}
+
+impl FnvHasher {
+    fn new() -> Self {
+        Self {
+            state: 0xcbf29ce484222325u64,
+        }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_u8(&mut self, b: u8) {
+        self.write_bytes(&[b]);
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.write_bytes(bytes);
+    }
 }
 
 fn canonical_dynamic_types(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<String> {
@@ -262,21 +515,6 @@ fn canonical_dynamic_types(state: &AbductiveDomain, canon: &Canonicalizer) -> Ve
         .into_iter()
         .map(|(label, typ)| format!("dyn:{label}={typ:?}"))
         .collect()
-}
-
-fn hash_section(hash: &mut u64, lines: &[String]) {
-    stable_hash_bytes(hash, &(lines.len() as u64).to_le_bytes());
-    for line in lines {
-        stable_hash_bytes(hash, line.as_bytes());
-        stable_hash_bytes(hash, &[0xff]);
-    }
-}
-
-fn stable_hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x100000001b3);
-    }
 }
 
 struct CanonicalizedState {
@@ -396,12 +634,11 @@ impl Canonicalizer {
         }
 
         let mut atoms: Vec<_> = phi.atoms.iter().collect();
-        // Cross-ref: `partial_atom_label` recursively allocates `String`s
-        // through `format!`. `sort_by_cached_key` evaluates each key exactly
-        // once instead of the O(N log N) re-evaluations a plain
-        // `sort_by_key` would do; this is the bulk of `state_cmp::canonicalize`
-        // self-time (32% inclusive on OBJ_bsearch_ex_ before this change).
-        atoms.sort_by_cached_key(|atom| self.partial_atom_label(atom));
+        // Cross-ref: `partial_atom_key` is structural (no `String`
+        // allocation), unlike the legacy `partial_atom_label`.
+        // `sort_by_cached_key` evaluates each key exactly once instead of
+        // the O(N log N) re-evaluations a plain `sort_by_key` would do.
+        atoms.sort_by_cached_key(|atom| self.partial_atom_key(atom));
         for atom in atoms {
             let vars = atom.all_vars();
             if vars.iter().any(|value| self.get(*value).is_some()) {
@@ -412,7 +649,7 @@ impl Canonicalizer {
         }
 
         let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_label(**lhs, term_eq));
+        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_key(**lhs, term_eq));
         for (lhs, term_eq) in term_eqs {
             let vars: Vec<_> = std::iter::once(*lhs)
                 .chain(operand_values(&term_eq.lhs))
@@ -462,8 +699,8 @@ impl Canonicalizer {
                 .actuals
                 .iter()
                 .filter_map(|actual| match actual {
-                    crate::formula::phi::FnAppActual::Const(_) => None,
-                    crate::formula::phi::FnAppActual::Var(value) => Some(*value),
+                    FnAppActual::Const(_) => None,
+                    FnAppActual::Var(value) => Some(*value),
                 })
                 .chain(std::iter::once(*ret))
                 .collect();
@@ -554,10 +791,7 @@ impl Canonicalizer {
 
         let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
         equalities.sort_by_key(|(lhs, rhs)| {
-            (
-                self.partial_value_label(*lhs),
-                self.partial_value_label(*rhs),
-            )
+            (self.partial_value_key(*lhs), self.partial_value_key(*rhs))
         });
         for (lhs, rhs) in equalities {
             self.map_value(lhs);
@@ -565,7 +799,7 @@ impl Canonicalizer {
         }
 
         let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-        linear_eqs.sort_by_cached_key(|(lhs, lin)| self.partial_linear_eq_label(**lhs, lin));
+        linear_eqs.sort_by_cached_key(|(lhs, lin)| self.partial_linear_eq_key(**lhs, lin));
         for (lhs, lin) in linear_eqs {
             self.map_value(*lhs);
             for value in lin.get_variables() {
@@ -574,7 +808,7 @@ impl Canonicalizer {
         }
 
         let mut atoms: Vec<_> = phi.atoms.iter().collect();
-        atoms.sort_by_cached_key(|atom| self.partial_atom_label(atom));
+        atoms.sort_by_cached_key(|atom| self.partial_atom_key(atom));
         for atom in atoms {
             for value in atom.all_vars() {
                 self.map_value(value);
@@ -582,7 +816,7 @@ impl Canonicalizer {
         }
 
         let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_label(**lhs, term_eq));
+        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_key(**lhs, term_eq));
         for (lhs, term_eq) in term_eqs {
             self.map_value(*lhs);
             for value in operand_values(&term_eq.lhs) {
@@ -595,7 +829,7 @@ impl Canonicalizer {
 
         let mut intervals: Vec<_> = phi.intervals.iter().collect();
         intervals.sort_by_cached_key(|(value, interval)| {
-            (self.partial_value_label(**value), format!("{interval:?}"))
+            (self.partial_value_key(**value), CanonCItv::from_citv(interval))
         });
         for (value, _) in intervals {
             self.map_value(*value);
@@ -608,10 +842,10 @@ impl Canonicalizer {
         }
 
         let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-        fn_apps.sort_by_cached_key(|(key, ret)| self.partial_fn_app_label(key, **ret));
+        fn_apps.sort_by_cached_key(|(key, ret)| self.partial_fn_app_key(key, **ret));
         for (key, ret) in fn_apps {
             for actual in &key.actuals {
-                if let crate::formula::phi::FnAppActual::Var(value) = actual {
+                if let FnAppActual::Var(value) = actual {
                     self.map_value(*value);
                 }
             }
@@ -619,25 +853,7 @@ impl Canonicalizer {
         }
     }
 
-    fn partial_value_label(&self, value: AbstractValue) -> String {
-        self.get(value).map_or_else(
-            || {
-                let kind = if value.is_restricted() { 'r' } else { 'u' };
-                format!("?{kind}{}", value.raw().unsigned_abs())
-            },
-            |canon| canon.to_string(),
-        )
-    }
-
-    /// Cheap allocation-free sort key for `partial_value_label`.
-    ///
-    /// Profile shows `Canonicalizer::partial_value_label` as the single
-    /// hottest function on the `whirlpool_block` slice (>20% of
-    /// self-time), driven by the `sort_by_key` calls in `propagate_*`.
-    /// Each call allocates a `String` purely for `Ord` comparison.
-    /// `partial_value_key` returns a comparable tuple that is
-    /// order-equivalent to the `String` form’s lexicographic order on
-    /// `"u"`/`"r"`/`"?u"`/`"?r"` prefixes, without allocating.
+    /// Cheap allocation-free sort key for an `AbstractValue`.
     fn partial_value_key(&self, value: AbstractValue) -> ValueSortKey {
         match self.get(value) {
             Some(CanonValue::Restricted(i)) => ValueSortKey::CanonRestricted(i),
@@ -671,137 +887,95 @@ impl Canonicalizer {
         }
     }
 
-    fn partial_linear_eq_label(&self, lhs: AbstractValue, lin: &LinArith) -> String {
-        format!(
-            "{}={}",
-            self.partial_value_label(lhs),
-            self.partial_lin_arith_label(lin)
-        )
-    }
-
-    fn partial_lin_arith_label(&self, lin: &LinArith) -> String {
-        let mut vars: Vec<_> = lin
-            .vars
-            .iter()
-            .map(|(value, coeff)| {
-                format!("{}*{}", format_q(coeff), self.partial_value_label(*value))
-            })
-            .collect();
-        vars.sort();
-        if lin.constant.is_zero() {
-            vars.join("+")
-        } else if vars.is_empty() {
-            format_q(&lin.constant)
-        } else {
-            format!("{}+{}", vars.join("+"), format_q(&lin.constant))
+    fn partial_operand_key(&self, operand: &Operand) -> CanonOperand {
+        match operand {
+            Operand::AbstractValue(value) => CanonOperand::Var(self.partial_value_key(*value)),
+            Operand::ConstOperand(value) => CanonOperand::Const(*value),
         }
     }
 
-    fn partial_atom_label(&self, atom: &Atom) -> String {
+    fn partial_term_key(&self, term: &Term) -> CanonTerm {
+        match term {
+            Term::Var(value) => CanonTerm::Var(self.partial_value_key(*value)),
+            Term::Const(value) => CanonTerm::Const(*value),
+            Term::Add(lhs, rhs) => CanonTerm::Add(
+                Box::new(self.partial_term_key(lhs)),
+                Box::new(self.partial_term_key(rhs)),
+            ),
+            Term::Sub(lhs, rhs) => CanonTerm::Sub(
+                Box::new(self.partial_term_key(lhs)),
+                Box::new(self.partial_term_key(rhs)),
+            ),
+            Term::Mult(lhs, rhs) => CanonTerm::Mult(
+                Box::new(self.partial_term_key(lhs)),
+                Box::new(self.partial_term_key(rhs)),
+            ),
+            Term::Neg(inner) => CanonTerm::Neg(Box::new(self.partial_term_key(inner))),
+            Term::Not(inner) => CanonTerm::Not(Box::new(self.partial_term_key(inner))),
+            Term::IsZero(inner) => CanonTerm::IsZero(Box::new(self.partial_term_key(inner))),
+        }
+    }
+
+    fn partial_atom_key(&self, atom: &Atom) -> CanonAtom {
         match atom {
             Atom::Equal(lhs, rhs) => {
-                format!(
-                    "eq:{}:{}",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
+                CanonAtom::Equal(self.partial_term_key(lhs), self.partial_term_key(rhs))
             }
             Atom::NotEqual(lhs, rhs) => {
-                format!(
-                    "neq:{}:{}",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
+                CanonAtom::NotEqual(self.partial_term_key(lhs), self.partial_term_key(rhs))
             }
             Atom::LessEqual(lhs, rhs) => {
-                format!(
-                    "le:{}:{}",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
+                CanonAtom::LessEqual(self.partial_term_key(lhs), self.partial_term_key(rhs))
             }
             Atom::LessThan(lhs, rhs) => {
-                format!(
-                    "lt:{}:{}",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
+                CanonAtom::LessThan(self.partial_term_key(lhs), self.partial_term_key(rhs))
             }
         }
     }
 
-    fn partial_term_label(&self, term: &Term) -> String {
-        match term {
-            Term::Var(value) => self.partial_value_label(*value),
-            Term::Const(value) => format!("const:{value}"),
-            Term::Add(lhs, rhs) => {
-                format!(
-                    "add({},{})",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
-            }
-            Term::Sub(lhs, rhs) => {
-                format!(
-                    "sub({},{})",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
-            }
-            Term::Mult(lhs, rhs) => {
-                format!(
-                    "mul({},{})",
-                    self.partial_term_label(lhs),
-                    self.partial_term_label(rhs)
-                )
-            }
-            Term::Neg(inner) => format!("neg({})", self.partial_term_label(inner)),
-            Term::Not(inner) => format!("not({})", self.partial_term_label(inner)),
-            Term::IsZero(inner) => format!("is_zero({})", self.partial_term_label(inner)),
+    fn partial_lin_arith_key(&self, lin: &LinArith) -> CanonLinArith {
+        let mut vars: Vec<(ValueSortKey, CanonQ)> = lin
+            .vars
+            .iter()
+            .map(|(value, coeff)| (self.partial_value_key(*value), CanonQ::from_q(coeff)))
+            .collect();
+        vars.sort();
+        CanonLinArith {
+            vars,
+            constant: CanonQ::from_q(&lin.constant),
         }
     }
 
-    fn partial_operand_label(&self, operand: &Operand) -> String {
-        match operand {
-            Operand::AbstractValue(value) => self.partial_value_label(*value),
-            Operand::ConstOperand(value) => format!("const:{value}"),
-        }
-    }
-
-    fn partial_term_eq_label(
+    fn partial_linear_eq_key(
         &self,
         lhs: AbstractValue,
-        term_eq: &crate::formula::phi::TermEq,
-    ) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            self.partial_value_label(lhs),
-            term_eq.op,
-            self.partial_operand_label(&term_eq.lhs),
-            self.partial_operand_label(&term_eq.rhs)
-        )
+        lin: &LinArith,
+    ) -> (ValueSortKey, CanonLinArith) {
+        (self.partial_value_key(lhs), self.partial_lin_arith_key(lin))
     }
 
-    fn partial_fn_app_label(
-        &self,
-        key: &crate::formula::phi::FnAppKey,
-        ret: AbstractValue,
-    ) -> String {
-        let actuals = key
-            .actuals
-            .iter()
-            .map(|actual| match actual {
-                crate::formula::phi::FnAppActual::Const(value) => format!("const:{value}"),
-                crate::formula::phi::FnAppActual::Var(value) => self.partial_value_label(*value),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{}({})->{}",
-            key.callee,
-            actuals,
-            self.partial_value_label(ret)
-        )
+    fn partial_term_eq_key(&self, lhs: AbstractValue, term_eq: &TermEq) -> CanonTermEq {
+        CanonTermEq {
+            lhs: self.partial_value_key(lhs),
+            op: term_eq.op.clone(),
+            op_lhs: self.partial_operand_key(&term_eq.lhs),
+            op_rhs: self.partial_operand_key(&term_eq.rhs),
+        }
+    }
+
+    fn partial_fn_app_key(&self, key: &FnAppKey, ret: AbstractValue) -> CanonFnApp {
+        CanonFnApp {
+            callee: key.callee.clone(),
+            actuals: key
+                .actuals
+                .iter()
+                .map(|actual| match actual {
+                    FnAppActual::Const(v) => CanonOperand::Const(*v),
+                    FnAppActual::Var(v) => CanonOperand::Var(self.partial_value_key(*v)),
+                })
+                .collect(),
+            ret: self.partial_value_key(ret),
+        }
     }
 }
 
@@ -859,85 +1033,51 @@ fn canonical_attrs(
     entries
 }
 
-fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<String> {
-    let mut parts = Vec::new();
+/// Build the structural canonical formula. Replaces the legacy
+/// `Vec<String>` formula with `Vec<CanonFormulaEntry>`. See the
+/// module-level "Design note".
+fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<CanonFormulaEntry> {
+    let mut parts: Vec<CanonFormulaEntry> = Vec::new();
     let phi = state.path_condition.phi();
 
-    let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-    equalities.sort_by_key(|(lhs, rhs)| (canon.get(*lhs).unwrap(), canon.get(*rhs).unwrap()));
-    for (lhs, rhs) in equalities {
-        parts.push(format!(
-            "uf:{}->{}",
-            canon.get(lhs).unwrap(),
-            canon.get(rhs).unwrap()
+    for (lhs, rhs) in phi.var_eqs.iter_equalities() {
+        parts.push(CanonFormulaEntry::VarEq(
+            canon.partial_value_key(lhs),
+            canon.partial_value_key(rhs),
         ));
     }
 
-    let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-    linear_eqs.sort_by_key(|(lhs, _)| canon.get(**lhs).unwrap());
-    for (lhs, lin) in linear_eqs {
-        parts.push(format!(
-            "lin:{}={}",
-            canon.get(*lhs).unwrap(),
-            canonical_lin_arith(lin, canon)
+    for (lhs, lin) in phi.linear_eqs.iter() {
+        parts.push(CanonFormulaEntry::LinearEq(
+            canon.partial_value_key(*lhs),
+            canon.partial_lin_arith_key(lin),
         ));
     }
 
-    let mut atoms: Vec<_> = phi.atoms.iter().collect();
-    atoms.sort_by_cached_key(|atom| canonical_atom(atom, canon));
-    for atom in atoms {
-        parts.push(format!("atom:{}", canonical_atom(atom, canon)));
+    for atom in phi.atoms.iter() {
+        parts.push(CanonFormulaEntry::Atom(canon.partial_atom_key(atom)));
     }
 
-    let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-    term_eqs.sort_by_key(|(lhs, _)| canon.get(**lhs).unwrap());
-    for (lhs, term_eq) in term_eqs {
-        parts.push(format!(
-            "term_eq:{}:{}:{}:{}",
-            canon.get(*lhs).unwrap(),
-            term_eq.op,
-            canonical_operand(&term_eq.lhs, canon),
-            canonical_operand(&term_eq.rhs, canon)
+    for (lhs, term_eq) in phi.term_eqs.iter() {
+        parts.push(CanonFormulaEntry::TermEq(
+            canon.partial_term_eq_key(*lhs,            term_eq,
+        )));
+    }
+
+    for (lhs, interval) in phi.intervals.iter() {
+        parts.push(CanonFormulaEntry::Interval(
+            canon.partial_value_key(*lhs),
+            CanonCItv::from_citv(interval),
         ));
     }
 
-    let mut intervals: Vec<_> = phi.intervals.iter().collect();
-    intervals.sort_by_key(|(value, _)| canon.get(**value).unwrap());
-    for (value, interval) in intervals {
-        parts.push(format!(
-            "interval:{}:{interval:?}",
-            canon.get(*value).unwrap()
-        ));
+    for value in phi.is_int_vars.iter() {
+        parts.push(CanonFormulaEntry::IsInt(canon.partial_value_key(*value)));
     }
 
-    let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-    is_int_vars.sort_by_key(|value| canon.get(*value).unwrap());
-    for value in is_int_vars {
-        parts.push(format!("is_int:{}", canon.get(value).unwrap()));
-    }
-
-    let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-    fn_apps.sort_by_cached_key(|(key, ret)| {
-        let actuals = key
-            .actuals
-            .iter()
-            .map(|actual| canonical_fn_app_actual(actual, canon))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("{}({})->{}", key.callee, actuals, canon.get(**ret).unwrap())
-    });
-    for (key, ret) in fn_apps {
-        let actuals = key
-            .actuals
-            .iter()
-            .map(|actual| canonical_fn_app_actual(actual, canon))
-            .collect::<Vec<_>>()
-            .join(",");
-        parts.push(format!(
-            "fn_app:{}({})->{}",
-            key.callee,
-            actuals,
-            canon.get(*ret).unwrap()
+    for (key, ret) in phi.iter_fn_app_eqs() {
+        parts.push(CanonFormulaEntry::FnApp(
+            canon.partial_fn_app_key(key, *ret),
         ));
     }
 
@@ -1008,14 +1148,90 @@ fn canonical_attr(attr: &Attribute, canon: &Canonicalizer) -> String {
     }
 }
 
-fn canonical_lin_arith(lin: &LinArith, canon: &Canonicalizer) -> String {
-    let mut vars: Vec<_> = lin
+fn operand_values(operand: &Operand) -> Vec<AbstractValue> {
+    match operand {
+        Operand::AbstractValue(value) => vec![*value],
+        Operand::ConstOperand(_) => Vec::new(),
+    }
+}
+
+fn format_q(q: &CanonQ) -> String {
+    if q.den == 1 {
+        q.num.to_string()
+    } else {
+        format!("{}/{}", q.num, q.den)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy String formatters for the structural canonical formula.
+//
+// These reproduce the byte-for-byte shape of the pre-structural
+// `partial_*_label` / `canonical_*` `String` form. They are used by:
+//   - `debug_canonical_dump` (a debug surface that prints the canonical
+//     state — the [pulse-progress] log shape relies on this remaining
+//     stable so it can be diffed across builds).
+//   - the `structural_canonical_matches_string_form` cross-check test.
+//
+// The hot fixpoint path (`alpha_equivalent`, `debug_signature.hash`)
+// does NOT touch these formatters.
+// ---------------------------------------------------------------------------
+
+fn format_value_key(key: &ValueSortKey) -> String {
+    match key {
+        ValueSortKey::CanonRestricted(i) => format!("r{i}"),
+        ValueSortKey::CanonUnrestricted(i) => format!("u{i}"),
+        ValueSortKey::UnmappedRestricted(i) => format!("?r{i}"),
+        ValueSortKey::UnmappedUnrestricted(i) => format!("?u{i}"),
+    }
+}
+
+fn format_canon_operand(op: &CanonOperand) -> String {
+    match op {
+        CanonOperand::Const(v) => format!("const:{v}"),
+        CanonOperand::Var(v) => format_value_key(v),
+    }
+}
+
+fn format_canon_term(term: &CanonTerm) -> String {
+    match term {
+        CanonTerm::Var(v) => format_value_key(v),
+        CanonTerm::Const(v) => format!("const:{v}"),
+        CanonTerm::Add(l, r) => format!("add({},{})", format_canon_term(l), format_canon_term(r)),
+        CanonTerm::Sub(l, r) => format!("sub({},{})", format_canon_term(l), format_canon_term(r)),
+        CanonTerm::Mult(l, r) => format!("mul({},{})", format_canon_term(l), format_canon_term(r)),
+        CanonTerm::Neg(t) => format!("neg({})", format_canon_term(t)),
+        CanonTerm::Not(t) => format!("not({})", format_canon_term(t)),
+        CanonTerm::IsZero(t) => format!("is_zero({})", format_canon_term(t)),
+    }
+}
+
+fn format_canon_atom(atom: &CanonAtom) -> String {
+    match atom {
+        CanonAtom::Equal(l, r) => {
+            format!("eq:{}:{}", format_canon_term(l), format_canon_term(r))
+        }
+        CanonAtom::NotEqual(l, r) => {
+            format!("neq:{}:{}", format_canon_term(l), format_canon_term(r))
+        }
+        CanonAtom::LessEqual(l, r) => {
+            format!("le:{}:{}", format_canon_term(l), format_canon_term(r))
+        }
+        CanonAtom::LessThan(l, r) => {
+            format!("lt:{}:{}", format_canon_term(l), format_canon_term(r))
+        }
+    }
+}
+
+fn format_canon_lin_arith(lin: &CanonLinArith) -> String {
+    let mut vars: Vec<String> = lin
         .vars
         .iter()
-        .map(|(value, coeff)| format!("{}*{}", format_q(coeff), canon.get(*value).unwrap()))
+        .map(|(v, c)| format!("{}*{}", format_q(c), format_value_key(v)))
         .collect();
     vars.sort();
-    if lin.constant.is_zero() {
+    let constant_is_zero = lin.constant.num == 0;
+    if constant_is_zero {
         vars.join("+")
     } else if vars.is_empty() {
         format_q(&lin.constant)
@@ -1024,94 +1240,76 @@ fn canonical_lin_arith(lin: &LinArith, canon: &Canonicalizer) -> String {
     }
 }
 
-fn canonical_atom(atom: &Atom, canon: &Canonicalizer) -> String {
-    match atom {
-        Atom::Equal(lhs, rhs) => {
-            format!(
-                "eq:{}:{}",
-                canonical_term(lhs, canon),
-                canonical_term(rhs, canon)
-            )
-        }
-        Atom::NotEqual(lhs, rhs) => {
-            format!(
-                "neq:{}:{}",
-                canonical_term(lhs, canon),
-                canonical_term(rhs, canon)
-            )
-        }
-        Atom::LessEqual(lhs, rhs) => {
-            format!(
-                "le:{}:{}",
-                canonical_term(lhs, canon),
-                canonical_term(rhs, canon)
-            )
-        }
-        Atom::LessThan(lhs, rhs) => {
-            format!(
-                "lt:{}:{}",
-                canonical_term(lhs, canon),
-                canonical_term(rhs, canon)
-            )
+fn format_canon_citv(c: &CanonCItv) -> String {
+    // Reproduce the `Debug` form of the legacy `CItv` — used only by
+    // `debug_canonical_dump` and the cross-check test, so we can re-derive
+    // it by reconstructing the legacy `CItv` and `Debug`-formatting it.
+    use crate::formula::citv::{Bound, CItv};
+    fn to_bound(b: &CanonBound) -> Bound {
+        match b {
+            CanonBound::MinusInfinity => Bound::MinusInfinity,
+            CanonBound::Int(i) => Bound::Int(*i),
+            CanonBound::PlusInfinity => Bound::PlusInfinity,
         }
     }
+    let citv = match c {
+        CanonCItv::Between(lo, hi) => CItv::Between(to_bound(lo), to_bound(hi)),
+        CanonCItv::Outside(lo, hi) => CItv::Outside(*lo, *hi),
+    };
+    format!("{citv:?}")
 }
 
-fn canonical_term(term: &Term, canon: &Canonicalizer) -> String {
-    match term {
-        Term::Var(value) => canon.get(*value).unwrap().to_string(),
-        Term::Const(value) => format!("const:{value}"),
-        Term::Add(lhs, rhs) => format!(
-            "add({},{})",
-            canonical_term(lhs, canon),
-            canonical_term(rhs, canon)
-        ),
-        Term::Sub(lhs, rhs) => format!(
-            "sub({},{})",
-            canonical_term(lhs, canon),
-            canonical_term(rhs, canon)
-        ),
-        Term::Mult(lhs, rhs) => format!(
-            "mul({},{})",
-            canonical_term(lhs, canon),
-            canonical_term(rhs, canon)
-        ),
-        Term::Neg(inner) => format!("neg({})", canonical_term(inner, canon)),
-        Term::Not(inner) => format!("not({})", canonical_term(inner, canon)),
-        Term::IsZero(inner) => format!("is_zero({})", canonical_term(inner, canon)),
+fn format_canon_fn_app(fa: &CanonFnApp) -> String {
+    let actuals = fa
+        .actuals
+        .iter()
+        .map(format_canon_operand)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}({})->{}", fa.callee, actuals, format_value_key(&fa.ret))
+}
+
+fn format_canon_formula_entry(entry: &CanonFormulaEntry) -> String {
+    match entry {
+        CanonFormulaEntry::VarEq(lhs, rhs) => {
+            format!("uf:{}->{}", format_value_key(lhs), format_value_key(rhs))
+        }
+        CanonFormulaEntry::LinearEq(lhs, lin) => {
+            format!(
+                "lin:{}={}",
+                format_value_key(lhs),
+                format_canon_lin_arith(lin)
+            )
+        }
+        CanonFormulaEntry::Atom(atom) => format!("atom:{}", format_canon_atom(atom)),
+        CanonFormulaEntry::TermEq(te) => {
+            format!(
+                "term_eq:{}:{}:{}:{}",
+                format_value_key(&te.lhs),
+                te.op,
+                format_canon_operand(&te.op_lhs),
+                format_canon_operand(&te.op_rhs)
+            )
+        }
+        CanonFormulaEntry::Interval(lhs, citv) => {
+            format!("interval:{}:{}", format_value_key(lhs), format_canon_citv(citv))
+        }
+        CanonFormulaEntry::IsInt(lhs) => format!("is_int:{}", format_value_key(lhs)),
+        CanonFormulaEntry::FnApp(fa) => format!("fn_app:{}", format_canon_fn_app(fa)),
     }
 }
 
-fn canonical_operand(operand: &Operand, canon: &Canonicalizer) -> String {
-    match operand {
-        Operand::AbstractValue(value) => canon.get(*value).unwrap().to_string(),
-        Operand::ConstOperand(value) => format!("const:{value}"),
-    }
-}
-
-fn canonical_fn_app_actual(
-    actual: &crate::formula::phi::FnAppActual,
-    canon: &Canonicalizer,
-) -> String {
-    match actual {
-        crate::formula::phi::FnAppActual::Const(value) => format!("const:{value}"),
-        crate::formula::phi::FnAppActual::Var(value) => canon.get(*value).unwrap().to_string(),
-    }
-}
-
-fn operand_values(operand: &Operand) -> Vec<AbstractValue> {
-    match operand {
-        Operand::AbstractValue(value) => vec![*value],
-        Operand::ConstOperand(_) => Vec::new(),
-    }
-}
-
-fn format_q(q: &crate::formula::lin_arith::Q) -> String {
-    if q.denom() == &1 {
-        q.numer().to_string()
-    } else {
-        format!("{}/{}", q.numer(), q.denom())
-    }
+/// Render the structural formula as the legacy sorted `Vec<String>` form.
+///
+/// The legacy code applied a final `parts.sort()` over the assembled
+/// `Vec<String>`, mixing entries across sections (atoms, term_eqs,
+/// linear_eqs, ...) by lexicographic prefix order. We reproduce that
+/// here so `debug_canonical_dump` and the cross-check test remain
+/// byte-identical to the pre-structural-key implementation.
+fn format_canon_formula_legacy(formula: &[CanonFormulaEntry]) -> Vec<String> {
+    let mut out: Vec<String> = formula.iter().map(format_canon_formula_entry).collect();
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -1126,6 +1324,8 @@ mod tests {
     use sil::qualified_cpp_name::QualifiedCppName;
     use sil::typ::{Typ, TypeName};
     use sil::var::Var;
+
+    use num_traits::Zero;
 
     use super::*;
     use crate::attribute::Allocator;
@@ -1491,6 +1691,255 @@ mod tests {
         assert!(
             exec_a.leq(&exec_b) && exec_b.leq(&exec_a),
             "states differing only in dead formula facts must be alpha-equivalent after GC"
+        );
+    }
+
+    // ---- Tests specific to the structural canonical formula. ----
+
+    /// The legacy String-formula path computed `Vec<String>` with this
+    /// shape; we keep it inline as a debug helper so we can cross-check
+    /// the structural formula against it on a small fixture. Mirrors the
+    /// pre-structural-key implementation byte-for-byte, including the
+    /// final `parts.sort()` over the assembled vector (which mixes
+    /// sections lexicographically by their `"uf:"` / `"lin:"` / `"atom:"`
+    /// / `"term_eq:"` / `"interval:"` / `"is_int:"` / `"fn_app:"`
+    /// prefix).
+    fn legacy_canonical_formula_strings(state: &AbductiveDomain) -> Vec<String> {
+        let canonical = canonicalize(state);
+        let canon = &canonical.canon;
+        let phi = state.path_condition.phi();
+        let mut parts: Vec<String> = Vec::new();
+
+        for (lhs, rhs) in phi.var_eqs.iter_equalities() {
+            parts.push(format!(
+                "uf:{}->{}",
+                canon.get(lhs).unwrap(),
+                canon.get(rhs).unwrap()
+            ));
+        }
+        for (lhs, lin) in phi.linear_eqs.iter() {
+            let mut vars: Vec<String> = lin
+                .vars
+                .iter()
+                .map(|(value, coeff)| {
+                    let q_str = if coeff.denom() == &1 {
+                        coeff.numer().to_string()
+                    } else {
+                        format!("{}/{}", coeff.numer(), coeff.denom())
+                    };
+                    format!("{}*{}", q_str, canon.get(*value).unwrap())
+                })
+                .collect();
+            vars.sort();
+            let lin_str = if lin.constant.is_zero() {
+                vars.join("+")
+            } else if vars.is_empty() {
+                if lin.constant.denom() == &1 {
+                    lin.constant.numer().to_string()
+                } else {
+                    format!("{}/{}", lin.constant.numer(), lin.constant.denom())
+                }
+            } else {
+                let const_str = if lin.constant.denom() == &1 {
+                    lin.constant.numer().to_string()
+                } else {
+                    format!("{}/{}", lin.constant.numer(), lin.constant.denom())
+                };
+                format!("{}+{}", vars.join("+"), const_str)
+            };
+            parts.push(format!("lin:{}={}", canon.get(*lhs).unwrap(), lin_str));
+        }
+        fn legacy_term_str(t: &Term, canon: &Canonicalizer) -> String {
+            match t {
+                Term::Var(v) => canon.get(*v).unwrap().to_string(),
+                Term::Const(v) => format!("const:{v}"),
+                Term::Add(l, r) => {
+                    format!("add({},{})", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+                Term::Sub(l, r) => {
+                    format!("sub({},{})", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+                Term::Mult(l, r) => {
+                    format!("mul({},{})", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+                Term::Neg(t) => format!("neg({})", legacy_term_str(t, canon)),
+                Term::Not(t) => format!("not({})", legacy_term_str(t, canon)),
+                Term::IsZero(t) => format!("is_zero({})", legacy_term_str(t, canon)),
+            }
+        }
+        for atom in phi.atoms.iter() {
+            let s = match atom {
+                Atom::Equal(l, r) => {
+                    format!("eq:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+                Atom::NotEqual(l, r) => {
+                    format!("neq:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+                Atom::LessEqual(l, r) => {
+                    format!("le:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+                Atom::LessThan(l, r) => {
+                    format!("lt:{}:{}", legacy_term_str(l, canon), legacy_term_str(r, canon))
+                }
+            };
+            parts.push(format!("atom:{s}"));
+        }
+        fn legacy_op_str(op: &Operand, canon: &Canonicalizer) -> String {
+            match op {
+                Operand::AbstractValue(v) => canon.get(*v).unwrap().to_string(),
+                Operand::ConstOperand(v) => format!("const:{v}"),
+            }
+        }
+        for (lhs, te) in phi.term_eqs.iter() {
+            parts.push(format!(
+                "term_eq:{}:{}:{}:{}",
+                canon.get(*lhs).unwrap(),
+                te.op,
+                legacy_op_str(&te.lhs, canon),
+                legacy_op_str(&te.rhs, canon)
+            ));
+        }
+        for (v, ci) in phi.intervals.iter() {
+            parts.push(format!("interval:{}:{ci:?}", canon.get(*v).unwrap()));
+        }
+        for v in phi.is_int_vars.iter() {
+            parts.push(format!("is_int:{}", canon.get(*v).unwrap()));
+        }
+        for (key, ret) in phi.iter_fn_app_eqs() {
+            let actuals = key
+                .actuals
+                .iter()
+                .map(|a| match a {
+                    FnAppActual::Const(c) => format!("const:{c}"),
+                    FnAppActual::Var(v) => canon.get(*v).unwrap().to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!(
+                "fn_app:{}({})->{}",
+                key.callee,
+                actuals,
+                canon.get(*ret).unwrap()
+            ));
+        }
+        parts.sort();
+        parts
+    }
+
+    /// Cross-check: on a small fixture exercising every formula entry
+    /// kind (atom, linear_eq, term_eq, var_eq, interval, is_int, fn_app),
+    /// the structural canonical formula — when formatted via the legacy
+    /// `String` shape — must match what the legacy `String`-only path
+    /// would have produced. This guards against drift between the two
+    /// representations: any divergence here means the structural form
+    /// has lost or duplicated information.
+    #[test]
+    fn structural_canonical_matches_string_form() {
+        AbstractValue::reset_counters();
+        let mut state = make_state(0, false);
+        let formal_addr = state
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .expect("formal should exist");
+        let pointee = state.read_heap(formal_addr, Access::Dereference);
+
+        // atom + linear_eq via and_equal_const
+        assert!(state.and_equal_const(pointee, 7).is_sat());
+
+        // is_int + fn_app
+        let arg = AbstractValue::mk_fresh();
+        let ret = AbstractValue::mk_fresh();
+        state.path_condition.and_is_int(arg);
+        assert!(state
+            .path_condition
+            .and_fn_app(ret, "external_fn", &[arg])
+            .is_sat());
+
+        let canonical = canonicalize(&state);
+        let structural_strings = format_canon_formula_legacy(&canonical.state.formula);
+        let legacy_strings = legacy_canonical_formula_strings(&state);
+
+        assert_eq!(
+            structural_strings, legacy_strings,
+            "structural canonical formula (formatted) must match legacy String-form output"
+        );
+    }
+
+    /// Sanity: the structural canonical formula compares equal under
+    /// alpha-renaming of the underlying `AbstractValue` IDs, the same
+    /// way `alpha_equivalent` does. This is the property the structural
+    /// representation exists to make cheap.
+    #[test]
+    fn structural_canonical_formula_is_alpha_invariant() {
+        AbstractValue::reset_counters();
+        let mut state1 = make_state(0, false);
+        let formal1 = state1
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .unwrap();
+        let pointee1 = state1.read_heap(formal1, Access::Dereference);
+        assert!(state1.and_equal_const(pointee1, 7).is_sat());
+
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(5 /* burn IDs */, false);
+        let formal2 = state2
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .unwrap();
+        let pointee2 = state2.read_heap(formal2, Access::Dereference);
+        assert!(state2.and_equal_const(pointee2, 7).is_sat());
+
+        let f1 = canonicalize(&state1).state.formula;
+        let f2 = canonicalize(&state2).state.formula;
+        assert_eq!(
+            f1, f2,
+            "structural canonical formula must be invariant under AbstractValue renaming"
+        );
+    }
+
+    /// Sanity: structurally different formulas must NOT compare equal
+    /// under the structural canonical key.
+    #[test]
+    fn structural_canonical_formula_distinguishes_different_shapes() {
+        AbstractValue::reset_counters();
+        let mut state1 = make_state(0, false);
+        let formal1 = state1
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .unwrap();
+        let pointee1 = state1.read_heap(formal1, Access::Dereference);
+        assert!(state1.and_equal_const(pointee1, 7).is_sat());
+
+        AbstractValue::reset_counters();
+        let mut state2 = make_state(0, false);
+        let formal2 = state2
+            .post
+            .stack
+            .iter()
+            .next()
+            .map(|(_var, addr)| *addr)
+            .unwrap();
+        let pointee2 = state2.read_heap(formal2, Access::Dereference);
+        // Different constant ⇒ different canonical formula.
+        assert!(state2.and_equal_const(pointee2, 99).is_sat());
+
+        let f1 = canonicalize(&state1).state.formula;
+        let f2 = canonicalize(&state2).state.formula;
+        assert_ne!(
+            f1, f2,
+            "structurally different formulas must not collapse under the structural canonical key"
         );
     }
 }
