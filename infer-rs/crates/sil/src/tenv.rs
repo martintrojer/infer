@@ -123,13 +123,11 @@ mod tests {
     fn test_merge_prefers_non_dummy_c_struct() {
         let name = mk_type("dup");
         let mut lhs = Tenv::new();
-        let mut left = Struct::default();
-        left.dummy = false;
+        let left = Struct { dummy: false, ..Struct::default() };
         lhs.insert(name.clone(), left);
 
         let mut rhs = Tenv::new();
-        let mut right = Struct::default();
-        right.dummy = true;
+        let right = Struct { dummy: true, ..Struct::default() };
         rhs.insert(name.clone(), right);
 
         lhs.merge(rhs);
