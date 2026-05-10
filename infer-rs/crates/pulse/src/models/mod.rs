@@ -13,6 +13,7 @@
 
 pub mod c;
 pub mod configured;
+pub mod hack;
 pub mod matching;
 
 use std::sync::LazyLock;
@@ -37,7 +38,11 @@ static MODELED_FUNCTIONS: LazyLock<std::collections::HashSet<&'static str>> = La
     for name in c::MODELED_NAMES {
         set.insert(*name);
     }
-    // Future: Java, Hack, ObjC models add their names here
+    // Hack models
+    for name in hack::MODELED_NAMES {
+        set.insert(*name);
+    }
+    // Future: Java, ObjC models add their names here
     set
 });
 
@@ -70,11 +75,15 @@ pub fn dispatch(
         return Some(results);
     }
 
+    if let Some(results) = hack::dispatch(callee, ret_id, args, loc, state.clone()) {
+        return Some(results);
+    }
+
     if let Some(results) = configured::dispatch(callee, ret_id, args, loc, state) {
         return Some(results);
     }
 
-    // Future: Java, Hack, ObjC, C++ models go here
+    // Future: Java, ObjC, C++ models go here
 
     None
 }

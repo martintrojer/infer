@@ -819,19 +819,13 @@ fn test_e2e_static_types() {
 /// Tests virtual method dispatch through class hierarchies, dynamic type
 /// inference, and summary specialization. Exercises `extends`, `.abstract`,
 /// `.final`, and `$static` type modifiers.
-/// OCaml expects: 5 _bad procs, 4 _good procs clean.
-/// We detect the dynamic-type-specialized allocated-Int cases, including
-/// pruning good branches after devirtualized return values flow back to the
-/// caller. Remaining gaps are plusBad (suppressed), declared-final receiver
-/// precision, and static-class virtual dispatch.
+/// OCaml expects: 5 _bad procs, 4 _good procs clean. We now match: every
+/// _good proc is clean (including the `$static`-class case backed by the
+/// `$builtins.hack_get_static_class` Hack model in `models/hack.rs`) and
+/// each _bad proc reports `NULLPTR_DEREFERENCE`.
 #[test]
 fn test_e2e_virt() {
-    assert_ocaml_pulse_test(
-        "virt.sil",
-        &[
-            "devirtualize_with_static_call_good", // FP: static-class virtual dispatch
-        ],
-    );
+    assert_ocaml_pulse_test("virt.sil", &[]);
 }
 
 /// Sweep: try to parse all C dump-textual output through our pipeline.
