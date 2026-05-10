@@ -95,7 +95,7 @@ impl Default for Struct {
             objc_protocols: BTreeSet::new(),
             methods: Vec::new(),
             exported_objc_methods: Vec::new(),
-            annots: AnnotItem::empty(),
+            annots: AnnotItem::default(),
             class_info: ClassInfo::NoInfo,
             dummy: false,
             source_file: None,
@@ -247,7 +247,7 @@ mod tests {
         Field {
             name: Fieldname::make(class_name.clone(), field_name),
             typ,
-            annot: AnnotItem::empty(),
+            annot: AnnotItem::default(),
         }
     }
 

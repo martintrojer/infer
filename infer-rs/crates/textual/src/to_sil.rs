@@ -272,7 +272,7 @@ fn field_to_sil(lang: Lang, field: &ast::FieldDecl) -> strukt::Field {
     strukt::Field {
         name: fieldname::Fieldname::make(class_name, &field.qualified_name.name.value),
         typ: typ_to_sil(lang, &field.typ),
-        annot: AnnotItem::empty(),
+        annot: AnnotItem::default(),
     }
 }
 
@@ -501,7 +501,7 @@ fn struct_to_sil(lang: Lang, s: &ast::Struct) -> (typ::TypeName, strukt::Struct)
     // a struct is recorded as the `Annot.final` annotation in the Tenv entry.
     // Pulse uses this annotation to know that a declared receiver type is
     // exact, which lets virtual dispatch resolve to the leaf override.
-    let mut annots = sil::annot::AnnotItem::empty();
+    let mut annots = sil::annot::AnnotItem::default();
     if s.attributes
         .iter()
         .any(|attr| attr.name == "final" && attr.values.is_empty())
@@ -581,7 +581,7 @@ fn procdesc_to_sil(
             (
                 Mangled::from_string(&name.value),
                 typ_to_sil(lang, &at.typ),
-                AnnotItem::empty(),
+                AnnotItem::default(),
             )
         })
         .collect();

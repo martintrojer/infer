@@ -151,7 +151,7 @@ mod tests {
                 fields: vec![Field {
                     name: Fieldname::make(name.clone(), "lhs_field"),
                     typ: Typ::int(IKind::IInt),
-                    annot: AnnotItem::empty(),
+                    annot: AnnotItem::default(),
                 }],
                 ..Struct::default()
             },
@@ -164,7 +164,7 @@ mod tests {
                 fields: vec![Field {
                     name: Fieldname::make(name.clone(), "rhs_field"),
                     typ: Typ::void(),
-                    annot: AnnotItem::empty(),
+                    annot: AnnotItem::default(),
                 }],
                 ..Struct::default()
             },
