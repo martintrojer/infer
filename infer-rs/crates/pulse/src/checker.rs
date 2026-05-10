@@ -5523,7 +5523,10 @@ mod tests {
         crate::operations::write_id(&recv_id, recv_val, &mut state);
         let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
 
-        let flags = sil::call_flags::CallFlags { cf_virtual: true, ..Default::default() };
+        let flags = sil::call_flags::CallFlags {
+            cf_virtual: true,
+            ..Default::default()
+        };
         let instr = Instr::Call {
             ret: (ret_id.clone(), Typ::int(sil::typ::IKind::IInt)),
             fun_exp: Exp::Const(Const::Cfun(virt_callee)),
