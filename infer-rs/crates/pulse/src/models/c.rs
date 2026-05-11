@@ -7,16 +7,17 @@
 //!
 //! Mirrors OCaml's `PulseModelsC.ml`.
 
+use sil::binop::Binop;
 use sil::builtin_decl;
 use sil::exp::Exp;
 use sil::ident::Ident;
 use sil::location::Location;
 use sil::procname::Procname;
-use sil::typ::Typ;
+use sil::typ::{Typ, TypeDesc};
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
-use crate::attribute::Allocator;
+use crate::attribute::{Allocator, Attribute};
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::invalidation::Invalidation;
@@ -89,7 +90,7 @@ fn dispatch_with_config(
     cfg: &config::InferConfig,
 ) -> Option<Vec<ExecutionDomain>> {
     if builtin_decl::match_builtin(&builtin_decl::malloc(), callee) {
-        return Some(malloc(ret_id, loc, state));
+        return Some(malloc(ret_id, args, loc, state));
     }
     if builtin_decl::match_builtin(&builtin_decl::free(), callee) {
         return Some(free(ret_id, args, loc, state));
@@ -147,7 +148,7 @@ fn dispatch_with_config(
         return Some(custom_realloc(callee, ret_id, args, loc, state));
     }
     if matches_procname_pattern(callee, cfg.pulse_model_malloc_pattern.as_deref()) {
-        return Some(custom_malloc(callee, ret_id, loc, state));
+        return Some(custom_malloc(callee, ret_id, args, loc, state));
     }
     // fopen: return null-or-non-null disjuncts for null-deref checking,
     // but do NOT mark as Allocated (no MEMORY_LEAK_C tracking for file
@@ -254,11 +255,60 @@ pub(crate) fn fresh_or_null(
     ]
 }
 
+/// Inspect a malloc-style size expression and, if it is a `sizeof(T)` (or
+/// `n * sizeof(T)` / `sizeof(T) * n`) over a primitive type, return that `T`.
+///
+/// Cross-ref: OCaml `PulseModelsImport.get_malloced_object_type` matches
+/// `Sizeof {typ}` and `BinOp (Mult _, Sizeof, _) | BinOp (Mult _, _, Sizeof)`.
+fn malloced_object_type(size_exp: &Exp) -> Option<Typ> {
+    match size_exp {
+        Exp::Sizeof(data) => Some(data.typ.clone()),
+        Exp::BinOp(Binop::Mult(_), lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+            (Exp::Sizeof(data), _) | (_, Exp::Sizeof(data)) => Some(data.typ.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Mark a freshly-allocated address as `Uninitialized` when the malloc'd type
+/// is a primitive scalar or pointer.
+///
+/// Cross-ref: OCaml `PulseAbductiveDomain.set_uninitialized` →
+/// `fold_pointer_targets`. The `Tint | Tfloat | Tptr` branch stamps
+/// `Uninitialized` directly on the returned address. The `Tstruct` branch
+/// requires walking fields via the type environment, which Rust's model
+/// dispatch does not yet thread through. Struct allocations therefore stay
+/// uncovered here — see triage doc Cluster C and the `create_p` /
+/// `alloc_ref_counted_ok` rows.
+fn mark_alloc_uninitialized_for_primitive(
+    state: &mut AbductiveDomain,
+    addr: AbstractValue,
+    size_exp_opt: Option<&Exp>,
+) {
+    let Some(size_exp) = size_exp_opt else { return };
+    let Some(typ) = malloced_object_type(size_exp) else {
+        return;
+    };
+    if matches!(
+        &*typ.desc,
+        TypeDesc::Tint(_) | TypeDesc::Tfloat(_) | TypeDesc::Tptr(..)
+    ) {
+        state.add_attr(addr, Attribute::Uninitialized);
+    }
+}
+
 /// Shared: allocate-or-null model. Returns two disjuncts: allocated + null.
 /// Used by malloc and similar functions that may fail.
+///
+/// `size_exp_opt` mirrors OCaml `alloc_common_dsl`'s `size_exp_opt` argument.
+/// When the call site has `initialize:false` (malloc / realloc / custom
+/// wrappers) and the size encodes a primitive type, the returned address is
+/// also marked `Uninitialized` to match OCaml's summary surface.
 fn allocate_or_null(
     ret_id: &Ident,
     allocator: Allocator,
+    size_exp_opt: Option<&Exp>,
     loc: &Location,
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
@@ -274,6 +324,7 @@ fn allocate_or_null(
         _ => None,
     };
     operations::allocate(addr, allocator, loc.clone(), &mut ok_state);
+    mark_alloc_uninitialized_for_primitive(&mut ok_state, addr, size_exp_opt);
     let ok_history = alloc_proc
         .as_ref()
         .map(|proc| ValueHistory::returned(loc.clone()).wrap_call(proc, loc))
@@ -318,8 +369,14 @@ fn allocate_or_null(
 }
 
 /// Model: `ret = malloc(size)` — allocate or null.
-fn malloc(ret_id: &Ident, loc: &Location, state: AbductiveDomain) -> Vec<ExecutionDomain> {
-    allocate_or_null(ret_id, Allocator::CMalloc, loc, state)
+fn malloc(
+    ret_id: &Ident,
+    args: &[(Exp, Typ)],
+    loc: &Location,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    let size_exp = args.first().map(|(exp, _)| exp);
+    allocate_or_null(ret_id, Allocator::CMalloc, size_exp, loc, state)
 }
 
 /// Model: configured wrapper to `malloc(size)` — allocate or null with a
@@ -327,10 +384,18 @@ fn malloc(ret_id: &Ident, loc: &Location, state: AbductiveDomain) -> Vec<Executi
 fn custom_malloc(
     callee: &Procname,
     ret_id: &Ident,
+    args: &[(Exp, Typ)],
     loc: &Location,
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
-    allocate_or_null(ret_id, Allocator::CustomMalloc(callee.clone()), loc, state)
+    let size_exp = args.first().map(|(exp, _)| exp);
+    allocate_or_null(
+        ret_id,
+        Allocator::CustomMalloc(callee.clone()),
+        size_exp,
+        loc,
+        state,
+    )
 }
 
 /// Shared: invalidate first argument with given invalidation kind.
@@ -562,7 +627,11 @@ fn getcwd_model(
     // integer 0 (is_pointer=false).
     let buf_is_null = args.first().map(|(exp, _)| exp.is_zero()).unwrap_or(true);
     if buf_is_null {
-        allocate_or_null(ret_id, Allocator::CMalloc, loc, state)
+        // Cross-ref: OCaml `getcwd` calls `ret_alloc_or_null CMalloc` (no
+        // size_exp). The size is unknown so we cannot mark `Uninitialized`
+        // — OCaml's `set_uninitialized` is also a no-op without a malloc'd
+        // type.
+        allocate_or_null(ret_id, Allocator::CMalloc, None, loc, state)
     } else {
         fresh_or_null(ret_id, loc, state)
     }
@@ -681,6 +750,10 @@ fn realloc_with_allocator(
     allocator: Allocator,
 ) -> Vec<ExecutionDomain> {
     // Cross-ref: OCaml PulseModelsC.ml realloc_common = free pointer >>= alloc_common.
+    // `realloc(ptr, size)` — the size_exp is the second argument and is
+    // forwarded to `allocate_or_null` so the result picks up the same
+    // `Uninitialized` companion attribute as `malloc(size)`.
+    let size_exp_owned = args.get(1).map(|(exp, _)| exp.clone());
     let free_results = if !args.is_empty() {
         free(&Ident::create_none(), args, loc, state)
     } else {
@@ -691,7 +764,13 @@ fn realloc_with_allocator(
     for result in free_results {
         match result {
             ExecutionDomain::ContinueProgram(state) => {
-                results.extend(allocate_or_null(ret_id, allocator.clone(), loc, state));
+                results.extend(allocate_or_null(
+                    ret_id,
+                    allocator.clone(),
+                    size_exp_owned.as_ref(),
+                    loc,
+                    state,
+                ));
             }
             other => results.push(other),
         }
@@ -798,7 +877,7 @@ mod tests {
     fn test_malloc_returns_two_disjuncts() {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
-        let results = malloc(&ret_id, &Location::dummy(), state);
+        let results = malloc(&ret_id, &[], &Location::dummy(), state);
         assert_eq!(results.len(), 2, "malloc should return ok + null disjuncts");
         assert!(results.iter().all(|r| r.is_continue()));
 
@@ -829,6 +908,147 @@ mod tests {
                 "failure path should be invalid"
             );
         }
+    }
+
+    /// Cross-ref: OCaml `PulseModelsImport.set_uninitialized`. When the
+    /// malloc'd type is a primitive (int / float / pointer), the success
+    /// disjunct's return address must carry both `Allocated(CMalloc)` and
+    /// `Uninitialized` to match OCaml's summary surface (Cluster C).
+    #[test]
+    fn test_malloc_with_sizeof_primitive_marks_return_uninitialized() {
+        use sil::exp::SizeofData;
+        use sil::typ::IKind;
+
+        for typ in [
+            Typ::int(IKind::IInt),
+            Typ::mk_ptr(Typ::int(IKind::IInt)),
+            Typ::float(sil::typ::FKind::FFloat),
+        ] {
+            let state = mk_state();
+            let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+            let size_arg = Exp::Sizeof(SizeofData {
+                typ: typ.clone(),
+                nbytes: None,
+                dynamic_length: None,
+                nullable: false,
+            });
+            let args = vec![(size_arg, Typ::void())];
+            let results = malloc(&ret_id, &args, &Location::dummy(), state);
+            let ok = match &results[0] {
+                ExecutionDomain::ContinueProgram(s) => s,
+                _ => panic!("first disjunct should be a continue"),
+            };
+            let addr = ok
+                .post
+                .stack
+                .find(&Var::LogicalVar(ret_id.clone()))
+                .expect("malloc must bind the return slot");
+            let attrs = ok
+                .post
+                .attrs
+                .get(&addr)
+                .expect("allocated address has attrs");
+            assert!(
+                attrs.is_allocated(),
+                "expected Allocated for sizeof({typ:?}); got {attrs:?}"
+            );
+            assert!(
+                attrs.is_uninitialized(),
+                "expected Uninitialized companion for sizeof({typ:?}); got {attrs:?}"
+            );
+        }
+    }
+
+    /// `n * sizeof(int)` and `sizeof(int) * n` (calloc-style) must also
+    /// trigger the `Uninitialized` companion.
+    /// Cross-ref: OCaml `get_malloced_object_type` matches both orderings of
+    /// `BinOp(Mult _, Sizeof, _)`.
+    #[test]
+    fn test_malloc_with_mult_sizeof_marks_return_uninitialized() {
+        use sil::const_val::Const;
+        use sil::exp::SizeofData;
+        use sil::int_lit::IntLit;
+        use sil::typ::IKind;
+
+        let sizeof_int = Exp::Sizeof(SizeofData {
+            typ: Typ::int(IKind::IInt),
+            nbytes: None,
+            dynamic_length: None,
+            nullable: false,
+        });
+        let n = Exp::Const(Const::Cint(IntLit::of_int(4)));
+
+        for size_arg in [
+            Exp::BinOp(
+                Binop::Mult(None),
+                Box::new(sizeof_int.clone()),
+                Box::new(n.clone()),
+            ),
+            Exp::BinOp(
+                Binop::Mult(None),
+                Box::new(n.clone()),
+                Box::new(sizeof_int.clone()),
+            ),
+        ] {
+            let state = mk_state();
+            let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+            let args = vec![(size_arg.clone(), Typ::void())];
+            let results = malloc(&ret_id, &args, &Location::dummy(), state);
+            let ok = match &results[0] {
+                ExecutionDomain::ContinueProgram(s) => s,
+                _ => panic!("first disjunct should be a continue"),
+            };
+            let addr = ok
+                .post
+                .stack
+                .find(&Var::LogicalVar(ret_id.clone()))
+                .unwrap();
+            let attrs = ok.post.attrs.get(&addr).unwrap();
+            assert!(
+                attrs.is_uninitialized(),
+                "expected Uninitialized companion for {size_arg:?}; got {attrs:?}"
+            );
+        }
+    }
+
+    /// Struct allocations stay uncovered today: walking field types requires
+    /// a `Tenv` that the model dispatch does not currently thread through.
+    /// This pin-down test documents that gap so a future tenv-aware fix
+    /// can change the assertion to `is_uninitialized()` once the
+    /// `Tstruct` branch of OCaml's `fold_pointer_targets` is mirrored.
+    #[test]
+    fn test_malloc_with_sizeof_struct_does_not_yet_mark_uninitialized() {
+        use sil::exp::SizeofData;
+        use sil::typ::TypeName;
+
+        use sil::qualified_cpp_name::QualifiedCppName;
+        let struct_typ = Typ::mk(TypeDesc::Tstruct(TypeName::CStruct(
+            QualifiedCppName::from_string("ref_counted"),
+        )));
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let size_arg = Exp::Sizeof(SizeofData {
+            typ: struct_typ,
+            nbytes: None,
+            dynamic_length: None,
+            nullable: false,
+        });
+        let args = vec![(size_arg, Typ::void())];
+        let results = malloc(&ret_id, &args, &Location::dummy(), state);
+        let ok = match &results[0] {
+            ExecutionDomain::ContinueProgram(s) => s,
+            _ => panic!("first disjunct should be a continue"),
+        };
+        let addr = ok.post.stack.find(&Var::LogicalVar(ret_id)).unwrap();
+        let attrs = ok.post.attrs.get(&addr).unwrap();
+        assert!(
+            attrs.is_allocated(),
+            "Allocated should still be present for struct malloc"
+        );
+        assert!(
+            !attrs.is_uninitialized(),
+            "Tstruct branch deliberately uncovered until tenv-aware field walk lands"
+        );
     }
 
     #[test]
@@ -1083,6 +1303,49 @@ mod tests {
         );
     }
 
+    /// Cross-ref: OCaml `realloc_common` calls `alloc_common ~initialize:false`.
+    /// The realloc'd return must therefore also pick up the `Uninitialized`
+    /// companion when the size is `sizeof(primitive)` (Cluster C).
+    #[test]
+    fn test_realloc_with_sizeof_primitive_marks_return_uninitialized() {
+        use sil::exp::SizeofData;
+        use sil::typ::IKind;
+
+        let mut state = mk_state();
+        let ptr_id = Ident::create_normal(IdentName::from_string("p"), 0);
+        state.post.stack.add(
+            Var::LogicalVar(ptr_id.clone()),
+            crate::abstract_value::AbstractValue::mk_fresh(),
+        );
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let size_arg = Exp::Sizeof(SizeofData {
+            typ: Typ::int(IKind::IInt),
+            nbytes: None,
+            dynamic_length: None,
+            nullable: false,
+        });
+        let args = vec![(Exp::Var(ptr_id), Typ::void()), (size_arg, Typ::void())];
+        let results = realloc(&ret_id, &args, &Location::dummy(), state);
+        let mut saw_uninit_alloc = false;
+        for result in &results {
+            if let ExecutionDomain::ContinueProgram(s) = result {
+                let var = Var::LogicalVar(ret_id.clone());
+                let Some(addr) = s.post.stack.find(&var) else {
+                    continue;
+                };
+                if let Some(attrs) = s.post.attrs.get(&addr) {
+                    if attrs.is_allocated() && attrs.is_uninitialized() {
+                        saw_uninit_alloc = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_uninit_alloc,
+            "at least one realloc allocate disjunct must carry both Allocated + Uninitialized"
+        );
+    }
+
     #[test]
     fn test_matches_configured_wrapper_for_free_pattern() {
         let callee = Procname::c_from_string("my_free");
@@ -1243,7 +1506,7 @@ mod tests {
 
         // malloc
         let n0 = Ident::create_normal(IdentName::from_string("n"), 0);
-        let results = malloc(&n0, &Location::dummy(), state);
+        let results = malloc(&n0, &[], &Location::dummy(), state);
         state = match results.into_iter().next().unwrap() {
             ExecutionDomain::ContinueProgram(s) => s,
             _ => panic!("malloc should continue"),
