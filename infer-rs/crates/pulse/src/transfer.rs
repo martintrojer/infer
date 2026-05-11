@@ -223,7 +223,19 @@ fn exec_store(
         PulseResult::Recoverable(v, _) => v,
     };
 
-    let (lhs_addr, lhs_errors) = match operations::eval_with_history(lhs_exp, loc, &mut state) {
+    // Cross-ref: OCaml `Pulse.exec_instr_aux Store` evaluates the LHS with
+    // mode=Write so that the outermost Lfield/Lindex base check abduces
+    // `MustBeValid` only (no `MustBeInitialized`) on the formal whose
+    // address we are about to overwrite. Using Read here — as Rust did
+    // before — systematically over-attaches `MustBeInitialized` to every
+    // formal that appears on the LHS of a store, e.g. `q->next = q` adding
+    // it to `q.*`.
+    let (lhs_addr, lhs_errors) = match operations::eval_with_history_mode(
+        lhs_exp,
+        operations::AccessMode::Write,
+        loc,
+        &mut state,
+    ) {
         PulseResult::Ok(v) => (v, vec![]),
         PulseResult::FatalError(d, _) => {
             return vec![ExecutionDomain::AbortProgram {

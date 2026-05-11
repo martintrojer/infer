@@ -64,9 +64,20 @@ fn materialize_known_zero_invalid(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AccessMode {
+pub(crate) enum AccessMode {
+    /// Read access: abduce both `MustBeValid` and `MustBeInitialized`,
+    /// then mark the address `Initialized` so repeated reads do not keep
+    /// re-reporting it.
     Read,
+    /// Write access: abduce `MustBeValid` only, then mark the address
+    /// `Initialized` (the write itself initializes it).
     Write,
+    /// Only abduce `MustBeValid` and check invalidation. No initialization
+    /// side effect, no `MustBeInitialized` abduction. Mirrors OCaml's
+    /// `PulseBasicInterface.AccessMode.NoAccess` used by `free`/`delete`,
+    /// `memcpy` validity checks, and other models that need to assert
+    /// pointer validity without claiming a read or write.
+    NoAccess,
 }
 
 fn check_validity_and_record_access(
@@ -77,7 +88,9 @@ fn check_validity_and_record_access(
 ) -> Result<(), Box<(Invalidation, ValueHistory)>> {
     // Cross-ref: OCaml `PulseOperations.check_addr_access` first abduces
     // `MustBeValid`, then checks invalidation, then applies the
-    // read/write-specific initialization side effect.
+    // mode-specific initialization side effect (Read => abduce
+    // `MustBeInitialized` + initialize; Write => initialize; NoAccess =>
+    // nothing).
     state.mark_must_be_valid_at(addr.addr, loc);
     materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
     let valid = state.check_valid(addr.addr);
@@ -87,6 +100,7 @@ fn check_validity_and_record_access(
                 let _ = state.record_read_access_at(addr.addr, loc);
             }
             AccessMode::Write => state.record_write_access_at(addr.addr),
+            AccessMode::NoAccess => {}
         }
     }
     valid
@@ -107,9 +121,27 @@ pub fn eval(
     }
 }
 
-/// Evaluate a SIL expression to an abstract value and provenance.
+/// Evaluate a SIL expression to an abstract value and provenance, using
+/// `Read` mode for the outermost Lfield/Lindex base check.
 pub fn eval_with_history(
     exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<ValueWithHistory, Diagnostic> {
+    eval_with_history_mode(exp, AccessMode::Read, loc, state)
+}
+
+/// Evaluate a SIL expression to an abstract value and provenance, threading
+/// an outer access `mode` into the immediate Lfield/Lindex base check.
+///
+/// Cross-ref: OCaml `PulseOperations.eval_to_value_origin` takes a `mode`
+/// argument that decides whether the access on the *outermost* l-value
+/// component abduces `MustBeInitialized` (Read), only initializes (Write),
+/// or only abduces `MustBeValid` (NoAccess). Inner recursive Lfield/Lindex
+/// bases always use `Read` because the inner pointer must be loaded.
+pub(crate) fn eval_with_history_mode(
+    exp: &Exp,
+    mode: AccessMode,
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<ValueWithHistory, Diagnostic> {
@@ -123,16 +155,21 @@ pub fn eval_with_history(
             PulseResult::Ok(state.eval_var_with_history(&var))
         }
         Exp::Lfield(data, field, _typ) => {
-            let base = match eval_with_history(&data.exp, loc, state) {
+            // Cross-ref: OCaml `PulseOperations.eval_to_value_origin` always
+            // recurses on the inner Lfield/Lindex base with `Read` mode and
+            // only threads the *outer* access mode into the FieldAccess
+            // check on the immediate base. So the base check here picks up
+            // the caller-supplied `mode` (defaulting to Read), not always
+            // Read. This avoids spuriously abducing `MustBeInitialized` on a
+            // formal whose only outermost use is a Store/free/etc.
+            let base = match eval_with_history_mode(&data.exp, AccessMode::Read, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
             // Check validity and initialization of the base before field
             // access (`null.field` is a null deref, reading the field also
-            // requires the base cell to be initialized).
-            if let Err(inv_info) =
-                check_validity_and_record_access(&base, loc, state, AccessMode::Read)
-            {
+            // requires the base cell to be initialized for `Read` mode).
+            if let Err(inv_info) = check_validity_and_record_access(&base, loc, state, mode) {
                 let (invalidation, invalidation_history) = *inv_info;
                 return PulseResult::Recoverable(
                     ValueWithHistory::new(
@@ -153,16 +190,16 @@ pub fn eval_with_history(
             PulseResult::Ok(state.read_heap_with_history(base, field_access))
         }
         Exp::Lindex(base_exp, index_exp) => {
-            let base = match eval_with_history(base_exp, loc, state) {
+            // Cross-ref: same Lfield reasoning — recurse on the inner base
+            // with `Read`, but check the immediate base with the outer mode.
+            let base = match eval_with_history_mode(base_exp, AccessMode::Read, loc, state) {
                 PulseResult::Ok(v) => v,
                 other => return other,
             };
             // Check validity and initialization of the base before array
             // access (`null[i]` is a null deref, reading the slot requires the
-            // base cell to be initialized).
-            if let Err(inv_info) =
-                check_validity_and_record_access(&base, loc, state, AccessMode::Read)
-            {
+            // base cell to be initialized for `Read` mode).
+            if let Err(inv_info) = check_validity_and_record_access(&base, loc, state, mode) {
                 let (invalidation, invalidation_history) = *inv_info;
                 return PulseResult::Recoverable(
                     ValueWithHistory::new(
@@ -445,7 +482,7 @@ pub fn eval_deref_addr_with_history(
     PulseResult::Ok(target)
 }
 
-/// Check if accessing an address is valid.
+/// Check if accessing an address is valid (Read access).
 pub fn check_addr_access(
     addr: AbstractValue,
     loc: &Location,
@@ -458,13 +495,53 @@ pub fn check_addr_access(
     )
 }
 
-/// Check if accessing an address is valid, using its current provenance.
+/// Check if accessing an address is valid, using its current provenance
+/// (Read access).
 pub fn check_addr_access_with_history(
     addr: ValueWithHistory,
     loc: &Location,
     state: &mut AbductiveDomain,
 ) -> PulseResult<(), Diagnostic> {
     if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::Read) {
+        let (invalidation, invalidation_history) = *inv_info;
+        return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
+            addr: addr.addr,
+            invalidation,
+            access_location: loc.clone(),
+            trace_access_location: None,
+            access_history: addr.history,
+            invalidation_history,
+        });
+    }
+    PulseResult::Ok(())
+}
+
+/// Check that an address is valid (`MustBeValid`) without claiming a read or
+/// write. Mirrors OCaml's `check_addr_access path NoAccess`, used by C
+/// models like `free`/`delete` and `memcpy`/`memmove` that must assert
+/// pointer validity but do not actually load or store through the pointer
+/// at the SIL level (the loads/stores happen inside the modelled call, on
+/// addresses the model itself synthesizes).
+pub fn check_addr_access_no_init(
+    addr: AbstractValue,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<(), Diagnostic> {
+    check_addr_access_no_init_with_history(
+        ValueWithHistory::new(addr, ValueHistory::epoch()),
+        loc,
+        state,
+    )
+}
+
+/// History-preserving variant of [`check_addr_access_no_init`].
+pub fn check_addr_access_no_init_with_history(
+    addr: ValueWithHistory,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) -> PulseResult<(), Diagnostic> {
+    if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::NoAccess)
+    {
         let (invalidation, invalidation_history) = *inv_info;
         return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
             addr: addr.addr,
@@ -902,6 +979,149 @@ mod tests {
                 .find_edge(formal_value, &Access::Dereference),
             Some(written),
             "the post-state should record the new pointee value"
+        );
+    }
+
+    #[test]
+    fn test_check_addr_access_no_init_skips_must_be_initialized_abduction() {
+        // Cross-ref: OCaml `PulseModelsImport.free_or_delete` calls
+        // `check_addr_access path NoAccess`, which abduces `MustBeValid` on
+        // the freed pointer but does *not* abduce `MustBeInitialized`. The
+        // Rust equivalent is `check_addr_access_no_init` for the same
+        // mode; this test pins the abduction shape so cluster A drift
+        // (`MustBeInitialized` over-attached on every freed formal) cannot
+        // creep back in via the model layer.
+        let loc = Location::dummy();
+        let (pdesc, pvar) = make_pdesc_with_formal("p");
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar)))
+            .expect("formal should be bound");
+
+        let result = check_addr_access_no_init(formal_addr, &loc, &mut state);
+        assert!(matches!(result, PulseResult::Ok(())));
+
+        let pre_attrs = state
+            .pre
+            .attrs
+            .get(&formal_addr)
+            .expect("NoAccess check should still abduce MustBeValid");
+        assert!(
+            pre_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _))),
+            "NoAccess access should keep MustBeValid in the precondition"
+        );
+        assert!(
+            !pre_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeInitialized(_, _))),
+            "NoAccess access should NOT abduce MustBeInitialized in the precondition"
+        );
+        assert!(
+            !state
+                .post
+                .attrs
+                .get(&formal_addr)
+                .map(|attrs| attrs.contains(&Attribute::Initialized))
+                .unwrap_or(false),
+            "NoAccess should not mark the address Initialized in the post"
+        );
+    }
+
+    #[test]
+    fn test_eval_lfield_base_in_write_mode_does_not_abduce_must_be_initialized() {
+        // Cross-ref: OCaml `PulseOperations.eval_to_value_origin` for
+        // `Lfield(base, field)` evaluated with mode=Write threads Write
+        // through `eval_access_to_value_origin`, so the immediate base
+        // check abduces `MustBeValid` only — not `MustBeInitialized`.
+        // This is what makes `q->next = q` (a Store with LHS
+        // `Lfield(Lvar q, next)`) abduce a clean `MustBeValid` on `q.*`
+        // in OCaml, instead of `MustBeInitialized + MustBeValid` which is
+        // what naive Read-mode evaluation would produce.
+        use sil::fieldname::Fieldname;
+
+        let loc = Location::dummy();
+        let (pdesc, pvar) = make_pdesc_with_formal("q");
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        // `mk_initial` binds `q` on the stack to a fresh abstract value
+        // representing the formal *value* (the pointer the caller passed in)
+        // and pre-registers that value in `pre.heap` with empty edges, so
+        // abducing attributes on it is allowed.
+        let formal_value = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar.clone())))
+            .expect("formal should be bound");
+
+        // Build `Lfield(Lvar q, next)` and evaluate with Write mode.
+        let lfield = Exp::Lfield(
+            sil::exp::LfieldObjData {
+                exp: Box::new(Exp::Lvar(pvar)),
+                is_implicit: false,
+            },
+            Fieldname::make(
+                sil::typ::TypeName::CStruct(
+                    sil::qualified_cpp_name::QualifiedCppName::from_string("node"),
+                ),
+                "next",
+            ),
+            Typ::void(),
+        );
+        let result = eval_with_history_mode(&lfield, AccessMode::Write, &loc, &mut state);
+        assert!(matches!(result, PulseResult::Ok(_)));
+
+        let pre_attrs =
+            state.pre.attrs.get(&formal_value).expect(
+                "the field-access base check should abduce MustBeValid on the formal value",
+            );
+        assert!(
+            pre_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _))),
+            "Lfield base check in Write mode should still abduce MustBeValid"
+        );
+        assert!(
+            !pre_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeInitialized(_, _))),
+            "Lfield base check in Write mode should NOT abduce MustBeInitialized (cluster A regression guard)"
+        );
+
+        // Sanity check: the same call with mode=Read should produce both.
+        let (pdesc2, pvar2) = make_pdesc_with_formal("q");
+        let mut state2 = AbductiveDomain::mk_initial(&pdesc2);
+        let formal_value2 = state2
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar2.clone())))
+            .expect("formal should be bound");
+        let lfield2 = Exp::Lfield(
+            sil::exp::LfieldObjData {
+                exp: Box::new(Exp::Lvar(pvar2)),
+                is_implicit: false,
+            },
+            Fieldname::make(
+                sil::typ::TypeName::CStruct(
+                    sil::qualified_cpp_name::QualifiedCppName::from_string("node"),
+                ),
+                "next",
+            ),
+            Typ::void(),
+        );
+        let _ = eval_with_history_mode(&lfield2, AccessMode::Read, &loc, &mut state2);
+        let pre_attrs2 = state2
+            .pre
+            .attrs
+            .get(&formal_value2)
+            .expect("the field-access base check should abduce on the formal value");
+        assert!(
+            pre_attrs2
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeInitialized(_, _))),
+            "Lfield base check in Read mode SHOULD still abduce MustBeInitialized (no over-correction)"
         );
     }
 

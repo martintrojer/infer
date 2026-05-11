@@ -362,7 +362,14 @@ fn invalidate_first_arg(
     if let Some((arg_exp, _)) = args.first() {
         let addr = operations::eval_or_fresh_with_history(arg_exp, loc, &mut state);
 
-        match operations::check_addr_access_with_history(addr.clone(), loc, &mut state) {
+        // Cross-ref: OCaml `PulseModelsImport.free_or_delete` calls
+        // `check_addr_access path NoAccess`. NoAccess only abduces
+        // `MustBeValid` on the freed pointer; it does NOT abduce
+        // `MustBeInitialized`. Using Read here — as Rust did before —
+        // spuriously claims that every freed pointer must be initialized
+        // by the caller, which over-attaches `MustBeInitialized` to formals
+        // that flow into `free`/`delete`.
+        match operations::check_addr_access_no_init_with_history(addr.clone(), loc, &mut state) {
             PulseResult::FatalError(diag, _) => {
                 return vec![ExecutionDomain::AbortProgram {
                     state: Box::new(state),
@@ -589,9 +596,12 @@ fn check_file_arg(
     loc: &Location,
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
+    // Cross-ref: OCaml stdio models (e.g. `getc(FILE*)`) call `check_valid`
+    // (NoAccess) on the FILE* argument; they do not require it to be
+    // `MustBeInitialized` from the caller's perspective.
     if let Some((arg_exp, _)) = args.first() {
         let addr = operations::eval_or_fresh(arg_exp, loc, &mut state);
-        match operations::check_addr_access(addr, loc, &mut state) {
+        match operations::check_addr_access_no_init(addr, loc, &mut state) {
             PulseResult::FatalError(diag, _) => {
                 return vec![ExecutionDomain::AbortProgram {
                     state: Box::new(state),
@@ -702,10 +712,14 @@ fn memcpy(
     loc: &Location,
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
+    // Cross-ref: OCaml `PulseModelsC.memcpy` calls `check_valid` (NoAccess)
+    // on dest and src — only `MustBeValid`, no `MustBeInitialized`. The
+    // memcpy itself does the load/store via the model's own loop, not
+    // through these arg checks.
     // Check dest (first arg)
     if let Some((dest_exp, _)) = args.first() {
         let dest_addr = operations::eval_or_fresh(dest_exp, loc, &mut state);
-        match operations::check_addr_access(dest_addr, loc, &mut state) {
+        match operations::check_addr_access_no_init(dest_addr, loc, &mut state) {
             PulseResult::FatalError(diag, _) => {
                 return vec![ExecutionDomain::AbortProgram {
                     state: Box::new(state),
@@ -726,7 +740,7 @@ fn memcpy(
     // Check src (second arg)
     if let Some((src_exp, _)) = args.get(1) {
         let src_addr = operations::eval_or_fresh(src_exp, loc, &mut state);
-        match operations::check_addr_access(src_addr, loc, &mut state) {
+        match operations::check_addr_access_no_init(src_addr, loc, &mut state) {
             PulseResult::FatalError(diag, _) => {
                 return vec![ExecutionDomain::AbortProgram {
                     state: Box::new(state),
