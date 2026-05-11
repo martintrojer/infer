@@ -224,27 +224,57 @@ enum CanonOperand {
     Var(ValueSortKey),
 }
 
+/// One node in a flat post-order encoding of a `CanonTerm`.
+///
+/// The flat encoding lets a `Term` of arbitrary depth be canonicalised
+/// with a single heap allocation (one `Box<[CanonTermNode]>`) instead
+/// of one `Box<CanonTerm>` per internal node. This is a hot-path win:
+/// worker-profile-1 saw `drop_in_place<CanonTerm>` at 13.7% inclusive
+/// on `DES_ede3_cfb_encrypt` because every `partial_term_key` call
+/// produced an O(depth) tree of boxed nodes only to be dropped after
+/// the sort/cmp.
+///
+/// Variant order is irrelevant for correctness; the canonical formula
+/// is sorted at the end of `canonical_formula`, and `alpha_equivalent`
+/// compares two equally canonicalised `CanonicalState`s for full
+/// equality. See the module-level "Design note".
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CanonTermNode {
+    Var(ValueSortKey),
+    Const(i64),
+    Neg,
+    Not,
+    IsZero,
+    Add,
+    Sub,
+    Mult,
+}
+
 /// Structural counterpart of `Term`.
 ///
-/// Variant declaration order is irrelevant for correctness; it only
-/// determines tie-breaking between, e.g., `Term::Var(_)` and
-/// `Term::Const(_)` during `sort_by_cached_key`. The order chosen here
-/// places leaves first, then unary, then binary, which keeps short
-/// fingerprints near the top of any sorted output and matches the visual
-/// intuition of the legacy String form well enough for the
-/// `structural_canonical_matches_string_form` cross-check (which only
-/// asserts the unsorted set of formatted entries — not the ordering — is
-/// identical).
+/// Leaves (`Var` / `Const`) are stored inline so trivial terms never
+/// allocate. Composite terms are stored as a single boxed slice of
+/// `CanonTermNode`s in post-order: the rebuild stack walks the slice
+/// left-to-right, pushing leaves and folding operator nodes off the
+/// stack. Two terms with identical post-order sequences are equal
+/// (derived `Eq`/`Ord`/`Hash`), and the encoding is canonical (the
+/// post-order of a given AST is unique), so structural equality and
+/// cmp/hash are byte-identical to the previous boxed-tree form modulo
+/// variant ordering.
+///
+/// Variant declaration order between `Var`/`Const`/`Tree` is
+/// irrelevant for correctness; it only changes the in-memory ordering
+/// of `CanonicalState.formula` entries before the final
+/// `parts.sort()`, which both sides of an `alpha_equivalent` comparison
+/// see consistently. The legacy `String` shape (used by
+/// `debug_canonical_dump` and `structural_canonical_matches_string_form`)
+/// re-sorts on the formatted strings, so the debug surface is
+/// byte-identical.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CanonTerm {
     Var(ValueSortKey),
     Const(i64),
-    Neg(Box<CanonTerm>),
-    Not(Box<CanonTerm>),
-    IsZero(Box<CanonTerm>),
-    Add(Box<CanonTerm>, Box<CanonTerm>),
-    Sub(Box<CanonTerm>, Box<CanonTerm>),
-    Mult(Box<CanonTerm>, Box<CanonTerm>),
+    Tree(Box<[CanonTermNode]>),
 }
 
 /// Structural counterpart of `Atom`.
@@ -1003,24 +1033,61 @@ impl Canonicalizer {
     }
 
     fn partial_term_key(&self, term: &Term) -> CanonTerm {
+        // Trivial terms stay inline (zero allocations). Composite terms
+        // are flattened into a single boxed post-order slab — one
+        // allocation regardless of depth, vs O(depth) `Box<CanonTerm>`
+        // allocations under the previous representation.
         match term {
             Term::Var(value) => CanonTerm::Var(self.partial_value_key(*value)),
             Term::Const(value) => CanonTerm::Const(*value),
-            Term::Add(lhs, rhs) => CanonTerm::Add(
-                Box::new(self.partial_term_key(lhs)),
-                Box::new(self.partial_term_key(rhs)),
-            ),
-            Term::Sub(lhs, rhs) => CanonTerm::Sub(
-                Box::new(self.partial_term_key(lhs)),
-                Box::new(self.partial_term_key(rhs)),
-            ),
-            Term::Mult(lhs, rhs) => CanonTerm::Mult(
-                Box::new(self.partial_term_key(lhs)),
-                Box::new(self.partial_term_key(rhs)),
-            ),
-            Term::Neg(inner) => CanonTerm::Neg(Box::new(self.partial_term_key(inner))),
-            Term::Not(inner) => CanonTerm::Not(Box::new(self.partial_term_key(inner))),
-            Term::IsZero(inner) => CanonTerm::IsZero(Box::new(self.partial_term_key(inner))),
+            _ => {
+                let mut nodes: Vec<CanonTermNode> = Vec::new();
+                self.flatten_term(term, &mut nodes);
+                CanonTerm::Tree(nodes.into_boxed_slice())
+            }
+        }
+    }
+
+    /// Post-order DFS over `Term`, pushing `CanonTermNode`s into `out`.
+    ///
+    /// Children are emitted before their parent, so a stack-based
+    /// rebuild (see `format_canon_term`) walks the slice left-to-right.
+    /// Two equal `Term`s produce identical sequences, so the derived
+    /// `Eq`/`Ord`/`Hash` on `Box<[CanonTermNode]>` agree with the
+    /// previous structural definition modulo variant ordering of
+    /// `CanonTerm` itself (which is not load-bearing — see the
+    /// `CanonTerm` doc comment).
+    fn flatten_term(&self, term: &Term, out: &mut Vec<CanonTermNode>) {
+        match term {
+            Term::Var(value) => out.push(CanonTermNode::Var(self.partial_value_key(*value))),
+            Term::Const(value) => out.push(CanonTermNode::Const(*value)),
+            Term::Add(lhs, rhs) => {
+                self.flatten_term(lhs, out);
+                self.flatten_term(rhs, out);
+                out.push(CanonTermNode::Add);
+            }
+            Term::Sub(lhs, rhs) => {
+                self.flatten_term(lhs, out);
+                self.flatten_term(rhs, out);
+                out.push(CanonTermNode::Sub);
+            }
+            Term::Mult(lhs, rhs) => {
+                self.flatten_term(lhs, out);
+                self.flatten_term(rhs, out);
+                out.push(CanonTermNode::Mult);
+            }
+            Term::Neg(inner) => {
+                self.flatten_term(inner, out);
+                out.push(CanonTermNode::Neg);
+            }
+            Term::Not(inner) => {
+                self.flatten_term(inner, out);
+                out.push(CanonTermNode::Not);
+            }
+            Term::IsZero(inner) => {
+                self.flatten_term(inner, out);
+                out.push(CanonTermNode::IsZero);
+            }
         }
     }
 
@@ -1289,13 +1356,69 @@ fn format_canon_term(term: &CanonTerm) -> String {
     match term {
         CanonTerm::Var(v) => format_value_key(v),
         CanonTerm::Const(v) => format!("const:{v}"),
-        CanonTerm::Add(l, r) => format!("add({},{})", format_canon_term(l), format_canon_term(r)),
-        CanonTerm::Sub(l, r) => format!("sub({},{})", format_canon_term(l), format_canon_term(r)),
-        CanonTerm::Mult(l, r) => format!("mul({},{})", format_canon_term(l), format_canon_term(r)),
-        CanonTerm::Neg(t) => format!("neg({})", format_canon_term(t)),
-        CanonTerm::Not(t) => format!("not({})", format_canon_term(t)),
-        CanonTerm::IsZero(t) => format!("is_zero({})", format_canon_term(t)),
+        CanonTerm::Tree(nodes) => format_canon_term_nodes(nodes),
     }
+}
+
+/// Rebuild the legacy `String` shape from a flat post-order slab.
+///
+/// Mirrors the recursive `format_canon_term` shape that the previous
+/// `Box<CanonTerm>` representation produced, so
+/// `structural_canonical_matches_string_form` and `debug_canonical_dump`
+/// remain byte-identical.
+fn format_canon_term_nodes(nodes: &[CanonTermNode]) -> String {
+    let mut stack: Vec<String> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        match node {
+            CanonTermNode::Var(v) => stack.push(format_value_key(v)),
+            CanonTermNode::Const(v) => stack.push(format!("const:{v}")),
+            CanonTermNode::Neg => {
+                let t = stack.pop().expect("malformed CanonTerm post-order: Neg");
+                stack.push(format!("neg({t})"));
+            }
+            CanonTermNode::Not => {
+                let t = stack.pop().expect("malformed CanonTerm post-order: Not");
+                stack.push(format!("not({t})"));
+            }
+            CanonTermNode::IsZero => {
+                let t = stack.pop().expect("malformed CanonTerm post-order: IsZero");
+                stack.push(format!("is_zero({t})"));
+            }
+            CanonTermNode::Add => {
+                let r = stack
+                    .pop()
+                    .expect("malformed CanonTerm post-order: Add rhs");
+                let l = stack
+                    .pop()
+                    .expect("malformed CanonTerm post-order: Add lhs");
+                stack.push(format!("add({l},{r})"));
+            }
+            CanonTermNode::Sub => {
+                let r = stack
+                    .pop()
+                    .expect("malformed CanonTerm post-order: Sub rhs");
+                let l = stack
+                    .pop()
+                    .expect("malformed CanonTerm post-order: Sub lhs");
+                stack.push(format!("sub({l},{r})"));
+            }
+            CanonTermNode::Mult => {
+                let r = stack
+                    .pop()
+                    .expect("malformed CanonTerm post-order: Mult rhs");
+                let l = stack
+                    .pop()
+                    .expect("malformed CanonTerm post-order: Mult lhs");
+                stack.push(format!("mul({l},{r})"));
+            }
+        }
+    }
+    debug_assert_eq!(
+        stack.len(),
+        1,
+        "CanonTerm post-order must rebuild to a single root"
+    );
+    stack.pop().expect("empty CanonTerm post-order slab")
 }
 
 fn format_canon_atom(atom: &CanonAtom) -> String {
@@ -2346,5 +2469,136 @@ mod tests {
             f1, f2,
             "structurally different formulas must not collapse under the structural canonical key"
         );
+    }
+
+    /// Cross-check for the flat-slab `CanonTerm` representation
+    /// introduced by `perf_fix_canon_term_box_representation`.
+    ///
+    /// Walks a deep, mixed `Term` tree (nested `Add`/`Mult`/`Neg`/`Sub`
+    /// over `Var` and `Const` leaves) through `partial_term_key` and
+    /// asserts:
+    ///   - the rendered legacy `String` shape matches the recursive
+    ///     definition byte-for-byte (locks `format_canon_term_nodes`
+    ///     against the previous `Box<CanonTerm>` formatter);
+    ///   - alpha-renaming of the underlying `AbstractValue` IDs
+    ///     produces the same `CanonTerm` (structural alpha-invariance
+    ///     for terms);
+    ///   - structurally different terms produce different `CanonTerm`s
+    ///     (no over-collapsing under the new representation);
+    ///   - leaf terms (`Var`/`Const`) stay inline (no allocation,
+    ///     `Tree` arm is reserved for composites).
+    #[test]
+    fn structural_canon_term_flat_slab_round_trips_legacy_string_form() {
+        // Recursive legacy shape, copy of the previous
+        // `format_canon_term` body, used here as the oracle.
+        fn legacy_term_str(t: &Term, canon: &Canonicalizer) -> String {
+            match t {
+                Term::Var(v) => format_value_key(&canon.partial_value_key(*v)),
+                Term::Const(v) => format!("const:{v}"),
+                Term::Add(l, r) => format!(
+                    "add({},{})",
+                    legacy_term_str(l, canon),
+                    legacy_term_str(r, canon)
+                ),
+                Term::Sub(l, r) => format!(
+                    "sub({},{})",
+                    legacy_term_str(l, canon),
+                    legacy_term_str(r, canon)
+                ),
+                Term::Mult(l, r) => format!(
+                    "mul({},{})",
+                    legacy_term_str(l, canon),
+                    legacy_term_str(r, canon)
+                ),
+                Term::Neg(t) => format!("neg({})", legacy_term_str(t, canon)),
+                Term::Not(t) => format!("not({})", legacy_term_str(t, canon)),
+                Term::IsZero(t) => format!("is_zero({})", legacy_term_str(t, canon)),
+            }
+        }
+
+        AbstractValue::reset_counters();
+        let v1 = AbstractValue::mk_fresh();
+        let v2 = AbstractValue::mk_fresh();
+        let v3 = AbstractValue::mk_fresh();
+        // Build  Add(Mult(Neg(Var(v1)), Sub(Var(v2), Const(3))), IsZero(Not(Var(v3))))
+        let term = Term::Add(
+            Box::new(Term::Mult(
+                Box::new(Term::Neg(Box::new(Term::Var(v1)))),
+                Box::new(Term::Sub(Box::new(Term::Var(v2)), Box::new(Term::Const(3)))),
+            )),
+            Box::new(Term::IsZero(Box::new(Term::Not(Box::new(Term::Var(v3)))))),
+        );
+
+        // Canonicalise with a Canonicalizer that has mapped v1/v2/v3.
+        let mut canon = Canonicalizer::default();
+        for v in [v1, v2, v3] {
+            canon.map_value(v);
+        }
+
+        let key = canon.partial_term_key(&term);
+        // Composite must use the flat slab.
+        assert!(
+            matches!(key, CanonTerm::Tree(_)),
+            "composite Term must canonicalise to CanonTerm::Tree, got {key:?}"
+        );
+
+        // Round-trip: the rebuilt String matches the legacy recursive
+        // shape byte-for-byte.
+        assert_eq!(
+            format_canon_term(&key),
+            legacy_term_str(&term, &canon),
+            "flat-slab CanonTerm must format identically to the legacy recursive shape"
+        );
+
+        // Alpha-invariance: rebuilding the same shape with fresh
+        // `AbstractValue` IDs (mapped through a fresh Canonicalizer in
+        // the same order) yields an identical `CanonTerm`.
+        AbstractValue::reset_counters();
+        for _ in 0..7 {
+            let _ = AbstractValue::mk_fresh(); // burn IDs
+        }
+        let w1 = AbstractValue::mk_fresh();
+        let w2 = AbstractValue::mk_fresh();
+        let w3 = AbstractValue::mk_fresh();
+        let term2 = Term::Add(
+            Box::new(Term::Mult(
+                Box::new(Term::Neg(Box::new(Term::Var(w1)))),
+                Box::new(Term::Sub(Box::new(Term::Var(w2)), Box::new(Term::Const(3)))),
+            )),
+            Box::new(Term::IsZero(Box::new(Term::Not(Box::new(Term::Var(w3)))))),
+        );
+        let mut canon2 = Canonicalizer::default();
+        for v in [w1, w2, w3] {
+            canon2.map_value(v);
+        }
+        assert_eq!(
+            canon2.partial_term_key(&term2),
+            key,
+            "alpha-renamed term must produce identical CanonTerm under the flat-slab representation"
+        );
+
+        // Distinguishability: changing one leaf changes the CanonTerm.
+        let term_diff = Term::Add(
+            Box::new(Term::Mult(
+                Box::new(Term::Neg(Box::new(Term::Var(w1)))),
+                Box::new(Term::Sub(Box::new(Term::Var(w2)), Box::new(Term::Const(4)))), // 4 not 3
+            )),
+            Box::new(Term::IsZero(Box::new(Term::Not(Box::new(Term::Var(w3)))))),
+        );
+        assert_ne!(
+            canon2.partial_term_key(&term_diff),
+            key,
+            "structurally distinct terms must canonicalise to distinct CanonTerms"
+        );
+
+        // Leaves remain inline (no allocation in the slab arm).
+        assert!(matches!(
+            canon.partial_term_key(&Term::Var(v1)),
+            CanonTerm::Var(_)
+        ));
+        assert!(matches!(
+            canon.partial_term_key(&Term::Const(42)),
+            CanonTerm::Const(42)
+        ));
     }
 }
