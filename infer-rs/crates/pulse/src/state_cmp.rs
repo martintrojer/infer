@@ -880,7 +880,7 @@ impl Canonicalizer {
         reachable: &std::collections::HashSet<AbstractValue>,
     ) {
         let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
-        entries.sort_by_key(|(src, _)| self.partial_value_key(*src));
+        entries.sort_by_cached_key(|(src, _)| self.partial_value_key(*src));
         for (src, edges) in entries {
             if !reachable.contains(&src) {
                 continue;
@@ -890,7 +890,8 @@ impl Canonicalizer {
                 .iter()
                 .map(|(access, target)| (access, *target))
                 .collect();
-            edge_entries.sort_by_key(|(access, target)| self.partial_edge_key(access, *target));
+            edge_entries
+                .sort_by_cached_key(|(access, target)| self.partial_edge_key(access, *target));
             for (access, target) in edge_entries {
                 if let Access::ArrayAccess(_, index) = access {
                     self.map_value(*index);
@@ -906,7 +907,7 @@ impl Canonicalizer {
         reachable: &std::collections::HashSet<AbstractValue>,
     ) {
         let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
-        entries.sort_by_key(|(addr, _)| self.partial_value_key(*addr));
+        entries.sort_by_cached_key(|(addr, _)| self.partial_value_key(*addr));
         for (addr, attrs) in entries {
             if !reachable.contains(&addr) {
                 continue;
@@ -926,8 +927,9 @@ impl Canonicalizer {
         let phi = state.path_condition.phi();
 
         let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-        equalities
-            .sort_by_key(|(lhs, rhs)| (self.partial_value_key(*lhs), self.partial_value_key(*rhs)));
+        equalities.sort_by_cached_key(|(lhs, rhs)| {
+            (self.partial_value_key(*lhs), self.partial_value_key(*rhs))
+        });
         for (lhs, rhs) in equalities {
             self.map_value(lhs);
             self.map_value(rhs);
@@ -974,7 +976,7 @@ impl Canonicalizer {
         }
 
         let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-        is_int_vars.sort_by_key(|value| self.partial_value_key(*value));
+        is_int_vars.sort_by_cached_key(|value| self.partial_value_key(*value));
         for value in is_int_vars {
             self.map_value(value);
         }
