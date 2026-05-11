@@ -125,6 +125,24 @@ OUT_DIR="$(pwd)/bench-out/current-head-openssl-$(date +%Y%m%d-%H%M%S)" \
   RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh
 ```
 
+`scripts/bench_openssl_partial.sh` runs preflight checks before the first
+iteration:
+
+- the release binary must exist and not be older than any tracked workspace
+  source file (`SKIP_FRESHNESS=1` to bypass, `REBUILD=1` to auto-rebuild);
+- every flag the script passes (built-ins, anything in `EXTRA_ARGS`, anything
+  listed in `REQUIRED_FLAGS`) must show up in `$BIN --help`
+  (`SKIP_FLAG_CHECK=1` to bypass).
+
+Failure semantics:
+
+- default: exit 0 if at least one run succeeds, nonzero if every run fails;
+- `STRICT=1`: exit nonzero if any run fails;
+- `PERMISSIVE=1`: legacy "always exit 0" mode for exploratory bisects.
+
+Use `DRY_RUN=1` or `--help` to inspect the resolved configuration without
+starting the benchmark.
+
 ## Per-instruction tracing
 
 ```bash
