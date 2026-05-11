@@ -377,12 +377,14 @@ Consequences for the (A) / (B) / (C) plan in
   value count to match OCaml's denser representation," but that is a
   semantic-fidelity change in how Pulse mints abstract values during
   field/array access, not a retained-state convergence change.
-- (B) ("validate Arc savings on whole-program OpenSSL") is now the right
-  next step. The single-procedure data here suggests Phase 1 Arc has
-  already pushed Rust's per-procedure memory below OCaml's, so the
-  whole-program memory comparison is likely much more favorable than the
-  legacy `~16-33 GB` OOM datapoints suggested.
+- (B) ("validate Arc savings on whole-program OpenSSL") became the right next
+  step and produced the later whole-program/profile work summarized in
+  `STATUS.md` and `WHOLE_PROGRAM_OPENSSL_FINDINGS.md`.
 
-This file is the artifact of the first investigative pass plus the OCaml
-comparison. Future passes should append findings here rather than
-overwriting.
+2026-05 update: this archive is not the active perf plan. Subsequent work moved
+the live bottleneck to `state_cmp::canonicalize` and landed `sort_by_cached_key`,
+structural canonical keys for formula/heap/attrs/stack/dynamic types, cached
+propagation sort keys, and flat-slab `CanonTerm`. Current live tasks are in
+`mu` (not this archive), with the clean full-corpus remeasure parked on host
+quiescence. Future findings should prefer mu task notes plus `STATUS.md`
+dashboard updates over appending more live backlog to this archive.

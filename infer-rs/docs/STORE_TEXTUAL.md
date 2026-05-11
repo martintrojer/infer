@@ -172,11 +172,13 @@ What the current OpenSSL probe shows after that exporter fix:
 - OCaml cross-check: `Pulse.ml` also keeps `Nullify` and `Abstract` as no-op
   metadata, so the remaining hotspot is not another metadata-family
   importer/executor gap
-- the selected-node dump maps that residual split to the line `540`
+- the selected-node dump mapped that residual split to the line `540`
   `r++` / load / prune block and the line `752-755` `S.q[...] = L*` stores;
-  matching OCaml HTML on those lines ends with `Got 1 disjunct back`, so the
-  current hotspot is narrower Rust-side retained-state convergence work, not
-  an exporter/importer metadata gap
+  matching OCaml HTML on those lines ended with `Got 1 disjunct back`, so the
+  old hotspot was narrower Rust-side analysis work, not an exporter/importer
+  metadata gap. Later investigations moved the active perf focus away from
+  metadata/export fidelity and into Pulse/state comparison costs; see
+  `STATUS.md` and `mu` for current work.
 
 Policy:
 

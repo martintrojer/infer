@@ -62,10 +62,11 @@ Default Rust caps:
 - `pulse-max-wall-secs = 60`
 - pass `0` to disable either cap
 
-Latest repeated current-HEAD checkpoint on the fresh patched-exporter re-export
+Latest clean repeated checkpoint on the fresh patched-exporter re-export
 (`textual-out-reexport-20260508-102338/`, `74` `.sil` files; DES and OBJ targets
 present; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh` with
-`TEXTUAL_DIR=.../textual-out-reexport-20260508-102338`):
+`TEXTUAL_DIR=.../textual-out-reexport-20260508-102338`). This table is the
+latest trustworthy full-corpus measurement, not necessarily current HEAD:
 
 | metric | OCaml old baseline (`-j 1`) | Rust default (`-j 4`) | Rust + formula-gc (`-j 4`) |
 |---|---:|---:|---:|
@@ -77,10 +78,10 @@ present; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh` with
 | max visit count | n/a | `4` | `4` |
 | process exit | clean (`0`) | `2` due reported leaks | `2` |
 
-Default Rust = current main with the textual parser O(N²) fix landed
+Default Rust = the clean checkpoint with the textual parser O(N²) fix
 (`2a17574854`) on top of the perf cleanup (`01a51f99ed`); the formula-gc
 column adds `--pulse-intermediate-formula-gc`. Both columns are 3 runs each
-on the same fresh export; old-export historical numbers (`239.67s` median
+on the same fresh export. Old-export historical numbers (`239.67s` median
 wall, `13.17 GB` median max RSS, `18 / 570` aborts, clean exit) are from the
 original `textual-out/` and are not directly comparable — the fresh export
 has fewer procedure definitions (`446` analyzed instead of `570`) but
@@ -88,9 +89,10 @@ includes newer cleanup/nullify/exit-scope metadata.
 
 Interpretation:
 
-- Default Rust vs OCaml old baseline: `244.70 / 42.9 ≈ 5.7×` (was `6.7×`
-  before the parser fix and `8.0×` before the perf cleanup; `~30%` cumulative
-  wall improvement on the same input).
+- At this clean checkpoint, default Rust vs OCaml old baseline is
+  `244.70 / 42.9 ≈ 5.7×` (was `6.7×` before the parser fix and `8.0×`
+  before the perf cleanup; `~30%` cumulative wall improvement on the same
+  input).
 - `--pulse-intermediate-formula-gc` is now roughly neutral on this corpus
   (`~2.5%` wall win; max RSS and peak footprint within noise of the default
   column). Worth keeping opt-in until we see another win condition. The
@@ -100,18 +102,18 @@ Interpretation:
 - Stale `term_value_index` repair was rejected for the default path: it improved
   selected DES target wall time but made whole-program median slower and produced
   no repair hits in the focused counter run.
-- Subsequent landings (`e8a10549ea` sort_by_cached_key,
-  `6e9e4fa56c` structural canonical formula keys, `b02a822805` structural
-  canonical stack/heap/attrs/dynamic_types) cumulatively cut isolated
-  `OBJ_bsearch_ex_` wall from `1.91s` to `0.54s` (~`72%` reduction) but a
-  whole-program OpenSSL remeasure has not yet landed in this dashboard
-  because two attempted remeasures were load-contaminated. Tracked under
-  the deferred task `perf_remeasure_quiescent_host`; the next clean run on
-  an idle host should drop the OFF/ON wall medians materially below the
-  `244.70s` / `238.56s` shown here.
-- The remaining wall-time gap to OCaml is tracked under
-  `perf_track_walltime_gap_vs_ocaml`; first follow-up is profiling a hot DES/OBJ
-  proc on the new baseline.
+- Subsequent focused `state_cmp` landings cumulatively cut the main isolated
+  hotspots substantially: `OBJ_bsearch_ex_` from `1.91s` to `~0.47s` and
+  `DES_ede3_cfb_encrypt` from `~40.2s` after the first structural fixes to
+  `~21.8s` after cached propagation sort keys and flat-slab `CanonTerm`.
+  The latest full-corpus OpenSSL remeasure has not landed in this dashboard:
+  earlier attempts were load-contaminated, and the current host sample is still
+  not quiescent. The clean rerun is tracked by `perf_remeasure_quiescent_host`
+  and should use the newly hardened benchmark script.
+- The remaining wall-time gap to OCaml is tracked by the current perf DAG:
+  `perf_remeasure_quiescent_host` should refresh whole-corpus numbers when the
+  host is idle, and `perf_decide_next_track_after_profile_and_remeasure` gates
+  any further perf work.
 
 Benchmark artifacts from the latest run are under ignored `bench-out/` in the
 main checkout. Historical OpenSSL archaeology is in
@@ -130,21 +132,21 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **SIL virtual dispatch** — all `virt.sil` cases pass after the recent
-  dispatch stack landed (`902b2deb50`, `cda27f6239`, `70365d047b`); the
-  `test_full_check_current_stack` gate closed green. New regressions in this
-  area should reopen the relevant follow-ups in `mu`.
-- **OpenSSL perf** — formula-cleanup expansion has landed behind the opt-in
-  flag; a one-shot remeasurement
-  (`perf_remeasure_fresh_openssl_after_formula_cleanup`) is in flight. The
-  ~`8×` wall-time gap vs OCaml on whole-program OpenSSL is tracked under
-  `perf_track_walltime_gap_vs_ocaml`.
-- **Test infrastructure** — opt-in trace-step assertions
-  (`test_trace_step_assertions`).
-- **Deferred backlog** — micro-cleanups (`code_*`), speculative perf
-  (`perf_component_clone_reduction`), and accepted parity limits
-  (`parity_sizeof_type_eval`) are parked with explicit reopen-when-... notes.
-  Run `mu task list -w infer-rs --status DEFERRED` for the live set.
+- **OpenSSL perf / benchmark hygiene** — the benchmark script now has stricter
+  preflight/failure behavior and focused `state_cmp` fixes have landed. The
+  remaining ready item is the clean quiescent-host full OpenSSL remeasure; do
+  not run it while load/security daemons are high.
+- **Decision gate** — after the clean full-corpus remeasure closes,
+  `perf_decide_next_track_after_profile_and_remeasure` should prune obsolete
+  placeholders and choose the next concrete track.
+- **Correctness parity** — current C store-textual deltas are accepted and
+  documented above. Reopen parity work only for new sweep regressions or a real
+  Textual/export-fidelity project.
+- **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
+  work (`perf_component_clone_reduction`), Textual enhancements, and accepted
+  parity limits (`parity_sizeof_type_eval`) are parked with explicit
+  reopen-when notes. Run `mu task list -w infer-rs --status DEFERRED` for the
+  live set.
 
 ## Test commands
 

@@ -8,13 +8,22 @@ lives in `mu` tasks.
 mu task list -w infer-rs --status OPEN
 ```
 
-## Current follow-up task IDs
+## Follow-up task IDs
 
-- `perf_profile_des_formula_volume`
-- `perf_investigate_obj_obj2txt_state_explosion`
-- `perf_incremental_formula_cleanup`
-- `perf_component_clone_reduction`
-- `openssl_reexport_shared_corpus`
+Historical tasks from this investigation have mostly closed or been deferred.
+The current live OpenSSL follow-ups are in `mu`; as of 2026-05-11 the important
+ones are:
+
+- `bench_harden_openssl_benchmark_script`
+- `perf_remeasure_quiescent_host`
+- `docs_refresh_status_after_quiescent_remeasure`
+- `perf_profile_current_state_cmp_after_structural`
+- `perf_fix_next_profiled_state_cmp_hotspot`
+- `perf_validate_next_perf_fix_focused`
+- `perf_decide_next_track_after_profile_and_remeasure`
+
+Older task names in this archive remain useful search terms for `mu task notes`,
+not active backlog.
 
 ## Headline conclusions preserved from the investigation
 
@@ -23,8 +32,9 @@ mu task list -w infer-rs --status OPEN
 - The original `OBJ_bsearch_ex_ max_visit_count=10001` convergence pathology is
   no longer the dominant blocker after the B-track convergence fixes.
 - The remaining long tail is mostly bounded-visit large-state cost, especially
-  DES-family procedures and `OBJ_obj2txt`.
-- Heap/attribute retained-state pruning was a clear default win.
+  DES-family procedures and OBJ-family procedures.
+- Heap/attribute retained-state pruning and later structural canonicalization
+  work were clear focused wins.
 - Formula GC improves memory headroom in focused/uncapped runs but was not a
   capped whole-program wall-time win on this host, so it remains opt-in.
 - Stale `term_value_index` repair was rejected for the default path: it helped a
@@ -33,6 +43,12 @@ mu task list -w infer-rs --status OPEN
 - Direct term-value cache reuse and cached-comparison pruning remain valuable;
   cheap TermKey shape normalization was measured on focused DES and rejected as
   inert for that target.
+- Later state-comparison fixes (`sort_by_cached_key`, structural canonical
+  formula keys, structural canonical heap/attrs/stack/dynamic-types keys,
+  cached propagation sort keys, and flat-slab `CanonTerm`) cut isolated
+  `OBJ_bsearch_ex_` wall from `1.91s` to `~0.47s`; DES-family focused probes
+  also improved materially. The clean whole-program remeasure is still pending
+  a quiescent host.
 
 ## Dated benchmark checkpoints
 

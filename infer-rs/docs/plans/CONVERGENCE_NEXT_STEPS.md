@@ -187,9 +187,11 @@ baseline peak drops `~10-12%` on small procs (e.g.
 
 Full findings: [`CONVERGENCE_8D4V_FINDINGS.md`](./CONVERGENCE_8D4V_FINDINGS.md).
 
-The next steps for the per-disjunct cost gap are now scoped narrower:
-actively re-key `term_value_index` on `subst_var` (currently we mint
-fresh on stale-key miss), per-iteration formula GC for values that
-lose all heap roots, and folding `mark_is_int(v)` into the
-`find_term_value` short-circuit so the `is_int_vars` count stops
-growing per BinOp.
+That next-step list is now historical. Later profiling shifted the active perf
+track to `state_cmp::canonicalize`: `sort_by_cached_key`, structural canonical
+formula keys, structural canonical heap/attrs/stack/dynamic-type keys, cached
+propagation sort keys, and flat-slab `CanonTerm` cut isolated
+`OBJ_bsearch_ex_` wall from `1.91s` to `~0.47s` and materially improved the
+DES-family focused probe. Current live follow-ups are in `mu`: run a clean
+quiescent-host whole-program OpenSSL remeasure (`perf_remeasure_quiescent_host`),
+then choose the next track (`perf_decide_next_track_after_profile_and_remeasure`).
