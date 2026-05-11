@@ -1,0 +1,158 @@
+# C-suite OCaml↔Rust Pulse summary triage
+
+Date: 2026-05-11
+Branch: detached HEAD on 1608ab4 (after triage commit b62437c)
+INFER_BIN: /Users/mtrojer/infer/infer/bin/infer (v1.2.0-e0d18cf1b6)
+
+## Per-file totals
+
+| File              | matching | diffs | ocaml_only | rust_only | wallclock |
+|-------------------|---------:|------:|-----------:|----------:|----------:|
+| arithmetic.c      |        4 |     7 |          0 |         1 |   ~25s    |
+| funptr.c          |       10 |    18 |          0 |         0 |   ~25s    |
+| interprocedural.c |        6 |    11 |          0 |         1 |   ~25s    |
+| latent.c          |        1 |    13 |          0 |         0 |   ~25s    |
+| memory_leak.c     |        9 |    37 |          0 |         5 |   ~25s    |
+| specialization.c  |       20 |     1 |          0 |         0 |   ~25s    |
+| nullptr.c         |        — |     — |          — |         — |  HANG     |
+
+Notes
+- "wallclock" is dominated by OCaml `infer capture` + analyze (~20s each).
+- nullptr.c: Rust Pulse hangs (>240s). Already documented in
+  infer-rs/docs/STATUS.md as a `1 TIMEOUT (known recursion hang)`.
+- `rust_only` procs are mostly Pulse models that OCaml drops on the floor:
+  `random` (declared via `__attribute__((__pure__))`), `realloc`/`a_malloc`/
+  `my_free`/`my_malloc`/`my_realloc` (assigned via function pointers).
+  Surface-only — they exist in Rust because we keep their summary store
+  entries; OCaml prunes them.
+
+## Recurring mismatch clusters (cross-file, ranked by frequency)
+
+### Cluster A — `MustBeInitialized` annotation drift on `MustBeValid` formals  (~38 occurrences)
+- Pattern: pre_attrs `missing=["x.*:[MustBeValid]"]` /
+  `extra=["x.*:[MustBeInitialized, MustBeValid]"]` (or symmetric).
+- Files: latent.c (16), memory_leak.c (20), funptr.c (6),
+  interprocedural.c (1).
+- Diagnosis: Rust attaches `MustBeInitialized` to dereferenced formals
+  even when OCaml only records `MustBeValid`. Looks like a one-line
+  policy diff in attribute construction in
+  `infer-rs/crates/pulse/src/path_condition.rs` /
+  `infer-rs/crates/pulse/src/abstract_state.rs` (vs OCaml's
+  `PulseAbductiveDomain.AddressAttributes.add_one`).
+- Effect: only changes pre_attr presentation; should not change reported
+  bugs. High-leverage fix — clearing this would erase ~38 of ~87 diffs.
+
+### Cluster B — `Initialized` post-attr leakage to formals (`x:[WrittenTo]` vs `x:[Initialized, WrittenTo]`)  (~10 occurrences)
+- Pattern: post_attrs `missing=["x:[Initialized, WrittenTo]"]` /
+  `extra=["x:[WrittenTo]"]`.
+- Files: latent.c (traverse_and_crash_*), memory_leak.c
+  (malloc_formal_leak_bad, report_leak_in_correct_line_bad,
+  malloc_out_parameter_*).
+- Diagnosis: Rust does not propagate `Initialized` to a formal pointer
+  after a write through it; OCaml does. Likely missing
+  `add_initialized` after `Store` of a formal address in Rust's
+  store-instruction transfer function (`pulse/src/checker/store.rs` or
+  similar). Worth confirming.
+
+### Cluster C — `Allocated(CMalloc)` missing the `Uninitialized` companion attr  (~12 occurrences)
+- Pattern: post_attrs `missing=[".*:[Allocated(CMalloc), Uninitialized]"]`
+  / `extra=[".*:[Allocated(CMalloc)]"]`.
+- Files: memory_leak.c (allocate_in_array, allocate_42_in_array,
+  allocate_all_in_array, free_42_in_array, alloc_then_free_parameter_array_ok,
+  malloc_returned_ok, malloc_out_parameter*, create_p, …).
+- Diagnosis: Rust's malloc model emits `Allocated` but not the paired
+  `Uninitialized` attribute that OCaml's
+  `PulseAbductiveDomain.AddressAttributes.{set_uninitialized, add_one}`
+  attaches. Surface-only divergence today, but if any caller reasons
+  about uninitialized allocation, this could turn into a real FN.
+
+### Cluster D — Function-pointer / closure summary surface  (~10 occurrences)
+- Pattern: pre_attrs `missing=["malloc_func=malloc_func"]` (in pre_stack)
+  + `phi missing=["atom:0 < malloc_func.*"]` /
+  post_attrs `missing=[".*:[Initialized]"]` / `extra=[".*:[Closure(...), Initialized]"]`.
+- Files: memory_leak.c (every `*_via_ptr`, every `malloc_ptr_*`,
+  `__infer_globals_initializer_*`, `free_via_ptr`),
+  funptr.c (`return_funptr`, `test_*_callback_*`, `apply_callback`).
+- Diagnosis: Rust serialises captured globals (the function pointers)
+  with the `Closure(<callee>)` attribute and elides the matching
+  `0 < <addr>` strict-positivity atom; OCaml uses the inverse encoding
+  (no Closure attr, just the formula atom + a stack entry for the
+  global). This is a *whole encoding-strategy* diff, not a one-liner.
+  Touches `pulse/src/closures.rs` and OCaml's
+  `PulseSummary.add_pre_stack_for_globals` / how
+  `PulseClosures.MakeClosure` serialises.
+
+### Cluster E — `UsedAsBranchCond` over-attachment on Rust side  (~25 occurrences in latent.c)
+- Pattern: pre_attrs `extra=[".*:[..., UsedAsBranchCond(<caller>)]"]`
+  with no OCaml peer. Often paired with a kind flip
+  `LatentInvalidAccess → AbortProgram` and an extra
+  `AccessToInvalidAddress` diagnostic.
+- Files: latent.c (`traverse_and_crash_*`,
+  `crash_after_*`, `crash_if_different_addresses`,
+  `equal_to_stack_address_test_then_crash_bad`).
+- Diagnosis: Rust marks every formal that ever feeds a branch with
+  `UsedAsBranchCond`, even when OCaml leaves it empty because the
+  branch was discharged via the formula instead. The correlated
+  kind-flip + extra diagnostic suggests the over-attachment is
+  preventing the latent-promotion logic in
+  `PulseSummary.summary_of_post`/`abductive_state_for_post` from
+  recognising the constraint as already satisfied.
+- This is the most semantically loaded cluster — worth a focused
+  follow-up because it actually changes which procedures publish a
+  Pulse diagnostic.
+
+### Cluster F — Atom encoding: `cond:0 < x` (Rust) vs `phi:atom:0 < x` (OCaml)  (~5 occurrences in memory_leak.c)
+- Pattern: conditions `extra=["cond:0 < v2"]` /
+  phi `missing=["atom:0 < v2"]`.
+- Files: memory_leak.c (alloc_then_free_parameter_array_ok,
+  alloc_ref_counted_arith_ok, …), arithmetic.c (`return_non_negative*`).
+- Diagnosis: Rust currently routes some witness atoms into
+  `path_condition.conditions`; OCaml keeps them in `phi`. The
+  comparator already canonicalises a lot of this, but a few survive.
+  Worth a tiny canonicalizer extension OR fix at the producer site
+  (`pulse/src/formula.rs::record_condition`).
+
+### Cluster G — `is_int(...)` divergence (Rust adds, OCaml omits, or vice-versa)  (~10 occurrences)
+- Files: funptr.c (`funptr_*_good`, `funptr_apply_*`,
+  `funptr_conditional_call_bad`, `dereference_dereference_ptr`),
+  memory_leak.c (`alloc_then_free_at_index_ok`, `interproc_mutual_recursion_leak`),
+  specialization.c.
+- Diagnosis: Rust adds `is_int(return.*)` to closure-call returns
+  where OCaml has `eq:return.*=0` (a stronger, dependent fact). The
+  comparator already strips redundant `is_int`, but here the OCaml
+  side doesn't have it because it has a *better* fact. Indicates the
+  closure-call modelling drops the equality fact in Rust.
+
+### Cluster H — Linear-form encoding diffs surviving the canonicalizer (~6 occurrences)
+- Pattern: phi `missing=["eq:x.*=lin(-1*v1,const=5)"]` with no rust peer.
+- Files: interprocedural.c (`conditional_free*`), arithmetic.c
+  (`assume_non_negative*`).
+- Diagnosis: A handful of linear equalities are lost in the Rust
+  formula because the call-summary substitution drops the affine
+  link between the caller's local and the callee's formal. The
+  canonicalizer cannot rescue this — it's a real summary-content
+  loss.
+
+## Cross-file procedure-level deltas worth tracking
+
+| Procedure                                      | File              | Severity | Notes |
+|------------------------------------------------|-------------------|----------|-------|
+| `traverse_and_crash_if_equal_to_root`          | latent.c          | high     | 7 OCaml pre_posts → 10 Rust; kind flips ContinueProgram→AbortProgram on three of them with brand-new diagnostics. Cluster E. |
+| `crash_after_two_nodes_bad`                    | latent.c          | high     | OCaml 4 → Rust 5; one ContinueProgram→AbortProgram flip + extra diagnostic. Cluster E. |
+| `FN_call_if_negative_then_crash_with_negative_bad` | arithmetic.c  | high     | Rust raises `AccessToInvalidAddress(ConstantDereference(0))` that OCaml leaves silent. |
+| `if_negative_then_crash_latent`                | arithmetic.c      | high     | Rust adds the same null-deref diagnostic. |
+| `call_if_negative_then_crash_with_local_bad`   | arithmetic.c      | high     | OCaml has 3 pre_posts, Rust 2; an `ExitProgram` post-condition is missing in Rust. |
+| `realloc_no_check_bad`, `realloc_no_free_bad`  | memory_leak.c     | medium   | OCaml has 4 pre_posts, Rust 1–3; multiple `ContinueProgram` cases collapsed. Likely realloc model surface diff. |
+| `free_all_in_array`, `allocate_all_in_array`   | memory_leak.c     | medium   | Multiple `eq:vN=…` and `Invalid(ConstantDereference(N))` post-attrs missing on Rust side; index/value indirection through arrays. |
+| `funptr_apply_funptr_with_intptrptr_and_after_*` | funptr.c        | medium   | OCaml has 2 pre_posts (one `AbortProgram` + diagnostic), Rust has 0 — Rust drops the bug entirely. |
+| `apply_callback`                               | funptr.c          | low      | Specialization-key encoding mismatch: Rust emits two `dynamic_types: {**callback->f: assign_NULL/do_nothing}` keys; OCaml emits a single `⊥`. |
+| `crash_if_different_addresses`                 | latent.c          | low      | OCaml 1 → Rust 2; an extra ContinueProgram in Rust where the post-state is reachable via formula equality OCaml prunes. |
+| `may_double_free_if_alias`                     | specialization.c  | low      | The single still-failing case in specialization.c; OCaml 3 main / Rust 4; latent kind flip + post_attr drift. |
+
+## Out-of-scope but observed
+
+- nullptr.c hangs Rust Pulse (already tracked elsewhere); did NOT
+  re-investigate the cause here.
+- `infer/bin/infer` is empty in this checkout. INFER_BIN env points
+  at the user's installed tree at `/Users/mtrojer/infer/infer/bin/infer`
+  (Infer v1.2.0-e0d18cf1b6) and the harness handles that fine.
