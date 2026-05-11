@@ -29,6 +29,25 @@ pub trait Comparable: Clone + fmt::Debug + PartialEq {
     fn equal_fast(&self, rhs: &Self) -> bool {
         self == rhs
     }
+
+    /// Cross-product subset check used by `DisjunctiveDomain::leq` after
+    /// the cheap `equal_fast` / `is_trivial_subset` short-circuits fail.
+    ///
+    /// Returns `true` iff every disjunct in `lhs_disjuncts` is `<=` some
+    /// disjunct in `rhs_disjuncts` under the inner-domain ordering.
+    /// Default impl drives the obvious O(N·M) `leq` cross-product.
+    /// Implementations may override to amortise per-disjunct work that
+    /// the inner `leq` would otherwise repeat across the cross-product
+    /// (e.g. Pulse's `state_cmp::canonicalize`, which is the dominant
+    /// cost on `DES_ede3_cfb_encrypt`).
+    ///
+    /// Semantics MUST exactly match the default implementation. This is
+    /// a structural rewrite hook, not a heuristic short-circuit.
+    fn disjunctive_leq_subset(lhs_disjuncts: &[Self], rhs_disjuncts: &[Self]) -> bool {
+        lhs_disjuncts
+            .iter()
+            .all(|d| rhs_disjuncts.iter().any(|r| d.leq(r)))
+    }
 }
 
 /// Abstract domain with join and widening.

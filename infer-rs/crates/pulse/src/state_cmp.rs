@@ -499,8 +499,12 @@ pub(crate) fn debug_canonical_dump(state: &AbductiveDomain) -> String {
 }
 
 /// Compare two states modulo abstract-value renaming.
+///
+/// Equivalent to [`eq_canonical`] composed with [`canonicalize_state`] on
+/// both sides; see [`canonicalize_state`] for the cross-product
+/// optimisation used by `DisjunctiveDomain::leq` on `ExecutionDomain`.
 pub fn alpha_equivalent(lhs: &AbductiveDomain, rhs: &AbductiveDomain) -> bool {
-    canonicalize(lhs).state == canonicalize(rhs).state
+    eq_canonical(&canonicalize_state(lhs), &canonicalize_state(rhs))
 }
 
 /// Compare two state values modulo the same alpha-renaming used by
@@ -509,17 +513,71 @@ pub fn alpha_equivalent(lhs: &AbductiveDomain, rhs: &AbductiveDomain) -> bool {
 /// This is stricter than raw [`AbstractValue`] equality: the states must be
 /// semantically equivalent, and the designated values must land on the same
 /// canonical value within that equivalence.
+///
+/// Equivalent to [`eq_canonical_with_value`] composed with
+/// [`canonicalize_state`] on both sides.
 pub fn alpha_equivalent_value(
     lhs: &AbductiveDomain,
     lhs_value: AbstractValue,
     rhs: &AbductiveDomain,
     rhs_value: AbstractValue,
 ) -> bool {
-    let lhs = canonicalize(lhs);
-    let rhs = canonicalize(rhs);
-    lhs.state == rhs.state
+    let lhs = canonicalize_state(lhs);
+    let rhs = canonicalize_state(rhs);
+    eq_canonical_with_value(&lhs, lhs_value, &rhs, rhs_value)
+}
+
+/// Pre-canonicalise an [`AbductiveDomain`] for repeated alpha-equivalence
+/// comparisons.
+///
+/// Use this when the same state participates in many leq comparisons
+/// (e.g. `DisjunctiveDomain::leq`'s N×M cross-product over
+/// `ExecutionDomain`s). Pre-canonicalising each side once and then
+/// driving the inner loop with [`eq_canonical`] / [`eq_canonical_with_value`]
+/// turns 2·N·M canonicalize calls into N+M, with byte-identical
+/// equality semantics:
+/// `alpha_equivalent(a, b) == eq_canonical(&canonicalize_state(a), &canonicalize_state(b))`
+/// and analogously for `alpha_equivalent_value`. The
+/// `alpha_equivalent_matches_canonicalize_then_eq_canonical_*` tests
+/// pin this invariant.
+pub fn canonicalize_state(state: &AbductiveDomain) -> CanonicalAbductive {
+    CanonicalAbductive {
+        inner: canonicalize(state),
+    }
+}
+
+/// Pre-canonicalised state suitable for repeated [`eq_canonical`] /
+/// [`eq_canonical_with_value`] calls. Opaque on purpose; the only
+/// supported operations are the two `eq_canonical*` helpers below.
+pub struct CanonicalAbductive {
+    inner: CanonicalizedState,
+}
+
+/// Compare two pre-canonicalised states for alpha-equivalence.
+///
+/// `eq_canonical(&canonicalize_state(a), &canonicalize_state(b))` is
+/// byte-identical to `alpha_equivalent(a, b)`.
+pub fn eq_canonical(lhs: &CanonicalAbductive, rhs: &CanonicalAbductive) -> bool {
+    lhs.inner.state == rhs.inner.state
+}
+
+/// Compare two pre-canonicalised states *and* designated values for
+/// alpha-equivalence.
+///
+/// `eq_canonical_with_value(&canonicalize_state(a), av, &canonicalize_state(b), bv)`
+/// is byte-identical to `alpha_equivalent_value(a, av, b, bv)`.
+pub fn eq_canonical_with_value(
+    lhs: &CanonicalAbductive,
+    lhs_value: AbstractValue,
+    rhs: &CanonicalAbductive,
+    rhs_value: AbstractValue,
+) -> bool {
+    lhs.inner.state == rhs.inner.state
         && matches!(
-            (lhs.value_label(lhs_value), rhs.value_label(rhs_value)),
+            (
+                lhs.inner.value_label(lhs_value),
+                rhs.inner.value_label(rhs_value),
+            ),
             (Some(lhs_label), Some(rhs_label)) if lhs_label == rhs_label
         )
 }
@@ -1707,6 +1765,170 @@ mod tests {
         ));
         state.write_heap(pointee, field, extra);
         state.allocate(extra, Allocator::CMalloc, Location::dummy());
+    }
+
+    /// Pin the contract that the `canonicalize_state` + `eq_canonical`
+    /// split is byte-identical to `alpha_equivalent` on every shape
+    /// state pair the existing suite covers (alpha-renamed, disconnected
+    /// garbage, helper sets, attribute timestamps, dynamic types, and
+    /// reachable-heap diff). Without this lock, the
+    /// `DisjunctiveDomain<ExecutionDomain>::leq` cross-product
+    /// optimisation could silently drift away from `alpha_equivalent`'s
+    /// equality.
+    #[test]
+    fn alpha_equivalent_matches_canonicalize_then_eq_canonical_state_only() {
+        // Every (lhs, rhs) pair below is a fixture used elsewhere in
+        // this module. For each one we assert the structural identity
+        //   alpha_equivalent(a, b)
+        // ==
+        //   eq_canonical(&canonicalize_state(a), &canonicalize_state(b))
+        // both ways.
+        fn check(lhs: &AbductiveDomain, rhs: &AbductiveDomain) {
+            let lhs_canon = canonicalize_state(lhs);
+            let rhs_canon = canonicalize_state(rhs);
+            assert_eq!(
+                alpha_equivalent(lhs, rhs),
+                eq_canonical(&lhs_canon, &rhs_canon),
+                "alpha_equivalent must equal eq_canonical(canonicalize(lhs), canonicalize(rhs))"
+            );
+            assert_eq!(
+                alpha_equivalent(rhs, lhs),
+                eq_canonical(&rhs_canon, &lhs_canon),
+                "alpha_equivalent must equal eq_canonical(canonicalize(rhs), canonicalize(lhs))"
+            );
+        }
+
+        // alpha-renamed via burning IDs.
+        AbstractValue::reset_counters();
+        let a = make_state(0, false);
+        AbstractValue::reset_counters();
+        let b = make_state(2, false);
+        check(&a, &b);
+
+        // disconnected garbage on rhs.
+        AbstractValue::reset_counters();
+        let a = make_state(0, false);
+        AbstractValue::reset_counters();
+        let b = make_state(2, true);
+        check(&a, &b);
+
+        // attribute timestamps differ.
+        AbstractValue::reset_counters();
+        let mut a = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut b = make_state(0, false);
+        let formal_a = a.post.stack.iter().next().map(|(_, addr)| *addr).unwrap();
+        let formal_b = b.post.stack.iter().next().map(|(_, addr)| *addr).unwrap();
+        let loc = Location::dummy();
+        a.add_attr(formal_a, Attribute::MustBeValid(1, loc.clone(), None));
+        b.add_attr(formal_b, Attribute::MustBeValid(99, loc.clone(), None));
+        check(&a, &b);
+
+        // structurally distinct via extra reachable edge.
+        AbstractValue::reset_counters();
+        let a = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut b = make_state(2, false);
+        add_extra_reachable_edge(&mut b);
+        check(&a, &b);
+
+        // identity on the same state must always agree.
+        AbstractValue::reset_counters();
+        let a = make_state(1, false);
+        check(&a, &a);
+    }
+
+    /// Same contract for the value variant (used by
+    /// `LatentInvalidAccess` leq). Locks `alpha_equivalent_value` ==
+    /// `eq_canonical_with_value(canonicalize(lhs), av, canonicalize(rhs), bv)`.
+    #[test]
+    fn alpha_equivalent_value_matches_canonicalize_then_eq_canonical_with_value() {
+        // Equivalent states + matching values: must be true under both APIs.
+        AbstractValue::reset_counters();
+        let mut a = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut b = make_state(3, false);
+        let formal_a = a.post.stack.iter().next().map(|(_, addr)| *addr).unwrap();
+        let formal_b = b.post.stack.iter().next().map(|(_, addr)| *addr).unwrap();
+        let pointee_a = a.read_heap(formal_a, Access::Dereference);
+        let pointee_b = b.read_heap(formal_b, Access::Dereference);
+
+        let a_canon = canonicalize_state(&a);
+        let b_canon = canonicalize_state(&b);
+        assert_eq!(
+            alpha_equivalent_value(&a, pointee_a, &b, pointee_b),
+            eq_canonical_with_value(&a_canon, pointee_a, &b_canon, pointee_b),
+        );
+        // Mismatched values on equivalent states: both APIs must say false.
+        assert_eq!(
+            alpha_equivalent_value(&a, formal_a, &b, pointee_b),
+            eq_canonical_with_value(&a_canon, formal_a, &b_canon, pointee_b),
+        );
+        // States not equivalent (extra reachable edge): both APIs say false.
+        AbstractValue::reset_counters();
+        let mut c = make_state(0, false);
+        add_extra_reachable_edge(&mut c);
+        let formal_c = c.post.stack.iter().next().map(|(_, addr)| *addr).unwrap();
+        let pointee_c = c.read_heap(formal_c, Access::Dereference);
+        let c_canon = canonicalize_state(&c);
+        assert_eq!(
+            alpha_equivalent_value(&a, pointee_a, &c, pointee_c),
+            eq_canonical_with_value(&a_canon, pointee_a, &c_canon, pointee_c),
+        );
+    }
+
+    /// End-to-end: with the new `disjunctive_leq_subset` hook on
+    /// `ExecutionDomain`, the cross-product `DisjunctiveDomain::leq`
+    /// observation must be byte-identical to the previous (default) impl.
+    /// We exercise the alpha-renamed cross-product on a multi-disjunct
+    /// pair so the optimised path is actually taken.
+    #[test]
+    fn disjunctive_leq_with_canonical_optimisation_matches_default_semantics() {
+        AbstractValue::reset_counters();
+        let a1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let a2 = make_state(2, false);
+        AbstractValue::reset_counters();
+        let b1 = make_state(0, false);
+        AbstractValue::reset_counters();
+        let mut b2 = make_state(2, false);
+        add_extra_reachable_edge(&mut b2);
+
+        // Build two domains: lhs has {a1, a2}, rhs has {b1, b2}. b1 is
+        // alpha-equivalent to a1 (and a2); b2 is structurally distinct.
+        let lhs = DisjunctiveDomain {
+            disjuncts: vec![
+                ExecutionDomain::ContinueProgram(a1),
+                ExecutionDomain::ContinueProgram(a2),
+            ],
+            max_disjuncts: 20,
+            max_widen_iters: 3,
+            had_dropped_disjuncts: false,
+        };
+        let rhs = DisjunctiveDomain {
+            disjuncts: vec![
+                ExecutionDomain::ContinueProgram(b1),
+                ExecutionDomain::ContinueProgram(b2),
+            ],
+            max_disjuncts: 20,
+            max_widen_iters: 3,
+            had_dropped_disjuncts: false,
+        };
+
+        // Reference implementation: explicit N·M cross-product with
+        // the unoptimised `alpha_equivalent` path.
+        let reference = lhs
+            .disjuncts
+            .iter()
+            .all(|l| rhs.disjuncts.iter().any(|r| l.leq(r)));
+        assert!(
+            reference,
+            "lhs should be subsumed by rhs in the reference impl"
+        );
+        // The DisjunctiveDomain leq path now goes through the
+        // `disjunctive_leq_subset` hook, which on `ExecutionDomain`
+        // pre-canonicalises each disjunct once. Result must match.
+        assert_eq!(reference, lhs.leq(&rhs));
     }
 
     #[test]

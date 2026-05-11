@@ -11,6 +11,9 @@ use absint::domain::Comparable;
 
 use crate::abductive::AbductiveDomain;
 use crate::diagnostic::Diagnostic;
+use crate::state_cmp::{
+    canonicalize_state, eq_canonical, eq_canonical_with_value, CanonicalAbductive,
+};
 
 /// The state of an analysis path after executing an instruction.
 ///
@@ -164,6 +167,103 @@ impl Comparable for ExecutionDomain {
             _ => false,
         }
     }
+
+    /// Pre-canonicalise each disjunct's underlying `AbductiveDomain`
+    /// once (N+M calls instead of 2·N·M) and drive the cross-product
+    /// over the cached canonical states. Semantics are byte-identical
+    /// to the default impl: every comparison that the default would run
+    /// is invoked here, only with the canonicalisation hoisted out of
+    /// the inner loop.
+    ///
+    /// Cross-ref: worker-profile-2 measured `state_cmp::canonicalize`
+    /// at 76% inclusive on `DES_ede3_cfb_encrypt`, almost entirely from
+    /// this cross-product. See task
+    /// `perf_dedupe_alpha_equivalent_canonicalize_in_disjunctive_leq`.
+    fn disjunctive_leq_subset(lhs_disjuncts: &[Self], rhs_disjuncts: &[Self]) -> bool {
+        let lhs_canon: Vec<CanonicalAbductive> = lhs_disjuncts
+            .iter()
+            .map(|d| canonicalize_state(d.get_astate()))
+            .collect();
+        let rhs_canon: Vec<CanonicalAbductive> = rhs_disjuncts
+            .iter()
+            .map(|d| canonicalize_state(d.get_astate()))
+            .collect();
+        lhs_disjuncts.iter().enumerate().all(|(i, l)| {
+            rhs_disjuncts
+                .iter()
+                .enumerate()
+                .any(|(j, r)| l.leq_with_canonical(r, &lhs_canon[i], &rhs_canon[j]))
+        })
+    }
+}
+
+impl ExecutionDomain {
+    /// `Comparable::leq` reusing pre-canonicalised states for both sides.
+    ///
+    /// Mirrors the body of `<ExecutionDomain as Comparable>::leq`
+    /// exactly, just substituting:
+    ///   - `state_cmp::alpha_equivalent(a, b)` →
+    ///     `state_cmp::eq_canonical(a_canon, b_canon)`
+    ///   - `state_cmp::alpha_equivalent_value(a, av, b, bv)` →
+    ///     `state_cmp::eq_canonical_with_value(a_canon, av, b_canon, bv)`
+    ///
+    /// Both substitutions are byte-identical equality checks (see the
+    /// `alpha_equivalent_matches_canonicalize_then_eq_canonical_*`
+    /// tests in `state_cmp`), so no observable behaviour changes.
+    fn leq_with_canonical(
+        &self,
+        rhs: &Self,
+        lhs_canon: &CanonicalAbductive,
+        rhs_canon: &CanonicalAbductive,
+    ) -> bool {
+        if self.equal_fast(rhs) {
+            return true;
+        }
+
+        use ExecutionDomain::{
+            AbortProgram, ContinueProgram, ExceptionRaised, ExitProgram, LatentAbortProgram,
+            LatentInvalidAccess,
+        };
+
+        match (self, rhs) {
+            (ContinueProgram(_), ContinueProgram(_))
+            | (ExceptionRaised(_), ExceptionRaised(_))
+            | (ExitProgram(_), ExitProgram(_)) => eq_canonical(lhs_canon, rhs_canon),
+            (
+                AbortProgram {
+                    diagnostic: lhs_diag,
+                    ..
+                },
+                AbortProgram {
+                    diagnostic: rhs_diag,
+                    ..
+                },
+            )
+            | (
+                LatentAbortProgram {
+                    diagnostic: lhs_diag,
+                    ..
+                },
+                LatentAbortProgram {
+                    diagnostic: rhs_diag,
+                    ..
+                },
+            ) => eq_canonical(lhs_canon, rhs_canon) && diagnostics_compatible(lhs_diag, rhs_diag),
+            (
+                LatentInvalidAccess {
+                    diagnostic: lhs_diag,
+                    ..
+                },
+                LatentInvalidAccess {
+                    diagnostic: rhs_diag,
+                    ..
+                },
+            ) => {
+                diagnostics_compatible_semantic_canonical(lhs_canon, lhs_diag, rhs_canon, rhs_diag)
+            }
+            _ => false,
+        }
+    }
 }
 
 fn diagnostics_compatible(lhs: &Diagnostic, rhs: &Diagnostic) -> bool {
@@ -248,6 +348,49 @@ fn diagnostics_compatible_semantic(
             },
         ) => {
             crate::state_cmp::alpha_equivalent_value(lhs_state, *lhs_addr, rhs_state, *rhs_addr)
+                && lhs_invalidation == rhs_invalidation
+                && lhs_access_location == rhs_access_location
+                && lhs_access_history == rhs_access_history
+                && lhs_invalidation_history == rhs_invalidation_history
+        }
+        _ => diagnostics_compatible(lhs, rhs),
+    }
+}
+
+/// Pre-canonicalised counterpart of [`diagnostics_compatible_semantic`].
+///
+/// Identical to the original except the `alpha_equivalent_value` call
+/// is replaced with `eq_canonical_with_value` over the supplied
+/// canonical states. The fall-through arm (`diagnostics_compatible`)
+/// does not touch state, so it is reused unchanged.
+fn diagnostics_compatible_semantic_canonical(
+    lhs_canon: &CanonicalAbductive,
+    lhs: &Diagnostic,
+    rhs_canon: &CanonicalAbductive,
+    rhs: &Diagnostic,
+) -> bool {
+    match (lhs, rhs) {
+        (
+            Diagnostic::AccessToInvalidAddress {
+                addr: lhs_addr,
+                invalidation: lhs_invalidation,
+                access_location: lhs_access_location,
+                trace_access_location: None,
+                access_history: lhs_access_history,
+                invalidation_history: lhs_invalidation_history,
+                ..
+            },
+            Diagnostic::AccessToInvalidAddress {
+                addr: rhs_addr,
+                invalidation: rhs_invalidation,
+                access_location: rhs_access_location,
+                trace_access_location: None,
+                access_history: rhs_access_history,
+                invalidation_history: rhs_invalidation_history,
+                ..
+            },
+        ) => {
+            eq_canonical_with_value(lhs_canon, *lhs_addr, rhs_canon, *rhs_addr)
                 && lhs_invalidation == rhs_invalidation
                 && lhs_access_location == rhs_access_location
                 && lhs_access_history == rhs_access_history

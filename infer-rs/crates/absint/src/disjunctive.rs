@@ -144,9 +144,13 @@ impl<D: Comparable> Comparable for DisjunctiveDomain<D> {
         if self.equal_fast(rhs) || self.is_trivial_subset(rhs) {
             return true;
         }
-        self.disjuncts
-            .iter()
-            .all(|d| rhs.disjuncts.iter().any(|r| d.leq(r)))
+        // Delegate the cross-product to the inner domain's hook so
+        // implementations can amortise per-disjunct setup (e.g. Pulse
+        // canonicalises each disjunct once instead of 2·N·M times). The
+        // default impl is the obvious N·M `leq` cross-product, so this
+        // change is semantics-preserving for any `Comparable` that does
+        // not override the hook.
+        D::disjunctive_leq_subset(&self.disjuncts, &rhs.disjuncts)
     }
 
     fn equal_fast(&self, rhs: &Self) -> bool {
