@@ -315,12 +315,78 @@ fn exec_prune(
     loc: &Location,
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
+    // Cross-ref: OCaml `Pulse.check_config_usage` runs over the prune
+    // expression *before* the prune itself and walks `Exp.free_vars`
+    // (logical idents only, not Lvars). It then resolves each ident through
+    // `read_id` and abduces `UsedAsBranchCond` on the stack value via
+    // `PulseAbductiveDomain.SafeAttributes.abduce_one`, which silently
+    // drops the attribute when the address is not already materialised in
+    // `pre.heap`. Mirror that here so we do not stamp `UsedAsBranchCond`
+    // on derived intermediates (e.g. `&x` from `if (y == &x)`) or on
+    // values that never reflect a caller-visible read.
+    record_branch_cond_for_free_idents(pdesc, exp, loc, &mut state);
     if prune_expr(pdesc, exp, loc, &mut state) {
         log::trace!("  [prune] SAT: {exp}");
         vec![ExecutionDomain::ContinueProgram(state)]
     } else {
         log::debug!("  [prune] UNSAT (path killed): {exp}");
         vec![]
+    }
+}
+
+/// Walk `exp` collecting free logical idents (mirroring OCaml's
+/// `Exp.free_vars`) and abduce `UsedAsBranchCond` on the stack value behind
+/// each ident. Pure traversal — no formula evaluation, no fresh allocations.
+fn record_branch_cond_for_free_idents(
+    pdesc: Option<&Procdesc>,
+    exp: &Exp,
+    loc: &Location,
+    state: &mut AbductiveDomain,
+) {
+    let Some(pdesc) = pdesc else {
+        return;
+    };
+    let mut idents = Vec::new();
+    collect_free_idents(exp, &mut idents);
+    for id in idents {
+        let var = sil::var::Var::LogicalVar(id);
+        let Some(addr) = state.post.stack.find(&var) else {
+            continue;
+        };
+        let repr = state.path_condition.get_var_repr(addr);
+        // Same gating as OCaml's abduce_one: only attach the attribute if
+        // the address is already materialised in `pre.heap`.
+        if state.pre.heap.get_edges(repr).is_none() {
+            continue;
+        }
+        state.pre.attrs.add_one(
+            repr,
+            crate::attribute::Attribute::UsedAsBranchCond(pdesc.proc_name.clone(), loc.clone()),
+        );
+    }
+}
+
+/// Mirror OCaml's `Exp.free_vars` — collect only logical idents (`Exp::Var`),
+/// not program-var addresses (`Exp::Lvar`) or constants.
+fn collect_free_idents(exp: &Exp, out: &mut Vec<sil::ident::Ident>) {
+    match exp {
+        Exp::Var(id) => out.push(id.clone()),
+        Exp::Cast(_, inner)
+        | Exp::UnOp(_, inner, _)
+        | Exp::Exn(inner)
+        | Exp::Lfield(sil::exp::LfieldObjData { exp: inner, .. }, _, _) => {
+            collect_free_idents(inner, out)
+        }
+        Exp::BinOp(_, lhs, rhs) | Exp::Lindex(lhs, rhs) => {
+            collect_free_idents(lhs, out);
+            collect_free_idents(rhs, out);
+        }
+        Exp::Closure(c) => {
+            for (e, _) in &c.captured_vars {
+                collect_free_idents(e, out);
+            }
+        }
+        Exp::Const(_) | Exp::Lvar(_) | Exp::Sizeof(_) => {}
     }
 }
 
@@ -359,8 +425,6 @@ fn prune_binop(
         Exp::BinOp(Binop::Lt, lhs, rhs) => {
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x < y) → y ≤ x
                 state.prune_less_equal(&op_rhs, &op_lhs).is_sat()
@@ -371,8 +435,6 @@ fn prune_binop(
         Exp::BinOp(Binop::Le, lhs, rhs) => {
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x ≤ y) → y < x
                 state.prune_less_than(&op_rhs, &op_lhs).is_sat()
@@ -384,8 +446,6 @@ fn prune_binop(
             // x > y ↔ y < x
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x > y) → x ≤ y
                 state.prune_less_equal(&op_lhs, &op_rhs).is_sat()
@@ -397,8 +457,6 @@ fn prune_binop(
             // x ≥ y ↔ y ≤ x
             let op_lhs = eval_operand_for_prune(lhs, loc, state);
             let op_rhs = eval_operand_for_prune(rhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_lhs, loc, state);
-            record_operand_used_as_branch_cond(pdesc, &op_rhs, loc, state);
             if negated {
                 // !(x ≥ y) → y < x  → wait, !(x ≥ y) = y > x = x < y
                 state.prune_less_than(&op_lhs, &op_rhs).is_sat()
@@ -413,7 +471,6 @@ fn prune_binop(
         // Default: variable/expression — truthy (≠ 0) or falsy (= 0)
         _ => {
             let val = operations::eval_or_fresh_for_prune(exp, loc, state);
-            record_used_as_branch_cond(pdesc, val, loc, state);
             state.prune_eq_const(val, 0, !negated).is_sat()
         }
     }
@@ -440,35 +497,8 @@ fn eval_operand_for_prune(
     }
 }
 
-fn record_used_as_branch_cond(
-    pdesc: Option<&Procdesc>,
-    value: AbstractValue,
-    loc: &Location,
-    state: &mut AbductiveDomain,
-) {
-    let Some(pdesc) = pdesc else {
-        return;
-    };
-    let value = state.path_condition.get_var_repr(value);
-    state.pre.attrs.add_one(
-        value,
-        crate::attribute::Attribute::UsedAsBranchCond(pdesc.proc_name.clone(), loc.clone()),
-    );
-}
-
-fn record_operand_used_as_branch_cond(
-    pdesc: Option<&Procdesc>,
-    operand: &crate::formula::Operand,
-    loc: &Location,
-    state: &mut AbductiveDomain,
-) {
-    if let crate::formula::Operand::AbstractValue(value) = operand {
-        record_used_as_branch_cond(pdesc, *value, loc, state);
-    }
-}
-
 fn prune_eq_operands(
-    pdesc: Option<&Procdesc>,
+    _pdesc: Option<&Procdesc>,
     lhs: &Exp,
     rhs: &Exp,
     loc: &Location,
@@ -477,8 +507,6 @@ fn prune_eq_operands(
 ) -> bool {
     let lhs = eval_operand_for_prune(lhs, loc, state);
     let rhs = eval_operand_for_prune(rhs, loc, state);
-    record_operand_used_as_branch_cond(pdesc, &lhs, loc, state);
-    record_operand_used_as_branch_cond(pdesc, &rhs, loc, state);
     match (lhs, rhs) {
         (
             crate::formula::Operand::AbstractValue(v1),
@@ -1654,6 +1682,11 @@ mod tests {
         let p = AbstractValue::mk_fresh();
         let id = Ident::create_normal(IdentName::from_string("p"), 0);
         state.post.stack.add(Var::LogicalVar(id.clone()), p);
+        // Cross-ref: OCaml `PulseAbductiveDomain.SafeAttributes.abduce_one`
+        // gates `UsedAsBranchCond` abduction on `BaseMemory.mem` over
+        // `pre.heap`. Mirror a Load-then-Prune sequence by registering `p`
+        // in pre.heap here.
+        state.pre.heap.register_address(p);
 
         let instr = Instr::Prune {
             exp: Exp::BinOp(
