@@ -761,8 +761,22 @@ impl Formula {
 
         self.phi_mut().simplify(keep);
 
+        // Cross-ref: OCaml `PulseFormula.DeadVariables.eliminate` filters
+        // `formula.conditions` against `closed_prunable_vars`, the formula-graph
+        // closure of `precondition_vocabulary` — *not* against `keep`. Conditions
+        // mentioning post-only values (e.g. a callee-local malloc return that
+        // is heap-reachable from a formal but not formula-reachable from the
+        // precondition) are dropped by OCaml because the caller has no way to
+        // influence them. Filtering by `keep` (the formula-reachable post set)
+        // would retain those conditions and surface them as `cond:0 < v` in
+        // exported summaries while OCaml only keeps the corresponding
+        // `phi.atoms` entry. This was Cluster F in the C-suite triage
+        // (memory_leak.c, arithmetic.c).
+        let condition_vocabulary_reprs: HashSet<_> = precondition_vocabulary
+            .iter()
+            .map(|v| self.phi.get_repr(*v))
+            .collect();
         let mut conditions: BTreeMap<Atom, usize> = BTreeMap::new();
-        let keep_reprs: HashSet<_> = keep.iter().map(|v| self.phi.get_repr(*v)).collect();
         for (atom, depth) in rewritten_conditions {
             if atom.is_trivially_true() == Some(true) {
                 continue;
@@ -770,7 +784,7 @@ impl Formula {
             if atom
                 .all_vars()
                 .into_iter()
-                .all(|v| keep_reprs.contains(&self.phi.get_repr(v)))
+                .all(|v| condition_vocabulary_reprs.contains(&self.phi.get_repr(v)))
             {
                 match conditions.get_mut(&atom) {
                     Some(existing_depth) => *existing_depth = (*existing_depth).min(depth),
@@ -1212,6 +1226,50 @@ mod tests {
             only_condition.is_trivially_true(),
             Some(true),
             "summary simplification should not erase caller-controlled linear guards"
+        );
+    }
+
+    #[test]
+    fn test_simplify_for_summary_drops_conditions_outside_precondition_vocabulary() {
+        // Cluster F repro: caller-invisible callee-local witness conditions
+        // (e.g. the `0 < ret` recorded by `free`'s prune_positive on a value
+        // that escaped via a heap edge but whose only formula-graph link is
+        // through dead vars) must be dropped from the exported summary's
+        // `conditions`. OCaml drops them via `closed_prunable_vars` derived
+        // from the formula-graph closure of the precondition vocabulary; only
+        // their `phi.atoms` peer is kept.
+        let mut f = Formula::ttrue();
+        let formal = AbstractValue::of_raw(1);
+        let post_only = AbstractValue::of_raw(2);
+
+        // Witness atom recorded in BOTH phi and conditions, mirroring how
+        // OCaml's `prune_binop` populates phi.atoms via `prune_atoms` and
+        // conditions via `add_condition`.
+        assert!(f
+            .prune_less_than(
+                &Operand::ConstOperand(0),
+                &Operand::AbstractValue(post_only)
+            )
+            .is_sat());
+
+        // `formula_reachable` (keep) sees `post_only` because some heap edge
+        // pulls it in; `precondition_vocabulary` does not because the formula
+        // graph never connects it to the formal.
+        let precondition_vocabulary = HashSet::from([formal]);
+        let keep = HashSet::from([formal, post_only]);
+        f.simplify_for_summary(&precondition_vocabulary, &keep);
+
+        assert!(
+            !f.conditions()
+                .contains_key(&Atom::LessThan(Term::Const(0), Term::Var(post_only))),
+            "conditions on values outside the precondition-vocabulary closure should be dropped, \
+             matching OCaml PulseFormula.DeadVariables.eliminate's `closed_prunable_vars` filter"
+        );
+        assert!(
+            f.phi()
+                .atoms
+                .contains(&Atom::LessThan(Term::Const(0), Term::Var(post_only))),
+            "the corresponding phi.atoms entry must survive: keep includes post_only so phi keeps the witness"
         );
     }
 
