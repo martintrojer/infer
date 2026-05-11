@@ -670,7 +670,10 @@ impl Canonicalizer {
 
     fn propagate_memory(&mut self, memory: &BaseMemory) {
         let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
-        entries.sort_by_key(|(src, _)| self.partial_value_key(*src));
+        // `sort_by_cached_key` evaluates `partial_value_key` exactly once
+        // per entry instead of O(N log N) times for `sort_by_key`. Sort
+        // order is unchanged because the cached key is identical.
+        entries.sort_by_cached_key(|(src, _)| self.partial_value_key(*src));
         for (src, edges) in entries {
             if self.get(src).is_none() {
                 continue;
@@ -679,7 +682,10 @@ impl Canonicalizer {
                 .iter()
                 .map(|(access, target)| (access, *target))
                 .collect();
-            edge_entries.sort_by_key(|(access, target)| self.partial_edge_key(access, *target));
+            // `partial_edge_key` allocates a fresh `AccessSortKey` per
+            // call; cache it once per entry.
+            edge_entries
+                .sort_by_cached_key(|(access, target)| self.partial_edge_key(access, *target));
             for (access, target) in edge_entries {
                 if let Access::ArrayAccess(_, index) = access {
                     self.map_value(*index);
@@ -691,7 +697,8 @@ impl Canonicalizer {
 
     fn propagate_attrs(&mut self, attrs: &BaseAddressAttributes) {
         let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
-        entries.sort_by_key(|(addr, _)| self.partial_value_key(*addr));
+        // Cache `partial_value_key` per entry; identical sort order.
+        entries.sort_by_cached_key(|(addr, _)| self.partial_value_key(*addr));
         for (addr, attrs) in entries {
             if self.get(addr).is_none() {
                 continue;
@@ -710,8 +717,10 @@ impl Canonicalizer {
         let phi = state.path_condition.phi();
 
         let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-        equalities
-            .sort_by_key(|(lhs, rhs)| (self.partial_value_key(*lhs), self.partial_value_key(*rhs)));
+        // Cached key = same tuple the old `sort_by_key` produced.
+        equalities.sort_by_cached_key(|(lhs, rhs)| {
+            (self.partial_value_key(*lhs), self.partial_value_key(*rhs))
+        });
         for (lhs, rhs) in equalities {
             if self.get(lhs).is_some() || self.get(rhs).is_some() {
                 self.map_value(lhs);
@@ -720,7 +729,7 @@ impl Canonicalizer {
         }
 
         let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-        linear_eqs.sort_by_key(|(lhs, _)| self.partial_value_key(**lhs));
+        linear_eqs.sort_by_cached_key(|(lhs, _)| self.partial_value_key(**lhs));
         for (lhs, lin) in linear_eqs {
             let vars: Vec<_> = std::iter::once(*lhs).chain(lin.get_variables()).collect();
             if vars.iter().any(|value| self.get(*value).is_some()) {
@@ -760,7 +769,7 @@ impl Canonicalizer {
         }
 
         let mut intervals: Vec<_> = phi.intervals.iter().collect();
-        intervals.sort_by_key(|(value, _)| self.partial_value_key(**value));
+        intervals.sort_by_cached_key(|(value, _)| self.partial_value_key(**value));
         for (value, _) in intervals {
             if self.get(*value).is_some() {
                 continue;
@@ -775,7 +784,7 @@ impl Canonicalizer {
         }
 
         let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-        is_int_vars.sort_by_key(|value| self.partial_value_key(*value));
+        is_int_vars.sort_by_cached_key(|value| self.partial_value_key(*value));
         for value in is_int_vars {
             if self.get(value).is_some() {
                 continue;
@@ -790,7 +799,7 @@ impl Canonicalizer {
         }
 
         let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-        fn_apps.sort_by_key(|(_, ret)| self.partial_value_key(**ret));
+        fn_apps.sort_by_cached_key(|(_, ret)| self.partial_value_key(**ret));
         for (key, ret) in fn_apps {
             let vars: Vec<_> = key
                 .actuals
