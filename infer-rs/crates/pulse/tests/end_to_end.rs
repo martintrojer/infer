@@ -1216,6 +1216,104 @@ fn test_summary_comparison_specialization_main() {
     );
 }
 
+/// Triage harness: run OCaml + Rust on a list of C Pulse tests and print a
+/// per-file mismatch report. Not a regression test — assertion is loose so it
+/// can surface deltas across many files. Override the file list via
+/// `INFER_RS_C_TRIAGE_FILES=arithmetic.c,latent.c` (comma-separated).
+///
+/// Heavy: spawns infer per file. Run with:
+///   cargo test -p pulse --test end_to_end \
+///       test_summary_comparison_c_triage -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_summary_comparison_c_triage() {
+    use test_harness::infer_runner::InferRunner;
+    use test_harness::summary_compare;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let default_files = [
+        "arithmetic.c",
+        "funptr.c",
+        "interprocedural.c",
+        "latent.c",
+        "memory_leak.c",
+        "nullptr.c",
+    ];
+    let env_files = std::env::var("INFER_RS_C_TRIAGE_FILES").ok();
+    let files: Vec<String> = match env_files.as_deref() {
+        Some(value) if !value.trim().is_empty() => value
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => default_files.iter().map(|s| s.to_string()).collect(),
+    };
+
+    let mut summary_lines = Vec::new();
+    for filename in &files {
+        let c_path = test_harness::fixtures::ocaml_c_test_dir()
+            .join("pulse")
+            .join(filename);
+        if !c_path.exists() {
+            eprintln!("--- {filename}: SKIPPED (file not found)");
+            summary_lines.push(format!("{filename}\tSKIPPED_NOT_FOUND"));
+            continue;
+        }
+        eprintln!("========== {filename} ==========");
+
+        let ocaml_summaries_path = match runner.analyze_pulse_c(&c_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("OCaml analysis failed for {filename}: {e}");
+                summary_lines.push(format!("{filename}\tOCAML_FAIL"));
+                continue;
+            }
+        };
+        let ocaml_summaries = summary_compare::parse_ocaml_summaries(&ocaml_summaries_path);
+
+        let sil_path = match runner.dump_textual_for_c(&c_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("dump-textual failed for {filename}: {e}");
+                summary_lines.push(format!("{filename}\tDUMP_TEXTUAL_FAIL"));
+                continue;
+            }
+        };
+        let tm = textual_utils::parse_file_and_convert(&sil_path);
+        let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+
+        let mut rust_summaries = std::collections::HashMap::new();
+        for (pname, summary) in store.to_vec() {
+            if sil::builtin_decl::is_declared(&pname) {
+                continue;
+            }
+            rust_summaries.insert(
+                pname.get_method_name().to_string(),
+                rust_summary_to_canonical(&summary),
+            );
+        }
+
+        let report = summary_compare::compare_summaries(&ocaml_summaries, &rust_summaries);
+        eprintln!("{report}");
+        summary_lines.push(format!(
+            "{filename}\tmatching={}\tdiffs={}\tocaml_only={}\trust_only={}",
+            report.matching,
+            report.differences.len(),
+            report.ocaml_only.len(),
+            report.rust_only.len(),
+        ));
+    }
+
+    eprintln!("========== TRIAGE SUMMARY ==========");
+    for line in &summary_lines {
+        eprintln!("{line}");
+    }
+}
+
 fn rust_summary_to_canonical(
     summary: &pulse::summary::PulseSummary,
 ) -> test_harness::summary_compare::CanonicalProcedureSummary {
