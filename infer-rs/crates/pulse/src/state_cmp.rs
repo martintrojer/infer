@@ -168,7 +168,7 @@ enum CanonAttribute {
     MustBeValid(Location, Option<MustBeValidReason>),
     MustBeInitialized(Location),
     WrittenTo(Location),
-    Other(Attribute),
+    Other(Box<Attribute>),
 }
 
 /// One dynamic-type binding in canonical form.
@@ -1249,7 +1249,7 @@ impl Canonicalizer {
                 CanonAttribute::MustBeInitialized(loc.clone())
             }
             Attribute::WrittenTo(_ts, loc) => CanonAttribute::WrittenTo(loc.clone()),
-            other => CanonAttribute::Other(other.clone()),
+            other => CanonAttribute::Other(Box::new(other.clone())),
         }
     }
 }

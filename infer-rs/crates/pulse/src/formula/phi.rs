@@ -961,6 +961,10 @@ impl Phi {
                 }
             }
         }
+        self.is_int_vars = std::mem::take(&mut self.is_int_vars)
+            .into_iter()
+            .map(|v| self.get_repr(v))
+            .collect();
 
         // Substitute in atoms
         let term_replacement = Term::Var(kept);

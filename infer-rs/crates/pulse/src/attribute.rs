@@ -376,6 +376,25 @@ impl Attributes {
     }
 }
 
+impl Attribute {
+    /// Whether this attribute means the cell was modified by the callee.
+    ///
+    /// Cross-ref: OCaml `PulseAttribute.Attributes.is_modified`, used by
+    /// `PulseInterproc.is_cell_read_only` to avoid replaying read-only summary
+    /// cells and overwriting caller-side facts.
+    pub(crate) fn is_modified(&self) -> bool {
+        matches!(
+            self,
+            Attribute::WrittenTo(_, _)
+                | Attribute::Initialized
+                | Attribute::Invalid(_, _)
+                | Attribute::UnknownEffect
+                | Attribute::Allocated(_, _)
+                | Attribute::Uninitialized
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

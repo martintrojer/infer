@@ -219,85 +219,15 @@ pub(crate) fn apply_summary_with_aliasing(
     let (stack_allocated_before_call, heap_allocated_before_call) =
         caller_state.snapshot_allocated_before_call();
 
-    // Step 2: Apply the callee's post heap to the caller.
-    //
-    // This must handle strong updates, not just writes. If an access exists in
-    // the callee pre but disappears from the callee post, we must delete the
-    // corresponding caller edge. Cross-ref: OCaml PulseInterproc.ml
-    // `delete_edges_in_callee_pre_from_caller` + `record_post_cell`.
-    let mut processed_pre_cells = HashSet::new();
-    for (callee_addr, pre_edges) in pre_post.pre.heap.iter() {
-        // Cross-ref: OCaml materializes actuals from the dereferenced formal
-        // value, not by replaying the callee formal stack cell onto the
-        // caller. Re-applying that bookkeeping cell after Step 1a would turn
-        // by-value actuals into bogus self-edges such as `v -*-> v`.
-        if value_actual_formal_stack_addrs.contains(callee_addr) {
-            continue;
-        }
-        let Some(&caller_addr) = subst.get(callee_addr) else {
-            continue;
-        };
-        apply_post_cell(
-            caller_addr,
-            Some(pre_edges),
-            pre_post.post.post.heap.get_edges(*callee_addr),
-            &mut subst,
-            &mut caller_state,
-        );
-        processed_pre_cells.insert(*callee_addr);
-    }
-
-    for (callee_addr, post_edges) in pre_post.post.post.heap.iter() {
-        if value_actual_formal_stack_addrs.contains(callee_addr) {
-            continue;
-        }
-        if processed_pre_cells.contains(callee_addr) {
-            continue;
-        }
-        let caller_addr = resolve_mut(&mut subst, *callee_addr);
-        apply_post_cell(
-            caller_addr,
-            None,
-            Some(post_edges),
-            &mut subst,
-            &mut caller_state,
-        );
-    }
-
-    // Step 3: Resolve the return value into the substitution before importing
-    // the formula, so constraints on the return value map to caller space.
-    if let Some(ret_addr) = &pre_post.result {
-        let caller_ret = resolve_mut(&mut subst, *ret_addr);
-        let ret_history = pre_post
-            .post
-            .history_of_value(*ret_addr)
-            .map(|history| history.map_formals(&formal_histories))
-            .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
-        operations::write_id_with_history(
-            ret_id,
-            crate::value_history::ValueWithHistory::new(caller_ret, ret_history),
-            &mut caller_state,
-        );
-    } else {
-        let fresh = AbstractValue::mk_fresh();
-        operations::write_id_with_history(
-            ret_id,
-            crate::value_history::ValueWithHistory::new(
-                fresh,
-                ValueHistory::assignment(loc.clone()),
-            ),
-            &mut caller_state,
-        );
-    }
-
     let callee_procname = summary_procname(pre_post);
     let callee_proc_start_location = summary_proc_start_location(pre_post);
 
-    // Step 4: Translate callee's formula constraints to the caller.
-    // We keep Rust's existing heap-then-formula sequencing, but preserve
-    // OCaml's allocation distinction by checking imported `EqZero` against the
-    // caller's pre-call allocation snapshot rather than the already-updated
-    // post heap.
+    // Step 2: Translate callee's formula constraints to the caller before
+    // applying post heap/attrs. OCaml's `materialize_pre` conjoins the callee
+    // path condition before `apply_post`; doing the same here lets equalities
+    // (notably closure-call return facts such as ret == 0) canonicalize the
+    // subsequent return/post write, instead of leaving a fresh return value
+    // carrying only `is_int`.
     log::debug!(
         "[apply_summary] translate_formula for {:?} pre_post",
         pre_post.kind
@@ -342,8 +272,86 @@ pub(crate) fn apply_summary_with_aliasing(
         }
     }
 
+    // Step 3: Apply the callee's post heap to the caller.
+    //
+    // This must handle strong updates, not just writes. If an access exists in
+    // the callee pre but disappears from the callee post, we must delete the
+    // corresponding caller edge. Cross-ref: OCaml PulseInterproc.ml
+    // `delete_edges_in_callee_pre_from_caller` + `record_post_cell`.
+    let mut processed_pre_cells = HashSet::new();
+    for (callee_addr, pre_edges) in pre_post.pre.heap.iter() {
+        // Cross-ref: OCaml materializes actuals from the dereferenced formal
+        // value, not by replaying the callee formal stack cell onto the
+        // caller. Re-applying that bookkeeping cell after Step 1a would turn
+        // by-value actuals into bogus self-edges such as `v -*-> v`.
+        if value_actual_formal_stack_addrs.contains(callee_addr) {
+            continue;
+        }
+        let Some(&caller_addr) = subst.get(callee_addr) else {
+            continue;
+        };
+        let post_edges = pre_post.post.post.heap.get_edges(*callee_addr);
+        if !callee_cell_is_read_only(Some(pre_edges), post_edges, pre_post, *callee_addr) {
+            apply_post_cell(
+                caller_addr,
+                Some(pre_edges),
+                post_edges,
+                &mut subst,
+                &mut caller_state,
+            );
+        }
+        processed_pre_cells.insert(*callee_addr);
+    }
+
+    for (callee_addr, post_edges) in pre_post.post.post.heap.iter() {
+        if value_actual_formal_stack_addrs.contains(callee_addr) {
+            continue;
+        }
+        if processed_pre_cells.contains(callee_addr) {
+            continue;
+        }
+        let caller_addr = resolve_mut(&mut subst, *callee_addr);
+        apply_post_cell(
+            caller_addr,
+            None,
+            Some(post_edges),
+            &mut subst,
+            &mut caller_state,
+        );
+    }
+
+    // Step 4: Resolve the return value after formula translation and post
+    // application, mirroring OCaml `read_return_value`. `resolve_mut` returns
+    // the same caller value that already received imported equalities and post
+    // heap writes, so the logical call result preserves stronger facts such as
+    // `ret == 0` and any dynamic-type/equality info instead of degrading to a
+    // fresh type-only result.
+    if let Some(ret_addr) = &pre_post.result {
+        let caller_ret = caller_state.get_var_repr(resolve_mut(&mut subst, *ret_addr));
+        let ret_history = pre_post
+            .post
+            .history_of_value(*ret_addr)
+            .map(|history| history.map_formals(&formal_histories))
+            .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
+        operations::write_id_with_history(
+            ret_id,
+            crate::value_history::ValueWithHistory::new(caller_ret, ret_history),
+            &mut caller_state,
+        );
+    } else {
+        let fresh = AbstractValue::mk_fresh();
+        operations::write_id_with_history(
+            ret_id,
+            crate::value_history::ValueWithHistory::new(
+                fresh,
+                ValueHistory::assignment(loc.clone()),
+            ),
+            &mut caller_state,
+        );
+    }
+
     // Step 5: Apply callee's attributes to caller (invalidations + allocations).
-    // This MUST happen after formula translation (step 4) because
+    // This MUST happen after formula translation (step 2) because
     // translate_formula calls and_equal/and_equal_const which can merge
     // union-find classes, changing get_var_repr results. If attrs are
     // applied before formula translation, Allocated and later CFree (from
@@ -1221,6 +1229,26 @@ fn import_callee_pre_attributes(
     }
 }
 
+fn callee_cell_is_read_only(
+    pre_edges_opt: Option<&crate::base_memory::Edges>,
+    post_edges_opt: Option<&crate::base_memory::Edges>,
+    pre_post: &PrePost,
+    callee_addr: AbstractValue,
+) -> bool {
+    let Some(pre_edges) = pre_edges_opt else {
+        return false;
+    };
+    if post_edges_opt != Some(pre_edges) {
+        return false;
+    }
+    !pre_post
+        .post
+        .post
+        .attrs
+        .get(&callee_addr)
+        .is_some_and(|attrs| attrs.iter().any(Attribute::is_modified))
+}
+
 fn apply_post_cell(
     caller_addr: AbstractValue,
     pre_edges_opt: Option<&crate::base_memory::Edges>,
@@ -1306,12 +1334,24 @@ fn translate_formula(
 
     fn apply_imported_formula_result(
         caller_state: &mut AbductiveDomain,
+        subst: &mut HashMap<AbstractValue, AbstractValue>,
         imported_must_be_valid: &mut std::collections::HashSet<AbstractValue>,
         stack_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
         heap_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
         result: crate::sat_unsat::SatUnsat<Vec<crate::formula::NewEq>>,
         loc: &Location,
     ) -> TranslateFormulaResult {
+        let result = result.map(|new_eqs| {
+            for new_eq in &new_eqs {
+                if let crate::formula::NewEq::Equal(old, new) = new_eq {
+                    for caller_v in subst.values_mut() {
+                        let caller_v0 = if *caller_v == *old { *new } else { *caller_v };
+                        *caller_v = caller_state.path_condition.get_var_repr(caller_v0);
+                    }
+                }
+            }
+            new_eqs
+        });
         match caller_state.apply_formula_result_for_summary_import(
             result,
             imported_must_be_valid,
@@ -1372,6 +1412,9 @@ fn translate_formula(
             ensure_formula_var(*v);
         }
     }
+    for (callee_v, _typ) in callee_post.iter_dynamic_types() {
+        ensure_formula_var(callee_v);
+    }
 
     let callee_stack_addrs: std::collections::HashSet<_> = callee_post
         .pre
@@ -1406,6 +1449,7 @@ fn translate_formula(
             .and_condition_direct(translated, depth + 1);
         match apply_imported_formula_result(
             caller_state,
+            subst,
             &mut imported_must_be_valid,
             &mut stack_allocated_before_call,
             &mut heap_allocated_before_call,
@@ -1433,6 +1477,7 @@ fn translate_formula(
             let result = caller_state.path_condition.and_equal_const(caller_v, c);
             match apply_imported_formula_result(
                 caller_state,
+                subst,
                 &mut imported_must_be_valid,
                 &mut stack_allocated_before_call,
                 &mut heap_allocated_before_call,
@@ -1455,6 +1500,7 @@ fn translate_formula(
                 .and_equal_vars(caller_v, caller_other);
             match apply_imported_formula_result(
                 caller_state,
+                subst,
                 &mut imported_must_be_valid,
                 &mut stack_allocated_before_call,
                 &mut heap_allocated_before_call,
@@ -1478,6 +1524,7 @@ fn translate_formula(
                 .and_equal_linear(caller_v, translated);
             match apply_imported_formula_result(
                 caller_state,
+                subst,
                 &mut imported_must_be_valid,
                 &mut stack_allocated_before_call,
                 &mut heap_allocated_before_call,
@@ -1510,6 +1557,7 @@ fn translate_formula(
         let result = caller_state.path_condition.and_atom_direct(translated);
         match apply_imported_formula_result(
             caller_state,
+            subst,
             &mut imported_must_be_valid,
             &mut stack_allocated_before_call,
             &mut heap_allocated_before_call,
@@ -1566,6 +1614,17 @@ fn translate_formula(
             log::debug!("    fn_app: {}({:?}) → UNSAT!", key.callee, key.actuals);
             return TranslateFormulaResult::Unsat;
         }
+    }
+
+    // Cross-ref: OCaml `PulseFormula.and_callee_formula` imports the full
+    // callee phi, including dynamic-type constraints. Preserve those in the
+    // abductive dynamic-type state (not as exported Closure attrs) so function
+    // pointer return values stay resolvable after summary application.
+    for (callee_v, typ) in callee_post.iter_dynamic_types() {
+        let Some(&caller_v) = subst.get(&callee_v) else {
+            continue;
+        };
+        caller_state.add_dynamic_type_unsafe(caller_v, typ.clone());
     }
 
     // Cross-ref: OCaml `PulseFormula.and_callee_formula` also imports `IsInt`
@@ -1835,6 +1894,127 @@ mod tests {
         assert!(
             state.path_condition.phi().is_marked_int(ret_addr),
             "callee is_int facts should be imported onto the caller result value"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_preserves_closure_return_zero_equality() {
+        let callee_pname = Procname::c_from_string("closure_target");
+        let callee_pdesc = Procdesc::new(
+            callee_pname,
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let ret_val = AbstractValue::mk_fresh();
+        assert!(callee_state.and_equal_const(ret_val, 0).is_sat());
+        callee_state.path_condition.and_is_int(ret_val);
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![],
+            result: Some(ret_val),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(
+            caller_pname,
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let Some(ExecutionDomain::ContinueProgram(state)) =
+            results.iter().find(|result| result.is_continue())
+        else {
+            panic!("expected a continuing result");
+        };
+        let ret_addr = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return value should be bound");
+        assert!(
+            state.is_known_zero(ret_addr),
+            "closure-call return should keep the stronger imported ret == 0 fact"
+        );
+        assert!(
+            state.path_condition.phi().is_marked_int(ret_addr),
+            "canonicalized result should still keep imported is_int"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_preserves_return_dynamic_type_on_canonical_result() {
+        let callee_pname = Procname::c_from_string("return_closure");
+        let callee_pdesc = Procdesc::new(callee_pname, Typ::void(), Location::dummy());
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let ret_val = AbstractValue::mk_fresh();
+        let target = Procname::c_from_string("assign_NULL");
+        callee_state.add_dynamic_type_unsafe(
+            ret_val,
+            Typ::mk_struct(sil::typ::TypeName::CFunction(match target {
+                Procname::C(sig) => sig,
+                _ => unreachable!(),
+            })),
+        );
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![],
+            result: Some(ret_val),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname, Typ::void(), Location::dummy());
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("fp"), 0);
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let Some(ExecutionDomain::ContinueProgram(state)) =
+            results.iter().find(|result| result.is_continue())
+        else {
+            panic!("expected a continuing result");
+        };
+        let ret_addr = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return value should be bound");
+        assert!(
+            matches!(
+                state.get_dynamic_type(ret_addr).map(|typ| typ.desc.as_ref()),
+                Some(sil::typ::TypeDesc::Tstruct(sil::typ::TypeName::CFunction(sig)))
+                    if sig.c_name.to_string() == "assign_NULL"
+            ),
+            "return dynamic type should follow the imported equality representative"
+        );
+        assert!(
+            state.get_closure_proc_name(ret_addr).is_none(),
+            "dynamic-type preservation should not seed exported Closure attrs"
         );
     }
 
