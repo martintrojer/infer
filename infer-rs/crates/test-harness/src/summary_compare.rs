@@ -222,6 +222,7 @@ impl RawPrePost {
             &mut phi,
             &mut diagnostic,
         );
+        route_zero_conditions_to_phi(&mut conditions, &mut phi);
         drop_phi_atoms_redundant_with_conditions(&conditions, &mut phi);
 
         CanonicalPrePost {
@@ -481,7 +482,10 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
             ) {
                 normalized.insert(witness_atom);
             } else {
-                normalized.insert(format!("atom:{lhs} {} {rhs}", atom.operator));
+                normalized.insert(format!(
+                    "atom:{}",
+                    format_canonical_atom(&lhs, atom.operator, &rhs)
+                ));
             }
         } else {
             normalized.insert(item.clone());
@@ -541,7 +545,7 @@ fn canonicalize_condition_items(conditions: &[String], phi: &[String]) -> Vec<St
                     .unwrap_or(&witness_atom)
                     .to_string()
             } else {
-                format!("{lhs} {} {rhs}", parsed.operator)
+                format_canonical_atom(&lhs, parsed.operator, &rhs)
             }
         };
 
@@ -1062,7 +1066,113 @@ fn canonicalize_redundancy_atom(
             .unwrap_or(&collapsed)
             .to_string()
     } else {
-        format!("{lhs} {} {rhs}", parsed.operator)
+        format_canonical_atom(&lhs, parsed.operator, &rhs)
+    }
+}
+
+fn route_zero_conditions_to_phi(conditions: &mut Vec<String>, phi: &mut Vec<String>) {
+    let mut routed = Vec::new();
+    conditions.retain(|condition| match condition_zero_phi_item(condition) {
+        Some(item) => {
+            routed.push(item);
+            false
+        }
+        None => true,
+    });
+
+    if routed.is_empty() {
+        return;
+    }
+
+    phi.extend(routed);
+    phi.sort();
+    phi.dedup();
+}
+
+fn condition_zero_phi_item(condition: &str) -> Option<String> {
+    let atom = parse_condition_item(condition)?;
+    match atom.operator {
+        "=" => {
+            if !is_zero_comparison_shape(&atom.lhs, &atom.rhs) {
+                return None;
+            }
+            let (lhs, rhs) = canonical_eq_ne_terms(&atom.lhs, &atom.rhs);
+            Some(format!("eq:{lhs}={rhs}"))
+        }
+        "!=" => Some(format!("atom:{}", zero_atom_key(&atom)?)),
+        _ => None,
+    }
+}
+
+fn zero_atom_key(atom: &ParsedAtom) -> Option<String> {
+    if !matches!(atom.operator, "=" | "!=") {
+        return None;
+    }
+
+    let lhs = normalize_term_syntax_for_phi(&atom.lhs);
+    let rhs = normalize_term_syntax_for_phi(&atom.rhs);
+    is_zero_comparison_shape(&lhs, &rhs).then(|| format_canonical_atom(&lhs, atom.operator, &rhs))
+}
+
+fn is_zero_comparison_shape(lhs: &str, rhs: &str) -> bool {
+    lhs == "0"
+        || rhs == "0"
+        || zero_diff_linear_terms(lhs).is_some()
+        || zero_diff_linear_terms(rhs).is_some()
+}
+
+fn format_canonical_atom(lhs: &str, operator: &str, rhs: &str) -> String {
+    if matches!(operator, "=" | "!=") {
+        let (lhs, rhs) = canonical_eq_ne_terms(lhs, rhs);
+        format!("{lhs} {operator} {rhs}")
+    } else {
+        format!("{lhs} {operator} {rhs}")
+    }
+}
+
+fn canonical_eq_ne_terms(lhs: &str, rhs: &str) -> (String, String) {
+    let lhs = normalize_term_syntax_for_phi(lhs);
+    let rhs = normalize_term_syntax_for_phi(rhs);
+
+    if rhs == "0" {
+        if let Some((lhs, rhs)) = zero_diff_linear_terms(&lhs) {
+            return sorted_eq_ne_terms(lhs, rhs);
+        }
+        return (lhs, rhs);
+    }
+    if lhs == "0" {
+        if let Some((lhs, rhs)) = zero_diff_linear_terms(&rhs) {
+            return sorted_eq_ne_terms(lhs, rhs);
+        }
+        return (rhs, lhs);
+    }
+
+    sorted_eq_ne_terms(lhs, rhs)
+}
+
+fn zero_diff_linear_terms(term: &str) -> Option<(String, String)> {
+    let (vars, constant) = parse_linear_term(term)?;
+    if constant != 0 || vars.len() != 2 {
+        return None;
+    }
+
+    let mut positive = None;
+    let mut negative = None;
+    for (var, coeff) in vars {
+        match coeff {
+            1 => positive = Some(var),
+            -1 => negative = Some(var),
+            _ => return None,
+        }
+    }
+    Some((positive?, negative?))
+}
+
+fn sorted_eq_ne_terms(lhs: String, rhs: String) -> (String, String) {
+    if condition_term_sort_key(&lhs) <= condition_term_sort_key(&rhs) {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
     }
 }
 
@@ -4560,6 +4670,142 @@ mod tests {
             left_pre_post.conditions,
             vec!["cond:0 < i.*".to_string(), "cond:0 < v1".to_string()]
         );
+    }
+
+    #[test]
+    fn test_zero_condition_phi_atom_routing_normalizes_to_phi() {
+        let with_conditions = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("argc".to_string(), "v1".to_string()),
+                    ("argv".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("argc".to_string(), "v1".to_string()),
+                    ("argv".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v3".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v3".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:v3 != 0".to_string(), "cond:v3 = 0".to_string()],
+                phi: vec!["atom:v3 != 0".to_string(), "eq:v3=0".to_string()],
+                diagnostic: None,
+            }],
+        };
+        let phi_only = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("argc".to_string(), "v10".to_string()),
+                    ("argv".to_string(), "v20".to_string()),
+                ],
+                post_stack: vec![
+                    ("argc".to_string(), "v10".to_string()),
+                    ("argv".to_string(), "v20".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v10".to_string(),
+                    access: "*".to_string(),
+                    dst: "v30".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v10".to_string(),
+                    access: "*".to_string(),
+                    dst: "v30".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec!["atom:v30 != 0".to_string(), "eq:v30=0".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = with_conditions.canonicalize();
+        let [pre_post] = canonical.main.as_slice() else {
+            panic!("expected one pre/post");
+        };
+        assert!(
+            pre_post.conditions.is_empty(),
+            "zero branch conditions already exported in phi should route to phi only"
+        );
+        assert_eq!(with_conditions.canonicalize(), phi_only.canonicalize());
+    }
+
+    #[test]
+    fn test_condition_normalization_canonicalizes_signed_linear_disequality() {
+        let left = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("x".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                post_stack: vec![
+                    ("x".to_string(), "v1".to_string()),
+                    ("y".to_string(), "v2".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v2".to_string(),
+                    access: "*".to_string(),
+                    dst: "v3".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v2".to_string(),
+                    access: "*".to_string(),
+                    dst: "v3".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:lin(-1*v1,1*v3) != 0".to_string()],
+                phi: vec![],
+                diagnostic: None,
+            }],
+        };
+        let right = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("x".to_string(), "v10".to_string()),
+                    ("y".to_string(), "v20".to_string()),
+                ],
+                post_stack: vec![
+                    ("x".to_string(), "v10".to_string()),
+                    ("y".to_string(), "v20".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v20".to_string(),
+                    access: "*".to_string(),
+                    dst: "v30".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v20".to_string(),
+                    access: "*".to_string(),
+                    dst: "v30".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec!["cond:v30 != v10".to_string()],
+                phi: vec![],
+                diagnostic: None,
+            }],
+        };
+
+        assert_eq!(left.canonicalize(), right.canonicalize());
     }
 
     #[test]
