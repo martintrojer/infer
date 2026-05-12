@@ -254,12 +254,29 @@ impl Phi {
 
     /// Record that a variable equals a linear expression: v = lin.
     pub fn and_linear_eq(&mut self, v: AbstractValue, lin: LinArith) -> SatUnsat<Vec<NewEq>> {
+        self.and_linear_eq_with_preferred(v, lin, None)
+    }
+
+    pub fn and_linear_eq_with_preferred(
+        &mut self,
+        v: AbstractValue,
+        lin: LinArith,
+        preferred: Option<AbstractValue>,
+    ) -> SatUnsat<Vec<NewEq>> {
         let repr = self.get_repr(v);
         let lin = self.normalize_linear(&lin);
 
         // Solve repr = lin → repr - lin = 0
         let diff = LinArith::of_var(repr).sub(&lin);
-        match diff.solve_eq_zero() {
+        let solution = preferred
+            .and_then(|preferred| {
+                let preferred = self.get_repr(preferred);
+                diff.solve_eq_zero_for(preferred)
+                    .map(|solution| (preferred, solution))
+            })
+            .map(|(preferred, solution)| SatUnsat::Sat(Some((preferred, solution))))
+            .unwrap_or_else(|| diff.solve_eq_zero());
+        match solution {
             SatUnsat::Unsat => SatUnsat::Unsat,
             SatUnsat::Sat(None) => SatUnsat::Sat(Vec::new()), // trivially true
             SatUnsat::Sat(Some((x, solution))) => {

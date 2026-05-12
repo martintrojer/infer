@@ -179,6 +179,12 @@ impl LinArith {
         self.sub(other).solve_eq_zero()
     }
 
+    /// Solve `self = 0` for a chosen variable.
+    pub fn solve_eq_zero_for(&self, x: AbstractValue) -> Option<LinArith> {
+        let coeff = self.vars.get(&x)?;
+        Some(self.pivot(x, coeff))
+    }
+
     /// Pivot: given `self` contains `x` with coefficient `coeff`,
     /// solve for `x` in terms of the other variables.
     ///
@@ -219,14 +225,14 @@ impl LinArith {
 
     /// Translate all variables using a mapping function.
     pub fn translate(&self, f: impl Fn(AbstractValue) -> AbstractValue) -> Self {
+        self.subst_variables(|v| Self::of_var(f(v)))
+    }
+
+    /// Substitute every variable with a linear expression.
+    pub fn subst_variables(&self, f: impl Fn(AbstractValue) -> LinArith) -> Self {
         let mut result = Self::of_q(self.constant);
         for (&v, coeff) in &self.vars {
-            let mapped = f(v);
-            let entry = result.vars.entry(mapped).or_insert(Q::zero());
-            *entry += coeff;
-            if entry.is_zero() {
-                result.vars.remove(&mapped);
-            }
+            result = result.add(&f(v).mult_scalar(coeff));
         }
         result
     }

@@ -293,6 +293,16 @@ impl Formula {
         self.phi_mut().and_linear_eq(v, lin)
     }
 
+    pub fn and_equal_linear_with_preferred(
+        &mut self,
+        v: AbstractValue,
+        lin: LinArith,
+        preferred: AbstractValue,
+    ) -> SatUnsat<Vec<NewEq>> {
+        self.phi_mut()
+            .and_linear_eq_with_preferred(v, lin, Some(preferred))
+    }
+
     /// Record that two operands are NOT equal.
     pub fn and_not_equal(&mut self, op1: &Operand, op2: &Operand) -> SatUnsat<Vec<NewEq>> {
         let t1 = operand_to_term(op1, &self.phi);

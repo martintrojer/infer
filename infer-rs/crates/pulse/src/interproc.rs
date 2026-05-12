@@ -1294,6 +1294,20 @@ fn resolve_mut(
         .or_insert_with(AbstractValue::mk_fresh)
 }
 
+fn imported_linear_subst(
+    phi: &crate::formula::phi::Phi,
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    callee_v: AbstractValue,
+) -> crate::formula::lin_arith::LinArith {
+    let callee_repr = phi.get_repr(callee_v);
+    match phi.linear_eqs.get(&callee_repr) {
+        Some(lin) => lin.subst_variables(|dep| imported_linear_subst(phi, subst, dep)),
+        None => crate::formula::lin_arith::LinArith::of_var(
+            *subst.get(&callee_repr).expect("formula subst"),
+        ),
+    }
+}
+
 /// Translate the callee's formula constraints into the caller's state.
 ///
 /// Returns false if unsatisfiable (callee constraints contradict caller).
@@ -1518,10 +1532,10 @@ fn translate_formula(
         // For more complex linear expressions, translate if all vars are in subst
         let all_vars_mapped = lin.vars.keys().all(|v| subst.contains_key(v));
         if all_vars_mapped {
-            let translated = lin.translate(|v| *subst.get(&v).expect("formula subst"));
+            let translated = lin.subst_variables(|v| imported_linear_subst(phi, subst, v));
             let result = caller_state
                 .path_condition
-                .and_equal_linear(caller_v, translated);
+                .and_equal_linear_with_preferred(caller_v, translated, caller_v);
             match apply_imported_formula_result(
                 caller_state,
                 subst,
@@ -3414,6 +3428,113 @@ mod tests {
             [ExecutionDomain::LatentInvalidAccess { diagnostic: found, .. }]
                 if found.as_ref().get_issue_type_id() == diagnostic.get_issue_type_id()
         ));
+    }
+
+    #[test]
+    fn test_apply_summary_preserves_imported_linear_eq_to_caller_visible_actual() {
+        let callee_pname = Procname::c_from_string("assume_non_negative");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("x"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        assert!(callee_state
+            .path_condition
+            .and_less_equal(
+                &crate::formula::Operand::ConstOperand(0),
+                &crate::formula::Operand::AbstractValue(formal_val),
+            )
+            .is_sat());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("if_negative_then_crash_latent");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar.clone())))
+            .unwrap();
+        let caller_x = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let neg_x = AbstractValue::mk_fresh();
+        assert!(caller_state
+            .and_equal_binop(
+                neg_x,
+                sil::binop::Binop::MinusA(Some(sil::typ::IKind::IInt)),
+                &crate::formula::Operand::ConstOperand(0),
+                &crate::formula::Operand::AbstractValue(caller_x),
+            )
+            .is_sat());
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                neg_x,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let [ExecutionDomain::ContinueProgram(state)] = results.as_slice() else {
+            panic!("expected summary application to continue, got {results:?}");
+        };
+        let caller_x_repr = state.path_condition.get_var_repr(caller_x);
+        let imported_formal_repr = state.path_condition.get_var_repr(neg_x);
+        assert!(
+            state
+                .path_condition
+                .phi()
+                .linear_eqs
+                .get(&caller_x_repr)
+                .is_some_and(|lin| {
+                    lin.get_coefficient(imported_formal_repr)
+                        == Some(&crate::formula::lin_arith::Q::from_integer(-1))
+                        && lin.get_as_const().is_none()
+                }),
+            "importing callee formula for assume_non_negative(-x) should keep the affine link \
+             x = -formal in caller vocabulary; got {:?}",
+            state.path_condition.phi().linear_eqs
+        );
+        let mut summary_formula = state.path_condition.clone();
+        summary_formula.simplify_for_summary(
+            &std::collections::HashSet::from([caller_formal_addr, caller_x, neg_x]),
+            &std::collections::HashSet::from([caller_formal_addr, caller_x, neg_x]),
+        );
+        assert!(
+            summary_formula.phi().linear_eqs.iter().any(|(&lhs, lin)| {
+                summary_formula.get_var_repr(lhs) == summary_formula.get_var_repr(caller_x)
+                    && lin.vars.keys().any(|v| {
+                        summary_formula.get_var_repr(*v) == summary_formula.get_var_repr(neg_x)
+                    })
+            }),
+            "simplify_for_summary must not collapse imported affine equations into dead temps; \
+             got {:?}",
+            summary_formula.phi().linear_eqs
+        );
     }
 
     #[test]
