@@ -598,17 +598,21 @@ impl PrePost {
             else {
                 continue;
             };
-            if !self
-                .post
-                .post
-                .attrs
-                .get(&self.post.path_condition.get_var_repr(funptr_val))
-                .is_some_and(|attrs| {
+            let funptr_repr = self.post.path_condition.get_var_repr(funptr_val);
+            let has_function_pointer_target =
+                self.post.post.attrs.get(&funptr_repr).is_some_and(|attrs| {
                     attrs
                         .iter()
                         .any(|attr| matches!(attr, Attribute::Closure(_)))
-                })
-            {
+                }) || self.post.get_dynamic_type(funptr_repr).is_some_and(|typ| {
+                    matches!(
+                        typ.desc.as_ref(),
+                        sil::typ::TypeDesc::Tstruct(
+                            sil::typ::TypeName::CFunction(_) | sil::typ::TypeName::ObjcBlock(_)
+                        )
+                    )
+                });
+            if !has_function_pointer_target {
                 continue;
             }
             self.pre.stack.add(var, global_addr);
@@ -4062,6 +4066,52 @@ mod tests {
             .phi()
             .atoms
             .contains(&Atom::LessThan(Term::Const(0), Term::Var(funptr_val))));
+    }
+
+    #[test]
+    fn test_normalize_imported_global_function_pointer_dynamic_type_exports_pre_stack() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let global = Pvar::mk_global(Mangled::from_string("malloc_func"));
+        let global_var = Var::ProgramVar(Box::new(global.clone()));
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let global_addr = astate.eval_var(&global_var);
+        let funptr_val = AbstractValue::mk_fresh();
+        astate
+            .post
+            .heap
+            .add_edge(global_addr, Access::Dereference, funptr_val);
+        astate.add_dynamic_type_unsafe(
+            funptr_val,
+            Typ::mk_struct(TypeName::CFunction(
+                match Procname::c_from_string("malloc") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("expected C procname"),
+                },
+            )),
+        );
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(astate)],
+            vec![],
+            false,
+        );
+
+        let pre_post = summary
+            .pre_posts
+            .first()
+            .expect("expected a continuing summary");
+        assert_eq!(pre_post.pre.stack.find(&global_var), Some(global_addr));
+        assert!(
+            pre_post
+                .pre
+                .attrs
+                .get(&global_addr)
+                .is_some_and(|attrs| attrs
+                    .iter()
+                    .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _)))),
+            "imported global C-function dynamic types should seed the OCaml-style global pre stack"
+        );
     }
 
     #[test]

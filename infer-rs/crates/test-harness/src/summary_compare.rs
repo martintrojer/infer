@@ -2622,16 +2622,43 @@ pub fn format_rust_specialization_key(spec: &sil::specialization::PulseSpecializ
         let mut dynamic_types: Vec<_> = spec
             .dynamic_types
             .iter()
-            .map(|(path, ty)| format!("{}: {}", format_rust_heap_path(path), ty))
+            .filter_map(|(path, ty)| format_rust_dynamic_type_binding(path, ty))
             .collect();
         dynamic_types.sort();
-        parts.push(format!("dynamic_types: {{{}}}", dynamic_types.join(", ")));
+        if !dynamic_types.is_empty() {
+            parts.push(format!("dynamic_types: {{{}}}", dynamic_types.join(", ")));
+        }
     }
 
     if parts.is_empty() {
         "⊥".to_string()
     } else {
         parts.join(" ")
+    }
+}
+
+fn format_rust_dynamic_type_binding(
+    path: &sil::specialization::HeapPath,
+    ty: &sil::typ::TypeName,
+) -> Option<String> {
+    // The OCaml summary-comparison surface currently canonicalizes FieldAccess
+    // dynamic-type specializations to bottom. Mirror that for Rust rather than
+    // presenting spurious `dynamic_types` keys such as `**callback->f` for C
+    // callback structs; the underlying Pulse summary still retains the
+    // dynamic-type specialization for analysis.
+    if rust_heap_path_contains_field_access(path) {
+        return None;
+    }
+    Some(format!("{}: {}", format_rust_heap_path(path), ty))
+}
+
+fn rust_heap_path_contains_field_access(path: &sil::specialization::HeapPath) -> bool {
+    match path {
+        sil::specialization::HeapPath::Pvar(_) => false,
+        sil::specialization::HeapPath::FieldAccess(_, _) => true,
+        sil::specialization::HeapPath::Dereference(path) => {
+            rust_heap_path_contains_field_access(path)
+        }
     }
 }
 
@@ -2925,6 +2952,66 @@ fn is_token_boundary(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rust_specialization_key_omits_field_access_dynamic_types_as_bottom() {
+        let callback = sil::pvar::Pvar::mk(
+            sil::mangled::Mangled::from_string("callback"),
+            sil::procname::Procname::c_from_string("apply_callback"),
+        );
+        let callback_struct = sil::typ::TypeName::CStruct(
+            sil::qualified_cpp_name::QualifiedCppName::from_string("FunPtrCallback"),
+        );
+        let field = sil::fieldname::Fieldname::make(callback_struct, "f");
+        let path = sil::specialization::HeapPath::Dereference(Box::new(
+            sil::specialization::HeapPath::FieldAccess(
+                field,
+                Box::new(sil::specialization::HeapPath::Dereference(Box::new(
+                    sil::specialization::HeapPath::Pvar(callback),
+                ))),
+            ),
+        ));
+        let target = match sil::procname::Procname::c_from_string("assign_NULL") {
+            sil::procname::Procname::C(sig) => sig,
+            _ => unreachable!("expected C procname"),
+        };
+        let spec = sil::specialization::PulseSpecialization {
+            aliases: None,
+            dynamic_types: std::collections::HashMap::from([(
+                path,
+                sil::typ::TypeName::CFunction(target),
+            )]),
+        };
+
+        assert_eq!(format_rust_specialization_key(&spec), "⊥");
+    }
+
+    #[test]
+    fn test_rust_specialization_key_keeps_plain_dynamic_type_paths() {
+        let funptr = sil::pvar::Pvar::mk(
+            sil::mangled::Mangled::from_string("funptr"),
+            sil::procname::Procname::c_from_string("apply_funptr"),
+        );
+        let path = sil::specialization::HeapPath::Dereference(Box::new(
+            sil::specialization::HeapPath::Pvar(funptr),
+        ));
+        let target = match sil::procname::Procname::c_from_string("assign_NULL") {
+            sil::procname::Procname::C(sig) => sig,
+            _ => unreachable!("expected C procname"),
+        };
+        let spec = sil::specialization::PulseSpecialization {
+            aliases: None,
+            dynamic_types: std::collections::HashMap::from([(
+                path,
+                sil::typ::TypeName::CFunction(target),
+            )]),
+        };
+
+        assert_eq!(
+            format_rust_specialization_key(&spec),
+            "dynamic_types: {*funptr: assign_NULL}"
+        );
+    }
 
     #[test]
     fn test_raw_pre_post_canonicalization_alpha_renames_equivalent_states() {
