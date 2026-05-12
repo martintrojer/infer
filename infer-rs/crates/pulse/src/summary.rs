@@ -4076,6 +4076,99 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_exports_zero_equality_for_visible_return_value() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let result = AbstractValue::of_raw(2);
+
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, result);
+        astate.initialize(return_addr);
+        astate.initialize(result);
+        astate.path_condition.and_is_int(result);
+        assert!(astate.path_condition.and_equal_const(result, 0).is_sat());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(result),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        assert_eq!(
+            pp.post.get_const(result),
+            Some(0),
+            "summary export must keep the stronger return == 0 equality"
+        );
+        assert!(
+            pp.post.path_condition.phi().is_marked_int(result),
+            "summary export may keep the type fact, but not instead of return == 0"
+        );
+    }
+
+    #[test]
+    fn test_of_proc_exports_closure_call_return_constant_not_only_is_int() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let loaded_return = AbstractValue::of_raw(3);
+
+        astate.post.stack.add(return_var, return_addr);
+        // Model the shape after returning through a specialized closure call:
+        // the returned load is an integer-typed value whose constant is known
+        // only through phi. Summary export must not drop that equality and
+        // leave only is_int(return.*).
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, loaded_return);
+        astate.initialize(return_addr);
+        astate.initialize(loaded_return);
+        astate.path_condition.and_is_int(loaded_return);
+        assert!(astate.and_equal_const(loaded_return, 0).is_sat());
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(astate)],
+            vec![],
+            false,
+        );
+
+        assert_eq!(summary.pre_posts.len(), 1);
+        let pre_post = &summary.pre_posts[0];
+        let exported_return = pre_post.result.expect("return result should be exported");
+        assert_eq!(
+            pre_post.post.get_const(exported_return),
+            Some(0),
+            "closure-call return summary should export return.* == 0"
+        );
+        assert!(
+            pre_post
+                .post
+                .path_condition
+                .phi()
+                .is_marked_int(exported_return),
+            "the integer type fact can coexist with the stronger equality"
+        );
+    }
+
+    #[test]
     fn test_normalize_does_not_materialize_zero_constant_invalid_for_visible_value() {
         let mut pdesc = make_pdesc_with_formals(&[]);
         pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);

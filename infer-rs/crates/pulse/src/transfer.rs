@@ -14,6 +14,7 @@ use sil::exp::Exp;
 use sil::instr::{Instr, InstrMetadata};
 use sil::location::Location;
 use sil::procdesc::Procdesc;
+use sil::typ::TypeDesc;
 use sil::var::Var;
 
 use crate::abductive::AbductiveDomain;
@@ -42,7 +43,9 @@ pub fn exec_instr_with_pdesc(
 ) -> Vec<ExecutionDomain> {
     match instr {
         Instr::Load { id, e, loc, typ } => exec_load(pdesc, id, e, typ, loc, state),
-        Instr::Store { e1, e2, loc, .. } => exec_store(pdesc, e1, e2, loc, state),
+        Instr::Store {
+            e1, e2, loc, typ, ..
+        } => exec_store(pdesc, e1, typ, e2, loc, state),
         Instr::Prune { exp, loc, .. } => exec_prune(pdesc, exp, loc, state),
         Instr::Call {
             ret: (ret_id, ret_typ),
@@ -208,6 +211,7 @@ fn record_more_precise_formal_dynamic_type(
 fn exec_store(
     pdesc: Option<&Procdesc>,
     lhs_exp: &Exp,
+    lhs_typ: &sil::typ::Typ,
     rhs_exp: &Exp,
     loc: &Location,
     mut state: AbductiveDomain,
@@ -254,8 +258,18 @@ fn exec_store(
         state.always_reachable(rhs_val.addr);
     }
 
+    let stored_value_addr = rhs_val.addr;
+    let lhs_addr_value = lhs_addr.addr;
     match operations::write_deref_with_history(lhs_addr, rhs_val, loc, &mut state) {
-        PulseResult::Ok(()) => vec![ExecutionDomain::ContinueProgram(state)],
+        PulseResult::Ok(()) => {
+            preserve_canonical_pointee_after_store(
+                lhs_typ,
+                lhs_addr_value,
+                stored_value_addr,
+                &mut state,
+            );
+            vec![ExecutionDomain::ContinueProgram(state)]
+        }
         PulseResult::FatalError(d, _) => vec![ExecutionDomain::AbortProgram {
             state: Box::new(state),
             diagnostic: Box::new(d),
@@ -263,6 +277,41 @@ fn exec_store(
         PulseResult::Recoverable((), errors) => {
             stopped_results_from_recoverable_errors(pdesc, state, errors)
         }
+    }
+}
+
+fn preserve_canonical_pointee_after_store(
+    lhs_typ: &sil::typ::Typ,
+    lhs_addr: AbstractValue,
+    stored_value: AbstractValue,
+    state: &mut AbductiveDomain,
+) {
+    let TypeDesc::Tptr(pointee_typ, _) = lhs_typ.desc.as_ref() else {
+        return;
+    };
+    if !(pointee_typ.is_int() || pointee_typ.is_pointer()) {
+        return;
+    }
+
+    let stored_repr = state.path_condition.get_var_repr(stored_value);
+    if state
+        .post
+        .heap
+        .find_edge(lhs_addr, &crate::access::Access::Dereference)
+        .is_some_and(|edge| edge == stored_repr)
+    {
+        return;
+    }
+
+    let Some(q) = state.path_condition.is_known_const(stored_value) else {
+        return;
+    };
+    if !q.is_integer() {
+        return;
+    }
+    let canonical = state.absval_of_int(*q.numer() / *q.denom());
+    if canonical != stored_repr {
+        state.write_heap(lhs_addr, crate::access::Access::Dereference, canonical);
     }
 }
 

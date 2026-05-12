@@ -258,7 +258,7 @@ fn collect_cfun_refs(
             flags,
             ..
         } => {
-            collect_cfun_refs_exp(fun_exp, ctx.summaries, out);
+            collect_cfun_refs_exp(fun_exp, ctx, vt_index, depth, out);
             if flags.cf_virtual {
                 if let sil::exp::Exp::Const(sil::const_val::Const::Cfun(callee)) = fun_exp {
                     const MAX_VIRTUAL_TARGET_DEPTH: usize = 5;
@@ -291,15 +291,15 @@ fn collect_cfun_refs(
                 }
             }
             for (arg_exp, _) in args {
-                collect_cfun_refs_exp(arg_exp, ctx.summaries, out);
+                collect_cfun_refs_exp(arg_exp, ctx, vt_index, depth, out);
             }
         }
         sil::instr::Instr::Store { e1, e2, .. } => {
-            collect_cfun_refs_exp(e1, ctx.summaries, out);
-            collect_cfun_refs_exp(e2, ctx.summaries, out);
+            collect_cfun_refs_exp(e1, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(e2, ctx, vt_index, depth, out);
         }
         sil::instr::Instr::Load { e, .. } => {
-            collect_cfun_refs_exp(e, ctx.summaries, out);
+            collect_cfun_refs_exp(e, ctx, vt_index, depth, out);
         }
         _ => {}
     }
@@ -342,30 +342,37 @@ fn collect_summary_closure_pnames(
 
 fn collect_cfun_refs_exp(
     exp: &sil::exp::Exp,
-    store: &ondemand::summary::SummaryStore<pulse::summary::PulseSummary>,
+    ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
+    vt_index: &pulse::virtual_targets::VirtualTargetIndex,
+    depth: usize,
     out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
 ) {
     match exp {
         sil::exp::Exp::Const(sil::const_val::Const::Cfun(pname)) => {
-            if let Some(summary) = store.get(pname) {
-                out.insert(pname.clone(), summary);
+            if let Some(summary) = ctx.summaries.get(pname) {
+                out.entry(pname.clone()).or_insert(summary);
+            } else if depth < 5 {
+                if let Some(pdesc) = ctx.cfg.get_proc_desc(pname) {
+                    let summary = analyze_with_spec_loop(pdesc, ctx, vt_index, None, depth + 1);
+                    out.entry(pname.clone()).or_insert(summary);
+                }
             }
         }
         sil::exp::Exp::BinOp(_, l, r) => {
-            collect_cfun_refs_exp(l, store, out);
-            collect_cfun_refs_exp(r, store, out);
+            collect_cfun_refs_exp(l, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(r, ctx, vt_index, depth, out);
         }
         sil::exp::Exp::UnOp(_, inner, _)
         | sil::exp::Exp::Cast(_, inner)
         | sil::exp::Exp::Exn(inner) => {
-            collect_cfun_refs_exp(inner, store, out);
+            collect_cfun_refs_exp(inner, ctx, vt_index, depth, out);
         }
         sil::exp::Exp::Lfield(data, _, _) => {
-            collect_cfun_refs_exp(&data.exp, store, out);
+            collect_cfun_refs_exp(&data.exp, ctx, vt_index, depth, out);
         }
         sil::exp::Exp::Lindex(base, idx) => {
-            collect_cfun_refs_exp(base, store, out);
-            collect_cfun_refs_exp(idx, store, out);
+            collect_cfun_refs_exp(base, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(idx, ctx, vt_index, depth, out);
         }
         _ => {}
     }
