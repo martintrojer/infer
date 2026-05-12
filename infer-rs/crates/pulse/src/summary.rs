@@ -137,6 +137,99 @@ struct PotentialInvalidAccessSummaryCandidate {
     recovered_from_summary_eq_zero: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreCycleHeapEdge {
+    src: AbstractValue,
+    access: Access,
+    target: AbstractValue,
+}
+
+fn collect_pre_cycle_heap_edges(
+    pre: &crate::base_domain::BaseDomain,
+    post: &AbductiveDomain,
+) -> Vec<PreCycleHeapEdge> {
+    let cycle_classes: HashSet<_> = pre
+        .heap
+        .iter()
+        .flat_map(|(src, edges)| {
+            edges.iter().filter_map(move |(access, target)| {
+                matches!(access, Access::Dereference)
+                    .then(|| {
+                        let src_repr = post.path_condition.get_var_repr(*src);
+                        let target_repr = post.path_condition.get_var_repr(*target);
+                        (src_repr == target_repr || src.raw() == target.raw()).then_some(src_repr)
+                    })
+                    .flatten()
+            })
+        })
+        .collect();
+
+    if cycle_classes.is_empty() {
+        return Vec::new();
+    }
+
+    pre.heap
+        .iter()
+        .flat_map(|(src, edges)| {
+            edges.iter().filter_map(|(access, target)| {
+                let src_repr = post.path_condition.get_var_repr(*src);
+                let target_repr = post.path_condition.get_var_repr(*target);
+                (cycle_classes.contains(&src_repr) || cycle_classes.contains(&target_repr))
+                    .then_some(PreCycleHeapEdge {
+                        src: *src,
+                        access: access.clone(),
+                        target: *target,
+                    })
+            })
+        })
+        .collect()
+}
+
+fn collect_direct_cycle_heap_edges_without_formula(
+    domain: &crate::base_domain::BaseDomain,
+) -> Vec<PreCycleHeapEdge> {
+    let cycle_roots: HashSet<_> = domain
+        .heap
+        .iter()
+        .flat_map(|(src, edges)| {
+            edges.iter().filter_map(|(access, target)| {
+                (matches!(access, Access::Dereference) && src.raw() == target.raw()).then_some(*src)
+            })
+        })
+        .collect();
+
+    if cycle_roots.is_empty() {
+        return Vec::new();
+    }
+
+    domain
+        .heap
+        .iter()
+        .flat_map(|(src, edges)| {
+            edges.iter().filter_map(|(access, target)| {
+                (cycle_roots.contains(src) || cycle_roots.contains(target)).then_some(
+                    PreCycleHeapEdge {
+                        src: *src,
+                        access: access.clone(),
+                        target: *target,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn restore_pre_cycle_heap_edges(
+    domain: &mut crate::base_domain::BaseDomain,
+    edges_to_restore: &[PreCycleHeapEdge],
+) {
+    for edge in edges_to_restore {
+        domain
+            .heap
+            .add_edge(edge.src, edge.access.clone(), edge.target);
+    }
+}
+
 fn build_pre_post(
     pdesc: &Procdesc,
     astate: AbductiveDomain,
@@ -205,6 +298,25 @@ pub(crate) fn abort_should_publish_manifest_diagnostic(
 }
 
 impl PrePost {
+    fn restore_direct_cycle_edges_for_summary(&mut self) {
+        if !matches!(
+            self.kind,
+            PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
+        ) {
+            return;
+        }
+
+        let mut pre_cycle_heap_edges = collect_pre_cycle_heap_edges(&self.pre, &self.post);
+        pre_cycle_heap_edges.extend(collect_direct_cycle_heap_edges_without_formula(&self.pre));
+        let mut post_cycle_heap_edges = collect_pre_cycle_heap_edges(&self.post.post, &self.post);
+        post_cycle_heap_edges.extend(collect_direct_cycle_heap_edges_without_formula(
+            &self.post.post,
+        ));
+        restore_pre_cycle_heap_edges(&mut self.pre, &pre_cycle_heap_edges);
+        restore_pre_cycle_heap_edges(&mut self.post.pre, &pre_cycle_heap_edges);
+        restore_pre_cycle_heap_edges(&mut self.post.post, &post_cycle_heap_edges);
+    }
+
     /// Canonicalize the exported state to the current formula representatives
     /// before summary filtering.
     ///
@@ -219,6 +331,7 @@ impl PrePost {
         // formula-equal pre/post frame edges look modified to `apply_post` and
         // callers get spurious self-cycle rewrites.
         self.pre = self.post.pre.clone();
+        self.restore_direct_cycle_edges_for_summary();
         for (_formal, addr) in &mut self.formals {
             *addr = self.post.path_condition.get_var_repr(*addr);
         }
@@ -575,6 +688,7 @@ impl PrePost {
                 &formula_reachable,
                 &witness_targets,
             );
+        self.restore_direct_cycle_edges_for_summary();
         self.materialize_visible_constant_invalidations(&post_canonical_reachable);
         self.align_function_pointer_closure_summary_surface();
 
@@ -4345,6 +4459,68 @@ mod tests {
             pp.post.post.heap.find_edge(next_slot, &Access::Dereference),
             Some(canonical_pointee),
             "summary post heap should use the same canonical frame edge as pre"
+        );
+    }
+
+    #[test]
+    fn test_normalize_preserves_direct_latent_cycle_heap_edges() {
+        let pdesc = make_pdesc_with_formals(&["p"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("p"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let root = astate.read_heap(formal_addr, Access::Dereference);
+        let next_field = Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_string("node")),
+            "next",
+        );
+        let next_slot = astate.read_heap(root, Access::FieldAccess(next_field));
+        let next_value = astate.read_heap(next_slot, Access::Dereference);
+        assert!(
+            root < next_value,
+            "fixture relies on root being the formula representative"
+        );
+        // Mirror the OCaml latent cycle summary surface: the equality has
+        // been discharged into a direct heap edge rather than exported as a
+        // formula equality.
+        astate
+            .pre
+            .heap
+            .add_edge(next_slot, Access::Dereference, next_value);
+        astate
+            .post
+            .heap
+            .add_edge(next_slot, Access::Dereference, next_value);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_addr)],
+            result: None,
+            kind: PrePostKind::LatentAbortProgram,
+            diagnostic: Some(dummy_invalid_access_diagnostic(
+                AbstractValue::mk_fresh(),
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            )),
+        };
+
+        let _ = pp.normalize();
+
+        assert_eq!(
+            pp.post.post.heap.find_edge(
+                pp.post.path_condition.get_var_repr(next_slot),
+                &Access::Dereference,
+            ),
+            Some(next_value),
+            "latent cycle summaries should preserve the direct callee heap edge instead of rewriting it to the root representative"
+        );
+        assert!(
+            pp.post.path_condition.phi().var_eqs.is_empty(),
+            "the direct heap cycle should not be exported as a var_eq"
+        );
+        assert!(
+            pp.post.path_condition.phi().linear_eqs.is_empty(),
+            "the direct heap cycle should not be exported as a linear_eq"
         );
     }
 

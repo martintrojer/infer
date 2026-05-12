@@ -1400,24 +1400,20 @@ fn translate_formula(
 
     fn apply_imported_formula_result(
         caller_state: &mut AbductiveDomain,
-        subst: &mut HashMap<AbstractValue, AbstractValue>,
+        _subst: &mut HashMap<AbstractValue, AbstractValue>,
         imported_must_be_valid: &mut std::collections::HashSet<AbstractValue>,
         stack_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
         heap_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
         result: crate::sat_unsat::SatUnsat<Vec<crate::formula::NewEq>>,
         loc: &Location,
     ) -> TranslateFormulaResult {
-        let result = result.map(|new_eqs| {
-            for new_eq in &new_eqs {
-                if let crate::formula::NewEq::Equal(old, new) = new_eq {
-                    for caller_v in subst.values_mut() {
-                        let caller_v0 = if *caller_v == *old { *new } else { *caller_v };
-                        *caller_v = caller_state.path_condition.get_var_repr(caller_v0);
-                    }
-                }
-            }
-            new_eqs
-        });
+        // Cross-ref: OCaml `PulseInterproc.incorporate_new_eqs` updates
+        // `rev_subst` (caller -> callee) after imported equalities, but it
+        // deliberately leaves the callee -> caller substitution ranges to be
+        // normalized lazily on lookup. Updating every mapped callee value here
+        // would erase direct post-heap targets that are equal to a simpler
+        // caller representative, turning a callee cycle edge into a root edge
+        // before `apply_post` has had a chance to replay the callee heap.
         match caller_state.apply_formula_result_for_summary_import(
             result,
             imported_must_be_valid,
@@ -3618,6 +3614,110 @@ mod tests {
             "simplify_for_summary must not collapse imported affine equations into dead temps; \
              got {:?}",
             summary_formula.phi().linear_eqs
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_preserves_direct_callee_cycle_post_edge() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let callee_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let callee_formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(callee_pvar.clone())))
+            .unwrap();
+        let callee_root = callee_state.read_heap(callee_formal_addr, Access::Dereference);
+        let next_field = Fieldname::make(
+            sil::typ::TypeName::CStruct(QualifiedCppName::from_string("node")),
+            "next",
+        );
+        let callee_next_slot =
+            callee_state.read_heap(callee_root, Access::FieldAccess(next_field.clone()));
+        let callee_next_value = callee_state.read_heap(callee_next_slot, Access::Dereference);
+        assert!(callee_state
+            .and_equal(callee_root, callee_next_value)
+            .is_sat());
+        // Summary export can preserve a cycle as a direct heap edge even when
+        // the formula representative for the target is the root. Pin
+        // `apply_post` to replay that direct edge target instead of resolving
+        // it through the representative.
+        callee_state
+            .pre
+            .heap
+            .add_edge(callee_next_slot, Access::Dereference, callee_next_value);
+        callee_state
+            .post
+            .heap
+            .add_edge(callee_next_slot, Access::Dereference, callee_next_value);
+        callee_state
+            .post
+            .attrs
+            .mark_written_to(callee_next_slot, 1, Location::dummy());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(callee_pvar, callee_formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let caller_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_pvar.clone())))
+            .unwrap();
+        let caller_root = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        let caller_next_slot =
+            caller_state.read_heap(caller_root, Access::FieldAccess(next_field.clone()));
+        let caller_next_value = caller_state.read_heap(caller_next_slot, Access::Dereference);
+        assert!(
+            caller_root < caller_next_value,
+            "fixture relies on root being the formula representative"
+        );
+
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_root,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let ExecutionDomain::ContinueProgram(state) = &results[0] else {
+            panic!("expected continue result, got {results:?}");
+        };
+        assert_eq!(
+            state
+                .post
+                .heap
+                .find_edge(caller_next_slot, &Access::Dereference),
+            Some(caller_next_value),
+            "apply_post should replay the callee's direct cycle edge target, not rewrite it through the canonical root representative"
+        );
+        assert_ne!(
+            caller_next_value, caller_root,
+            "the test should distinguish the direct edge target from the canonical root"
         );
     }
 
