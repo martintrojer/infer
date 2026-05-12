@@ -183,6 +183,30 @@ impl Edges {
         self.values.len()
     }
 
+    /// Rewrite edge targets/access indices through an arbitrary value mapper.
+    pub fn map_values(&mut self, mut f: impl FnMut(AbstractValue) -> AbstractValue) {
+        let rewritten = self
+            .recency_bindings_cloned()
+            .into_iter()
+            .map(|(access, mut value)| {
+                let access = match access {
+                    Access::ArrayAccess(typ, index) => Access::ArrayAccess(typ, f(index)),
+                    Access::FieldAccess(_) | Access::Dereference => access,
+                };
+                value.addr = f(value.addr);
+                (access, value)
+            })
+            .collect();
+        *self = match Self::configured_limit() {
+            Some(limit) => Self::from_recency_bindings_limited(rewritten, limit),
+            None => Self {
+                new_keys: Vec::new(),
+                old_keys: Vec::new(),
+                values: rewritten.into_iter().collect(),
+            },
+        };
+    }
+
     /// Substitute abstract values in edge targets.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
         let rewritten = self
@@ -352,6 +376,17 @@ impl BaseMemory {
 
     pub fn is_empty(&self) -> bool {
         self.graph.is_empty()
+    }
+
+    /// Rewrite every heap source/target/index through an arbitrary value mapper.
+    pub fn map_values(&mut self, mut f: impl FnMut(AbstractValue) -> AbstractValue) {
+        let mut rewritten = BTreeMap::new();
+        for (src, edges) in self.iter() {
+            let mut edges = edges.clone();
+            edges.map_values(&mut f);
+            rewritten.insert(f(*src), Arc::new(edges));
+        }
+        *self.graph_mut() = rewritten;
     }
 
     /// Substitute abstract values: replace `old` with `new` in both

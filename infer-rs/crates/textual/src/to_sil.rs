@@ -656,14 +656,31 @@ fn procdesc_to_sil(
 
     // Store-textual export can emit declaration-like empty `define`s with the
     // canonical `#node_0: @?; jmp  @?` body shape. Treat those as undefined so
-    // merged analysis does not mistake them for real bodies.
-    sil_pdesc.is_defined = !sil_pdesc.is_empty_body();
+    // merged analysis does not mistake them for real bodies. Do not classify
+    // real source-level empty bodies the same way: clang dump-textual emits
+    // bodies such as `void do_nothing(int**) { return; }` as a chain of empty
+    // jump nodes with concrete source locations. OCaml still publishes their
+    // read-only formal materialization summaries, which callers need to avoid
+    // treating those no-op calls as unknown havoc.
+    let is_declaration_stub = is_declaration_like_empty_define(pdesc);
+    sil_pdesc.is_defined = !is_declaration_stub;
+    sil_pdesc.has_source_body = !is_declaration_stub;
 
     if errors.is_empty() {
         Ok(sil_pdesc)
     } else {
         Err(errors)
     }
+}
+
+fn is_declaration_like_empty_define(pdesc: &ast::ProcDesc) -> bool {
+    pdesc.nodes.len() == 1
+        && pdesc.params.is_empty()
+        && pdesc.locals.is_empty()
+        && pdesc.nodes.iter().all(|node| {
+            node.instrs.is_empty()
+                && matches!(node.last, ast::Terminator::Jump(ref calls) if calls.is_empty())
+        })
 }
 
 fn textual_prune_is_then_branch(exp: &ast::Exp) -> bool {
@@ -1475,6 +1492,29 @@ define f() : void {
         let pdesc = cfg.iter_proc_descs().next().unwrap();
         assert!(pdesc.is_empty_body());
         assert!(!pdesc.is_defined);
+    }
+
+    #[test]
+    fn test_source_empty_function_body_stays_defined() {
+        let src = r#".source_language = "c"
+
+define do_nothing(_ptr: **int) : void {
+  #node_0: @[9:1]
+      jmp node_1 @[9:1]
+
+  #node_1: @[9:31]
+      jmp  @[9:31]
+
+} @[9:1]
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        assert!(pdesc.is_empty_body());
+        assert!(pdesc.is_defined);
+        assert!(pdesc.has_source_body);
     }
 
     #[test]

@@ -1238,7 +1238,10 @@ fn callee_cell_is_read_only(
     let Some(pre_edges) = pre_edges_opt else {
         return false;
     };
-    if !post_edges_opt.is_some_and(|post_edges| edge_targets_equal(pre_edges, post_edges)) {
+    let Some(post_edges) = post_edges_opt else {
+        return false;
+    };
+    if pre_edges.len() != post_edges.len() {
         return false;
     }
     !pre_post
@@ -1247,13 +1250,6 @@ fn callee_cell_is_read_only(
         .attrs
         .get(&callee_addr)
         .is_some_and(|attrs| attrs.iter().any(Attribute::is_modified))
-}
-
-fn edge_targets_equal(left: &crate::base_memory::Edges, right: &crate::base_memory::Edges) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .all(|(access, target)| right.find(access) == Some(*target))
 }
 
 fn apply_post_cell(

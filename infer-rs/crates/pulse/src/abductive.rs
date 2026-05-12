@@ -1040,6 +1040,21 @@ impl AbductiveDomain {
         self.path_condition.get_var_repr(v)
     }
 
+    /// Rewrite post-heap roots and edge targets to formula representatives.
+    ///
+    /// This is a light-weight canonicalization pass for retained intermediate
+    /// states. It avoids keeping stale heap edges such as `ptr -> old_x` after
+    /// a summary application or no-op call has learned/reintroduced that the
+    /// canonical pointee is still `x`. Unlike full `subst_var`, this does not
+    /// merge address attributes through every equality, so it preserves local
+    /// facts on values such as `x.* = 0` until summary export can root them.
+    pub fn preserve_canonical_heap_targets(&mut self) {
+        let path_condition = &self.path_condition;
+        self.post
+            .heap
+            .map_values(|value| path_condition.get_var_repr(value));
+    }
+
     /// Rewrite the current state to the formula's canonical representatives.
     ///
     /// Cross-ref: OCaml `PulseAbductiveDomain.canonicalize` runs before

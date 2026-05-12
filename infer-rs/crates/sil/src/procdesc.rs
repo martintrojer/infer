@@ -179,6 +179,12 @@ pub struct Procdesc {
     /// available from the capture pipeline.
     #[serde(default)]
     pub is_no_return: bool,
+    /// Whether an instruction-less procedure body came from a real source
+    /// definition rather than a declaration-like textual stub. Clang can emit
+    /// real empty bodies such as `void do_nothing(int**) { return; }` as only
+    /// jump nodes; Pulse must still publish/apply their read-only summaries.
+    #[serde(default)]
+    pub has_source_body: bool,
 }
 
 impl Procdesc {
@@ -210,6 +216,7 @@ impl Procdesc {
             exn_succs: HashMap::new(),
             is_defined: true,
             is_no_return: false,
+            has_source_body: true,
         }
     }
 
@@ -261,6 +268,11 @@ impl Procdesc {
     /// unknown calls rather than analyzed.
     pub fn is_empty_body(&self) -> bool {
         self.nodes.iter().all(|n| n.instrs.is_empty())
+    }
+
+    /// Whether this procdesc is only a declaration-like textual stub.
+    pub fn is_declaration_stub(&self) -> bool {
+        self.is_empty_body() && !self.has_source_body
     }
 
     /// Iterate over all instructions in the procedure.

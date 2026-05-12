@@ -1126,7 +1126,7 @@ impl PulseSummary {
             pp.post.shrink_for_storage();
         }
 
-        let is_empty_body = pdesc.is_empty_body();
+        let is_empty_body = pdesc.is_declaration_stub();
         let formal_types = pdesc
             .formals
             .iter()

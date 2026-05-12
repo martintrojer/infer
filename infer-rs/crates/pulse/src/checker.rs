@@ -402,6 +402,54 @@ fn shrink_intermediate_post_to_stack_reachable(state: &mut DisjunctiveDomain<Exe
     }
 }
 
+fn preserve_canonical_access_targets(state: &mut DisjunctiveDomain<ExecutionDomain>) {
+    for disjunct in state.disjuncts.iter_mut() {
+        let astate = match disjunct {
+            ExecutionDomain::ContinueProgram(s)
+            | ExecutionDomain::ExitProgram(s)
+            | ExecutionDomain::ExceptionRaised(s) => s,
+            // Error/latent variants carry their own snapshot used in
+            // diagnostics; do not mutate them after the fact.
+            ExecutionDomain::AbortProgram { .. }
+            | ExecutionDomain::LatentAbortProgram { .. }
+            | ExecutionDomain::LatentInvalidAccess { .. } => continue,
+        };
+        astate.preserve_canonical_heap_targets();
+    }
+}
+
+fn analyze_bodyless_source_definition(pdesc: &Procdesc) -> Option<PulseSummary> {
+    if !pdesc.is_empty_body() || !pdesc.has_source_body || pdesc.is_declaration_stub() {
+        return None;
+    }
+
+    // Clang dump-textual emits real source empty bodies such as
+    // `void do_nothing(int**) { return; }` as instruction-less jump nodes.
+    // OCaml Pulse still publishes a read-only summary rooted at each formal:
+    // the initial taint/formal pre-evaluation materializes `formal -> formal.*`
+    // but the body does not mutate it. Build that summary directly rather than
+    // letting later call sites treat the function as an unknown external havoc.
+    crate::abstract_value::AbstractValue::reset_counters();
+    let mut astate = AbductiveDomain::mk_initial(pdesc);
+    for (mangled, _typ, _annot) in &pdesc.formals {
+        let pvar = sil::pvar::Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+        let var = sil::var::Var::ProgramVar(Box::new(pvar));
+        let Some(formal_addr) = astate.post.stack.find(&var) else {
+            continue;
+        };
+        let _ = astate.record_read_access_at(formal_addr, &pdesc.loc);
+        let target = astate.read_heap(formal_addr, crate::access::Access::Dereference);
+        astate.pre.heap.register_address(target);
+    }
+
+    Some(PulseSummary::of_proc(
+        pdesc,
+        &[ExecutionDomain::ContinueProgram(astate)],
+        Vec::new(),
+        false,
+    ))
+}
+
 fn drop_dead_logical_vars(
     state: &mut DisjunctiveDomain<ExecutionDomain>,
     node_id: NodeId,
@@ -818,6 +866,10 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     crate::abstract_value::AbstractValue::reset_counters();
 
     log::info!("[pulse] analyzing {}", pdesc.proc_name);
+
+    if let Some(summary) = analyze_bodyless_source_definition(pdesc) {
+        return (summary, Vec::new());
+    }
 
     let cfg = config::get();
     if pdesc.size() > cfg.pulse_max_cfg_size {
@@ -1454,6 +1506,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                 self.return_candidate_logical_stamp,
             );
         }
+        preserve_canonical_access_targets(&mut state);
 
         let mut joined = current_post.join(&state);
         if node_id != pdesc.exit_node {
@@ -4491,6 +4544,44 @@ mod tests {
         // exports a single `ContinueProgram` summary for this shape.
         assert_eq!(continue_paths, 1, "summary={summary:?}");
         assert_eq!(latent_null_derefs, 0, "summary={summary:?}");
+    }
+
+    #[test]
+    fn test_analyze_bodyless_source_definition_publishes_read_only_summary() {
+        let pname = Procname::c_from_string("do_nothing");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("_ptr"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        let body = pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
+            Vec::new(),
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![body]);
+        pdesc.set_succs(body, vec![1]);
+
+        let summary = analyze(&pdesc);
+        assert_eq!(summary.pre_posts.len(), 1);
+        assert!(!summary.is_empty_body);
+        let pre_post = &summary.pre_posts[0];
+        assert_eq!(pre_post.kind, crate::summary::PrePostKind::ContinueProgram);
+        let formal = Pvar::mk(Mangled::from_string("_ptr"), pname);
+        let formal_addr = pre_post
+            .pre
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal)))
+            .expect("formal stack should be summarized");
+        assert!(
+            pre_post
+                .pre
+                .heap
+                .find_edge(formal_addr, &Access::Dereference)
+                .is_some(),
+            "bodyless source definitions should keep read-only formal materialization"
+        );
     }
 
     #[test]

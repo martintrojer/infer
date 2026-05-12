@@ -65,8 +65,8 @@ fn should_replace_procdesc(current: &Procdesc, incoming: &Procdesc) -> bool {
     // plus one or more empty `@?` stubs. Never let an empty stub overwrite a
     // real body during merged direct-Textual analysis.
     match (
-        current.is_defined && !current.is_empty_body(),
-        incoming.is_defined && !incoming.is_empty_body(),
+        current.is_defined && !current.is_declaration_stub(),
+        incoming.is_defined && !incoming.is_declaration_stub(),
     ) {
         (false, true) => true,
         (true, false) => false,
@@ -104,6 +104,7 @@ mod tests {
     fn mk_stub_proc(name: &str) -> Procdesc {
         let mut pdesc = mk_proc(name);
         pdesc.is_defined = false;
+        pdesc.has_source_body = false;
         pdesc
     }
 
