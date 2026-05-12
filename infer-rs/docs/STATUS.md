@@ -110,14 +110,26 @@ Secondary residual fixes also landed:
   canonicalization during imported formula application; preserve direct
   pre/post cycle heap edges in latent summary shape.
 
+Latent.c-focused fourth pass also landed:
+
+- `cluster_atom_normalization_argc_lin_signed` — comparator-side normalization
+  for cond ↔ phi.atom routing on zero (in)equalities and sign-normalized
+  linear-form atoms.
+- `cluster_use_after_free_caller_alpha_substitution` — prefer caller-actual
+  representative when canonicalizing imported substitution ranges in
+  `apply_post`.
+- `cluster_latent_classification_extra_aborts` — align latent invalid-access
+  classification (no over-broad local manifest twin; latent diagnostics replay
+  on specialized apply).
+
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `84 matching / 53 diffs`
-(`+34 matching / -34 diffs`). Per-file breakdown and per-pass narrative live
+(`50 matching / 87 diffs`) is now `86 matching / 51 diffs`
+(`+36 matching / -36 diffs`). Per-file breakdown and per-pass narrative live
 in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 
 No open `cluster_*` residual tasks remain in the C-suite triage track. Future
-work would be a fresh trace of remaining `latent.c` classification rows or
+work would be a fresh trace of remaining `latent.c` heap-shape rows or
 `may_double_free_if_alias` (the lone surviving specialization.c diff).
 
 ## OpenSSL benchmark dashboard

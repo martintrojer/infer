@@ -338,15 +338,60 @@ Branch: `infer-rs` at `56f496f878` after the secondary residual stack landed:
 
 ### Open residuals after this pass
 
-No open `cluster_*` residual tasks remain in the C-suite triage track. Future
-work lives outside the triage harness:
-
 - `cluster_a_taint_initial_formal_preeval_gap` follow-on residuals folded into
   the broader memory_leak.c residual; no separate task.
 - `may_double_free_if_alias` is the only remaining specialization.c diff (latent
   kind/post-attr drift); accepted, no follow-up planned at this checkpoint.
 - Remaining latent.c rows (`traverse_and_crash_if_equal_to_root`,
   `FN_crash_after_six_nodes_bad`, `crash_after_two_nodes_bad`) are a broader
-  latent classification concern. The direct-edge preservation has been pinned;
-  re-open follow-ups only if a deeper trace reveals a tractable producer-side
-  fix.
+  latent classification concern. Two further passes (atom normalization +
+  classification + caller substitution) landed on top of this; see the next
+  section.
+
+---
+
+## Remeasure after latent.c classification pass (2026-05-12, fourth pass)
+
+Branch: `infer-rs` at `45c6b9004f`. Three new fixes landed:
+
+- `cluster_atom_normalization_argc_lin_signed` (`1d26a295f5` /
+  `b92bfefaa3`) — comparator-side normalization for cond ↔ phi.atom routing on
+  zero (in)equalities and sign-normalized lin form
+  `(<a-b> {!=,=} 0)` ↔ `(<a> {!=,=} <b>)`. Improves latent.c `3/11 → 5/9`.
+- `cluster_use_after_free_caller_alpha_substitution` (`dd3f0f64e7` /
+  `d43907a2e3`) — prefer caller-actual representative when canonicalizing
+  imported substitution ranges in `apply_post`. Pin-down only at this point;
+  latent.c `FN_nonlatent_use_after_free_bad` still differs on broader summary
+  shape, but the alpha-rename mechanism is now OCaml-aligned.
+- `cluster_latent_classification_extra_aborts` (`f9bb6319a1` /
+  `45c6b9004f`) — remove the over-broad branch-controlled local manifest twin,
+  classify recovered invalid accesses latent for non-entry procedures, strip
+  recovered latent-invalid diagnostics from exported pre/posts, and replay
+  stripped latent stopped diagnostics for specialized summaries. Pin-down only;
+  latent.c counters unchanged at this layer.
+
+### Per-file totals after the fourth pass
+
+| File              | baseline matching | baseline diffs | current matching | current diffs | delta matching | delta diffs |
+|-------------------|------------------:|---------------:|-----------------:|--------------:|---------------:|------------:|
+| arithmetic.c      |                 4 |              7 |                6 |             5 |             +2 |          -2 |
+| funptr.c          |                10 |             18 |               20 |             8 |            +10 |         -10 |
+| interprocedural.c |                 6 |             11 |               10 |             7 |             +4 |          -4 |
+| latent.c          |                 1 |             13 |                5 |             9 |             +4 |          -4 |
+| memory_leak.c     |                 9 |             37 |               25 |            21 |            +16 |         -16 |
+| specialization.c  |                20 |              1 |               20 |             1 |             +0 |          -0 |
+| **total**         |            **50** |         **87** |           **86** |        **51** |        **+36** |     **-36** |
+
+### Status after the fourth pass
+
+No open `cluster_*` residual tasks remain in the C-suite triage track. Remaining
+top-level diffs are concentrated in:
+
+- latent.c `traverse_and_crash_if_equal_to_root` / `FN_crash_after_six_nodes_bad`
+  / `crash_after_two_nodes_bad` — deeper latent classification + state-shape
+  drift. The classification mechanism is OCaml-aligned via
+  `cluster_latent_classification_extra_aborts`; the remaining drift is in heap
+  shape during apply_post and per-step witness conditions.
+- memory_leak.c — array/index heap shape, malloc/realloc branch-count surface,
+  and recursion self-cycle/value-shape differences.
+- specialization.c — single accepted residual on `may_double_free_if_alias`.
