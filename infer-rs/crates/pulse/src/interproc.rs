@@ -77,6 +77,7 @@ pub(crate) fn apply_summary_with_aliasing(
     let mut subst: HashMap<AbstractValue, AbstractValue> = HashMap::new();
     let mut callee_heap_paths: HashMap<AbstractValue, Option<HeapPath>> = HashMap::new();
     let mut value_actual_formal_stack_addrs = std::collections::HashSet::new();
+    let mut callee_actual_value_addrs = std::collections::HashSet::new();
     let mut formal_histories: std::collections::BTreeMap<Pvar, ValueHistory> =
         std::collections::BTreeMap::new();
 
@@ -134,6 +135,7 @@ pub(crate) fn apply_summary_with_aliasing(
                         } else {
                             subst.insert(*target, *actual_val);
                         }
+                        callee_actual_value_addrs.insert(*target);
                         callee_heap_paths
                             .entry(*target)
                             .or_insert_with(|| Some(pvar_heap_path(formal_pvar)));
@@ -290,6 +292,12 @@ pub(crate) fn apply_summary_with_aliasing(
         let Some(&caller_addr) = subst.get(callee_addr) else {
             continue;
         };
+        let caller_addr = canonicalize_imported_actual_value(
+            &callee_actual_value_addrs,
+            *callee_addr,
+            caller_addr,
+            &caller_state,
+        );
         let post_edges = pre_post.post.post.heap.get_edges(*callee_addr);
         if !callee_cell_is_read_only(Some(pre_edges), post_edges, pre_post, *callee_addr) {
             apply_post_cell(
@@ -297,6 +305,7 @@ pub(crate) fn apply_summary_with_aliasing(
                 Some(pre_edges),
                 post_edges,
                 &mut subst,
+                &callee_actual_value_addrs,
                 &mut caller_state,
             );
         }
@@ -310,12 +319,18 @@ pub(crate) fn apply_summary_with_aliasing(
         if processed_pre_cells.contains(callee_addr) {
             continue;
         }
-        let caller_addr = resolve_mut(&mut subst, *callee_addr);
+        let caller_addr = resolve_for_post(
+            &mut subst,
+            *callee_addr,
+            &callee_actual_value_addrs,
+            &caller_state,
+        );
         apply_post_cell(
             caller_addr,
             None,
             Some(post_edges),
             &mut subst,
+            &callee_actual_value_addrs,
             &mut caller_state,
         );
     }
@@ -361,7 +376,12 @@ pub(crate) fn apply_summary_with_aliasing(
     // incorporating the callee's path condition.
     let callee_attrs = &pre_post.post.post.attrs;
     for (callee_addr, attrs) in callee_attrs.iter() {
-        let caller_addr = resolve_mut(&mut subst, *callee_addr);
+        let caller_addr = resolve_for_post(
+            &mut subst,
+            *callee_addr,
+            &callee_actual_value_addrs,
+            &caller_state,
+        );
         for attr in attrs.iter() {
             caller_state.post.attrs.add_one(
                 caller_addr,
@@ -1257,6 +1277,7 @@ fn apply_post_cell(
     pre_edges_opt: Option<&crate::base_memory::Edges>,
     post_edges_opt: Option<&crate::base_memory::Edges>,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
     caller_state: &mut AbductiveDomain,
 ) {
     let mut caller_edges = caller_state
@@ -1275,13 +1296,53 @@ fn apply_post_cell(
 
     if let Some(post_edges) = post_edges_opt {
         for (access, callee_target) in post_edges.iter() {
-            let caller_target = resolve_mut(subst, *callee_target);
+            let caller_target = resolve_for_post(
+                subst,
+                *callee_target,
+                callee_actual_value_addrs,
+                caller_state,
+            );
             let caller_access = translate_access(subst, access, caller_state);
             caller_edges.add(caller_access, caller_target);
         }
     }
 
     caller_state.post.heap.set_edges(caller_addr, caller_edges);
+}
+
+fn canonicalize_imported_actual_value(
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    callee_val: AbstractValue,
+    caller_val: AbstractValue,
+    caller_state: &AbductiveDomain,
+) -> AbstractValue {
+    // OCaml `to_caller_value_` normalizes substitution ranges lazily when
+    // reading from the callee→caller map. That makes imported post roots and
+    // targets follow the caller actual representative after callee formula
+    // equalities have been conjoined. Keep direct callee cycle targets intact
+    // (they are not actual/formal substitution values), but prefer the
+    // caller-visible representative for actual values such as `b.*` in
+    // `create_branching(b)`.
+    if callee_actual_value_addrs.contains(&callee_val) {
+        caller_state.get_var_repr(caller_val)
+    } else {
+        caller_val
+    }
+}
+
+fn resolve_for_post(
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_val: AbstractValue,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    caller_state: &AbductiveDomain,
+) -> AbstractValue {
+    let caller_val = resolve_mut(subst, callee_val);
+    canonicalize_imported_actual_value(
+        callee_actual_value_addrs,
+        callee_val,
+        caller_val,
+        caller_state,
+    )
 }
 
 /// Resolve a callee abstract value to a caller abstract value.
@@ -2614,6 +2675,164 @@ mod tests {
                 .any(|attr| matches!(attr, Attribute::WrittenTo(_, _))),
             "summary import should preserve caller-visible WrittenTo on the old pointee"
         );
+    }
+
+    #[test]
+    fn test_apply_summary_caller_actual_repr_for_imported_post_root_and_target() {
+        let callee_pname = Procname::c_from_string("create_branching");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(
+            Mangled::from_string("b"),
+            Typ::int(sil::typ::IKind::IInt),
+            Default::default(),
+        )];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let b_pvar = Pvar::mk(Mangled::from_string("b"), callee_pname);
+        let b_stack = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(b_pvar.clone())))
+            .unwrap();
+        let callee_b_val = callee_state.read_heap(b_stack, Access::Dereference);
+        assert!(callee_state.and_equal_const(callee_b_val, 0).is_sat());
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(b_pvar, b_stack)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![
+            (
+                Mangled::from_string("b"),
+                Typ::int(sil::typ::IKind::IInt),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("x"),
+                Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+                Default::default(),
+            ),
+        ];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_b_pvar = Pvar::mk(Mangled::from_string("b"), caller_pname.clone());
+        let caller_b_stack = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_b_pvar.clone())))
+            .unwrap();
+        let caller_b_val = caller_state.read_heap(caller_b_stack, Access::Dereference);
+        let caller_x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_x_stack = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_x_pvar.clone())))
+            .unwrap();
+        let caller_x_val = caller_state.read_heap(caller_x_stack, Access::Dereference);
+
+        let actual_id = Ident::create_normal(IdentName::from_string("b_actual"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_b_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::int(sil::typ::IKind::IInt))],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let mut state = match results.as_slice() {
+            [ExecutionDomain::ContinueProgram(state)] => state.clone(),
+            other => panic!("expected one continue result, got {other:?}"),
+        };
+        assert!(state
+            .and_equal_linear(
+                caller_b_val,
+                crate::formula::lin_arith::LinArith::of_var(caller_x_val),
+            )
+            .is_sat());
+        state.invalidate(
+            caller_x_val,
+            crate::invalidation::Invalidation::CFree,
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
+        );
+        state
+            .post
+            .heap
+            .add_edge(caller_x_stack, Access::Dereference, caller_b_val);
+        state
+            .post
+            .heap
+            .add_edge(caller_b_val, Access::Dereference, AbstractValue::mk_fresh());
+        state
+            .post
+            .attrs
+            .mark_written_to(caller_b_val, 1, Location::dummy());
+        state.post.attrs.add_one(
+            caller_b_val,
+            Attribute::Invalid(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42)),
+                ValueHistory::invalidated(
+                    crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42)),
+                    Location::dummy(),
+                ),
+            ),
+        );
+
+        let summary = crate::summary::PulseSummary::of_proc(
+            &caller_pdesc,
+            &[ExecutionDomain::ContinueProgram(state)],
+            vec![],
+            false,
+        );
+        let summary = summary.pre_posts.first().expect("expected one pre/post");
+        let imported_actual_repr = summary.post.path_condition.get_var_repr(caller_b_val);
+        assert_eq!(
+            summary
+                .pre
+                .heap
+                .find_edge(caller_x_stack, &Access::Dereference),
+            Some(imported_actual_repr),
+            "summary export should prefer the caller actual representative imported from create_branching(b)"
+        );
+        assert_eq!(
+            summary
+                .post
+                .post
+                .heap
+                .find_edge(caller_x_stack, &Access::Dereference),
+            Some(imported_actual_repr),
+            "post formal view should use the same caller actual representative"
+        );
+        assert!(
+            summary
+                .post
+                .path_condition
+                .is_known_zero(imported_actual_repr),
+            "the preferred actual representative should carry the imported zero fact"
+        );
+        assert!(summary
+            .post
+            .post
+            .attrs
+            .get(&imported_actual_repr)
+            .is_some_and(|attrs| attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::WrittenTo(_, _)))));
     }
 
     #[test]
