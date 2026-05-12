@@ -8,7 +8,7 @@
 //! Mirrors OCaml's `VarUF` (via `UnionFind.Make`).
 //!
 //! Tracks which abstract values are known to be equal. The canonical
-//! representative of each class is the "simplest" value (lowest raw id).
+//! representative of each class mirrors OCaml's `PulseFormulaVar` order.
 
 use std::collections::HashMap;
 
@@ -77,7 +77,7 @@ impl VarUF {
             return None; // already in same class
         }
 
-        // The "simpler" variable (lower raw absolute value) becomes the representative
+        // The "simpler" variable becomes the representative.
         let (keep, merge) = if is_simpler(r1, r2) {
             (r1, r2)
         } else {
@@ -133,16 +133,14 @@ impl VarUF {
     }
 }
 
-/// The "simpler" variable has lower absolute raw value.
-/// Unrestricted (positive) values are simpler than restricted (negative).
+/// Mirror OCaml `PulseFormulaVar.is_simpler_than`, which delegates to
+/// `PulseAbstractValue.compare` over raw ids. Restricted values are negative
+/// there, so a restricted representative is preferred over an unrestricted
+/// one. This matters when a field cursor is proven equal to its root: OCaml
+/// keeps the first field-derived value as the summary representative instead
+/// of rewriting the cycle target back to the root.
 fn is_simpler(v1: AbstractValue, v2: AbstractValue) -> bool {
-    if v1.is_unrestricted() && v2.is_restricted() {
-        true
-    } else if v1.is_restricted() && v2.is_unrestricted() {
-        false
-    } else {
-        v1.raw().unsigned_abs() < v2.raw().unsigned_abs()
-    }
+    v1.raw() < v2.raw()
 }
 
 #[cfg(test)]
@@ -167,7 +165,7 @@ mod tests {
 
         // Both should now have the same representative
         assert_eq!(uf.find(v1), uf.find(v2));
-        // v1 is simpler (lower id), so it should be the representative
+        // v1 is simpler (lower raw id), so it should be the representative
         assert_eq!(uf.find(v2), v1);
     }
 
@@ -196,6 +194,20 @@ mod tests {
         let r = uf.find(v1);
         assert_eq!(uf.find(v2), r);
         assert_eq!(uf.find(v3), r);
+    }
+
+    #[test]
+    fn test_union_prefers_ocaml_raw_order_for_restricted_values() {
+        let mut uf = VarUF::new();
+        let unrestricted = AbstractValue::of_raw(1);
+        let restricted = AbstractValue::of_raw(-1);
+
+        assert_eq!(
+            uf.union(unrestricted, restricted),
+            Some((unrestricted, restricted))
+        );
+        assert_eq!(uf.find(unrestricted), restricted);
+        assert_eq!(uf.find(restricted), restricted);
     }
 
     #[test]
