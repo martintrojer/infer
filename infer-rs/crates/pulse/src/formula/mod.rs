@@ -757,6 +757,23 @@ impl Formula {
         precondition_vocabulary: &HashSet<AbstractValue>,
         keep: &HashSet<AbstractValue>,
     ) {
+        self.simplify_for_summary_with_witness_targets(precondition_vocabulary, keep, keep);
+    }
+
+    /// Summary-specific simplification with an explicit set of direct summary
+    /// roots that may receive synthesized restricted/tableau inequality witnesses.
+    ///
+    /// OCaml `DeadVariables.eliminate` may keep formula-only affine temps alive
+    /// through the var graph, but its exported tableau witnesses are still rooted
+    /// in directly visible summary values. Passing only the pre-expansion seeds
+    /// here prevents synthesized witnesses from leaking onto recursive
+    /// specialization temps that escape alpha-renaming.
+    pub fn simplify_for_summary_with_witness_targets(
+        &mut self,
+        precondition_vocabulary: &HashSet<AbstractValue>,
+        keep: &HashSet<AbstractValue>,
+        witness_targets: &HashSet<AbstractValue>,
+    ) {
         let rewritten_conditions: Vec<_> = std::mem::take(&mut self.conditions)
             .into_iter()
             .filter_map(|(atom, depth)| {
@@ -776,9 +793,11 @@ impl Formula {
             .chain(rewritten_conditions.iter().map(|(atom, _)| atom))
             .cloned()
             .collect();
-        let witness_vars = self
-            .phi_mut()
-            .export_inequality_witnesses_for_summary(summary_atoms.iter(), keep);
+        let witness_vars = self.phi_mut().export_inequality_witnesses_for_summary(
+            summary_atoms.iter(),
+            keep,
+            witness_targets,
+        );
         let mut keep_with_witnesses = keep.clone();
         keep_with_witnesses.extend(witness_vars.iter().copied());
 
@@ -1338,6 +1357,47 @@ mod tests {
         let (witness, coeff) = lin.vars.iter().next().unwrap();
         assert!(witness.is_restricted());
         assert_eq!(*coeff, Q::from_integer(1));
+    }
+
+    #[test]
+    fn test_simplify_for_summary_does_not_export_witness_on_formula_only_temp() {
+        let mut f = Formula::ttrue();
+        let i = AbstractValue::of_raw(1);
+        let recursive_temp = AbstractValue::of_raw(2);
+
+        assert!(f
+            .and_equal_linear(
+                i,
+                LinArith::of_var(recursive_temp).add(&LinArith::of_int(2))
+            )
+            .is_sat());
+        assert!(f
+            .prune_less_than(
+                &Operand::ConstOperand(0),
+                &Operand::AbstractValue(recursive_temp),
+            )
+            .is_sat());
+        f.simplify_for_summary_with_witness_targets(
+            &HashSet::from([i]),
+            &HashSet::from([i, recursive_temp]),
+            &HashSet::from([i]),
+        );
+
+        assert!(
+            !f.phi().linear_eqs.contains_key(&recursive_temp),
+            "formula-only temps kept alive through an exported affine equality must not receive a \
+             synthesized restricted witness"
+        );
+        let lin = f
+            .phi()
+            .linear_eqs
+            .get(&i)
+            .expect("visible affine equality should remain exported");
+        assert_eq!(
+            lin.get_coefficient(recursive_temp),
+            Some(&Q::from_integer(1)),
+            "the existing visible equality should still keep the temp available for canonicalization"
+        );
     }
 
     #[test]

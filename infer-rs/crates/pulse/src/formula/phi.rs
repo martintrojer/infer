@@ -663,18 +663,25 @@ impl Phi {
     /// structure.
     ///
     /// This is deliberately summary-only and conservative: export at most one
-    /// equality per atom, only when the inequality has a single caller-visible
-    /// unrestricted variable to solve for. This avoids inventing relational
-    /// witnesses for multi-variable inequalities or perturbing transfer-time
-    /// satisfiability.
+    /// equality per atom, only when the inequality has a single direct summary
+    /// root to solve for. This avoids inventing relational witnesses for
+    /// formula-only values that are merely kept alive through another affine
+    /// equality (notably recursive specialization temps), multi-variable
+    /// inequalities, or transfer-time satisfiability.
     pub(crate) fn export_inequality_witnesses_for_summary<'a>(
         &mut self,
         atoms: impl IntoIterator<Item = &'a Atom>,
         keep: &HashSet<AbstractValue>,
+        witness_targets: &HashSet<AbstractValue>,
     ) -> HashSet<AbstractValue> {
+        let witness_targets: HashSet<_> = witness_targets
+            .iter()
+            .map(|target| self.get_repr(*target))
+            .collect();
         let mut pending = Vec::new();
         for atom in atoms {
-            let Some((target, solution)) = self.inequality_witness_eq(atom, keep) else {
+            let Some((target, solution)) = self.inequality_witness_eq(atom, keep, &witness_targets)
+            else {
                 continue;
             };
             if self.linear_eqs.contains_key(&target) {
@@ -698,7 +705,12 @@ impl Phi {
         &self,
         atom: &Atom,
         keep: &HashSet<AbstractValue>,
+        witness_targets: &HashSet<AbstractValue>,
     ) -> Option<(AbstractValue, LinArith)> {
+        if witness_targets.is_empty() {
+            return None;
+        }
+
         let (lhs, rhs, strict) = match atom {
             Atom::LessEqual(lhs, rhs) => (lhs, rhs, false),
             Atom::LessThan(lhs, rhs) => (lhs, rhs, true),
@@ -722,6 +734,7 @@ impl Phi {
             .filter(|v| {
                 v.is_unrestricted()
                     && keep.contains(v)
+                    && witness_targets.contains(v)
                     && !self.linear_eqs.contains_key(v)
                     && !self
                         .linear_eqs
@@ -740,6 +753,7 @@ impl Phi {
                 .copied()
                 .filter(|candidate| {
                     candidate.is_unrestricted()
+                        && witness_targets.contains(candidate)
                         && !self.linear_eqs.contains_key(candidate)
                         && self
                             .linear_eqs

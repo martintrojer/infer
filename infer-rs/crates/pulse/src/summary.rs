@@ -520,6 +520,7 @@ impl PrePost {
         pre_heap_reachable.extend(pre_canonical_reachable.iter().copied());
         let mut formula_seeds = post_canonical_reachable.clone();
         formula_seeds.extend(self.collect_reachable_array_indices(&post_heap_reachable));
+        let witness_targets = formula_seeds.clone();
         let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
         let mut precondition_vocabulary = pre_reachable.clone();
         precondition_vocabulary.extend(expand_formula_reachable(
@@ -569,7 +570,11 @@ impl PrePost {
         // rewritten through phi and dropped if they become tautological.
         self.post
             .path_condition
-            .simplify_for_summary(&precondition_vocabulary, &formula_reachable);
+            .simplify_for_summary_with_witness_targets(
+                &precondition_vocabulary,
+                &formula_reachable,
+                &witness_targets,
+            );
         self.materialize_visible_constant_invalidations(&post_canonical_reachable);
         self.align_function_pointer_closure_summary_surface();
 
@@ -2042,7 +2047,11 @@ fn prune_later_direct_formal_artifacts_for_potential_invalid_access(
     pre_post
         .post
         .path_condition
-        .simplify_for_summary(&precondition_vocabulary, &formula_reachable);
+        .simplify_for_summary_with_witness_targets(
+            &precondition_vocabulary,
+            &formula_reachable,
+            &formula_reachable,
+        );
 }
 
 fn classify_recovered_invalid_access_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
@@ -3381,7 +3390,7 @@ mod tests {
     use crate::attribute::Allocator;
     use crate::checker;
     use crate::formula::atom::Atom;
-    use crate::formula::lin_arith::LinArith;
+    use crate::formula::lin_arith::{LinArith, Q};
     use crate::formula::term::Term;
     use crate::value_history::ValueHistory;
     use ondemand::checker::InterChecker;
@@ -3835,6 +3844,64 @@ mod tests {
                 .linear_eqs
                 .contains_key(&local_value),
             "constraints on dead local-only values should be dropped from summaries"
+        );
+    }
+
+    #[test]
+    fn test_normalize_does_not_export_witness_on_formula_only_temp() {
+        let pdesc = make_pdesc_with_formals(&["i"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let i_pvar = Pvar::mk(Mangled::from_string("i"), pdesc.proc_name.clone());
+        let i_var = Var::ProgramVar(Box::new(i_pvar.clone()));
+        let i_addr = astate.post.stack.find(&i_var).unwrap();
+        let i = astate.read_heap(i_addr, Access::Dereference);
+        let recursive_temp = AbstractValue::mk_fresh();
+
+        assert!(astate
+            .path_condition
+            .and_equal_linear(
+                i,
+                LinArith::of_var(recursive_temp).add(&LinArith::of_int(2))
+            )
+            .is_sat());
+        assert!(astate
+            .path_condition
+            .prune_less_than(
+                &crate::formula::Operand::ConstOperand(0),
+                &crate::formula::Operand::AbstractValue(recursive_temp),
+            )
+            .is_sat());
+
+        let mut pre_post = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(i_pvar, i_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+        let _ = pre_post.normalize();
+
+        assert!(
+            !pre_post
+                .post
+                .path_condition
+                .phi()
+                .linear_eqs
+                .contains_key(&recursive_temp),
+            "recursive-specialization formula temps kept via a visible affine equality should not \
+             receive synthesized restricted witnesses"
+        );
+        let lin = pre_post
+            .post
+            .path_condition
+            .phi()
+            .linear_eqs
+            .get(&i)
+            .expect("visible formal equality should remain exported");
+        assert_eq!(
+            lin.get_coefficient(recursive_temp),
+            Some(&Q::from_integer(1))
         );
     }
 
