@@ -8,6 +8,7 @@
 use std::sync::{LazyLock, Mutex};
 
 use diagnostics::issue_type::IssueTypeId;
+use sil::typ::{TypeDesc, TypeName};
 use test_harness::textual_utils;
 
 // The end-to-end test binary exercises shared global analysis state (for
@@ -335,6 +336,11 @@ fn collect_summary_closure_pnames(
         for (_addr, attrs) in pre_post.post.post.attrs.iter() {
             if let Some(pname) = attrs.get_closure_proc_name() {
                 out.insert(pname.clone());
+            }
+        }
+        for (_addr, typ) in pre_post.post.iter_dynamic_types() {
+            if let TypeDesc::Tstruct(TypeName::CFunction(sig)) = typ.desc.as_ref() {
+                out.insert(sil::procname::Procname::C(sig.clone()));
             }
         }
     }

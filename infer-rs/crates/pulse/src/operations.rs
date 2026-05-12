@@ -364,9 +364,10 @@ fn eval_const(
         }
         Const::Cfun(pname) => {
             // Record the procedure name as a Closure attribute so that
-            // __call_c_function_ptr can resolve it later.
-            // Cross-ref: OCaml PulseOperations.ml eval_const records a
-            // closure via record_closure for Cfun constants.
+            // __call_c_function_ptr can resolve direct Cfun constants as a
+            // fallback. Summary export rewrites global/return function-pointer
+            // surfaces to OCaml's dynamic-type + `0 < addr` encoding instead
+            // of relying on exported Closure attrs.
             let v = AbstractValue::mk_fresh();
             log::trace!("  [eval_const] Cfun({pname}) → {v} with Closure attr");
             state

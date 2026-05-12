@@ -32,6 +32,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use sil::procname::Procname;
 use sil::source_file::SourceFile;
+use sil::typ::{TypeDesc, TypeName};
 
 /// infer-rs: Rust implementation of the Infer static analyzer.
 ///
@@ -1489,12 +1490,20 @@ fn collect_summary_closure_summaries(
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
     out: &mut std::collections::HashMap<sil::procname::Procname, Arc<pulse::summary::PulseSummary>>,
 ) {
+    let mut add = |pname: sil::procname::Procname| {
+        if let Some(summary) = ctx.summaries.get_arc(&pname) {
+            out.entry(pname).or_insert(summary);
+        }
+    };
     for pre_post in &summary.pre_posts {
         for (_addr, attrs) in pre_post.post.post.attrs.iter() {
             if let Some(pname) = attrs.get_closure_proc_name() {
-                if let Some(summary) = ctx.summaries.get_arc(pname) {
-                    out.entry(pname.clone()).or_insert(summary);
-                }
+                add(pname.clone());
+            }
+        }
+        for (_addr, typ) in pre_post.post.iter_dynamic_types() {
+            if let TypeDesc::Tstruct(TypeName::CFunction(sig)) = typ.desc.as_ref() {
+                add(sil::procname::Procname::C(sig.clone()));
             }
         }
     }

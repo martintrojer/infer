@@ -503,6 +503,46 @@ mod tests {
     }
 
     #[test]
+    fn test_make_specialization_from_caller_uses_closure_only_as_direct_fallback() {
+        let callee_pdesc = make_pdesc("callee", &["f"]);
+        let f_formal = Pvar::mk(Mangled::from_string("f"), callee_pdesc.proc_name.clone());
+        let needed_path = formal_value_heap_path(&f_formal);
+
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let mut callee_needs = HashMap::new();
+        callee_needs.insert(needed_path.clone(), AbstractValue::mk_fresh());
+
+        let spec = make_specialization_from_caller(
+            &callee_needs,
+            &caller_state,
+            &[(f_formal, AbstractValue::mk_fresh())],
+            &[Typ::mk_ptr(Typ::mk(sil::typ::TypeDesc::Tfun(None)))],
+            &[(
+                Exp::Const(sil::const_val::Const::Cfun(Procname::c_from_string(
+                    "assign_NULL",
+                ))),
+                Typ::mk_ptr(Typ::mk(sil::typ::TypeDesc::Tfun(None))),
+            )],
+        )
+        .expect("expected direct Cfun fallback specialization");
+
+        assert_eq!(
+            spec.dynamic_types.get(&needed_path),
+            Some(&TypeName::CFunction(
+                match Procname::c_from_string("assign_NULL") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("c procname expected"),
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn test_make_specialization_from_caller_uses_dynamic_type_without_closure_attr() {
         let callee_pdesc = make_pdesc("apply_callback", &["callback"]);
         let callback_formal = Pvar::mk(

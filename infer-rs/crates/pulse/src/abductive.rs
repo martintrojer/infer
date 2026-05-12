@@ -294,14 +294,14 @@ impl AbductiveDomain {
     /// - `need_dynamic_type_specialization`: caller-side; the
     ///   summary-level needs are summarized into
     ///   `PulseSummary::needs_specialization` before this point. Cleared.
-    /// - `dynamic_types`: caller-side; the summary-level needs are
-    ///   summarized into `PulseSummary::needs_specialization` before
-    ///   this point. Cleared.
+    /// - `dynamic_types`: preserved. OCaml stores function-pointer and
+    ///   closure targets in the summary formula's dynamic-type constraints;
+    ///   callers need those facts to resolve summary-returned/global function
+    ///   pointers without exported `Closure(...)` attrs.
     pub fn shrink_for_storage(&mut self) {
         self.pre = BaseDomain::empty();
         self.const_cache.clear();
         self.need_dynamic_type_specialization.clear();
-        self.dynamic_types.clear();
     }
 
     /// Create the initial state for analyzing a procedure.

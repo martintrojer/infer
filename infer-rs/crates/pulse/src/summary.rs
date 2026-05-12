@@ -13,6 +13,7 @@
 
 use sil::int_lit::IntLit;
 use sil::procdesc::Procdesc;
+use sil::procname::Procname;
 use sil::pvar::Pvar;
 use sil::specialization::{HeapPath, PulseSpecialization};
 use sil::var::Var;
@@ -21,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
+use crate::attribute::{Attribute, Attributes};
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::formula::atom::Atom;
@@ -477,6 +479,7 @@ impl PrePost {
             }
         }
         self.post.post.attrs.retain_for_post_summary();
+        self.add_pre_stack_for_global_function_pointer_values();
 
         // The caller-visible summary surface is rooted in the visible stack:
         // restored pre bindings, globals, and the return slot. After
@@ -568,11 +571,117 @@ impl PrePost {
             .path_condition
             .simplify_for_summary(&precondition_vocabulary, &formula_reachable);
         self.materialize_visible_constant_invalidations(&post_canonical_reachable);
+        self.align_function_pointer_closure_summary_surface();
 
         NormalizedSummaryInfo {
             leaks,
             summary_eq_zero_must_be_valid,
         }
+    }
+
+    fn add_pre_stack_for_global_function_pointer_values(&mut self) {
+        let post_globals: Vec<_> = self
+            .post
+            .post
+            .stack
+            .iter()
+            .filter(|(var, _addr)| var.is_global() && self.pre.stack.find(var).is_none())
+            .map(|(var, addr)| (var.clone(), *addr))
+            .collect();
+
+        for (var, global_addr) in post_globals {
+            let Some(funptr_val) = self
+                .post
+                .post
+                .heap
+                .find_edge(global_addr, &Access::Dereference)
+            else {
+                continue;
+            };
+            if !self
+                .post
+                .post
+                .attrs
+                .get(&self.post.path_condition.get_var_repr(funptr_val))
+                .is_some_and(|attrs| {
+                    attrs
+                        .iter()
+                        .any(|attr| matches!(attr, Attribute::Closure(_)))
+                })
+            {
+                continue;
+            }
+            self.pre.stack.add(var, global_addr);
+            self.pre.heap.register_address(global_addr);
+            self.pre.attrs.add_one(
+                global_addr,
+                Attribute::MustBeValid(0, sil::location::Location::dummy(), None),
+            );
+        }
+    }
+
+    fn is_exported_global_or_return_value(&self, addr: AbstractValue) -> bool {
+        self.result
+            .is_some_and(|result| self.post.path_condition.get_var_repr(result) == addr)
+            || self.post.post.stack.iter().any(|(var, stack_addr)| {
+                var.is_global()
+                    && self
+                        .post
+                        .post
+                        .heap
+                        .find_edge(*stack_addr, &Access::Dereference)
+                        .is_some_and(|target| self.post.path_condition.get_var_repr(target) == addr)
+            })
+    }
+
+    fn align_function_pointer_closure_summary_surface(&mut self) {
+        // Cross-ref: OCaml `PulseOperations.record_closure` records both a
+        // `Closure` attr and a dynamic type + `0 < addr`, but summary export
+        // for C function pointers surfaces the formula atom (and any stack
+        // entry for a global) rather than a caller-visible `Closure(...)`
+        // post attr. Keep Rust's `Closure` attrs for direct/Cfun fallback at
+        // analysis time, but remove them from exported values that already
+        // carry a C-function dynamic type.
+        let closure_addrs: Vec<_> = self
+            .post
+            .post
+            .attrs
+            .iter()
+            .filter(|(_addr, attrs)| {
+                attrs
+                    .iter()
+                    .any(|attr| matches!(attr, Attribute::Closure(_)))
+            })
+            .map(|(addr, _attrs)| *addr)
+            .collect();
+
+        for addr in closure_addrs {
+            let repr = self.post.path_condition.get_var_repr(addr);
+            let Some(proc_name) = self
+                .post
+                .post
+                .attrs
+                .get(&repr)
+                .and_then(Attributes::get_closure_proc_name)
+                .cloned()
+            else {
+                continue;
+            };
+            let is_c_function = matches!(proc_name, Procname::C(_));
+            if self.post.get_dynamic_type(repr).is_none() {
+                add_c_function_dynamic_type_if_possible(&mut self.post, repr, &proc_name);
+            }
+            if self.post.get_dynamic_type(repr).is_none() {
+                continue;
+            }
+            let _ = self.post.and_positive(repr);
+            if is_c_function && self.is_exported_global_or_return_value(repr) {
+                if let Some(attrs) = self.post.post.attrs.get_mut(&repr) {
+                    attrs.remove(&Attribute::Closure(proc_name));
+                }
+            }
+        }
+        self.post.post.attrs.remove_empty_entries();
     }
 
     /// Check for memory leaks among locally-reachable but summary-unreachable addresses.
@@ -3086,6 +3195,20 @@ fn atom_is_benign_manifest_constraint(
 // can use the same canonicalization-aware oracle. See the use-statement at
 // the top of this file for the import.
 
+fn add_c_function_dynamic_type_if_possible(
+    state: &mut AbductiveDomain,
+    addr: AbstractValue,
+    proc_name: &Procname,
+) {
+    let Procname::C(sig) = proc_name else {
+        return;
+    };
+    state.add_dynamic_type_unsafe(
+        addr,
+        sil::typ::Typ::mk_struct(sil::typ::TypeName::CFunction(sig.clone())),
+    );
+}
+
 /// Check if an allocator and invalidation are a matching pair (alloc then free).
 ///
 /// Cross-ref: OCaml PulseAttribute.ml alloc_free_match.
@@ -3886,6 +4009,117 @@ mod tests {
                 .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
             "the caller-visible pointee value should keep Initialized"
         );
+    }
+
+    #[test]
+    fn test_normalize_global_function_pointer_exports_pre_stack_and_positive_atom_not_closure_attr()
+    {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let global = Pvar::mk_global(Mangled::from_string("malloc_func"));
+        let global_var = Var::ProgramVar(Box::new(global.clone()));
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let global_addr = astate.eval_var(&global_var);
+        let funptr_val = AbstractValue::mk_fresh();
+        astate
+            .post
+            .heap
+            .add_edge(global_addr, Access::Dereference, funptr_val);
+        astate.add_attr(
+            funptr_val,
+            Attribute::Closure(Procname::c_from_string("malloc")),
+        );
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(astate)],
+            vec![],
+            false,
+        );
+
+        let pre_post = summary
+            .pre_posts
+            .first()
+            .expect("expected a continuing summary");
+        assert_eq!(pre_post.pre.stack.find(&global_var), Some(global_addr));
+        assert!(pre_post
+            .pre
+            .attrs
+            .get(&global_addr)
+            .is_some_and(|attrs| attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _)))));
+        assert!(pre_post
+            .post
+            .post
+            .attrs
+            .get(&funptr_val)
+            .is_none_or(|attrs| !attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::Closure(_)))));
+        assert!(pre_post
+            .post
+            .path_condition
+            .phi()
+            .atoms
+            .contains(&Atom::LessThan(Term::Const(0), Term::Var(funptr_val))));
+    }
+
+    #[test]
+    fn test_normalize_return_function_pointer_exports_positive_atom_not_closure_attr() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::mk_ptr(Typ::mk(sil::typ::TypeDesc::Tfun(None)));
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let ret_val = AbstractValue::mk_fresh();
+        astate.add_attr(
+            ret_val,
+            Attribute::Closure(Procname::c_from_string("assign_NULL")),
+        );
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        astate
+            .post
+            .stack
+            .add(Var::LogicalVar(ret_id.clone()), ret_val);
+        let ret_node = pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::ReturnStmt),
+            vec![sil::instr::Instr::Load {
+                id: ret_id,
+                e: sil::exp::Exp::Const(sil::const_val::Const::Cfun(Procname::c_from_string(
+                    "assign_NULL",
+                ))),
+                typ: pdesc.ret_type.clone(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![ret_node]);
+        pdesc.set_succs(ret_node, vec![1]);
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(astate)],
+            vec![],
+            false,
+        );
+
+        let pre_post = summary
+            .pre_posts
+            .first()
+            .expect("expected a continuing summary");
+        assert_eq!(pre_post.result, Some(ret_val));
+        assert!(pre_post
+            .post
+            .post
+            .attrs
+            .get(&ret_val)
+            .is_none_or(|attrs| !attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::Closure(_)))));
+        assert!(pre_post
+            .post
+            .path_condition
+            .phi()
+            .atoms
+            .contains(&Atom::LessThan(Term::Const(0), Term::Var(ret_val))));
     }
 
     #[test]

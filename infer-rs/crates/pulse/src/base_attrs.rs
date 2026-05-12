@@ -210,6 +210,13 @@ impl BaseAddressAttributes {
         });
     }
 
+    pub fn remove_empty_entries(&mut self) {
+        if self.map.values().all(|attrs| !attrs.is_empty()) {
+            return;
+        }
+        self.map_mut().retain(|_addr, attrs| !attrs.is_empty());
+    }
+
     /// Substitute abstract values.
     pub fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
         if !self.map.contains_key(&old) {
