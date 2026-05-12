@@ -245,6 +245,15 @@ fn run_infer_rs_cli_report(
 }
 
 /// Collect all Cfun procname references from an instruction and look up summaries.
+///
+/// Keep expression-only `Cfun` discovery non-recursive: the syntactic call
+/// graph already schedules those direct references before their users. A
+/// recursive fallback here re-analyzes recursive-specialization callees from
+/// inside the harness, diverging from OCaml's cycle-cut behavior and producing
+/// spurious `invoke_itself_bad` / `two_pointers_recursion_bad` disjuncts.
+/// Concrete virtual targets are the only exception because the call graph does
+/// not know them syntactically; they are still discovered below via the virtual
+/// target index.
 fn collect_cfun_refs(
     instr: &sil::instr::Instr,
     ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
@@ -259,7 +268,7 @@ fn collect_cfun_refs(
             flags,
             ..
         } => {
-            collect_cfun_refs_exp(fun_exp, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(fun_exp, ctx.summaries, out);
             if flags.cf_virtual {
                 if let sil::exp::Exp::Const(sil::const_val::Const::Cfun(callee)) = fun_exp {
                     const MAX_VIRTUAL_TARGET_DEPTH: usize = 5;
@@ -292,15 +301,15 @@ fn collect_cfun_refs(
                 }
             }
             for (arg_exp, _) in args {
-                collect_cfun_refs_exp(arg_exp, ctx, vt_index, depth, out);
+                collect_cfun_refs_exp(arg_exp, ctx.summaries, out);
             }
         }
         sil::instr::Instr::Store { e1, e2, .. } => {
-            collect_cfun_refs_exp(e1, ctx, vt_index, depth, out);
-            collect_cfun_refs_exp(e2, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(e1, ctx.summaries, out);
+            collect_cfun_refs_exp(e2, ctx.summaries, out);
         }
         sil::instr::Instr::Load { e, .. } => {
-            collect_cfun_refs_exp(e, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(e, ctx.summaries, out);
         }
         _ => {}
     }
@@ -348,37 +357,30 @@ fn collect_summary_closure_pnames(
 
 fn collect_cfun_refs_exp(
     exp: &sil::exp::Exp,
-    ctx: &ondemand::checker::AnalysisContext<pulse::summary::PulseSummary>,
-    vt_index: &pulse::virtual_targets::VirtualTargetIndex,
-    depth: usize,
+    store: &ondemand::summary::SummaryStore<pulse::summary::PulseSummary>,
     out: &mut std::collections::HashMap<sil::procname::Procname, pulse::summary::PulseSummary>,
 ) {
     match exp {
         sil::exp::Exp::Const(sil::const_val::Const::Cfun(pname)) => {
-            if let Some(summary) = ctx.summaries.get(pname) {
-                out.entry(pname.clone()).or_insert(summary);
-            } else if depth < 5 {
-                if let Some(pdesc) = ctx.cfg.get_proc_desc(pname) {
-                    let summary = analyze_with_spec_loop(pdesc, ctx, vt_index, None, depth + 1);
-                    out.entry(pname.clone()).or_insert(summary);
-                }
+            if let Some(summary) = store.get(pname) {
+                out.insert(pname.clone(), summary);
             }
         }
         sil::exp::Exp::BinOp(_, l, r) => {
-            collect_cfun_refs_exp(l, ctx, vt_index, depth, out);
-            collect_cfun_refs_exp(r, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(l, store, out);
+            collect_cfun_refs_exp(r, store, out);
         }
         sil::exp::Exp::UnOp(_, inner, _)
         | sil::exp::Exp::Cast(_, inner)
         | sil::exp::Exp::Exn(inner) => {
-            collect_cfun_refs_exp(inner, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(inner, store, out);
         }
         sil::exp::Exp::Lfield(data, _, _) => {
-            collect_cfun_refs_exp(&data.exp, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(&data.exp, store, out);
         }
         sil::exp::Exp::Lindex(base, idx) => {
-            collect_cfun_refs_exp(base, ctx, vt_index, depth, out);
-            collect_cfun_refs_exp(idx, ctx, vt_index, depth, out);
+            collect_cfun_refs_exp(base, store, out);
+            collect_cfun_refs_exp(idx, store, out);
         }
         _ => {}
     }
@@ -1176,6 +1178,21 @@ fn test_e2e_fopen_null_deref() {
 ///
 /// Heavy test — spawns infer.
 ///   cargo test --test end_to_end test_summary_comparison_specialization_main -- --ignored --nocapture
+fn assert_specialization_summary_report_at_post_overflow_baseline(
+    report: &test_harness::summary_compare::ComparisonReport,
+) {
+    assert_eq!(
+        (report.matching, report.differences.len()),
+        (20, 1),
+        "specialization.c summary parity should stay at the post-overflow baseline\n{report}"
+    );
+    assert_eq!(
+        report.differences.first().map(|diff| diff.proc_name.as_str()),
+        Some("may_double_free_if_alias"),
+        "the only expected residual specialization.c diff should remain may_double_free_if_alias\n{report}"
+    );
+}
+
 #[test]
 #[ignore]
 fn test_summary_comparison_specialization_main() {
@@ -1223,10 +1240,7 @@ fn test_summary_comparison_specialization_main() {
         report.ocaml_only.is_empty() && report.rust_only.is_empty(),
         "specialization.c summary harness should compare the same procedure set\n{report}"
     );
-    assert!(
-        report.matching + report.differences.len() > 0,
-        "specialization.c summary harness should compare at least one procedure"
-    );
+    assert_specialization_summary_report_at_post_overflow_baseline(&report);
 }
 
 /// Triage harness: run OCaml + Rust on a list of C Pulse tests and print a
@@ -1312,6 +1326,9 @@ fn test_summary_comparison_c_triage() {
 
         let report = summary_compare::compare_summaries(&ocaml_summaries, &rust_summaries);
         eprintln!("{report}");
+        if filename == "specialization.c" {
+            assert_specialization_summary_report_at_post_overflow_baseline(&report);
+        }
         summary_lines.push(format!(
             "{filename}\tmatching={}\tdiffs={}\tocaml_only={}\trust_only={}",
             report.matching,
