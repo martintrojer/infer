@@ -1247,6 +1247,171 @@ mod tests {
     }
 
     #[test]
+    fn test_store_lvar_marks_written_cell_initialized_without_initializing_pointee() {
+        let loc = Location::dummy();
+        let pname = Procname::c_from_string("test");
+        let pvar = Pvar::mk(Mangled::from_string("x"), pname.clone());
+        let mut pdesc = Procdesc::new(pname, Typ::void(), loc.clone());
+        pdesc.formals = vec![(
+            pvar.name.clone(),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar.clone())))
+            .expect("formal should be bound");
+        let rhs_id = Ident::create_normal(IdentName::from_string("rhs"), 0);
+        let rhs_val = AbstractValue::mk_fresh();
+        state
+            .post
+            .stack
+            .add(Var::LogicalVar(rhs_id.clone()), rhs_val);
+
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Lvar(pvar)),
+            typ: Typ::mk_ptr(Typ::void()),
+            e2: Box::new(Exp::Var(rhs_id)),
+            loc,
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let Some(ExecutionDomain::ContinueProgram(state)) = results.into_iter().next() else {
+            panic!("store should continue");
+        };
+        let formal_attrs = state
+            .post
+            .attrs
+            .get(&formal_addr)
+            .expect("store should leave attrs on the written formal cell");
+        assert!(
+            formal_attrs.contains(&crate::attribute::Attribute::Initialized),
+            "Store LHS Lvar should mark the written formal cell Initialized"
+        );
+        assert!(
+            formal_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "Store LHS Lvar should mark the written formal cell WrittenTo"
+        );
+        assert!(
+            !state
+                .post
+                .attrs
+                .get(&rhs_val)
+                .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
+            "assigning a pointer value into the formal cell must not initialize the RHS/pointee"
+        );
+    }
+
+    #[test]
+    fn test_store_lfield_marks_field_cell_initialized_without_initializing_formal_base() {
+        use sil::fieldname::Fieldname;
+        use sil::qualified_cpp_name::QualifiedCppName;
+        use sil::typ::TypeName;
+
+        let loc = Location::dummy();
+        let pname = Procname::c_from_string("test");
+        let pvar = Pvar::mk(Mangled::from_string("q"), pname.clone());
+        let mut pdesc = Procdesc::new(pname, Typ::void(), loc.clone());
+        pdesc.formals = vec![(
+            pvar.name.clone(),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_value = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar.clone())))
+            .expect("formal should be bound");
+        let field = Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_string("node")),
+            "next",
+        );
+
+        let rhs_id = Ident::create_normal(IdentName::from_string("rhs"), 0);
+        let rhs_val = AbstractValue::mk_fresh();
+        state
+            .post
+            .stack
+            .add(Var::LogicalVar(rhs_id.clone()), rhs_val);
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Lfield(
+                sil::exp::LfieldObjData {
+                    exp: Box::new(Exp::Lvar(pvar)),
+                    is_implicit: false,
+                },
+                field.clone(),
+                Typ::void(),
+            )),
+            typ: Typ::void(),
+            e2: Box::new(Exp::Var(rhs_id)),
+            loc,
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let Some(ExecutionDomain::ContinueProgram(state)) = results.into_iter().next() else {
+            panic!("field store should continue");
+        };
+        let field_cell = state
+            .post
+            .heap
+            .find_edge_with_history(formal_value, &Access::FieldAccess(field))
+            .expect("evaluating the Lfield should materialize the field cell")
+            .addr;
+        let field_attrs = state
+            .post
+            .attrs
+            .get(&field_cell)
+            .expect("store should leave attrs on the written field cell");
+        assert!(
+            field_attrs.contains(&crate::attribute::Attribute::Initialized),
+            "Store LHS Lfield should mark the field cell Initialized"
+        );
+        assert!(
+            field_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "Store LHS Lfield should mark the field cell WrittenTo"
+        );
+        let base_attrs = state
+            .post
+            .attrs
+            .get(&formal_value)
+            .expect("OCaml Write-mode Lfield base checks initialize the formal pointer base");
+        assert!(
+            base_attrs.contains(&crate::attribute::Attribute::Initialized),
+            "Lfield base check in Write mode should initialize the formal pointer base, matching OCaml `check_addr_access Write`"
+        );
+        assert!(
+            !base_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
+            "Lfield base check must not mark the formal pointer base WrittenTo; only the field cell is written"
+        );
+        let pre_base_attrs = state
+            .pre
+            .attrs
+            .get(&formal_value)
+            .expect("field access should abduce validity on the formal pointer base");
+        assert!(
+            pre_base_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::MustBeValid(_, _, _))),
+            "field-store base should still abduce MustBeValid"
+        );
+        assert!(
+            !pre_base_attrs
+                .iter()
+                .any(|attr| matches!(attr, crate::attribute::Attribute::MustBeInitialized(_, _))),
+            "field-store base should not abduce MustBeInitialized"
+        );
+    }
+
+    #[test]
     fn test_store_to_cleanup_local_marks_rhs_always_reachable() {
         let pname = Procname::c_from_string("test");
         let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());

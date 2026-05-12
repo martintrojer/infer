@@ -162,6 +162,7 @@ struct CanonAttrEntry {
 /// they participate as-is via the `Other` arm; the wrapped `Attribute`
 /// already derives `Ord`/`Hash`/`Eq`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(clippy::large_enum_variant)]
 enum CanonAttribute {
     ReturnedFromUnknown(Vec<ValueSortKey>),
     MustBeValid(Location, Option<MustBeValidReason>),
@@ -588,7 +589,8 @@ fn canonicalize(state: &AbductiveDomain) -> CanonicalizedState {
     // helper caches such as `must_be_valid`, and it ignores disconnected
     // retained heap/attr garbage.
     let pre_reachable = reachable_from_stack(&state.pre.stack, &state.pre.heap);
-    let post_reachable = reachable_from_stack(&state.post.stack, &state.post.heap);
+    let mut post_reachable = reachable_from_stack(&state.post.stack, &state.post.heap);
+    post_reachable.extend(written_stack_roots(&state.post.stack, &state.post.attrs));
     let mut canon = Canonicalizer::default();
     canon.seed_from_stack(&state.pre.stack);
     canon.seed_from_stack(&state.post.stack);
@@ -683,6 +685,22 @@ impl Hasher for FnvHasher {
     fn write(&mut self, bytes: &[u8]) {
         self.write_bytes(bytes);
     }
+}
+
+fn written_stack_roots(
+    stack: &crate::base_stack::BaseStack,
+    attrs: &crate::base_attrs::BaseAddressAttributes,
+) -> std::collections::HashSet<AbstractValue> {
+    let mut roots = std::collections::HashSet::new();
+    for (_var, addr) in stack.iter() {
+        if attrs
+            .get(addr)
+            .is_some_and(|attrs| attrs.get_written_to().is_some())
+        {
+            roots.insert(*addr);
+        }
+    }
+    roots
 }
 
 fn canonical_dynamic_types(

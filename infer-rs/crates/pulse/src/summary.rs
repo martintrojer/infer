@@ -456,18 +456,20 @@ impl PrePost {
             .filter(|(var, _)| !var.is_global() && !var.is_return())
             .map(|(_, addr)| *addr)
             .collect();
-        let mut empty_attr_roots = Vec::new();
         for addr in &hidden_stack_roots {
-            if let Some(attrs) = self.post.post.attrs.get_mut(addr) {
+            let Some(attrs) = self.post.post.attrs.get_mut(addr) else {
+                continue;
+            };
+            // Drop read-side `Initialized` markers from local/formal stack
+            // roots, but preserve write-side initialization. OCaml
+            // `AddressAttributes.add_one` records `Initialized` together
+            // with `WrittenTo`, and summaries expose both for written
+            // formal cells such as `x = malloc(...)` or `*out = ...`.
+            if attrs.get_written_to().is_none() {
                 attrs.remove(&crate::attribute::Attribute::Initialized);
-                if attrs.is_empty() {
-                    empty_attr_roots.push(*addr);
-                }
             }
         }
-        for addr in empty_attr_roots {
-            self.post.post.attrs.remove_addr(&addr);
-        }
+        self.post.post.attrs.retain_for_post_summary();
 
         // The caller-visible summary surface is rooted in the visible stack:
         // restored pre bindings, globals, and the return slot. After

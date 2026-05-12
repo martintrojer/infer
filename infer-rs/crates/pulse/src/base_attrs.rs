@@ -49,8 +49,15 @@ impl BaseAddressAttributes {
     }
 
     /// Add a single attribute to an address.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.AddressAttributes.add_one`
+    /// treats `WrittenTo` as a write-side initialization event too.
     pub fn add_one(&mut self, addr: AbstractValue, attr: Attribute) {
-        self.entry_mut(addr).add(attr);
+        let attrs = self.entry_mut(addr);
+        if matches!(attr, Attribute::WrittenTo(_, _)) {
+            attrs.add(Attribute::Initialized);
+        }
+        attrs.add(attr);
     }
 
     /// Get all attributes for an address.
