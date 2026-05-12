@@ -51,6 +51,57 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze.
 
+### C-suite OCaml↔Rust Pulse summary parity
+
+A separate parity track compares OCaml and Rust Pulse summaries directly per
+procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
+`interprocedural.c`, `latent.c`, `memory_leak.c`, `specialization.c`; `nullptr.c`
+is the known recursion hang). The triage harness lives in
+`crates/pulse/tests/end_to_end.rs::test_summary_comparison_c_triage` and the
+full narrative is in
+[`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
+
+Initial cluster pass landed (commits on branch):
+
+- `cluster_a_drop_spurious` — thread access modes through eval, drop spurious
+  `MustBeInitialized` on formals.
+- `cluster_a_taint_initial_formal_preeval_gap` — pre-evaluate formals at
+  procedure entry to mirror OCaml `taint_initial`.
+- `cluster_b_propagate_initialized_after_store` — pair `Initialized` with
+  `WrittenTo` in `add_one`.
+- `cluster_c_pair_allocated_cmalloc_with` — emit `Uninitialized` companion
+  on malloc/realloc primitives.
+- `cluster_c_tenv_struct_uninitialized_followup` — thread `&Tenv`, port
+  Tstruct field walk.
+- `cluster_d_align_global_function_pointer` — align global function-pointer
+  summary surface (pre_stack + `0 < addr`).
+- `cluster_e_stop_over_attaching` — gate `UsedAsBranchCond` like OCaml.
+- `cluster_e_residual_state_shape_self_cycle` — canonicalize summary pre.
+- `cluster_f_route_witness_atoms_through` — filter summary conditions by
+  precondition vocabulary.
+- `cluster_g_preserve_closure_call_return` — import callee formula before
+  post.
+- `cluster_g_residual_funptr_return_export` — preserve return zero facts
+  on exported summary surface.
+- `cluster_h_keep_linear_equalities_across` — preserve imported affine
+  equations.
+- `bug_specialization_c_stack_overflow_lin_arith_of_q` — break imported
+  linear cycles introduced by Cluster H (regression fix).
+
+Triage delta vs original 2026-05-11 baseline (5-file slice excluding
+`specialization.c`, which currently has its own residual track): `30 matching /
+86 diffs` → `51 matching / 65 diffs` (`+21 matching / -21 diffs`). Carrying
+the earlier `specialization.c 20 / 1` row forward gives a suite-equivalent
+`71 / 66` vs the original `50 / 87`.
+
+Residual / follow-up tracks remain open in `mu`:
+`cluster_d_residual_global_pre_stack_initializer`,
+`cluster_e_residual_cycle_eq_repr`,
+`cluster_g_residual_funptr_apply_post_canonical_edges`,
+`cluster_h_residual_inequality_witness_export`,
+`cluster_specialization_residual_post_overflow_fix`. They all gate the next
+dashboard refresh task `summary_c_triage_remeasure_after_clusters`.
+
 ## OpenSSL benchmark dashboard
 
 Corpus: 74-file partial OpenSSL capture under
@@ -132,16 +183,24 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **OpenSSL perf / benchmark hygiene** — the benchmark script now has stricter
+- **C-suite OCaml↔Rust Pulse summary parity** — initial 8-cluster pass
+  landed with measurable diff reduction (see the section above). Active work
+  is now the residual deeper traces: `cluster_d_residual_*`,
+  `cluster_e_residual_cycle_eq_repr`,
+  `cluster_g_residual_funptr_apply_post_canonical_edges`,
+  `cluster_h_residual_inequality_witness_export`,
+  `cluster_specialization_residual_post_overflow_fix`.
+- **OpenSSL perf / benchmark hygiene** — the benchmark script has stricter
   preflight/failure behavior and focused `state_cmp` fixes have landed. The
   remaining ready item is the clean quiescent-host full OpenSSL remeasure; do
   not run it while load/security daemons are high.
 - **Decision gate** — after the clean full-corpus remeasure closes,
   `perf_decide_next_track_after_profile_and_remeasure` should prune obsolete
   placeholders and choose the next concrete track.
-- **Correctness parity** — current C store-textual deltas are accepted and
+- **Correctness parity** — store-textual sweep-level deltas are accepted and
   documented above. Reopen parity work only for new sweep regressions or a real
-  Textual/export-fidelity project.
+  Textual/export-fidelity project. Procedure-level summary parity is tracked
+  separately by the C-suite triage track above.
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
   work (`perf_component_clone_reduction`), Textual enhancements, and accepted
   parity limits (`parity_sizeof_type_eval`) are parked with explicit
@@ -167,4 +226,5 @@ See [`docs/TESTING.md`](TESTING.md) for methodology and benchmark reproduction.
 - [`docs/TESTING.md`](TESTING.md) — test/benchmark commands.
 - [`docs/PULSE.md`](PULSE.md) — Pulse architecture.
 - [`docs/STORE_TEXTUAL.md`](STORE_TEXTUAL.md) — capture/export notes and accepted fidelity limits.
+- [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md) — C-suite OCaml↔Rust Pulse summary triage and per-cluster status.
 - [`docs/plans/`](plans/) — archived investigations.

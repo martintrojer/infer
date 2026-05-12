@@ -29,6 +29,12 @@ Current status and active work are intentionally separated:
 - [`STORE_TEXTUAL.md`](STORE_TEXTUAL.md) — store/export pipeline and accepted
   fidelity limits.
 
+## Triage and parity tracks
+
+- [`triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md)
+  — C-suite OCaml↔Rust Pulse summary mismatch triage. Per-cluster status
+  and remeasure totals after the initial cluster pass.
+
 ## Archived plans and findings
 
 Files under [`plans/`](plans/) are historical records, not the live task list.

@@ -6,12 +6,14 @@ iterate on in Rust.
 
 ## Current status
 
-- Store-textual C Pulse sweep: **52 / 55** files analyzed.
-- Issue counts: NPE expected `131`, found `134`; leaks expected/found `20`; UAF
-  expected/found `7`.
-- Accepted current count deltas: `nullptr.c` `+1` real-bug divergence and
-  `sizeof.c` `+2` exported-Textual fidelity limit.
-- Latest OpenSSL partial-corpus dashboard lives in [`docs/STATUS.md`](docs/STATUS.md).
+The authoritative dashboard is [`docs/STATUS.md`](docs/STATUS.md). At a glance:
+
+- Store-textual C Pulse sweep: `501` procedures analyzed, `185` issues, `51 OK` /
+  `0 FAIL_ANALYZE` / `1 TIMEOUT` (known recursion hang).
+- Active C-suite OCaml↔Rust Pulse summary parity work: see
+  [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](docs/triage/c_pulse_summary_mismatches_2026_05_11.md).
+- Latest OpenSSL partial-corpus performance dashboard lives in
+  [`docs/STATUS.md`](docs/STATUS.md).
 - Active work/backlog lives in `mu` tasks, not this file:
 
   ```sh
