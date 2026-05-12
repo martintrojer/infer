@@ -210,6 +210,13 @@ impl PrePost {
     /// `canonicalize`, then restores formals and discards unreachable state.
     fn canonicalize_for_summary(&mut self) {
         self.post.canonicalize_with_current_path_condition();
+        // Keep the exported precondition in lock-step with the canonicalized
+        // abductive state. OCaml `PulseAbductiveDomain.filter_for_summary`
+        // canonicalizes the whole astate first, then `restore_formals_for_summary`
+        // reads from that canonical pre. If Rust keeps `self.pre` stale here,
+        // formula-equal pre/post frame edges look modified to `apply_post` and
+        // callers get spurious self-cycle rewrites.
+        self.pre = self.post.pre.clone();
         for (_formal, addr) in &mut self.formals {
             *addr = self.post.path_condition.get_var_repr(*addr);
         }
@@ -3878,6 +3885,53 @@ mod tests {
                 .get(&formal_val)
                 .is_some_and(|attrs| attrs.contains(&crate::attribute::Attribute::Initialized)),
             "the caller-visible pointee value should keep Initialized"
+        );
+    }
+
+    #[test]
+    fn test_normalize_canonicalizes_pre_and_post_frame_edges_together() {
+        let pdesc = make_pdesc_with_formals(&["p"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("p"), pdesc.proc_name.clone());
+        let var = Var::ProgramVar(Box::new(pvar.clone()));
+        let formal_addr = astate.post.stack.find(&var).unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let field = Fieldname::make(
+            TypeName::CStruct(QualifiedCppName::from_string("node")),
+            "next",
+        );
+        let next_slot = astate.read_heap(formal_val, Access::FieldAccess(field));
+        let pre_pointee = astate.read_heap(next_slot, Access::Dereference);
+        let post_pointee_alias = AbstractValue::mk_fresh();
+        astate.write_heap(next_slot, Access::Dereference, post_pointee_alias);
+        assert_eq!(
+            astate.post.heap.find_edge(next_slot, &Access::Dereference),
+            Some(post_pointee_alias),
+            "fixture should start with a stale post target before equality normalization"
+        );
+        assert!(astate.and_equal(pre_pointee, post_pointee_alias).is_sat());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(pvar, formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+        let canonical_pointee = pp.post.path_condition.get_var_repr(pre_pointee);
+
+        assert_eq!(
+            pp.pre.heap.find_edge(next_slot, &Access::Dereference),
+            Some(canonical_pointee),
+            "summary pre heap should be rewritten to canonical representatives"
+        );
+        assert_eq!(
+            pp.post.post.heap.find_edge(next_slot, &Access::Dereference),
+            Some(canonical_pointee),
+            "summary post heap should use the same canonical frame edge as pre"
         );
     }
 
