@@ -653,6 +653,159 @@ impl Phi {
         }
     }
 
+    /// Add OCaml-style restricted witnesses for exported inequality facts.
+    ///
+    /// OCaml's linear solver encodes inequalities via fresh restricted
+    /// (non-negative) slack variables in its tableau. For example, `x <= 5`
+    /// is exported as `x = 5 - a`, and `5 < x` as `x = a + 6`, where `a` is
+    /// restricted. Rust does not keep a full tableau, but summary export still
+    /// needs these witness equalities so callers can see the same affine guard
+    /// structure.
+    ///
+    /// This is deliberately summary-only and conservative: export at most one
+    /// equality per atom, only when the inequality has a single caller-visible
+    /// unrestricted variable to solve for. This avoids inventing relational
+    /// witnesses for multi-variable inequalities or perturbing transfer-time
+    /// satisfiability.
+    pub(crate) fn export_inequality_witnesses_for_summary<'a>(
+        &mut self,
+        atoms: impl IntoIterator<Item = &'a Atom>,
+        keep: &HashSet<AbstractValue>,
+    ) -> HashSet<AbstractValue> {
+        let mut pending = Vec::new();
+        for atom in atoms {
+            let Some((target, solution)) = self.inequality_witness_eq(atom, keep) else {
+                continue;
+            };
+            if self.linear_eqs.contains_key(&target) {
+                continue;
+            }
+            pending.push((target, solution));
+        }
+
+        let mut witness_vars = HashSet::new();
+        for (target, solution) in pending {
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.linear_eqs.entry(target)
+            {
+                witness_vars.extend(solution.get_variables());
+                entry.insert(solution);
+            }
+        }
+        witness_vars
+    }
+
+    fn inequality_witness_eq(
+        &self,
+        atom: &Atom,
+        keep: &HashSet<AbstractValue>,
+    ) -> Option<(AbstractValue, LinArith)> {
+        let (lhs, rhs, strict) = match atom {
+            Atom::LessEqual(lhs, rhs) => (lhs, rhs, false),
+            Atom::LessThan(lhs, rhs) => (lhs, rhs, true),
+            Atom::Equal(_, _) | Atom::NotEqual(_, _) => return None,
+        };
+
+        let lhs = self.term_to_lin(lhs)?;
+        let rhs = self.term_to_lin(rhs)?;
+        let mut nonnegative = rhs.sub(&lhs);
+        if strict {
+            // Over integer expressions, `lhs < rhs` means `rhs - lhs - 1 >= 0`.
+            // This mirrors OCaml `solve_lin_ineq`'s strict-less-than lowering.
+            nonnegative = nonnegative.sub(&LinArith::of_int(1));
+        }
+
+        let mut candidates = nonnegative
+            .vars
+            .keys()
+            .copied()
+            .map(|v| self.get_repr(v))
+            .filter(|v| {
+                v.is_unrestricted()
+                    && keep.contains(v)
+                    && !self.linear_eqs.contains_key(v)
+                    && !self
+                        .linear_eqs
+                        .values()
+                        .any(|lin| lin.get_coefficient(*v).is_some())
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        if candidates.len() > 1 {
+            return None;
+        }
+        let target = candidates.into_iter().next().or_else(|| {
+            let mut anchored = keep
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    candidate.is_unrestricted()
+                        && !self.linear_eqs.contains_key(candidate)
+                        && self
+                            .linear_eqs
+                            .values()
+                            .any(|lin| lin.get_coefficient(*candidate).is_some())
+                })
+                .collect::<Vec<_>>();
+            anchored.sort();
+            (anchored.len() == 1).then(|| anchored[0])
+        })?;
+        let coeff = *nonnegative.vars.get(&target)?;
+
+        let mut without_target = nonnegative;
+        without_target.vars.remove(&target);
+        let witness = AbstractValue::mk_fresh_restricted();
+        // witness = coeff*target + without_target
+        // target = (witness - without_target) / coeff
+        let solution = LinArith::of_var(witness)
+            .sub(&without_target)
+            .mult_scalar(&(Q::from_integer(1) / coeff));
+
+        // `0 <= x` lowers to `x = witness`. OCaml often represents this by
+        // making the visible value itself restricted instead of exporting a
+        // separate equality. Emitting it here would add presentation noise
+        // without helping Cluster H's affine residuals.
+        if solution.constant.is_zero()
+            && solution.vars.len() == 1
+            && solution.vars.get(&witness) == Some(&Q::from_integer(1))
+        {
+            return None;
+        }
+
+        Some((target, solution))
+    }
+
+    fn term_to_lin(&self, term: &Term) -> Option<LinArith> {
+        match term {
+            Term::Var(v) => Some(LinArith::of_var(self.get_repr(*v))),
+            Term::Const(c) => Some(LinArith::of_int(*c)),
+            Term::Add(lhs, rhs) => Some(self.term_to_lin(lhs)?.add(&self.term_to_lin(rhs)?)),
+            Term::Sub(lhs, rhs) => Some(self.term_to_lin(lhs)?.sub(&self.term_to_lin(rhs)?)),
+            Term::Neg(inner) => Some(self.term_to_lin(inner)?.neg()),
+            Term::Mult(lhs, rhs) => match (lhs.as_const(), rhs.as_const()) {
+                (Some(coeff), None) => {
+                    Some(self.term_to_lin(rhs)?.mult_scalar(&Q::from_integer(coeff)))
+                }
+                (None, Some(coeff)) => {
+                    Some(self.term_to_lin(lhs)?.mult_scalar(&Q::from_integer(coeff)))
+                }
+                (Some(lhs), Some(rhs)) => Some(LinArith::of_int(lhs * rhs)),
+                (None, None) => None,
+            },
+            Term::Not(_) | Term::IsZero(_) => None,
+        }
+    }
+
+    pub(crate) fn drop_atoms_involving_or_restricted(&mut self, ignored: &HashSet<AbstractValue>) {
+        let var_eqs = &self.var_eqs;
+        self.atoms.retain(|atom| {
+            atom.all_vars().into_iter().all(|v| {
+                let repr = var_eqs.find_immut(v);
+                !repr.is_restricted() && !ignored.contains(&repr)
+            })
+        });
+    }
+
     /// Simplify: remove constraints mentioning unreachable variables.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
         let var_eqs = &self.var_eqs;

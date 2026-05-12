@@ -769,7 +769,22 @@ impl Formula {
             })
             .collect();
 
-        self.phi_mut().simplify(keep);
+        let summary_atoms: Vec<_> = self
+            .phi
+            .atoms
+            .iter()
+            .chain(rewritten_conditions.iter().map(|(atom, _)| atom))
+            .cloned()
+            .collect();
+        let witness_vars = self
+            .phi_mut()
+            .export_inequality_witnesses_for_summary(summary_atoms.iter(), keep);
+        let mut keep_with_witnesses = keep.clone();
+        keep_with_witnesses.extend(witness_vars.iter().copied());
+
+        self.phi_mut().simplify(&keep_with_witnesses);
+        self.phi_mut()
+            .drop_atoms_involving_or_restricted(&witness_vars);
 
         // Cross-ref: OCaml `PulseFormula.DeadVariables.eliminate` filters
         // `formula.conditions` against `closed_prunable_vars`, the formula-graph
@@ -1245,9 +1260,7 @@ mod tests {
         // (e.g. the `0 < ret` recorded by `free`'s prune_positive on a value
         // that escaped via a heap edge but whose only formula-graph link is
         // through dead vars) must be dropped from the exported summary's
-        // `conditions`. OCaml drops them via `closed_prunable_vars` derived
-        // from the formula-graph closure of the precondition vocabulary; only
-        // their `phi.atoms` peer is kept.
+        // `conditions`.
         let mut f = Formula::ttrue();
         let formal = AbstractValue::of_raw(1);
         let post_only = AbstractValue::of_raw(2);
@@ -1279,8 +1292,52 @@ mod tests {
             f.phi()
                 .atoms
                 .contains(&Atom::LessThan(Term::Const(0), Term::Var(post_only))),
-            "the corresponding phi.atoms entry must survive: keep includes post_only so phi keeps the witness"
+            "pure positive atoms without a restricted/tableau witness should survive summary export"
         );
+    }
+
+    #[test]
+    fn test_simplify_for_summary_exports_restricted_witness_for_le_guard() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+
+        assert!(f
+            .prune_less_equal(&Operand::AbstractValue(x), &Operand::ConstOperand(5))
+            .is_sat());
+        f.simplify_for_summary(&HashSet::from([x]), &HashSet::from([x]));
+
+        let lin = f
+            .phi()
+            .linear_eqs
+            .get(&x)
+            .expect("visible inequality should export an affine witness equality");
+        assert_eq!(lin.constant, Q::from_integer(5));
+        assert_eq!(lin.vars.len(), 1);
+        let (witness, coeff) = lin.vars.iter().next().unwrap();
+        assert!(witness.is_restricted());
+        assert_eq!(*coeff, Q::from_integer(-1));
+    }
+
+    #[test]
+    fn test_simplify_for_summary_exports_restricted_witness_for_strict_gt_guard() {
+        let mut f = Formula::ttrue();
+        let x = AbstractValue::of_raw(1);
+
+        assert!(f
+            .prune_less_than(&Operand::ConstOperand(5), &Operand::AbstractValue(x))
+            .is_sat());
+        f.simplify_for_summary(&HashSet::from([x]), &HashSet::from([x]));
+
+        let lin = f
+            .phi()
+            .linear_eqs
+            .get(&x)
+            .expect("strict visible inequality should export an affine witness equality");
+        assert_eq!(lin.constant, Q::from_integer(6));
+        assert_eq!(lin.vars.len(), 1);
+        let (witness, coeff) = lin.vars.iter().next().unwrap();
+        assert!(witness.is_restricted());
+        assert_eq!(*coeff, Q::from_integer(1));
     }
 
     #[test]
