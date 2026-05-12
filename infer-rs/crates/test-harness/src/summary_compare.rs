@@ -411,6 +411,7 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
     let witness_equivs = build_witness_equivalences(&eqs);
     let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
     let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
+    let constant_eqs = build_exact_constant_eqs(&eqs);
     let reverse_eqs = build_exact_rhs_equivalences(&eqs);
     let affine_env = build_unit_affine_equivalences(&eqs);
 
@@ -449,8 +450,28 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
                 normalized.insert(witness_atom);
                 continue;
             }
-            let lhs = normalize_atom_term_for_phi(&atom.lhs, &reverse_eqs, &affine_env);
-            let rhs = normalize_atom_term_for_phi(&atom.rhs, &reverse_eqs, &affine_env);
+            let lhs = normalize_atom_term_for_phi_with_anchors(
+                &atom.lhs,
+                &reverse_eqs,
+                &affine_env,
+                anchored_ids,
+            );
+            let rhs = normalize_atom_term_for_phi_with_anchors(
+                &atom.rhs,
+                &reverse_eqs,
+                &affine_env,
+                anchored_ids,
+            );
+            let lhs_is_zero = lhs == "0" || constant_eqs.get(&lhs).is_some_and(|c| c == "0");
+            if lhs_is_zero && atom.operator == "<" && anchored_ids.contains(&rhs) {
+                normalized.insert(format!("atom:0 < {rhs}"));
+                continue;
+            }
+            let rhs_is_zero = rhs == "0" || constant_eqs.get(&rhs).is_some_and(|c| c == "0");
+            if rhs_is_zero && atom.operator == "<" && anchored_ids.contains(&lhs) {
+                normalized.insert(format!("atom:{lhs} < 0"));
+                continue;
+            }
             if let Some(witness_atom) = collapse_witness_atom(
                 &lhs,
                 atom.operator,
@@ -539,12 +560,48 @@ fn normalize_atom_term_for_phi(
     reverse_eqs: &HashMap<String, Vec<String>>,
     affine_env: &HashMap<String, Vec<AffineExpr>>,
 ) -> String {
+    normalize_atom_term_for_phi_with_anchors(term, reverse_eqs, affine_env, &HashSet::new())
+}
+
+fn normalize_atom_term_for_phi_with_anchors(
+    term: &str,
+    reverse_eqs: &HashMap<String, Vec<String>>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
+    anchored_ids: &HashSet<String>,
+) -> String {
     let normalized = normalize_term_for_phi(term, affine_env);
-    reverse_eqs
-        .get(&normalized)
-        .and_then(|lhss| lhss.first())
-        .map(|lhs| normalize_term_for_phi(lhs, affine_env))
-        .unwrap_or(normalized)
+    if is_integer_constant(&normalized) {
+        return normalized;
+    }
+    let mut candidates = Vec::new();
+    candidates.push(normalized.clone());
+    if let Some(lhss) = reverse_eqs.get(&normalized) {
+        candidates.extend(
+            lhss.iter()
+                .map(|lhs| normalize_term_for_phi(lhs, affine_env)),
+        );
+    }
+
+    // OCaml summary export keeps atom terms rooted on stable caller-visible
+    // heap representatives when one exists (for example a global function
+    // pointer `malloc_func.*`) rather than rewriting through another alias
+    // such as a caller return/formal. Mirror that presentation in the
+    // comparison surface by preferring anchored aliases over the raw term, then
+    // fall back to the previous lexicographic representative rule.
+    candidates.sort_by_key(|candidate| atom_term_repr_sort_key(candidate, anchored_ids));
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| term.to_string())
+}
+
+fn atom_term_repr_sort_key(term: &str, anchored_ids: &HashSet<String>) -> (bool, bool, String) {
+    (
+        !anchored_ids.contains(term),
+        term.contains('('),
+        term.to_string(),
+    )
 }
 
 fn normalize_atom_term_for_condition(
@@ -618,6 +675,15 @@ fn condition_term_sort_key(term: &str) -> (bool, bool, bool, usize, String) {
         term.len(),
         term.to_string(),
     )
+}
+
+fn build_exact_constant_eqs(eqs: &HashMap<String, String>) -> HashMap<String, String> {
+    eqs.iter()
+        .filter_map(|(lhs, rhs)| {
+            let rhs = normalize_term_syntax_for_phi(rhs);
+            is_integer_constant(&rhs).then_some((lhs.clone(), rhs))
+        })
+        .collect()
 }
 
 fn build_exact_constant_lhs_set(eqs: &HashMap<String, String>, constant: &str) -> HashSet<String> {
@@ -3010,6 +3076,136 @@ mod tests {
         assert_eq!(
             format_rust_specialization_key(&spec),
             "dynamic_types: {*funptr: assign_NULL}"
+        );
+    }
+
+    #[test]
+    fn test_phi_atom_repr_prefers_anchored_global_funptr_over_return_alias() {
+        let summary = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("malloc_func".to_string(), "v5".to_string()),
+                    ("return".to_string(), "v11".to_string()),
+                ],
+                post_stack: vec![
+                    ("malloc_func".to_string(), "v5".to_string()),
+                    ("return".to_string(), "v11".to_string()),
+                ],
+                pre_heap: vec![RawEdge {
+                    src: "v5".to_string(),
+                    access: "*".to_string(),
+                    dst: "v6".to_string(),
+                }],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v5".to_string(),
+                        access: "*".to_string(),
+                        dst: "v6".to_string(),
+                    },
+                    RawEdge {
+                        src: "v11".to_string(),
+                        access: "*".to_string(),
+                        dst: "v9".to_string(),
+                    },
+                ],
+                pre_attrs: vec![
+                    ("v5".to_string(), vec!["MustBeValid".to_string()]),
+                    (
+                        "v9".to_string(),
+                        vec!["Invalid(ConstantDereference(0))".to_string()],
+                    ),
+                ],
+                post_attrs: vec![(
+                    "v9".to_string(),
+                    vec!["Invalid(ConstantDereference(0))".to_string()],
+                )],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v9=0".to_string(),
+                    "eq:v6=lin(1*a6,const=1)".to_string(),
+                    "atom:0 < v6".to_string(),
+                    "atom:v9 < v6".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = summary.canonicalize();
+        let pre_post = canonical.main.first().expect("one pre/post");
+        assert!(
+            pre_post.phi.contains(&"atom:0 < malloc_func.*".to_string()),
+            "global function pointer should be the exported atom representative: {pre_post:?}"
+        );
+        assert!(
+            !pre_post
+                .phi
+                .contains(&"atom:return.* < malloc_func.*".to_string()),
+            "caller return alias should not be kept as a residual positive atom: {pre_post:?}"
+        );
+    }
+
+    #[test]
+    fn test_phi_atom_repr_prefers_anchored_global_funptr_over_formal_alias() {
+        let summary = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![
+                    ("free_func".to_string(), "v3".to_string()),
+                    ("x".to_string(), "v1".to_string()),
+                ],
+                post_stack: vec![
+                    ("free_func".to_string(), "v3".to_string()),
+                    ("x".to_string(), "v1".to_string()),
+                ],
+                pre_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v2".to_string(),
+                    },
+                    RawEdge {
+                        src: "v3".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                ],
+                post_heap: vec![
+                    RawEdge {
+                        src: "v1".to_string(),
+                        access: "*".to_string(),
+                        dst: "v2".to_string(),
+                    },
+                    RawEdge {
+                        src: "v3".to_string(),
+                        access: "*".to_string(),
+                        dst: "v4".to_string(),
+                    },
+                ],
+                pre_attrs: vec![("v3".to_string(), vec!["MustBeValid".to_string()])],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec![
+                    "eq:v2=0".to_string(),
+                    "eq:v4=lin(1*a1,const=1)".to_string(),
+                    "atom:0 < v4".to_string(),
+                    "atom:v2 < v4".to_string(),
+                ],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = summary.canonicalize();
+        let pre_post = canonical.main.first().expect("one pre/post");
+        assert!(
+            pre_post.phi.contains(&"atom:0 < free_func.*".to_string()),
+            "global function pointer should be the exported atom representative: {pre_post:?}"
+        );
+        assert!(
+            !pre_post.phi.contains(&"atom:x.* < free_func.*".to_string()),
+            "caller formal alias should not be kept as a residual positive atom: {pre_post:?}"
         );
     }
 

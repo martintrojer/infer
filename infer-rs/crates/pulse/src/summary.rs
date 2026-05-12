@@ -4136,6 +4136,68 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_global_funptr_positive_atom_does_not_pick_zero_return_alias() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::mk_ptr(Typ::void());
+        let global = Pvar::mk_global(Mangled::from_string("malloc_func"));
+        let global_var = Var::ProgramVar(Box::new(global.clone()));
+        let return_pvar = Pvar::mk(Mangled::from_string("__return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let global_addr = astate.eval_var(&global_var);
+        let funptr_val = AbstractValue::mk_fresh();
+        let return_addr = AbstractValue::mk_fresh();
+        let zero_return = AbstractValue::mk_fresh();
+        astate
+            .post
+            .heap
+            .add_edge(global_addr, Access::Dereference, funptr_val);
+        astate.post.stack.add(return_var.clone(), return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, zero_return);
+        astate.add_dynamic_type_unsafe(
+            funptr_val,
+            Typ::mk_struct(TypeName::CFunction(
+                match Procname::c_from_string("malloc") {
+                    Procname::C(sig) => sig,
+                    _ => unreachable!("expected C procname"),
+                },
+            )),
+        );
+        assert!(astate.and_positive(funptr_val).is_sat());
+        assert!(astate.and_equal_const(zero_return, 0).is_sat());
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(astate)],
+            vec![],
+            false,
+        );
+
+        let pre_post = summary
+            .pre_posts
+            .first()
+            .expect("expected a continuing summary");
+        let funptr_repr = pre_post.post.path_condition.get_var_repr(funptr_val);
+        let return_repr = pre_post.post.path_condition.get_var_repr(zero_return);
+        assert!(pre_post
+            .post
+            .path_condition
+            .phi()
+            .atoms
+            .contains(&Atom::LessThan(Term::Const(0), Term::Var(funptr_repr))));
+        assert!(
+            !pre_post.post.path_condition.phi().atoms.contains(&Atom::LessThan(
+                Term::Var(return_repr),
+                Term::Var(funptr_repr),
+            )),
+            "summary normalization should keep OCaml's global funptr representative instead of a zero return alias"
+        );
+    }
+
+    #[test]
     fn test_normalize_imported_global_function_pointer_dynamic_type_exports_pre_stack() {
         let pdesc = make_pdesc_with_formals(&[]);
         let global = Pvar::mk_global(Mangled::from_string("malloc_func"));
