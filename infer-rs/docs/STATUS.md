@@ -102,16 +102,23 @@ Residual track also landed (commits on branch):
 - `bug_h_residual_witness_regresses_specialization` — scope H witness export
   to direct summary roots; restored specialization.c parity.
 
+Secondary residual fixes also landed:
+
+- `cluster_d_residual_funptr_atom_repr` — prefer global funptr pointee as the
+  atom representative during summary comparison/normalization.
+- `cluster_e_residual_apply_post_cycle_edges` — remove eager subst-value
+  canonicalization during imported formula application; preserve direct
+  pre/post cycle heap edges in latent summary shape.
+
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `82 matching / 55 diffs`
-(`+32 matching / -32 diffs`). Per-file breakdown lives in
+(`50 matching / 87 diffs`) is now `84 matching / 53 diffs`
+(`+34 matching / -34 diffs`). Per-file breakdown and per-pass narrative live
+in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 
-Remaining open residual tracks:
-`cluster_d_residual_funptr_atom_repr` (formula-atom representative drift) and
-`cluster_e_residual_apply_post_cycle_edges` (preserve direct callee cycle heap
-edges in apply_post / latent recovery). They gate the next dashboard refresh
-task `summary_c_triage_remeasure_after_clusters`.
+No open `cluster_*` residual tasks remain in the C-suite triage track. Future
+work would be a fresh trace of remaining `latent.c` classification rows or
+`may_double_free_if_alias` (the lone surviving specialization.c diff).
 
 ## OpenSSL benchmark dashboard
 

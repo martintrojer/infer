@@ -303,12 +303,50 @@ Residual-track fixes landed on top of the initial cluster pass:
 
 ### Open residuals after this pass
 
-- `cluster_d_residual_funptr_atom_repr` — formula-atom representative drift
-  (`atom:0 < malloc_func.*` vs `atom:return.* < malloc_func.*`).
-- `cluster_e_residual_apply_post_cycle_edges` — preserve direct callee cycle
-  heap edges in `apply_post` / latent recovery instead of rewriting them through
-  the canonical representative.
 - `cluster_a_taint_initial_formal_preeval_gap` follow-on residuals are folded
   into the broader memory_leak.c residual; no separate task.
 - The single remaining specialization.c diff stays on `may_double_free_if_alias`
   (latent kind/post-attr drift), unchanged across this pass.
+
+---
+
+## Remeasure after secondary residual cluster fixes (2026-05-12, third pass)
+
+Branch: `infer-rs` at `56f496f878` after the secondary residual stack landed:
+
+- `cluster_d_residual_funptr_atom_repr` (`f4ead67353` / `f172c2fc95`) — prefer
+  the global funptr pointee as the atom representative during summary
+  comparison/normalization. Pure normalization fix; analysis semantics and
+  Closure seeding unchanged. memory_leak.c improves; nothing else moves.
+- `cluster_e_residual_apply_post_cycle_edges` (`0748df5dc3` / `56f496f878`) —
+  remove eager subst-value canonicalization during imported formula
+  application; restore direct pre/post cycle heap edges in latent summary
+  shape. Unit-pinned; latent.c counters unchanged because the remaining drift
+  is in broader latent classification, not the direct-edge mechanism.
+
+### Per-file totals after the third pass
+
+| File              | baseline matching | baseline diffs | current matching | current diffs | delta matching | delta diffs |
+|-------------------|------------------:|---------------:|-----------------:|--------------:|---------------:|------------:|
+| arithmetic.c      |                 4 |              7 |                6 |             5 |             +2 |          -2 |
+| funptr.c          |                10 |             18 |               20 |             8 |            +10 |         -10 |
+| interprocedural.c |                 6 |             11 |               10 |             7 |             +4 |          -4 |
+| latent.c          |                 1 |             13 |                3 |            11 |             +2 |          -2 |
+| memory_leak.c     |                 9 |             37 |               25 |            21 |            +16 |         -16 |
+| specialization.c  |                20 |              1 |               20 |             1 |             +0 |          -0 |
+| **total**         |            **50** |         **87** |           **84** |        **53** |        **+34** |     **-34** |
+
+### Open residuals after this pass
+
+No open `cluster_*` residual tasks remain in the C-suite triage track. Future
+work lives outside the triage harness:
+
+- `cluster_a_taint_initial_formal_preeval_gap` follow-on residuals folded into
+  the broader memory_leak.c residual; no separate task.
+- `may_double_free_if_alias` is the only remaining specialization.c diff (latent
+  kind/post-attr drift); accepted, no follow-up planned at this checkpoint.
+- Remaining latent.c rows (`traverse_and_crash_if_equal_to_root`,
+  `FN_crash_after_six_nodes_bad`, `crash_after_two_nodes_bad`) are a broader
+  latent classification concern. The direct-edge preservation has been pinned;
+  re-open follow-ups only if a deeper trace reveals a tractable producer-side
+  fix.
