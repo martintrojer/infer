@@ -229,7 +229,7 @@ impl LinArith {
     }
 
     /// Substitute every variable with a linear expression.
-    pub fn subst_variables(&self, f: impl Fn(AbstractValue) -> LinArith) -> Self {
+    pub fn subst_variables(&self, mut f: impl FnMut(AbstractValue) -> LinArith) -> Self {
         let mut result = Self::of_q(self.constant);
         for (&v, coeff) in &self.vars {
             result = result.add(&f(v).mult_scalar(coeff));

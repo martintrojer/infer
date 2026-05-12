@@ -1306,13 +1306,62 @@ fn imported_linear_subst(
     subst: &HashMap<AbstractValue, AbstractValue>,
     callee_v: AbstractValue,
 ) -> crate::formula::lin_arith::LinArith {
-    let callee_repr = phi.get_repr(callee_v);
-    match phi.linear_eqs.get(&callee_repr) {
-        Some(lin) => lin.subst_variables(|dep| imported_linear_subst(phi, subst, dep)),
-        None => crate::formula::lin_arith::LinArith::of_var(
+    imported_linear_subst_with_cache(
+        phi,
+        subst,
+        callee_v,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
+}
+
+fn imported_linear_subst_with_cache(
+    phi: &crate::formula::phi::Phi,
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    callee_v: AbstractValue,
+    cache: &mut HashMap<AbstractValue, crate::formula::lin_arith::LinArith>,
+    visiting: &mut HashSet<AbstractValue>,
+) -> crate::formula::lin_arith::LinArith {
+    fn mapped_var(
+        subst: &HashMap<AbstractValue, AbstractValue>,
+        callee_repr: AbstractValue,
+    ) -> crate::formula::lin_arith::LinArith {
+        crate::formula::lin_arith::LinArith::of_var(
             *subst.get(&callee_repr).expect("formula subst"),
-        ),
+        )
     }
+
+    let callee_repr = phi.get_repr(callee_v);
+    if let Some(cached) = cache.get(&callee_repr) {
+        return cached.clone();
+    }
+    if visiting.contains(&callee_repr) {
+        return mapped_var(subst, callee_repr);
+    }
+    let Some(lin) = phi.linear_eqs.get(&callee_repr) else {
+        return mapped_var(subst, callee_repr);
+    };
+
+    visiting.insert(callee_repr);
+    let mut result = crate::formula::lin_arith::LinArith::of_q(lin.constant);
+    let mut hit_cycle = false;
+    for (&dep, coeff) in &lin.vars {
+        if visiting.contains(&phi.get_repr(dep)) {
+            hit_cycle = true;
+            break;
+        }
+        let dep_lin = imported_linear_subst_with_cache(phi, subst, dep, cache, visiting);
+        result = result.add(&dep_lin.mult_scalar(coeff));
+    }
+    visiting.remove(&callee_repr);
+
+    let result = if hit_cycle {
+        mapped_var(subst, callee_repr)
+    } else {
+        result
+    };
+    cache.insert(callee_repr, result.clone());
+    result
 }
 
 /// Translate the callee's formula constraints into the caller's state.
@@ -3435,6 +3484,38 @@ mod tests {
             [ExecutionDomain::LatentInvalidAccess { diagnostic: found, .. }]
                 if found.as_ref().get_issue_type_id() == diagnostic.get_issue_type_id()
         ));
+    }
+
+    #[test]
+    fn test_imported_linear_subst_breaks_callee_formula_cycles() {
+        let x = AbstractValue::of_raw(1);
+        let y = AbstractValue::of_raw(2);
+        let caller_x = AbstractValue::of_raw(101);
+        let caller_y = AbstractValue::of_raw(102);
+        let mut phi = crate::formula::phi::Phi::ttrue();
+        phi.linear_eqs.insert(
+            x,
+            crate::formula::lin_arith::LinArith::of_var(y)
+                .add(&crate::formula::lin_arith::LinArith::of_int(1)),
+        );
+        phi.linear_eqs.insert(
+            y,
+            crate::formula::lin_arith::LinArith::of_var(x)
+                .add(&crate::formula::lin_arith::LinArith::of_int(2)),
+        );
+        let subst = HashMap::from([(x, caller_x), (y, caller_y)]);
+
+        let translated = imported_linear_subst(&phi, &subst, x);
+
+        assert_eq!(translated.get_coefficient(caller_x), None);
+        assert_eq!(
+            translated.get_coefficient(caller_y),
+            Some(&crate::formula::lin_arith::Q::from_integer(1))
+        );
+        assert_eq!(
+            *translated.get_constant_part(),
+            crate::formula::lin_arith::Q::from_integer(1)
+        );
     }
 
     #[test]
