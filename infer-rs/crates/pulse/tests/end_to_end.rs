@@ -1995,13 +1995,10 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             vec![
                 "ContinueProgram",
                 "ContinueProgram",
-                "AbortProgram",
                 "LatentAbortProgram",
                 "ContinueProgram",
-                "AbortProgram",
                 "LatentAbortProgram",
                 "ContinueProgram",
-                "AbortProgram",
                 "LatentAbortProgram",
             ],
         ),
@@ -2015,7 +2012,6 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
                 "ContinueProgram",
                 "LatentInvalidAccess",
                 "AbortProgram",
-                "LatentInvalidAccess",
                 "AbortProgram",
             ],
         ),
@@ -2025,11 +2021,8 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
                 "ContinueProgram",
                 "LatentInvalidAccess",
                 "AbortProgram",
-                "LatentInvalidAccess",
                 "AbortProgram",
-                "LatentInvalidAccess",
                 "AbortProgram",
-                "LatentInvalidAccess",
             ],
         ),
     ];
@@ -2063,16 +2056,16 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             .collect();
         if proc_name == "traverse_and_crash_if_equal_to_root" {
             assert!(
-                issue_ids
+                !issue_ids
                     .iter()
                     .any(|id| id == IssueTypeId::NullptrDereference.id()),
-                "traverse should publish a local manifest null dereference, got {issue_ids:?}"
+                "traverse should keep cursor-cycle null paths latent in the callee, got {issue_ids:?}"
             );
             assert!(
                 issue_ids.iter().any(|id| {
                     id == &format!("{}_LATENT", IssueTypeId::NullptrDereference.id())
                 }),
-                "traverse should also keep the latent null path, got {issue_ids:?}"
+                "traverse should keep the latent null path, got {issue_ids:?}"
             );
         }
         if proc_name == "FN_crash_after_six_nodes_bad" {
@@ -2973,8 +2966,7 @@ fn test_e2e_two_hop_field_write_keeps_null_derefs_latent() {
         .iter()
         .filter(|pp| {
             pp.kind == pulse::summary::PrePostKind::LatentInvalidAccess
-                && pp
-                    .diagnostic
+                && pulse::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pp)
                     .as_ref()
                     .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
         })

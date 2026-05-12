@@ -1752,7 +1752,7 @@ struct KnownCalleeCall<'a> {
 #[derive(Clone)]
 struct SelectedSummary<'a> {
     pre_posts: &'a [crate::summary::PrePost],
-    latent_abort_diagnostics: Option<&'a [Option<Diagnostic>]>,
+    latent_stopped_diagnostics: Option<&'a [Option<Diagnostic>]>,
     specialization: PulseSpecialization,
     has_dropped_disjuncts: bool,
 }
@@ -2004,7 +2004,7 @@ fn select_pre_posts_and_specialization<'a>(
         if let Some(specialized) = callee_summary.get_specialized_data(spec) {
             return SelectedSummary {
                 pre_posts: &specialized.pre_posts,
-                latent_abort_diagnostics: Some(&specialized.latent_abort_diagnostics),
+                latent_stopped_diagnostics: Some(&specialized.latent_abort_diagnostics),
                 specialization: spec.clone(),
                 has_dropped_disjuncts: specialized.has_dropped_disjuncts,
             };
@@ -2013,7 +2013,7 @@ fn select_pre_posts_and_specialization<'a>(
 
     SelectedSummary {
         pre_posts: &callee_summary.pre_posts,
-        latent_abort_diagnostics: None,
+        latent_stopped_diagnostics: None,
         specialization: PulseSpecialization::bottom(),
         has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
     }
@@ -2039,7 +2039,7 @@ fn apply_pre_posts_with_specialization_loop(
     let callee_pname = known_callee.callee_pname;
     let callee_summary = known_callee.callee_summary;
     let mut current_pre_posts = initial_summary.pre_posts;
-    let mut current_latent_abort_diagnostics = initial_summary.latent_abort_diagnostics;
+    let mut current_latent_stopped_diagnostics = initial_summary.latent_stopped_diagnostics;
     let mut current_spec = initial_summary.specialization;
     let mut current_has_dropped_disjuncts = initial_summary.has_dropped_disjuncts;
     let mut tried_specs: Vec<PulseSpecialization> = Vec::new();
@@ -2061,12 +2061,15 @@ fn apply_pre_posts_with_specialization_loop(
         let mut results = Vec::new();
         let mut alias_groups = Vec::new();
         for (j, pre_post) in current_pre_posts.iter().enumerate() {
-            let effective_pre_post = current_latent_abort_diagnostics
+            let effective_pre_post = current_latent_stopped_diagnostics
                 .and_then(|diagnostics| diagnostics.get(j))
                 .and_then(|diag| diag.as_ref())
                 .filter(|_| {
-                    pre_post.kind == crate::summary::PrePostKind::LatentAbortProgram
-                        && pre_post.diagnostic.is_none()
+                    matches!(
+                        pre_post.kind,
+                        crate::summary::PrePostKind::LatentAbortProgram
+                            | crate::summary::PrePostKind::LatentInvalidAccess
+                    ) && pre_post.diagnostic.is_none()
                 })
                 .map(|diag| {
                     let mut recovered = pre_post.clone();
@@ -2128,7 +2131,7 @@ fn apply_pre_posts_with_specialization_loop(
             log::debug!("  [call] retrying {callee_pname} with alias specialization {next_spec}");
             current_spec = next_spec;
             current_pre_posts = &specialized.pre_posts;
-            current_latent_abort_diagnostics = Some(&specialized.latent_abort_diagnostics);
+            current_latent_stopped_diagnostics = Some(&specialized.latent_abort_diagnostics);
             current_has_dropped_disjuncts = specialized.has_dropped_disjuncts;
             continue;
         }
@@ -4266,10 +4269,12 @@ mod tests {
             .iter()
             .filter(|pp| {
                 pp.kind == PrePostKind::LatentInvalidAccess
-                    && pp.diagnostic.as_ref().is_some_and(|diag| {
-                        diag.get_issue_type_id()
-                            == diagnostics::issue_type::IssueTypeId::NullptrDereference
-                    })
+                    && crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pp)
+                        .as_ref()
+                        .is_some_and(|diag| {
+                            diag.get_issue_type_id()
+                                == diagnostics::issue_type::IssueTypeId::NullptrDereference
+                        })
             })
             .count();
 
@@ -4297,10 +4302,12 @@ mod tests {
             .iter()
             .filter(|pp| {
                 pp.kind == PrePostKind::LatentInvalidAccess
-                    && pp.diagnostic.as_ref().is_some_and(|diag| {
-                        diag.get_issue_type_id()
-                            == diagnostics::issue_type::IssueTypeId::NullptrDereference
-                    })
+                    && crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pp)
+                        .as_ref()
+                        .is_some_and(|diag| {
+                            diag.get_issue_type_id()
+                                == diagnostics::issue_type::IssueTypeId::NullptrDereference
+                        })
             })
             .count();
 

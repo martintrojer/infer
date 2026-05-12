@@ -1278,7 +1278,10 @@ impl PulseSummary {
             .pre_posts
             .iter_mut()
             .map(|pre_post| {
-                if pre_post.kind == PrePostKind::LatentAbortProgram {
+                if matches!(
+                    pre_post.kind,
+                    PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
+                ) {
                     pre_post.diagnostic.take()
                 } else {
                     None
@@ -1493,7 +1496,16 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
             kind: PrePostKind::AbortProgram,
             diagnostic: Some(diagnostic),
         };
+        let was_recovered_latent_invalid_access = !proc_is_entry_point(pdesc);
         classify_recovered_invalid_access_pre_post(pdesc, &mut recovered);
+        if was_recovered_latent_invalid_access && recovered.kind == PrePostKind::LatentInvalidAccess
+        {
+            // OCaml's `PotentialInvalidAccessSummary` latent pre/post stores
+            // the summarized invalid access obligation, not the concrete
+            // manifest diagnostic payload. The diagnostic is reconstructed at
+            // the caller when/if the latent invalid access reifies.
+            recovered.diagnostic = None;
+        }
 
         let key = pre_post
             .pre
@@ -2169,8 +2181,13 @@ fn prune_later_direct_formal_artifacts_for_potential_invalid_access(
 }
 
 fn classify_recovered_invalid_access_pre_post(pdesc: &Procdesc, pre_post: &mut PrePost) {
-    let stays_latent = (!proc_is_entry_point(pdesc)
-        && pre_post_has_direct_formal_constant_deref(pdesc, pre_post))
+    // Cross-ref: OCaml `PulseSummary.exec_summary_of_post_common` exports
+    // `PotentialInvalidAccessSummary` as `LatentInvalidAccess`, even for
+    // summary-space paths whose remaining constraints are manifest in the
+    // current procedure. These recovered pre/posts represent caller-reifiable
+    // `must_be_valid` obligations, not fresh local aborts to publish now.
+    let stays_latent = !proc_is_entry_point(pdesc)
+        || pre_post_has_direct_formal_constant_deref(pdesc, pre_post)
         || !pre_post_is_manifest(pdesc, pre_post);
     pre_post.kind = if stays_latent {
         PrePostKind::LatentInvalidAccess
@@ -2687,7 +2704,7 @@ fn post_addr_was_compared_to_null(pre_post: &PrePost, addr: AbstractValue) -> bo
         })
 }
 
-pub(crate) fn latent_invalid_access_diagnostic_from_exported_pre_post(
+pub fn latent_invalid_access_diagnostic_from_exported_pre_post(
     pre_post: &PrePost,
 ) -> Option<Diagnostic> {
     if pre_post.kind != PrePostKind::LatentInvalidAccess {
@@ -3025,13 +3042,10 @@ fn abort_has_caller_visible_branch_control(pdesc: &Procdesc, pre_post: &PrePost)
 /// abort slice:
 /// - caller-sensitive field rewrites still get the old manifest twin
 /// - imported call-side invalid accesses still get the old manifest twin
-/// - `traverse_and_crash_if_equal_to_root`-style local cursor crashes also
-///   keep the twin when the latent side still depends on caller-visible
-///   branch-controlled dereference state
 ///
 /// Purely local null-like aborts whose only caller-sensitive signal is a
-/// generic latent pre-heap assumption or imported arithmetic guard should stay
-/// latent-only.
+/// generic latent pre-heap assumption, imported arithmetic guard, or
+/// caller-visible branch-controlled cursor state should stay latent-only.
 fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
     let Some(Diagnostic::AccessToInvalidAddress { invalidation, .. }) =
         pre_post.diagnostic.as_ref()
@@ -3055,8 +3069,7 @@ fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -
         return true;
     }
 
-    abort_has_local_invalid_access(pdesc, pre_post)
-        && abort_has_caller_visible_branch_control(pdesc, pre_post)
+    false
 }
 
 fn abort_invalid_access_is_imported_from_call(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
@@ -5227,6 +5240,65 @@ mod tests {
             classify_abort_kind(&pdesc, &astate, &diagnostic),
             PrePostKind::AbortProgram
         ));
+    }
+
+    #[test]
+    fn test_recovered_abort_invalid_access_stays_latent_without_diagnostic() {
+        let pdesc = make_named_pdesc_with_formals("caller", &["q"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let q_pvar = Pvar::mk(Mangled::from_string("q"), pdesc.proc_name.clone());
+        let q_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(q_pvar)))
+            .unwrap();
+        let q_value = astate.read_heap(q_addr, Access::Dereference);
+        let next_value = AbstractValue::mk_fresh();
+        astate
+            .pre
+            .heap
+            .add_edge(q_value, Access::Dereference, next_value);
+        astate
+            .post
+            .heap
+            .add_edge(q_value, Access::Dereference, next_value);
+        astate.pre.heap.register_address(next_value);
+        astate.post.heap.register_address(next_value);
+        astate.mark_must_be_valid_at(next_value, &Location::dummy());
+        astate
+            .post
+            .attrs
+            .mark_written_to(next_value, 1, Location::dummy());
+        astate.invalidate(
+            q_value,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+                Location::dummy(),
+            ),
+        );
+        let diagnostic = dummy_invalid_access_diagnostic(
+            q_value,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
+        let abort_pp = build_pre_post(&pdesc, astate, PrePostKind::AbortProgram, Some(diagnostic));
+
+        let mut latent_pp = abort_pp.clone();
+        latent_pp.kind = PrePostKind::LatentInvalidAccess;
+        latent_pp.diagnostic = Some(dummy_invalid_access_diagnostic(
+            next_value,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        ));
+        classify_recovered_invalid_access_pre_post(&pdesc, &mut latent_pp);
+        latent_pp.diagnostic = None;
+        let recovered = vec![latent_pp];
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].kind, PrePostKind::LatentInvalidAccess);
+        assert!(
+            recovered[0].diagnostic.is_none(),
+            "OCaml PotentialInvalidAccessSummary stores a latent obligation without a concrete diagnostic payload"
+        );
     }
 
     #[test]
