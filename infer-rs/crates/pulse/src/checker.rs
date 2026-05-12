@@ -862,6 +862,7 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     let pulse_tf = PulseTransferFunctions {
         callee_summaries,
         pdesc,
+        tenv,
         proc_name: format!("{}", pdesc.proc_name),
         spec_requests: RefCell::new(Vec::new()),
         progress: RefCell::new(ProcProgress::new()),
@@ -1212,6 +1213,7 @@ fn stopped_summary_key(exec: &ExecutionDomain) -> Option<(u8, String)> {
 struct PulseTransferFunctions<'a> {
     callee_summaries: &'a dyn SummaryLookup,
     pdesc: &'a Procdesc,
+    tenv: Option<&'a Tenv>,
     proc_name: String,
     spec_requests: RefCell<Vec<(Procname, PulseSpecialization)>>,
     progress: RefCell<ProcProgress>,
@@ -1278,6 +1280,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                     log::trace!("[{pn}]   disjunct #{i}: {astate:?}");
                     let results = exec_instr_with_summaries(
                         self.pdesc,
+                        self.tenv,
                         instr,
                         astate.clone(),
                         self.callee_summaries,
@@ -1471,6 +1474,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
 /// Priority: arg validity check > models > noreturn summaries > pre/post summaries > transfer.
 fn exec_instr_with_summaries(
     pdesc: &Procdesc,
+    tenv: Option<&Tenv>,
     instr: &Instr,
     mut state: AbductiveDomain,
     callee_summaries: &dyn SummaryLookup,
@@ -1533,6 +1537,7 @@ fn exec_instr_with_summaries(
                     };
                     return exec_instr_with_summaries(
                         pdesc,
+                        tenv,
                         &direct_call,
                         state,
                         callee_summaries,
@@ -1554,7 +1559,8 @@ fn exec_instr_with_summaries(
         // empty define in textual but should still be modeled as noreturn)
         if crate::models::has_model(callee_pname) {
             log::debug!("  [call] model: {callee_pname}");
-            let results = transfer::exec_instr_with_pdesc(Some(pdesc), instr, state.clone());
+            let results =
+                transfer::exec_instr_with_pdesc_and_tenv(Some(pdesc), tenv, instr, state.clone());
             return merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state);
         }
 
@@ -1588,7 +1594,7 @@ fn exec_instr_with_summaries(
         }
     }
 
-    transfer::exec_instr_with_pdesc(Some(pdesc), instr, state)
+    transfer::exec_instr_with_pdesc_and_tenv(Some(pdesc), tenv, instr, state)
 }
 
 fn resolve_virtual_call_target(
@@ -2851,6 +2857,7 @@ mod tests {
         let tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
+            tenv: None,
             proc_name: format!("{pname}"),
             spec_requests: RefCell::new(vec![]),
             progress: RefCell::new(ProcProgress::new()),
@@ -2901,6 +2908,7 @@ mod tests {
         let tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
+            tenv: None,
             proc_name: format!("{pname}"),
             spec_requests: RefCell::new(vec![]),
             progress: RefCell::new(ProcProgress::new()),
@@ -3547,6 +3555,7 @@ mod tests {
 
         let results = exec_instr_with_summaries(
             &pdesc,
+            None,
             &instr,
             state,
             &HashMap::<Procname, PulseSummary>::new(),
@@ -3672,6 +3681,7 @@ mod tests {
 
         let results = exec_instr_with_summaries(
             &pdesc,
+            None,
             &instr,
             state,
             &HashMap::<Procname, PulseSummary>::new(),
@@ -4322,6 +4332,7 @@ mod tests {
         let pulse_tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
+            tenv: None,
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
@@ -4424,6 +4435,7 @@ mod tests {
             let pulse_tf = PulseTransferFunctions {
                 callee_summaries: &callee_summaries,
                 pdesc: &pdesc,
+                tenv: None,
                 proc_name: format!("{}", pdesc.proc_name),
                 spec_requests: RefCell::new(Vec::new()),
                 progress: RefCell::new(ProcProgress::new()),
@@ -4525,6 +4537,7 @@ mod tests {
         let pulse_tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
+            tenv: None,
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
@@ -4990,6 +5003,7 @@ mod tests {
         let pulse_tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
+            tenv: None,
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
@@ -5121,6 +5135,7 @@ mod tests {
         let pulse_tf = PulseTransferFunctions {
             callee_summaries: &callee_summaries,
             pdesc: &pdesc,
+            tenv: None,
             proc_name: format!("{}", pdesc.proc_name),
             spec_requests: RefCell::new(Vec::new()),
             progress: RefCell::new(ProcProgress::new()),
@@ -5216,6 +5231,7 @@ mod tests {
             let pulse_tf = PulseTransferFunctions {
                 callee_summaries: &callee_summaries,
                 pdesc: &caller,
+                tenv: None,
                 proc_name: format!("{}", caller.proc_name),
                 spec_requests: RefCell::new(Vec::new()),
                 progress: RefCell::new(ProcProgress::new()),
@@ -5616,7 +5632,7 @@ mod tests {
             "test precondition: resolved target must have no summary"
         );
 
-        let results = exec_instr_with_summaries(&pdesc, &instr, state, &summaries, None);
+        let results = exec_instr_with_summaries(&pdesc, None, &instr, state, &summaries, None);
 
         let mut continues = results.iter().filter_map(|r| match r {
             ExecutionDomain::ContinueProgram(s) => Some(s),

@@ -10,10 +10,12 @@
 use sil::binop::Binop;
 use sil::builtin_decl;
 use sil::exp::Exp;
+use sil::fieldname::Fieldname;
 use sil::ident::Ident;
 use sil::location::Location;
 use sil::procname::Procname;
-use sil::typ::{Typ, TypeDesc};
+use sil::tenv::Tenv;
+use sil::typ::{Typ, TypeDesc, TypeName};
 
 use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
@@ -68,8 +70,15 @@ pub const MODELED_NAMES: &[&str] = &[
     "ungetc",
 ];
 
+#[derive(Clone, Copy)]
+struct DispatchEnv<'a> {
+    tenv: Option<&'a Tenv>,
+    caller: Option<&'a Procname>,
+}
+
 /// Dispatch a call to the matching C model.
 pub fn dispatch(
+    tenv: Option<&Tenv>,
     caller: Option<&Procname>,
     callee: &Procname,
     ret_id: &Ident,
@@ -77,11 +86,19 @@ pub fn dispatch(
     loc: &Location,
     state: AbductiveDomain,
 ) -> Option<Vec<ExecutionDomain>> {
-    dispatch_with_config(caller, callee, ret_id, args, loc, state, config::get())
+    dispatch_with_config(
+        DispatchEnv { tenv, caller },
+        callee,
+        ret_id,
+        args,
+        loc,
+        state,
+        config::get(),
+    )
 }
 
 fn dispatch_with_config(
-    caller: Option<&Procname>,
+    env: DispatchEnv<'_>,
     callee: &Procname,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -90,7 +107,7 @@ fn dispatch_with_config(
     cfg: &config::InferConfig,
 ) -> Option<Vec<ExecutionDomain>> {
     if builtin_decl::match_builtin(&builtin_decl::malloc(), callee) {
-        return Some(malloc(ret_id, args, loc, state));
+        return Some(malloc(env.tenv, ret_id, args, loc, state));
     }
     if builtin_decl::match_builtin(&builtin_decl::free(), callee) {
         return Some(free(ret_id, args, loc, state));
@@ -98,7 +115,7 @@ fn dispatch_with_config(
     if builtin_decl::match_builtin(&builtin_decl::__new(), callee)
         || builtin_decl::match_builtin(&builtin_decl::__new_array(), callee)
     {
-        return Some(new_model(caller, ret_id, args, loc, state));
+        return Some(new_model(env.caller, ret_id, args, loc, state));
     }
     if builtin_decl::match_builtin(&builtin_decl::__delete(), callee)
         || builtin_decl::match_builtin(&builtin_decl::__delete_array(), callee)
@@ -139,16 +156,16 @@ fn dispatch_with_config(
     // realloc(ptr, size): free old ptr, then allocate-or-null.
     // Cross-ref: OCaml PulseModelsC.ml realloc_common.
     if name == "realloc" {
-        return Some(realloc(ret_id, args, loc, state));
+        return Some(realloc(env.tenv, ret_id, args, loc, state));
     }
     if matches_procname_pattern(callee, cfg.pulse_model_free_pattern.as_deref()) {
         return Some(free(ret_id, args, loc, state));
     }
     if matches_procname_pattern(callee, cfg.pulse_model_realloc_pattern.as_deref()) {
-        return Some(custom_realloc(callee, ret_id, args, loc, state));
+        return Some(custom_realloc(env.tenv, callee, ret_id, args, loc, state));
     }
     if matches_procname_pattern(callee, cfg.pulse_model_malloc_pattern.as_deref()) {
-        return Some(custom_malloc(callee, ret_id, args, loc, state));
+        return Some(custom_malloc(env.tenv, callee, ret_id, args, loc, state));
     }
     // fopen: return null-or-non-null disjuncts for null-deref checking,
     // but do NOT mark as Allocated (no MEMORY_LEAK_C tracking for file
@@ -271,30 +288,111 @@ fn malloced_object_type(size_exp: &Exp) -> Option<Typ> {
     }
 }
 
-/// Mark a freshly-allocated address as `Uninitialized` when the malloc'd type
-/// is a primitive scalar or pointer.
+/// Mark a freshly-allocated address (or its scalar/pointer struct fields) as
+/// `Uninitialized` based on the malloc'd type.
 ///
 /// Cross-ref: OCaml `PulseAbductiveDomain.set_uninitialized` →
 /// `fold_pointer_targets`. The `Tint | Tfloat | Tptr` branch stamps
-/// `Uninitialized` directly on the returned address. The `Tstruct` branch
-/// requires walking fields via the type environment, which Rust's model
-/// dispatch does not yet thread through. Struct allocations therefore stay
-/// uncovered here — see triage doc Cluster C and the `create_p` /
-/// `alloc_ref_counted_ok` rows.
-fn mark_alloc_uninitialized_for_primitive(
+/// `Uninitialized` directly on the current pointer target. The `Tstruct`
+/// branch walks non-internal fields via `Tenv`, materializes field edges, and
+/// recurses so nested scalar/pointer fields are stamped too.
+fn mark_alloc_uninitialized(
+    tenv: Option<&Tenv>,
     state: &mut AbductiveDomain,
     addr: AbstractValue,
     size_exp_opt: Option<&Exp>,
+    loc: &Location,
 ) {
     let Some(size_exp) = size_exp_opt else { return };
     let Some(typ) = malloced_object_type(size_exp) else {
         return;
     };
-    if matches!(
-        &*typ.desc,
-        TypeDesc::Tint(_) | TypeDesc::Tfloat(_) | TypeDesc::Tptr(..)
-    ) {
-        state.add_attr(addr, Attribute::Uninitialized);
+    fold_pointer_targets(tenv, state, addr, &typ, loc);
+}
+
+fn fold_pointer_targets(
+    tenv: Option<&Tenv>,
+    state: &mut AbductiveDomain,
+    addr: AbstractValue,
+    typ: &Typ,
+    loc: &Location,
+) {
+    match typ.desc.as_ref() {
+        TypeDesc::Tint(_) | TypeDesc::Tfloat(_) | TypeDesc::Tptr(..) => {
+            state.add_attr(addr, Attribute::Uninitialized);
+        }
+        TypeDesc::Tstruct(type_name) if !should_walk_struct_name(type_name) => {}
+        TypeDesc::Tstruct(type_name) => {
+            let Some(strukt) = tenv.and_then(|tenv| tenv.lookup(type_name)) else {
+                return;
+            };
+            if strukt.fields.len() == 1 {
+                // Cross-ref: OCaml ignores single-field structs (D26146578).
+                return;
+            }
+            for field in &strukt.fields {
+                if should_skip_uninit_field(&field.name) {
+                    continue;
+                }
+                let field_addr = AbstractValue::mk_fresh();
+                let field_history = ValueHistory::assignment(loc.clone());
+                state.write_heap_with_history(
+                    addr,
+                    crate::access::Access::FieldAccess(field.name.clone()),
+                    crate::value_history::ValueWithHistory::new(field_addr, field_history),
+                );
+                fold_pointer_targets(tenv, state, field_addr, &field.typ, loc);
+            }
+        }
+        TypeDesc::Tarray { .. } | TypeDesc::Tvoid | TypeDesc::Tfun(_) | TypeDesc::TVar(_) => {}
+    }
+}
+
+fn should_skip_uninit_field(field: &Fieldname) -> bool {
+    // Cross-ref: OCaml `Fieldname.is_internal`; Rust does not currently carry
+    // closure-capture metadata on `Fieldname`, so only internal names can be
+    // filtered here.
+    field.field_name.starts_with("__")
+}
+
+fn should_walk_struct_name(type_name: &TypeName) -> bool {
+    match type_name {
+        TypeName::CUnion(_) | TypeName::CppClass { is_union: true, .. } => false,
+        _ => !is_uninit_blocklisted_struct(type_name),
+    }
+}
+
+fn is_uninit_blocklisted_struct(type_name: &TypeName) -> bool {
+    let Some(parts) = qualified_type_parts(type_name) else {
+        return false;
+    };
+    matches!(
+        parts.as_slice(),
+        ["folly", "Optional", ..]
+            | ["folly", "small_vector", ..]
+            | ["std", "__wrap_iter", ..]
+            | ["std", "atomic", ..]
+            | ["std", "function", ..]
+            | ["std", "optional", ..]
+            | ["std", "vector", ..]
+    )
+}
+
+fn qualified_type_parts(type_name: &TypeName) -> Option<Vec<&str>> {
+    match type_name {
+        TypeName::CStruct(name) | TypeName::CUnion(name) => {
+            Some(name.parts.iter().map(String::as_str).collect())
+        }
+        TypeName::CppClass { name, .. }
+        | TypeName::ObjcClass(name)
+        | TypeName::ObjcProtocol(name) => Some(name.parts.iter().map(String::as_str).collect()),
+        TypeName::CSharpClass(name) => Some(name.0.split("::").collect()),
+        TypeName::ErlangType(name) => Some(name.0.split("::").collect()),
+        TypeName::HackClass(name) => Some(name.0.split("::").collect()),
+        TypeName::JavaClass(name) => Some(name.0.split("::").collect()),
+        TypeName::PythonClass(name) => Some(name.0.split("::").collect()),
+        TypeName::SwiftClass(name) => Some(name.0.split("::").collect()),
+        TypeName::ObjcBlock(_) | TypeName::CFunction(_) | TypeName::SwiftClosure(_) => None,
     }
 }
 
@@ -306,6 +404,7 @@ fn mark_alloc_uninitialized_for_primitive(
 /// wrappers) and the size encodes a primitive type, the returned address is
 /// also marked `Uninitialized` to match OCaml's summary surface.
 fn allocate_or_null(
+    tenv: Option<&Tenv>,
     ret_id: &Ident,
     allocator: Allocator,
     size_exp_opt: Option<&Exp>,
@@ -324,7 +423,7 @@ fn allocate_or_null(
         _ => None,
     };
     operations::allocate(addr, allocator, loc.clone(), &mut ok_state);
-    mark_alloc_uninitialized_for_primitive(&mut ok_state, addr, size_exp_opt);
+    mark_alloc_uninitialized(tenv, &mut ok_state, addr, size_exp_opt, loc);
     let ok_history = alloc_proc
         .as_ref()
         .map(|proc| ValueHistory::returned(loc.clone()).wrap_call(proc, loc))
@@ -370,18 +469,20 @@ fn allocate_or_null(
 
 /// Model: `ret = malloc(size)` — allocate or null.
 fn malloc(
+    tenv: Option<&Tenv>,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     loc: &Location,
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
     let size_exp = args.first().map(|(exp, _)| exp);
-    allocate_or_null(ret_id, Allocator::CMalloc, size_exp, loc, state)
+    allocate_or_null(tenv, ret_id, Allocator::CMalloc, size_exp, loc, state)
 }
 
 /// Model: configured wrapper to `malloc(size)` — allocate or null with a
 /// custom allocator tag.
 fn custom_malloc(
+    tenv: Option<&Tenv>,
     callee: &Procname,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -390,6 +491,7 @@ fn custom_malloc(
 ) -> Vec<ExecutionDomain> {
     let size_exp = args.first().map(|(exp, _)| exp);
     allocate_or_null(
+        tenv,
         ret_id,
         Allocator::CustomMalloc(callee.clone()),
         size_exp,
@@ -631,7 +733,7 @@ fn getcwd_model(
         // size_exp). The size is unknown so we cannot mark `Uninitialized`
         // — OCaml's `set_uninitialized` is also a no-op without a malloc'd
         // type.
-        allocate_or_null(ret_id, Allocator::CMalloc, None, loc, state)
+        allocate_or_null(None, ret_id, Allocator::CMalloc, None, loc, state)
     } else {
         fresh_or_null(ret_id, loc, state)
     }
@@ -717,16 +819,18 @@ fn builtin_expect(
 /// Cross-ref: OCaml PulseModelsC.ml realloc_common.
 /// Steps: 1) Free the old pointer. 2) Return allocate-or-null.
 fn realloc(
+    tenv: Option<&Tenv>,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     loc: &Location,
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
-    realloc_with_allocator(ret_id, args, loc, state, Allocator::CRealloc)
+    realloc_with_allocator(tenv, ret_id, args, loc, state, Allocator::CRealloc)
 }
 
 /// Model: configured wrapper to `realloc(ptr, size)`.
 fn custom_realloc(
+    tenv: Option<&Tenv>,
     callee: &Procname,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
@@ -734,6 +838,7 @@ fn custom_realloc(
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
     realloc_with_allocator(
+        tenv,
         ret_id,
         args,
         loc,
@@ -743,6 +848,7 @@ fn custom_realloc(
 }
 
 fn realloc_with_allocator(
+    tenv: Option<&Tenv>,
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     loc: &Location,
@@ -765,6 +871,7 @@ fn realloc_with_allocator(
         match result {
             ExecutionDomain::ContinueProgram(state) => {
                 results.extend(allocate_or_null(
+                    tenv,
                     ret_id,
                     allocator.clone(),
                     size_exp_owned.as_ref(),
@@ -865,6 +972,7 @@ mod tests {
     use sil::mangled::Mangled;
     use sil::procdesc::Procdesc;
     use sil::pvar::Pvar;
+    use sil::strukt::{Field, Struct};
     use sil::var::Var;
 
     fn mk_state() -> AbductiveDomain {
@@ -877,7 +985,7 @@ mod tests {
     fn test_malloc_returns_two_disjuncts() {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
-        let results = malloc(&ret_id, &[], &Location::dummy(), state);
+        let results = malloc(None, &ret_id, &[], &Location::dummy(), state);
         assert_eq!(results.len(), 2, "malloc should return ok + null disjuncts");
         assert!(results.iter().all(|r| r.is_continue()));
 
@@ -933,7 +1041,7 @@ mod tests {
                 nullable: false,
             });
             let args = vec![(size_arg, Typ::void())];
-            let results = malloc(&ret_id, &args, &Location::dummy(), state);
+            let results = malloc(None, &ret_id, &args, &Location::dummy(), state);
             let ok = match &results[0] {
                 ExecutionDomain::ContinueProgram(s) => s,
                 _ => panic!("first disjunct should be a continue"),
@@ -993,7 +1101,7 @@ mod tests {
             let state = mk_state();
             let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
             let args = vec![(size_arg.clone(), Typ::void())];
-            let results = malloc(&ret_id, &args, &Location::dummy(), state);
+            let results = malloc(None, &ret_id, &args, &Location::dummy(), state);
             let ok = match &results[0] {
                 ExecutionDomain::ContinueProgram(s) => s,
                 _ => panic!("first disjunct should be a continue"),
@@ -1011,30 +1119,46 @@ mod tests {
         }
     }
 
-    /// Struct allocations stay uncovered today: walking field types requires
-    /// a `Tenv` that the model dispatch does not currently thread through.
-    /// This pin-down test documents that gap so a future tenv-aware fix
-    /// can change the assertion to `is_uninitialized()` once the
-    /// `Tstruct` branch of OCaml's `fold_pointer_targets` is mirrored.
+    /// Cross-ref: OCaml `PulseAbductiveDomain.fold_pointer_targets` walks
+    /// Tstruct fields and marks scalar/pointer targets as Uninitialized.
     #[test]
-    fn test_malloc_with_sizeof_struct_does_not_yet_mark_uninitialized() {
+    fn test_malloc_with_sizeof_struct_marks_pointer_target_fields_uninitialized() {
+        use sil::annot::AnnotItem;
         use sil::exp::SizeofData;
-        use sil::typ::TypeName;
-
         use sil::qualified_cpp_name::QualifiedCppName;
-        let struct_typ = Typ::mk(TypeDesc::Tstruct(TypeName::CStruct(
-            QualifiedCppName::from_string("ref_counted"),
-        )));
+        use sil::typ::{IKind, TypeName};
+
+        let struct_name = TypeName::CStruct(QualifiedCppName::from_string("ref_counted"));
+        let mut tenv = Tenv::new();
+        tenv.insert(
+            struct_name.clone(),
+            Struct {
+                fields: vec![
+                    Field {
+                        name: Fieldname::make(struct_name.clone(), "ref_count"),
+                        typ: Typ::int(IKind::IInt),
+                        annot: AnnotItem::default(),
+                    },
+                    Field {
+                        name: Fieldname::make(struct_name.clone(), "next"),
+                        typ: Typ::mk_ptr(Typ::void()),
+                        annot: AnnotItem::default(),
+                    },
+                ],
+                ..Struct::default()
+            },
+        );
+
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let size_arg = Exp::Sizeof(SizeofData {
-            typ: struct_typ,
+            typ: Typ::mk_struct(struct_name.clone()),
             nbytes: None,
             dynamic_length: None,
             nullable: false,
         });
         let args = vec![(size_arg, Typ::void())];
-        let results = malloc(&ret_id, &args, &Location::dummy(), state);
+        let results = malloc(Some(&tenv), &ret_id, &args, &Location::dummy(), state);
         let ok = match &results[0] {
             ExecutionDomain::ContinueProgram(s) => s,
             _ => panic!("first disjunct should be a continue"),
@@ -1047,7 +1171,115 @@ mod tests {
         );
         assert!(
             !attrs.is_uninitialized(),
-            "Tstruct branch deliberately uncovered until tenv-aware field walk lands"
+            "struct root should not be marked; scalar/pointer fields should be"
+        );
+
+        for field in ["ref_count", "next"] {
+            let field_addr = ok
+                .post
+                .heap
+                .find_edge(
+                    addr,
+                    &crate::access::Access::FieldAccess(Fieldname::make(
+                        struct_name.clone(),
+                        field,
+                    )),
+                )
+                .unwrap_or_else(|| panic!("expected materialized .{field} field"));
+            let field_attrs = ok
+                .post
+                .attrs
+                .get(&field_addr)
+                .unwrap_or_else(|| panic!("expected attrs for .{field}"));
+            assert!(
+                field_attrs.is_uninitialized(),
+                "expected .{field} to be Uninitialized; got {field_attrs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malloc_with_sizeof_nested_struct_marks_nested_pointer_field_uninitialized() {
+        use sil::annot::AnnotItem;
+        use sil::exp::SizeofData;
+        use sil::qualified_cpp_name::QualifiedCppName;
+        use sil::typ::{IKind, TypeName};
+
+        let outer_name = TypeName::CStruct(QualifiedCppName::from_string("outer"));
+        let inner_name = TypeName::CStruct(QualifiedCppName::from_string("inner"));
+        let mut tenv = Tenv::new();
+        tenv.insert(
+            outer_name.clone(),
+            Struct {
+                fields: vec![
+                    Field {
+                        name: Fieldname::make(outer_name.clone(), "tag"),
+                        typ: Typ::int(IKind::IInt),
+                        annot: AnnotItem::default(),
+                    },
+                    Field {
+                        name: Fieldname::make(outer_name.clone(), "inner"),
+                        typ: Typ::mk_struct(inner_name.clone()),
+                        annot: AnnotItem::default(),
+                    },
+                ],
+                ..Struct::default()
+            },
+        );
+        tenv.insert(
+            inner_name.clone(),
+            Struct {
+                fields: vec![
+                    Field {
+                        name: Fieldname::make(inner_name.clone(), "payload"),
+                        typ: Typ::mk_ptr(Typ::void()),
+                        annot: AnnotItem::default(),
+                    },
+                    Field {
+                        name: Fieldname::make(inner_name.clone(), "count"),
+                        typ: Typ::int(IKind::IInt),
+                        annot: AnnotItem::default(),
+                    },
+                ],
+                ..Struct::default()
+            },
+        );
+
+        let state = mk_state();
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+        let size_arg = Exp::Sizeof(SizeofData {
+            typ: Typ::mk_struct(outer_name.clone()),
+            nbytes: None,
+            dynamic_length: None,
+            nullable: false,
+        });
+        let args = vec![(size_arg, Typ::void())];
+        let results = malloc(Some(&tenv), &ret_id, &args, &Location::dummy(), state);
+        let ok = match &results[0] {
+            ExecutionDomain::ContinueProgram(s) => s,
+            _ => panic!("first disjunct should be a continue"),
+        };
+        let root = ok.post.stack.find(&Var::LogicalVar(ret_id)).unwrap();
+        let inner_addr = ok
+            .post
+            .heap
+            .find_edge(
+                root,
+                &crate::access::Access::FieldAccess(Fieldname::make(outer_name, "inner")),
+            )
+            .expect("expected materialized .inner field");
+        let payload_addr = ok
+            .post
+            .heap
+            .find_edge(
+                inner_addr,
+                &crate::access::Access::FieldAccess(Fieldname::make(inner_name, "payload")),
+            )
+            .expect("expected materialized .inner.payload field");
+        let payload_attrs = ok.post.attrs.get(&payload_addr).expect("payload attrs");
+        assert!(
+            payload_attrs.is_uninitialized(),
+            "expected nested pointer field to be Uninitialized; got {payload_attrs:?}"
         );
     }
 
@@ -1192,7 +1424,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = builtin_decl::malloc();
-        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_some(), "malloc should be dispatched");
     }
 
@@ -1201,7 +1433,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = builtin_decl::free();
-        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_some(), "free should be dispatched");
     }
 
@@ -1210,7 +1442,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = Procname::c_from_string("unknown_func");
-        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(result.is_none(), "unknown function should not dispatch");
     }
 
@@ -1219,7 +1451,7 @@ mod tests {
         let state = mk_state();
         let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
         let callee = Procname::c_from_string("__infer_fail");
-        let result = dispatch(None, &callee, &ret_id, &[], &Location::dummy(), state);
+        let result = dispatch(None, None, &callee, &ret_id, &[], &Location::dummy(), state);
         assert!(
             result.is_none(),
             "__infer_fail should fall back to normal empty-body/unknown-call handling"
@@ -1237,9 +1469,19 @@ mod tests {
             ..config::InferConfig::default()
         };
 
-        let result =
-            dispatch_with_config(None, &callee, &ret_id, &[], &Location::dummy(), state, &cfg)
-                .expect("configured malloc wrapper should dispatch");
+        let result = dispatch_with_config(
+            DispatchEnv {
+                tenv: None,
+                caller: None,
+            },
+            &callee,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            state,
+            &cfg,
+        )
+        .expect("configured malloc wrapper should dispatch");
 
         let continue_state = result
             .into_iter()
@@ -1272,8 +1514,18 @@ mod tests {
             ..config::InferConfig::default()
         };
 
-        let result =
-            dispatch_with_config(None, &callee, &ret_id, &[], &Location::dummy(), state, &cfg);
+        let result = dispatch_with_config(
+            DispatchEnv {
+                tenv: None,
+                caller: None,
+            },
+            &callee,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            state,
+            &cfg,
+        );
         assert!(
             result.is_some(),
             "configured realloc wrapper should dispatch"
@@ -1290,6 +1542,7 @@ mod tests {
         );
 
         let results = realloc(
+            None,
             &Ident::create_normal(IdentName::from_string("n"), 0),
             &[(Exp::Var(ptr_id), Typ::void())],
             &Location::dummy(),
@@ -1325,7 +1578,7 @@ mod tests {
             nullable: false,
         });
         let args = vec![(Exp::Var(ptr_id), Typ::void()), (size_arg, Typ::void())];
-        let results = realloc(&ret_id, &args, &Location::dummy(), state);
+        let results = realloc(None, &ret_id, &args, &Location::dummy(), state);
         let mut saw_uninit_alloc = false;
         for result in &results {
             if let ExecutionDomain::ContinueProgram(s) = result {
@@ -1380,6 +1633,7 @@ mod tests {
         )];
 
         let result = dispatch(
+            None,
             Some(&caller),
             &callee,
             &ret_id,
@@ -1421,6 +1675,7 @@ mod tests {
         let callee = builtin_decl::__new();
 
         let result = dispatch(
+            None,
             Some(&caller),
             &callee,
             &ret_id,
@@ -1465,6 +1720,7 @@ mod tests {
         let callee = builtin_decl::__new();
 
         let result = dispatch(
+            None,
             Some(&caller),
             &callee,
             &ret_id,
@@ -1506,7 +1762,7 @@ mod tests {
 
         // malloc
         let n0 = Ident::create_normal(IdentName::from_string("n"), 0);
-        let results = malloc(&n0, &[], &Location::dummy(), state);
+        let results = malloc(None, &n0, &[], &Location::dummy(), state);
         state = match results.into_iter().next().unwrap() {
             ExecutionDomain::ContinueProgram(s) => s,
             _ => panic!("malloc should continue"),

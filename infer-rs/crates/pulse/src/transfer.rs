@@ -14,6 +14,7 @@ use sil::exp::Exp;
 use sil::instr::{Instr, InstrMetadata};
 use sil::location::Location;
 use sil::procdesc::Procdesc;
+use sil::tenv::Tenv;
 use sil::typ::TypeDesc;
 use sil::var::Var;
 
@@ -41,6 +42,17 @@ pub fn exec_instr_with_pdesc(
     instr: &Instr,
     state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
+    exec_instr_with_pdesc_and_tenv(pdesc, None, instr, state)
+}
+
+/// Execute a single SIL instruction with access to the enclosing procedure and
+/// type environment.
+pub fn exec_instr_with_pdesc_and_tenv(
+    pdesc: Option<&Procdesc>,
+    tenv: Option<&Tenv>,
+    instr: &Instr,
+    state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
     match instr {
         Instr::Load { id, e, loc, typ } => exec_load(pdesc, id, e, typ, loc, state),
         Instr::Store {
@@ -53,7 +65,18 @@ pub fn exec_instr_with_pdesc(
             args,
             loc,
             ..
-        } => exec_call(pdesc, ret_id, ret_typ, fun_exp, args, loc, state),
+        } => exec_call(
+            CallContext {
+                pdesc,
+                tenv,
+                ret_id,
+                ret_typ,
+                fun_exp,
+                args,
+                loc,
+            },
+            state,
+        ),
         Instr::Metadata(InstrMetadata::ExitScope(vars, _loc)) => {
             // Cross-ref: OCaml `Pulse.ml` handles `Metadata (ExitScope ...)`
             // by removing dead vars from the post stack while preserving
@@ -601,19 +624,30 @@ fn prune_eq_operands(
     }
 }
 
+struct CallContext<'a> {
+    pdesc: Option<&'a Procdesc>,
+    tenv: Option<&'a Tenv>,
+    ret_id: &'a sil::ident::Ident,
+    ret_typ: &'a sil::typ::Typ,
+    fun_exp: &'a Exp,
+    args: &'a [(Exp, sil::typ::Typ)],
+    loc: &'a Location,
+}
+
 /// Call: `ret_id = fun_exp(args)`
 ///
 /// Dispatches to built-in models (malloc/free/etc.) via `models::dispatch`.
 /// Unknown functions get a fresh return value.
-fn exec_call(
-    pdesc: Option<&Procdesc>,
-    ret_id: &sil::ident::Ident,
-    ret_typ: &sil::typ::Typ,
-    fun_exp: &Exp,
-    args: &[(Exp, sil::typ::Typ)],
-    loc: &Location,
-    mut state: AbductiveDomain,
-) -> Vec<ExecutionDomain> {
+fn exec_call(ctx: CallContext<'_>, mut state: AbductiveDomain) -> Vec<ExecutionDomain> {
+    let CallContext {
+        pdesc,
+        tenv,
+        ret_id,
+        ret_typ,
+        fun_exp,
+        args,
+        loc,
+    } = ctx;
     // Try to dispatch to a built-in model
     if let Exp::Const(sil::const_val::Const::Cfun(callee)) = fun_exp {
         if crate::models::has_model(callee) {
@@ -627,6 +661,7 @@ fn exec_call(
             // `Initialized` in exported summaries.
             state.conservatively_initialize_args(model_actual_vals.iter().copied());
             if let Some(results) = crate::models::dispatch(
+                tenv,
                 pdesc.map(|proc| &proc.proc_name),
                 callee,
                 ret_id,
