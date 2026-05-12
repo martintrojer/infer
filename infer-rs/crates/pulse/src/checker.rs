@@ -31,6 +31,7 @@ use sil::instr::Instr;
 use sil::location::Location;
 use sil::procdesc::{NodeId, Procdesc};
 use sil::procname::Procname;
+use sil::pvar::Pvar;
 use sil::specialization::PulseSpecialization;
 use sil::tenv::Tenv;
 use sil::typ::TypeDesc;
@@ -38,6 +39,7 @@ use sil::typ::TypeDesc;
 use crate::abductive::{AbductiveDomain, AstateSizeStats};
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
+use crate::operations;
 use crate::pulse_result::PulseResult;
 use crate::summary::PulseSummary;
 use crate::transfer;
@@ -732,9 +734,6 @@ pub fn analyze(pdesc: &Procdesc) -> PulseSummary {
 /// resolves to a `*Tstruct` whose `Struct.annots` contain `Annot.final` get a
 /// dynamic type. Every other formal is left untouched.
 fn seed_final_type_formals(tenv: &Tenv, pdesc: &Procdesc, state: &mut AbductiveDomain) {
-    use sil::pvar::Pvar;
-    use sil::var::Var;
-
     for (mangled, formal_typ, _annot) in &pdesc.formals {
         let TypeDesc::Tptr(pointee, _) = formal_typ.desc.as_ref() else {
             continue;
@@ -749,7 +748,7 @@ fn seed_final_type_formals(tenv: &Tenv, pdesc: &Procdesc, state: &mut AbductiveD
             continue;
         }
         let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
-        let var = Var::ProgramVar(Box::new(pvar));
+        let var = sil::var::Var::ProgramVar(Box::new(pvar));
         let Some(formal_addr) = state.post.stack.find(&var) else {
             continue;
         };
@@ -835,13 +834,18 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
 
     let mut initial_state = AbductiveDomain::mk_initial(pdesc);
 
-    if let Some(tenv) = tenv {
-        seed_final_type_formals(tenv, pdesc, &mut initial_state);
-    }
-
-    // Apply specialization to initial state if provided
+    // Apply specialization to initial state if provided. Cross-ref: OCaml
+    // `Pulse.initial` applies specialization before `taint_initial`.
     if let Some(spec) = specialization {
         crate::specialization::apply(spec, &mut initial_state);
+    }
+
+    if config::get().pulse_formal_preeval {
+        preeval_formals(pdesc, &mut initial_state);
+    }
+
+    if let Some(tenv) = tenv {
+        seed_final_type_formals(tenv, pdesc, &mut initial_state);
     }
 
     let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
@@ -1123,6 +1127,37 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     );
     let spec_requests = pulse_tf.spec_requests.into_inner();
     (summary, spec_requests)
+}
+
+/// Mirror the side effects of OCaml's `PulseTaintOperations.taint_initial` formal loop.
+///
+/// OCaml calls `taint_initial` unconditionally from `Pulse.initial` after
+/// `initial_with_positive_self` and before ordinary analysis. Even when no taint
+/// matcher applies, it first evaluates `*formal` for every formal:
+///
+/// ```ocaml
+/// PulseOperations.eval_deref_to_value_origin PathContext.initial loc (Lvar pvar) astate
+/// ```
+///
+/// That read abduces `MustBeValid` + `MustBeInitialized` on the formal stack
+/// value and materializes a `Dereference` edge in both pre and post. Rust does
+/// not model taint propagation yet, but keeping this pre-evaluation surface is
+/// required for OCaml summary parity (notably memory_leak.c formal rows).
+fn preeval_formals(pdesc: &Procdesc, state: &mut AbductiveDomain) {
+    for (mangled, _formal_typ, _annot) in &pdesc.formals {
+        let pvar = Pvar::mk(mangled.clone(), pdesc.proc_name.clone());
+        let exp = Exp::Lvar(pvar);
+        if let PulseResult::FatalError(diagnostic, _) =
+            operations::eval_deref_with_history(&exp, &pdesc.loc, state)
+        {
+            log::debug!(
+                "[pulse] formal pre-eval failed for {} in {}: {:?}",
+                exp,
+                pdesc.proc_name,
+                diagnostic
+            );
+        }
+    }
 }
 
 fn diagnostic_originates_in_proc(pdesc: &Procdesc, diagnostic: &Diagnostic) -> bool {
@@ -2539,6 +2574,46 @@ mod tests {
 
     fn formal_value_heap_path(formal_pvar: &Pvar) -> HeapPath {
         HeapPath::Dereference(Box::new(HeapPath::Pvar(formal_pvar.clone())))
+    }
+
+    #[test]
+    fn test_formal_preeval_abduces_read_preconditions_and_deref_edge() {
+        let loc = Location::dummy();
+        let pname = Procname::c_from_string("test");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), loc.clone());
+        pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let pvar = Pvar::mk(Mangled::from_string("p"), pname);
+        let var = Var::ProgramVar(Box::new(pvar));
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&var)
+            .expect("formal should be bound in the initial stack");
+
+        preeval_formals(&pdesc, &mut state);
+
+        let pointee = state
+            .pre
+            .heap
+            .find_edge(formal_addr, &Access::Dereference)
+            .expect("formal pre-eval should materialize a pre dereference edge");
+        assert_eq!(
+            state.post.heap.find_edge(formal_addr, &Access::Dereference),
+            Some(pointee),
+            "formal pre-eval should materialize the same post dereference edge"
+        );
+        let pre_attrs = state
+            .pre
+            .attrs
+            .get(&formal_addr)
+            .expect("formal pre-eval should abduce attrs on the formal value");
+        assert!(pre_attrs
+            .iter()
+            .any(|attr| matches!(attr, crate::attribute::Attribute::MustBeValid(_, _, _))));
+        assert!(pre_attrs
+            .iter()
+            .any(|attr| matches!(attr, crate::attribute::Attribute::MustBeInitialized(_, _))));
     }
 
     fn retain_named_procs(tm: &mut textual_utils::TestModule, proc_names: &[&str]) {

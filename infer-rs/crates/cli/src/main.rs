@@ -162,6 +162,10 @@ struct Cli {
     #[arg(long = "max-widens")]
     max_widens: Option<usize>,
 
+    /// Disable OCaml-compatible formal pre-evaluation at Pulse procedure entry.
+    #[arg(long = "no-pulse-formal-preeval")]
+    no_pulse_formal_preeval: bool,
+
     /// Number of parallel analysis jobs (default: number of CPUs).
     #[arg(short = 'j', long = "jobs")]
     jobs: Option<usize>,
@@ -286,6 +290,9 @@ impl Cli {
         }
         if let Some(v) = self.max_widens {
             c.max_widens = v;
+        }
+        if self.no_pulse_formal_preeval {
+            c.pulse_formal_preeval = false;
         }
         if self.debug_level_analysis > 0 {
             c.debug_level_analysis = self.debug_level_analysis;

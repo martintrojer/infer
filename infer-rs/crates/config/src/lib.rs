@@ -151,6 +151,17 @@ pub struct InferConfig {
     )]
     pub pulse_max_wall_secs: Option<u64>,
 
+    /// Pre-evaluate every formal at procedure entry by dereferencing its
+    /// stack slot. OCaml Pulse does this unconditionally via
+    /// `PulseTaintOperations.taint_initial` in `Pulse.initial` (even under
+    /// `--pulse-only`; it is not gated by configured taint matchers), and the
+    /// dereference side effects materialize `formal -*-> formal.*` plus
+    /// `MustBeValid` / `MustBeInitialized` preconditions before ordinary
+    /// transfer. Rust currently does not model taint itself, but keeps this
+    /// entry-surface effect for OCaml summary parity.
+    #[serde(rename = "pulse-formal-preeval", default = "default_true")]
+    pub pulse_formal_preeval: bool,
+
     /// Run only the Pulse checker.
     /// OCaml: `--pulse-only` (default false)
     #[serde(rename = "pulse-only")]
@@ -311,6 +322,7 @@ impl Default for InferConfig {
             pulse_max_wall_secs: default_pulse_max_wall_secs(),
             pulse_intraprocedural_only: false,
             pulse_recency_limit: None,
+            pulse_formal_preeval: true,
             pulse_only: false,
             liveness_only: false,
             pulse_report_issues_for_tests: false,
@@ -410,6 +422,7 @@ mod tests {
         assert_eq!(config.pulse_max_disjuncts, 20);
         assert_eq!(config.pulse_widen_threshold, 3);
         assert_eq!(config.pulse_max_cfg_size, 15_000);
+        assert!(config.pulse_formal_preeval);
         assert!(!config.pulse_intermediate_formula_gc);
         assert_eq!(config.pulse_max_heap_mb, Some(2048));
         assert_eq!(config.pulse_max_wall_secs, Some(60));
