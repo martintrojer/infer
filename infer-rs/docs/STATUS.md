@@ -88,19 +88,30 @@ Initial cluster pass landed (commits on branch):
 - `bug_specialization_c_stack_overflow_lin_arith_of_q` — break imported
   linear cycles introduced by Cluster H (regression fix).
 
-Triage delta vs original 2026-05-11 baseline (5-file slice excluding
-`specialization.c`, which currently has its own residual track): `30 matching /
-86 diffs` → `51 matching / 65 diffs` (`+21 matching / -21 diffs`). Carrying
-the earlier `specialization.c 20 / 1` row forward gives a suite-equivalent
-`71 / 66` vs the original `50 / 87`.
+Residual track also landed (commits on branch):
 
-Residual / follow-up tracks remain open in `mu`:
-`cluster_d_residual_global_pre_stack_initializer`,
-`cluster_e_residual_cycle_eq_repr`,
-`cluster_g_residual_funptr_apply_post_canonical_edges`,
-`cluster_h_residual_inequality_witness_export`,
-`cluster_specialization_residual_post_overflow_fix`. They all gate the next
-dashboard refresh task `summary_c_triage_remeasure_after_clusters`.
+- `cluster_d_residual_global_pre_stack_initializer` — dynamic
+  CFunction/ObjcBlock pre-stack seeding + `apply_callback` key surface.
+- `cluster_specialization_residual_post_overflow_fix` — stop recursive Cfun
+  harness fallback exposed by the cycle-break fix.
+- `cluster_h_residual_inequality_witness_export` — OCaml-style
+  restricted/tableau witness export for inequalities.
+- `cluster_e_residual_cycle_eq_repr` — align VarUF representative ordering.
+- `cluster_g_residual_funptr_apply_post_canonical_edges` — preserve no-op
+  call summaries instead of unknown-call havoc.
+- `bug_h_residual_witness_regresses_specialization` — scope H witness export
+  to direct summary roots; restored specialization.c parity.
+
+Full six-file triage delta vs original 2026-05-11 baseline
+(`50 matching / 87 diffs`) is now `82 matching / 55 diffs`
+(`+32 matching / -32 diffs`). Per-file breakdown lives in
+[`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
+
+Remaining open residual tracks:
+`cluster_d_residual_funptr_atom_repr` (formula-atom representative drift) and
+`cluster_e_residual_apply_post_cycle_edges` (preserve direct callee cycle heap
+edges in apply_post / latent recovery). They gate the next dashboard refresh
+task `summary_c_triage_remeasure_after_clusters`.
 
 ## OpenSSL benchmark dashboard
 

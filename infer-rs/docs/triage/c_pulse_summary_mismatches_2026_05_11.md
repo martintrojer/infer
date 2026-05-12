@@ -243,3 +243,72 @@ be `71 matching / 66 diffs`, i.e. `+21 matching / -21 diffs` vs the original
 - `specialization.c`: current triage harness stack-overflows before producing a
   row. Earlier cluster notes recorded `20 matching / 1 diff`, but that number is
   not reverified at this final initial-cluster checkpoint.
+
+---
+
+## Remeasure after residual cluster fixes (2026-05-12, second pass)
+
+Branch: `infer-rs` at `b0d55c8bd7` after the residual stack landed (full list
+below). INFER_BIN: `/Users/mtrojer/infer/infer/bin/infer` (Infer
+v1.2.0-e0d18cf1b6). Stack overflow seen in the previous remeasure has been
+fixed (`bug_specialization_c_stack_overflow_lin_arith_of_q`,
+`ed9ef8caeb`), so the full six-file run completes again.
+
+Repro:
+
+```sh
+cd infer-rs
+INFER_BIN=/Users/mtrojer/infer/infer/bin/infer \
+  INFER_RS_C_TRIAGE_FILES=arithmetic.c,funptr.c,interprocedural.c,latent.c,memory_leak.c,specialization.c \
+  cargo test -p pulse --test end_to_end test_summary_comparison_c_triage \
+  -- --ignored --nocapture
+```
+
+### Per-file totals vs original baseline
+
+| File              | baseline matching | baseline diffs | current matching | current diffs | ocaml_only | rust_only | delta matching | delta diffs |
+|-------------------|------------------:|---------------:|-----------------:|--------------:|-----------:|----------:|---------------:|------------:|
+| arithmetic.c      |                 4 |              7 |                6 |             5 |          0 |         1 |             +2 |          -2 |
+| funptr.c          |                10 |             18 |               20 |             8 |          0 |         0 |            +10 |         -10 |
+| interprocedural.c |                 6 |             11 |               10 |             7 |          0 |         1 |             +4 |          -4 |
+| latent.c          |                 1 |             13 |                3 |            11 |          0 |         0 |             +2 |          -2 |
+| memory_leak.c     |                 9 |             37 |               23 |            23 |          0 |         5 |            +14 |         -14 |
+| specialization.c  |                20 |              1 |               20 |             1 |          0 |         0 |             +0 |          -0 |
+| **total**         |            **50** |         **87** |           **82** |        **55** |          0 |         7 |        **+32** |     **-32** |
+
+### New / amended commits in this pass
+
+Residual-track fixes landed on top of the initial cluster pass:
+
+- `cluster_d_residual_global_pre_stack_initializer` (`ebc2483271`) — dynamic
+  CFunction/ObjcBlock pre-stack seeding plus `apply_callback` specialization-key
+  surface alignment; memory_leak.c `18/28 → 22/24`, funptr.c `17/11 → 18/10`.
+- `cluster_specialization_residual_post_overflow_fix` (`f822d97d5b`) — stop
+  the recursive Cfun harness fallback that the cycle-break fix exposed;
+  specialization.c restored from `18/3` back to `20/1`.
+- `cluster_h_residual_inequality_witness_export` (`b8e4d41959`) — OCaml-style
+  restricted/tableau witness export for inequalities; interprocedural.c
+  `9/8 → 10/7`, arithmetic.c `4/7 → 6/5`.
+- `cluster_e_residual_cycle_eq_repr` (`4f993fd916`) — align VarUF
+  representative ordering with OCaml. Pin-down only at this point; latent.c
+  counters unchanged because the remaining divergence is in apply_post / latent
+  recovery (tracked by `cluster_e_residual_apply_post_cycle_edges`).
+- `cluster_g_residual_funptr_apply_post_canonical_edges` (`98c5d37652`) —
+  preserve no-op call summaries instead of going through unknown-call havoc;
+  funptr.c `18/10 → 20/8`.
+- `bug_h_residual_witness_regresses_specialization` (`24d2ff6e15`) — scope
+  the H restricted witness export to direct summary roots; restored
+  specialization.c from `19/2` back to `20/1` while preserving the H residual
+  gains on interprocedural.c and arithmetic.c.
+
+### Open residuals after this pass
+
+- `cluster_d_residual_funptr_atom_repr` — formula-atom representative drift
+  (`atom:0 < malloc_func.*` vs `atom:return.* < malloc_func.*`).
+- `cluster_e_residual_apply_post_cycle_edges` — preserve direct callee cycle
+  heap edges in `apply_post` / latent recovery instead of rewriting them through
+  the canonical representative.
+- `cluster_a_taint_initial_formal_preeval_gap` follow-on residuals are folded
+  into the broader memory_leak.c residual; no separate task.
+- The single remaining specialization.c diff stays on `may_double_free_if_alias`
+  (latent kind/post-attr drift), unchanged across this pass.
