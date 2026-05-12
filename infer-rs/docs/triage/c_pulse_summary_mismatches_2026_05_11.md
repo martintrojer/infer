@@ -156,3 +156,90 @@ Notes
 - `infer/bin/infer` is empty in this checkout. INFER_BIN env points
   at the user's installed tree at `/Users/mtrojer/infer/infer/bin/infer`
   (Infer v1.2.0-e0d18cf1b6) and the harness handles that fine.
+
+---
+
+## Remeasure after initial cluster fixes (2026-05-12)
+
+Branch: `infer-rs` at `0fbb99d9bb` plus the landed cluster-fix stack listed below.
+INFER_BIN: `/Users/mtrojer/infer/infer/bin/infer`.
+
+Requested repro command:
+
+```sh
+INFER_BIN=/Users/mtrojer/infer/infer/bin/infer \
+  INFER_RS_C_TRIAGE_FILES=arithmetic.c,funptr.c,interprocedural.c,latent.c,memory_leak.c,specialization.c \
+  cargo test -p pulse --test end_to_end test_summary_comparison_c_triage \
+  -- --ignored --nocapture
+```
+
+Result: this six-file run aborts while entering `specialization.c` with a Rust
+stack overflow (exit 101 / SIGABRT). The first five files complete and were
+re-run without `specialization.c` to get a clean `TRIAGE SUMMARY` (exit 0). A
+focused `specialization.c` run also stack-overflows, even with a larger
+`RUST_MIN_STACK`, so the current specialization row is recorded as unmeasured.
+
+### Per-file totals vs original baseline
+
+| File              | baseline matching | baseline diffs | current matching | current diffs | ocaml_only | rust_only | delta matching | delta diffs | status |
+|-------------------|------------------:|---------------:|-----------------:|--------------:|-----------:|----------:|---------------:|------------:|--------|
+| arithmetic.c      |                 4 |              7 |                4 |             7 |          0 |         1 |             +0 |          +0 | remeasured |
+| funptr.c          |                10 |             18 |               17 |            11 |          0 |         0 |             +7 |          -7 | remeasured |
+| interprocedural.c |                 6 |             11 |                9 |             8 |          0 |         1 |             +3 |          -3 | remeasured |
+| latent.c          |                 1 |             13 |                3 |            11 |          0 |         0 |             +2 |          -2 | remeasured |
+| memory_leak.c     |                 9 |             37 |               18 |            28 |          0 |         5 |             +9 |          -9 | remeasured |
+| specialization.c  |                20 |              1 |                — |             — |          — |         — |              — |           — | stack overflow |
+
+Totals for the five completed files: original equivalent slice `30 matching / 86
+diffs / 0 ocaml_only / 7 rust_only`; current `51 matching / 65 diffs / 0
+ocaml_only / 7 rust_only`, for a verified slice delta of `+21 matching / -21
+diffs`.
+
+If `specialization.c` is carried forward at the original `20 matching / 1 diff`
+(row not verified in this remeasure), the six-file suite-equivalent total would
+be `71 matching / 66 diffs`, i.e. `+21 matching / -21 diffs` vs the original
+`50 / 87` baseline.
+
+### Per-cluster status snapshot
+
+| Cluster | Initial fix status | Residual status |
+|---------|--------------------|-----------------|
+| A — formal `MustBeInitialized` drift | Landed `cluster_a_drop_spurious` (`b36da9543d`, rebased) and `cluster_a_taint_initial_formal_preeval_gap` (`f92c448b22`). | No open `cluster_a_residual_*` task. Some remaining pre-attr rows are mixed with D/G/array state-shape residuals. |
+| B — `Initialized` after `Store` | Landed `cluster_b_propagate_initialized_after_store` (`2edf69ce06`). | No open `cluster_b_residual_*` task; remaining B-looking rows are broader summary/canonicalization cases. |
+| C — `Allocated(CMalloc), Uninitialized` | Landed `cluster_c_pair_allocated_cmalloc_with` (`447ebff065`) and `cluster_c_tenv_struct_uninitialized_followup` (`edfa5f072f`). | No open `cluster_c_residual_*` task; array/realloc/index-shape rows remain outside the initial C fixes. |
+| D — function-pointer/global summary surface | Landed `cluster_d_align_global_function_pointer` (`0fbb99d9bb`). | Open: `cluster_d_residual_global_pre_stack_initializer`. |
+| E — `UsedAsBranchCond` / latent state shape | Landed `cluster_e_stop_over_attaching` (`8a52f5f5e0`) and narrow state-shape fix `cluster_e_residual_state_shape_self_cycle` (`2bcf498605`). | Open: `cluster_e_residual_cycle_eq_repr`; closed trace task `cluster_e_follow_up_trace_residual` was folded into it. |
+| F — witness atoms in `conditions` vs `phi` | Landed `cluster_f_route_witness_atoms_through` (`ee3116407c`). | No open `cluster_f_residual_*` task. |
+| G — closure-call return equality | Landed `cluster_g_preserve_closure_call_return` (`cdd901797f`) and partial residual fix `cluster_g_residual_funptr_return_export` (`563749a94a`). | Open: `cluster_g_residual_funptr_apply_post_canonical_edges`. |
+| H — linear equalities across summaries | Landed `cluster_h_keep_linear_equalities_across` (`66fb6444d0`). | Open: `cluster_h_residual_inequality_witness_export`. |
+
+### Remaining residuals
+
+- `cluster_d_residual_global_pre_stack_initializer` — align global initializer
+  pre-stack/pre-attrs and the `apply_callback` specialization-key surface.
+- `cluster_e_residual_cycle_eq_repr` — fix latent traverse/crash cycle-equality
+  representative choice so heap shape and latent kinds match OCaml.
+- `cluster_g_residual_funptr_apply_post_canonical_edges` — preserve canonical
+  read-only/post edges for `funptr_if_good` / `funptr_else_good` return loads.
+- `cluster_h_residual_inequality_witness_export` — implement OCaml-style
+  restricted/tableau witness export for inequality-derived affine facts.
+
+### Current notable residual rows
+
+- `funptr.c`: residuals are concentrated in `apply_callback`, callback update
+  pre-attrs/closure attrs, `funptr_if_good` / `funptr_else_good`, and the
+  `*_with_intptrptr_and_after_*` rows. Cluster D/G residual tasks cover the
+  highest-leverage pieces.
+- `latent.c`: still `3 matching / 11 diffs`; the large rows remain
+  `traverse_and_crash_if_equal_to_root`, `FN_crash_after_six_nodes_bad`, and
+  `crash_after_two_nodes_bad`, consistent with the open Cluster E representative
+  task.
+- `memory_leak.c`: now `18 matching / 28 diffs`; major residual families are
+  array/index heap shape, malloc/realloc branch-count surface, global function
+  pointer pre-stack, and recursion self-cycle/value-shape differences.
+- `arithmetic.c` and `interprocedural.c`: counters are unchanged in this final
+  stack; remaining rows are mainly arithmetic/inequality witness export and
+  latent diagnostic/kind differences.
+- `specialization.c`: current triage harness stack-overflows before producing a
+  row. Earlier cluster notes recorded `20 matching / 1 diff`, but that number is
+  not reverified at this final initial-cluster checkpoint.
