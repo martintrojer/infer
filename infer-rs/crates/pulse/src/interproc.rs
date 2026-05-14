@@ -1372,6 +1372,20 @@ fn imported_linear_subst(
     )
 }
 
+fn ensure_formula_var_for_import(
+    phi: &crate::formula::phi::Phi,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    callee_v: AbstractValue,
+) {
+    let callee_repr = phi.get_repr(callee_v);
+    let caller_v = subst
+        .get(&callee_v)
+        .or_else(|| subst.get(&callee_repr))
+        .copied()
+        .unwrap_or_else(|| callee_repr.mk_fresh_same_kind());
+    subst.entry(callee_repr).or_insert(caller_v);
+}
+
 fn imported_linear_subst_with_cache(
     phi: &crate::formula::phi::Phi,
     subst: &HashMap<AbstractValue, AbstractValue>,
@@ -1495,9 +1509,7 @@ fn translate_formula(
 
     let phi = &callee_formula.phi();
     let mut ensure_formula_var = |callee_v: AbstractValue| {
-        subst
-            .entry(callee_v)
-            .or_insert_with(|| callee_v.mk_fresh_same_kind());
+        ensure_formula_var_for_import(phi, subst, callee_v);
     };
     for &callee_v in &callee_post.must_be_valid {
         ensure_formula_var(callee_v);
@@ -1846,6 +1858,21 @@ mod tests {
         );
         pdesc.set_succs(0, vec![load_node]);
         pdesc.set_succs(load_node, vec![1]);
+    }
+
+    #[test]
+    fn test_ensure_formula_var_maps_canonical_representative_from_alias() {
+        let canonical = AbstractValue::of_raw(113);
+        let alias = AbstractValue::of_raw(114);
+        let caller_actual = AbstractValue::of_raw(7);
+        let mut phi = crate::formula::phi::Phi::ttrue();
+        assert!(phi.and_var_equal(canonical, alias).is_sat());
+
+        let mut subst = std::collections::HashMap::from([(alias, caller_actual)]);
+        ensure_formula_var_for_import(&phi, &mut subst, alias);
+
+        assert_eq!(subst.get(&canonical), Some(&caller_actual));
+        assert_eq!(subst.get(&alias), Some(&caller_actual));
     }
 
     #[test]
