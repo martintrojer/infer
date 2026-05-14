@@ -2092,23 +2092,35 @@ fn apply_pre_posts_with_specialization_loop(
             }
         }
         if !results.is_empty() || alias_groups.is_empty() {
-            // Cross-ref: OCaml keeps dropped-disjunct bookkeeping in the
-            // hidden non-disj summary sideband. Callers can still
-            // `pulse_force_continue` when the selected alias-specialized
-            // summary contains only stopped states rooted in latent invalid
-            // accesses
-            // (`specialization.c:call_may_double_free_if_alias_bad`).
-            //
-            // Rust does not yet mirror that non-disj sideband, so preserve
-            // the same observable caller behavior here: a selected
-            // alias-specialized latent-invalid-access summary with no
-            // ContinueProgram is treated as incomplete for the narrow purpose
-            // of force-continue.
-            let alias_specialization_needs_force_continue = current_spec.aliases.is_some()
-                && !has_continue_program(&results)
-                && current_pre_posts
-                    .iter()
-                    .any(|pp| matches!(pp.kind, crate::summary::PrePostKind::LatentInvalidAccess));
+            // Cross-ref: OCaml `PulseCallOperations.call` computes
+            // `has_continue_program` from both the disjunctive results and the
+            // hidden non-disj astate, then `pulse_force_continue`s only when
+            // the selected summary has dropped/empty disjuncts and still has
+            // no continue. Rust does not model that non-disj sideband for
+            // alias-specialized summaries, so approximate the same narrow
+            // signal only for alias-specialized summaries whose cached rows
+            // are all latent stopped states and whose applied rows all stop.
+            let alias_specialized_latent_only_summary = current_spec.aliases.is_some()
+                && !current_pre_posts.is_empty()
+                && current_pre_posts.iter().all(|pp| {
+                    matches!(
+                        pp.kind,
+                        crate::summary::PrePostKind::LatentAbortProgram
+                            | crate::summary::PrePostKind::LatentInvalidAccess
+                    )
+                });
+            let applied_results_all_stopped = !results.is_empty()
+                && results.iter().all(|result| {
+                    matches!(
+                        result,
+                        ExecutionDomain::AbortProgram { .. }
+                            | ExecutionDomain::LatentAbortProgram { .. }
+                            | ExecutionDomain::LatentInvalidAccess { .. }
+                    )
+                });
+            let alias_specialization_needs_force_continue = alias_specialized_latent_only_summary
+                && applied_results_all_stopped
+                && !has_continue_program(&results);
             return KnownCalleeResults {
                 results,
                 used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts
@@ -2824,8 +2836,13 @@ mod tests {
         )
     }
 
-    fn make_alias_specialization_latent_invalid_summary(
+    fn make_alias_specialization_latent_only_summary(
+        kind: PrePostKind,
     ) -> (Procname, PulseSummary, PulseSpecialization, Fieldname) {
+        assert!(matches!(
+            kind,
+            PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
+        ));
         let (callee_pname, mut callee_summary, alias_spec, next_field) =
             make_alias_specialization_summary(true);
         let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
@@ -2847,8 +2864,9 @@ mod tests {
             .pre_posts
             .first_mut()
             .expect("specialized summary should contain one pre/post");
-        pre_post.kind = PrePostKind::LatentInvalidAccess;
+        pre_post.kind = kind;
         pre_post.diagnostic = Some(diagnostic.clone());
+        specialized.1.latent_abort_diagnostics[0] = Some(diagnostic);
         callee_summary.diagnostics = vec![];
         (callee_pname, callee_summary, alias_spec, next_field)
     }
@@ -4833,11 +4851,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_exec_known_callee_summary_force_continue_for_alias_specialized_latent_invalid_summary_without_continue(
-    ) {
+    fn exec_alias_specialized_latent_only_callee(kind: PrePostKind) -> Vec<ExecutionDomain> {
         let (callee_pname, callee_summary, _alias_spec, next_field) =
-            make_alias_specialization_latent_invalid_summary();
+            make_alias_specialization_latent_only_summary(kind);
         let caller_pname = Procname::c_from_string("caller");
         let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
         let mut caller_state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
@@ -4874,6 +4890,17 @@ mod tests {
             },
             caller_state,
         );
+        assert!(
+            requests.into_inner().is_empty(),
+            "cached specialization should avoid re-enqueueing the same alias request"
+        );
+        results
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_force_continue_for_alias_specialized_latent_invalid_summary_without_continue(
+    ) {
+        let results = exec_alias_specialized_latent_only_callee(PrePostKind::LatentInvalidAccess);
 
         assert!(
             results
@@ -4881,9 +4908,18 @@ mod tests {
                 .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
             "alias-specialized summaries with only stopped states should still gain the OCaml-style unknown-call continue, got {results:?}"
         );
+    }
+
+    #[test]
+    fn test_exec_known_callee_summary_force_continue_for_alias_specialized_latent_abort_summary_without_continue(
+    ) {
+        let results = exec_alias_specialized_latent_only_callee(PrePostKind::LatentAbortProgram);
+
         assert!(
-            requests.into_inner().is_empty(),
-            "cached specialization should avoid re-enqueueing the same alias request"
+            results
+                .iter()
+                .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
+            "alias-specialized latent-abort-only summaries should mirror OCaml non-disj force-continue, got {results:?}"
         );
     }
 
