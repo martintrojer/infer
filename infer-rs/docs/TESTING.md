@@ -183,6 +183,25 @@ If `RUST_LOG` is unset, `--trace-ondemand` defaults to
 Use `pulse-progress` and `live-fixpoint` together to separate active-frontier
 cost from retained-state storage cost.
 
+## Resource hazards
+
+- In-process summary harnesses such as `test_summary_comparison_c_triage` do
+  not honor `--pulse-max-heap-mb` or `--pulse-max-wall-secs`, because they run
+  analysis in-process rather than through the capped `infer-rs` CLI. During the
+  2026-05-14 Linux session on devvm36499 (235 GB RAM), repeated measurements
+  climbed past 160 GB RSS before orchestrator SIGTERM.
+- Scope these tests to one file and add external caps, for example:
+  `ulimit -v 8388608; INFER_RS_C_TRIAGE_FILES=<one_file>
+  RUST_TEST_THREADS=1 RAYON_NUM_THREADS=1 timeout 180 cargo test
+  test_summary_comparison_c_triage`.
+- Whole-corpus `infer-rs --pulse-only -j N <textual-out>/*.sil` runs can also
+  bypass practical per-procedure protection when `-j` is high. Raw invocations
+  should mirror the `scripts/bench_openssl_partial.sh` defaults:
+  `--pulse-max-heap-mb 2048 --pulse-max-wall-secs 60`.
+- Incident note: worker `scout_openssl_corpus_capture_linux` scope-crept into a
+  full-corpus `-j4` run that reached about 160 GB RSS and was SIGTERM-killed.
+  Prefer single-file invocations or the bench script for corpus experiments.
+
 ## Determinism
 
 Analysis results are deterministic across runs:
