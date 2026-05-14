@@ -4301,6 +4301,38 @@ fn test_store_textual_sweep() {
     // Files known to hang (infinite loops / deep recursion exhaust fixpoint)
     let skip_files = ["infinite.c", "recursion.c", "recursion2.c"];
 
+    // Pre-warm the Rust CLI before starting the per-file timed loop. The first
+    // call to `run_infer_rs_on_textual` lazily builds target/{debug,release}/infer-rs;
+    // if that happens inside the 30s per-file budget, a cold release build can
+    // be misclassified as a source-file timeout. Keep the real per-file budget
+    // unchanged and pay the cold-start cost explicitly here instead. Cross-ref:
+    // mu task `scout_sweep_cold_start_timeout_audit`.
+    let warmup_entry = manifest_entries
+        .iter()
+        .find(|entry| {
+            std::path::Path::new(&entry.source)
+                .file_name()
+                .is_some_and(|name| name == "divide_by_zero.c")
+        })
+        .expect("divide_by_zero.c should be present in the store-textual sweep");
+    let warmup_sil_path = export_dir.join(&warmup_entry.sil);
+    let warmup_source_dir = std::path::Path::new(&warmup_entry.source)
+        .parent()
+        .unwrap_or(c_dir.as_path());
+    let warmup_start = std::time::Instant::now();
+    test_harness::infer_runner::run_infer_rs_on_textual(
+        &warmup_sil_path,
+        Some(&warmup_entry.source),
+        warmup_source_dir,
+        Some(&results_dir),
+        true,
+    )
+    .unwrap_or_else(|e| panic!("warmup analysis failed: {e}"));
+    eprintln!(
+        "Pre-warmed infer-rs CLI on divide_by_zero.c in {:.2}s",
+        warmup_start.elapsed().as_secs_f64()
+    );
+
     let mut ok = 0;
     let mut fail_analyze = 0;
     let mut fail_timeout = 0;

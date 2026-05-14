@@ -55,15 +55,26 @@ pub fn find_infer_binary() -> Option<PathBuf> {
     }
 
     // 3. On PATH
-    if Command::new("infer")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return Some(PathBuf::from("infer"));
+    if let Some(path) = find_executable_on_path("infer") {
+        if Command::new(&path)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return Some(path);
+        }
     }
 
     None
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(&exe_name))
+            .find(|candidate| candidate.exists())
+    })
 }
 
 /// Locate the `infer-rs` binary in the current Cargo target directory.
