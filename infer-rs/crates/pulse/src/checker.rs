@@ -2041,6 +2041,7 @@ fn apply_pre_posts_with_specialization_loop(
     let mut current_pre_posts = initial_summary.pre_posts;
     let mut current_latent_stopped_diagnostics = initial_summary.latent_stopped_diagnostics;
     let mut current_spec = initial_summary.specialization;
+    let mut current_dynamic_type_specialization = !current_spec.dynamic_types.is_empty();
     let mut current_has_dropped_disjuncts = initial_summary.has_dropped_disjuncts;
     let mut tried_specs: Vec<PulseSpecialization> = Vec::new();
 
@@ -2084,6 +2085,7 @@ fn apply_pre_posts_with_specialization_loop(
                 args,
                 loc,
                 caller_state.clone(),
+                current_dynamic_type_specialization,
             );
             log::debug!("    pre/post #{j}: {} results", outcome.results.len());
             results.extend(outcome.results);
@@ -2121,10 +2123,24 @@ fn apply_pre_posts_with_specialization_loop(
             let alias_specialization_needs_force_continue = alias_specialized_latent_only_summary
                 && applied_results_all_stopped
                 && !has_continue_program(&results);
+            // Cross-ref: OCaml `PulseCallOperations.iter_call` applies
+            // `DynamicTypeNeeded` specialized summaries through `apply_callee`;
+            // when the specialized side only stops, `PulseCallOperations.call`
+            // can still add the force-continue unknown-call path. Keep this
+            // narrow to dynamic-type specializations so raw callee-local aborts
+            // stay suppressed by `interproc::apply_summary_with_aliasing`.
+            let dynamic_type_abort_specialization_needs_force_continue =
+                current_dynamic_type_specialization
+                    && current_pre_posts
+                        .iter()
+                        .all(|pp| pp.kind == crate::summary::PrePostKind::AbortProgram)
+                    && applied_results_all_stopped
+                    && !has_continue_program(&results);
             return KnownCalleeResults {
                 results,
                 used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts
-                    || alias_specialization_needs_force_continue,
+                    || alias_specialization_needs_force_continue
+                    || dynamic_type_abort_specialization_needs_force_continue,
                 used_summary_was_empty: false,
             };
         }
@@ -2144,6 +2160,7 @@ fn apply_pre_posts_with_specialization_loop(
             current_spec = next_spec;
             current_pre_posts = &specialized.pre_posts;
             current_latent_stopped_diagnostics = Some(&specialized.latent_abort_diagnostics);
+            current_dynamic_type_specialization = !current_spec.dynamic_types.is_empty();
             current_has_dropped_disjuncts = specialized.has_dropped_disjuncts;
             continue;
         }
@@ -5513,6 +5530,7 @@ mod tests {
                     &actuals,
                     &call_loc,
                     caller_state_after_store.clone(),
+                    false,
                 );
                 let rendered = outcome
                     .results
@@ -5690,6 +5708,7 @@ mod tests {
             &actuals,
             &call_loc,
             caller_state_after_store,
+            false,
         );
         assert!(
             matches!(

@@ -1338,6 +1338,7 @@ impl PulseSummary {
         // itself. Keep them on the owning summary, and strip manifest abort
         // diagnostics from the cached specialized pre/posts so callers do not
         // report the same issue again for each call context.
+        let dynamic_type_specialization = !spec.dynamic_types.is_empty();
         let latent_abort_diagnostics: Vec<_> = summary
             .pre_posts
             .iter_mut()
@@ -1374,7 +1375,7 @@ impl PulseSummary {
             }
         }
         for pre_post in &mut summary.pre_posts {
-            if pre_post.kind == PrePostKind::AbortProgram {
+            if !dynamic_type_specialization && pre_post.kind == PrePostKind::AbortProgram {
                 pre_post.diagnostic = None;
             }
         }

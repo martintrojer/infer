@@ -62,7 +62,16 @@ pub fn apply_summary(
     loc: &Location,
     caller_state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
-    apply_summary_with_aliasing(caller_pdesc, pre_post, ret_id, actuals, loc, caller_state).results
+    apply_summary_with_aliasing(
+        caller_pdesc,
+        pre_post,
+        ret_id,
+        actuals,
+        loc,
+        caller_state,
+        false,
+    )
+    .results
 }
 
 pub(crate) fn apply_summary_with_aliasing(
@@ -72,6 +81,7 @@ pub(crate) fn apply_summary_with_aliasing(
     actuals: &[(Exp, Typ)],
     loc: &Location,
     mut caller_state: AbductiveDomain,
+    propagate_dynamic_type_specialized_abort: bool,
 ) -> ApplySummaryOutcome {
     // Step 1: Build the callee→caller substitution from formals→actuals
     let mut subst: HashMap<AbstractValue, AbstractValue> = HashMap::new();
@@ -495,20 +505,43 @@ pub(crate) fn apply_summary_with_aliasing(
             vec![ExecutionDomain::ContinueProgram(caller_state)]
         }
         crate::summary::PrePostKind::AbortProgram => {
-            // A manifest AbortProgram in the callee is already published on
-            // the callee's own summary. Applying that same abort as a caller
-            // AbortProgram republishes the local callee issue on every caller
-            // (`angelism.c: skip_function_with_no_spec_ok` style duplication).
+            // A raw callee-local manifest AbortProgram is already published on
+            // the callee's own summary; suppress it to avoid duplicating the
+            // same issue on every caller. Cross-ref: OCaml duplicate
+            // publication is avoided during reporting of ordinary callee
+            // summaries.
             //
-            // Specialized summaries are handled separately:
-            // `PulseSummary::add_specialized_summary` merges their diagnostics
-            // onto the owning summary and strips manifest abort diagnostics
-            // from the cached specialized pre/posts before they can reach
-            // callers.
-            //
-            // So for ordinary callee-local manifest aborts, stop this caller
-            // path without producing a caller-side execution state.
-            vec![]
+            // However OCaml `PulseCallOperations.iter_call` applies a
+            // `DynamicTypeNeeded` specialized summary as the actual callee
+            // execution state; its `apply_callee` then wraps
+            // `Stopped (AbortProgram ...)` with `Summary.of_post` and
+            // propagates it to the caller. Mirror that only for dynamic-type
+            // specializations, where the abort is caller-context evidence
+            // rather than just the callee's local manifest report.
+            if propagate_dynamic_type_specialized_abort {
+                if let Some(diag) = &pre_post.diagnostic {
+                    let diag = rebase_diagnostic_to_state(
+                        translate_diagnostic(
+                            diag,
+                            &mut subst,
+                            &caller_state,
+                            &formal_histories,
+                            loc,
+                            callee_procname.as_ref(),
+                            callee_proc_start_location.as_ref(),
+                        ),
+                        &caller_state,
+                    );
+                    vec![ExecutionDomain::AbortProgram {
+                        state: Box::new(caller_state),
+                        diagnostic: Box::new(diag),
+                    }]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
         }
         crate::summary::PrePostKind::LatentAbortProgram => {
             // Cross-ref: OCaml PulseCallOperations.ml re-checks a latent issue
@@ -2471,6 +2504,7 @@ mod tests {
             &[(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))],
             &Location::dummy(),
             caller_state,
+            false,
         );
 
         assert!(
