@@ -14,7 +14,7 @@ mu task list -w infer-rs --status OPEN
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `~134` (`+3` over expected; next sweep should reflect this after today's angelism.c closure) |
+| NPE count | expected `131`, found `139` (`+8` over expected, measured with upstream `--no-pulse-force-continue` test config) |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
@@ -25,22 +25,25 @@ mu task list -w infer-rs --status OPEN
 
 ### NPE issue-count deltas (current Linux)
 
-Current Linux store-textual NPE count is expected `131`, found `~134` (`+3`
-net over expected). This is the post-today equivalent of the historical macOS
-surface after recency-limit alignment (`459ec03492`), return-slot preservation
-(`f78e622ff1`), and sideband follow-ups; the next sweep, when run, should
-reflect `131/134` or thereabouts (do not infer a new measured sweep here).
+Current Linux store-textual NPE count is expected `131`, found `139` (`+8`
+net over expected), measured by
+`INFER_BIN=/home/mtrojer/infer/infer/bin/infer RUST_TEST_THREADS=1 cargo test --test end_to_end test_store_textual_sweep -- --ignored --nocapture`.
+The sweep harness now mirrors the upstream C Pulse test Makefile's
+`--no-pulse-force-continue` setting before comparing against `issues.exp`.
+That semantic test-config alignment fixes the previous `var_arg.c` `+2` by
+preventing force-continue fallback after the bounded `sum` summary rejects the
+`n == 4` call sites, but it also exposes the still-open `angelism.c` Rust-only
+surface under the real upstream config.
 
-- `angelism.c`: `0` (was historical macOS `+5`; closed today by recency-limit
-  + return-slot + sideband fixes, confirmed by single-file capped triage).
-- `fopen.c`: `-3` (still present; stdio model gap).
+- `angelism.c`: `+5` (present under upstream `--no-pulse-force-continue`; the
+  earlier closure was measured under the production force-continue default).
 - `latent.c`: `-1` (still present; producer classification, partly addressed;
   deferred `cluster_latent_record_post_for_address_porting` tracks the deeper
   port).
 - `nullptr.c`: `+2` (still present; mixed publication/suppression mix).
 - `sizeof.c`: `+2` (still present; accepted Textual fidelity).
-- `struct_values.c`: `+1` (still present; by-value struct surface).
-- `var_arg.c`: `+2` (still present; vararg loop `FN_*` patterns).
+- `var_arg.c`: `0` (fixed by aligning the Rust store-textual sweep harness with
+  the upstream test config, not by suppressing the `FN_*` diagnostics).
 
 Leak per-file detail: LEAK now matches expected exactly per file after
 `bug_store_textual_leak_dead_root_parity` (commit `9078f04176`).
@@ -83,6 +86,10 @@ now analyze. Today's Linux session additions:
   facts, accept both `return` and `__return`, and add the missing Rust C
   `memset` model (worker-1).
 - `5524f43c71` — docs refresh for C-suite triage after recency findings.
+- `cluster_var_arg_fn_overreports` — store-textual harness passes
+  `--pulse-force-continue=false`, matching upstream C Pulse Makefiles' semantic
+  test config. `var_arg.c` moves `6→4`; LEAK remains `20/20`, UAF `7/7`, full
+  sweep remains `52/0/0`. NPE is now measured as `131/139` under that config.
 
 ### C-suite OCaml↔Rust Pulse summary parity (`90 matching / 47 diffs`)
 

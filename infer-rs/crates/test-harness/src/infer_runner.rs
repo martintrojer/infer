@@ -148,6 +148,12 @@ pub fn run_infer_rs_on_textual(
         cmd.current_dir(cwd)
             .arg("--pulse-only")
             .arg("--quiet")
+            // The upstream C/C++ Pulse tests generate issues.exp with
+            // `--no-pulse-force-continue` (see
+            // infer/tests/codetoanalyze/c/pulse/Makefile). Mirror that
+            // semantic test configuration for store-textual sweeps instead
+            // of using the production default.
+            .arg("--pulse-force-continue=false")
             .arg("-o")
             .arg(&out_dir);
         if report_issues_for_tests {
