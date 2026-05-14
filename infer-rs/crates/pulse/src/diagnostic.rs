@@ -117,6 +117,25 @@ impl Diagnostic {
         self.get_issue_type_id().id()
     }
 
+    /// OCaml-style publication key for issue-log deduplication.
+    ///
+    /// Cross-ref: OCaml `Errlog.add_issue` keys by issue type + error
+    /// description, and by default (`--deduplicate-by location`) keeps only
+    /// one `err_data` per source location. Keep detailed provenance out of this
+    /// key so two paths that find the same user-visible issue at the same
+    /// source location do not both get published.
+    pub fn report_dedup_key(&self, latent: bool) -> String {
+        let loc = self.get_location();
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.build_issue_type(latent).id,
+            loc,
+            self.qualifier_message(),
+            loc.line,
+            loc.col
+        )
+    }
+
     fn build_issue_type(&self, latent: bool) -> diagnostics::issue_type::IssueType {
         let type_id = self.get_issue_type_id();
         let id = if latent {

@@ -2611,7 +2611,7 @@ fn report_diagnostic_issue(
 }
 
 fn diagnostic_dedup_key(diagnostic: &Diagnostic, latent: bool) -> String {
-    format!("{latent}|{}", diagnostic.dedup_key())
+    diagnostic.report_dedup_key(latent)
 }
 
 #[cfg(test)]
@@ -3195,6 +3195,48 @@ mod tests {
         assert!(
             log.is_empty(),
             "suppressed constant-dereference diagnostics should stay out of default reporting"
+        );
+    }
+
+    #[test]
+    fn test_to_issue_log_deduplicates_same_location_and_description() {
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        let diagnostic1 = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::of_raw(1),
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            trace_access_location: None,
+            access_history: ValueHistory::invalidated(invalidation.clone(), Location::dummy())
+                .append_assignment(Location::dummy()),
+            invalidation_history: ValueHistory::invalidated(
+                invalidation.clone(),
+                Location::dummy(),
+            ),
+        };
+        let diagnostic2 = Diagnostic::AccessToInvalidAddress {
+            addr: AbstractValue::of_raw(2),
+            invalidation: invalidation.clone(),
+            access_location: Location::dummy(),
+            trace_access_location: None,
+            access_history: ValueHistory::invalidated(invalidation.clone(), Location::dummy())
+                .append_assignment(Location::dummy()),
+            invalidation_history: ValueHistory::invalidated(
+                invalidation,
+                Location {
+                    line: 7,
+                    col: 9,
+                    ..Location::dummy()
+                },
+            ),
+        };
+        let summary = PulseSummary::intra_only(vec![diagnostic1, diagnostic2]);
+
+        let log = to_issue_log(&summary, "duplicate_null_deref");
+
+        assert_eq!(
+            log.len(),
+            1,
+            "OCaml Errlog deduplicates same-type/same-description issues at the same location"
         );
     }
 
