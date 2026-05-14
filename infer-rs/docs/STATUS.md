@@ -13,17 +13,19 @@ mu task list -w infer-rs --status OPEN
 
 | area | current status |
 |---|---|
-| Store-textual C Pulse sweep | `52` OK / `0` FAIL_ANALYZE / `0` TIMEOUT |
-| NPE count | expected `131`, found `140` (+9, see deltas below) |
+| Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
+| NPE count | expected `131`, found `131` (Linux baseline exact; macOS historical `140`/`+9`, see note below) |
 | Leak count | expected `20`, found `20` (matches expected) |
 | UAF count | expected `7`, found `7` (matches expected) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
 | specialization summary harness | `20 / 20` procedures match (only `may_double_free_if_alias` residual) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `86 matching / 51 diffs` (+36/-36 vs original `50/87` baseline) |
+| C-suite OCaml↔Rust Pulse summary triage | `88 matching / 49 diffs` (+38/-38 vs original `50/87` baseline) |
 
-Accepted current NPE deltas (`+9` over expected):
+Linux store-textual NPE baseline is exact: expected `131`, found `131`. The
+previously documented `+9` over expected was macOS-derived and does not
+reproduce on this Linux checkout. Historical macOS per-host deltas were:
 
 - `angelism.c`: `+5` (Pulse pre-evaluation surface from
   `cluster_a_taint_initial_formal_preeval_gap`).
@@ -34,12 +36,8 @@ Accepted current NPE deltas (`+9` over expected):
 - `struct_values.c`: `+1`
 - `var_arg.c`: `+2`
 
-Leak per-file detail (totals match):
-
-- `memory_leak.c`: `-1` vs expected
-- `memory_leak_more.c`: `+1` vs expected
-
-(Net `0` — the sweep total now matches the expected `20` exactly.)
+Leak per-file detail: LEAK now matches expected exactly per file after
+`bug_store_textual_leak_dead_root_parity` (commit `9078f04176`).
 
 LEAK baseline note (historical): the previous `expected 20 / found 16` row was
 recovered after the cluster A/B/C/D pass landed. Numbers above are the live
@@ -54,16 +52,30 @@ and comparator normalizations for semantic noise only. The recent SIL virtual
 dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `virt.sil` skips: `plus_formal` / `plus_ok`,
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
-now analyze.
+now analyze. Today's Linux tyre-kick additions:
 
-### C-suite OCaml↔Rust Pulse summary parity
+- `502236c5b2` — sweep harness pre-warm to avoid first-run TIMEOUT races on
+  cold caches.
+- `e7dd96291a` — `cluster_latent_witness_routing_surface`: comparator-side
+  `LatentAbortProgram` diagnostic routing plus `UsedAsBranchCond` on aliased
+  heap-path values.
+- `9078f04176` — `bug_store_textual_leak_dead_root_parity`: dead-root leak
+  inspection (mirrors OCaml `check_memory_leaks` over
+  `astate_before_filter`), allocator-return import to caller, and `BasedOn`
+  pointer-arithmetic provenance for `reaches_into`-style suppression. LEAK
+  moved from the first Linux `20/15` measurement to `20/20` exact; the macOS
+  dashboard had already shown `20/20`.
+
+### C-suite OCaml↔Rust Pulse summary parity (`88 matching / 49 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
-`interprocedural.c`, `latent.c`, `memory_leak.c`, `specialization.c`; `nullptr.c`
-is the known recursion hang). The triage harness lives in
-`crates/pulse/tests/end_to_end.rs::test_summary_comparison_c_triage` and the
-full narrative is in
+`interprocedural.c`, `latent.c`, `memory_leak.c`, `specialization.c`,
+`nullptr.c`). Standalone Rust analysis of `nullptr.c` completes in ~0.02s under
+the standard 60s/2GB caps. The historical "recursion hang" was actually an
+in-process OOM (~7.86 GB) inside
+`crates/pulse/tests/end_to_end.rs::test_summary_comparison_c_triage`. The
+single-file behavior is now sound. The full narrative is in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 
 Initial cluster pass landed (commits on branch):
@@ -126,16 +138,28 @@ Latent.c-focused fourth pass also landed:
 - `cluster_latent_classification_extra_aborts` — align latent invalid-access
   classification (no over-broad local manifest twin; latent diagnostics replay
   on specialized apply).
+- `cluster_latent_witness_routing_surface` — comparator-side
+  `LatentAbortProgram` diagnostic routing plus `UsedAsBranchCond` on aliased
+  heap-path values.
+
+Store-textual LEAK fifth pass also landed:
+
+- `bug_store_textual_leak_dead_root_parity` — dead-root leak inspection
+  mirroring OCaml `check_memory_leaks` over `astate_before_filter`,
+  allocator-return import to caller, and `BasedOn` pointer-arithmetic
+  provenance for `reaches_into`-style suppression.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `86 matching / 51 diffs`
-(`+36 matching / -36 diffs`). Per-file breakdown and per-pass narrative live
+(`50 matching / 87 diffs`) is now `88 matching / 49 diffs`
+(`+38 matching / -38 diffs`). Per-file breakdown and per-pass narrative live
 in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 
-No open `cluster_*` residual tasks remain in the C-suite triage track. Future
-work would be a fresh trace of remaining `latent.c` heap-shape rows or
-`may_double_free_if_alias` (the lone surviving specialization.c diff).
+Current residual work is `cluster_latent_producer_heap_shape` for the remaining
+`latent.c` heap-shape rows (after the fourth pass, latent.c is `6/8`) and
+`cluster_memory_leak_array_index_residual` for the `memory_leak.c` summary
+surface. `may_double_free_if_alias` remains the lone accepted
+specialization.c residual.
 
 ## OpenSSL benchmark dashboard
 
@@ -153,6 +177,11 @@ Latest clean repeated checkpoint on the fresh patched-exporter re-export
 present; `RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh` with
 `TEXTUAL_DIR=.../textual-out-reexport-20260508-102338`). This table is the
 latest trustworthy full-corpus measurement, not necessarily current HEAD:
+
+Note: these dashboard numbers are macOS-derived historical reference. The
+current Linux corpus has `74` `.sil` / `150` procs (vs macOS `74` `.sil` /
+`446` procs), so it is not directly comparable; see
+`mu task notes perf_remeasure_quiescent_host -w infer-rs` for context.
 
 | metric | OCaml old baseline (`-j 1`) | Rust default (`-j 4`) | Rust + formula-gc (`-j 4`) |
 |---|---:|---:|---:|
@@ -218,27 +247,27 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **C-suite OCaml↔Rust Pulse summary parity** — four passes landed with
-  measurable diff reduction; current full-suite total is `86 matching / 51
-  diffs` (`+36/-36` vs original `50/87` baseline). No open `cluster_*`
-  residual tasks. Remaining diffs are concentrated in latent.c heap-shape rows
-  (`traverse_and_crash_if_equal_to_root` family), memory_leak.c array/index
-  shape, and the single accepted `may_double_free_if_alias` residual. Future
-  work would be a fresh trace, not a queued cluster.
+- **C-suite OCaml↔Rust Pulse summary parity** — five passes landed with
+  measurable diff reduction; current full-suite total is `88 matching / 49
+  diffs` (`+38/-38` vs original `50/87` baseline). Active residual work is
+  `cluster_latent_producer_heap_shape` for latent producer heap-shape rows and
+  `cluster_memory_leak_array_index_residual` for the `memory_leak.c` summary
+  surface. `may_double_free_if_alias` remains the single accepted
+  specialization.c residual.
 - **OpenSSL perf / benchmark hygiene** — the benchmark script has stricter
   preflight/failure behavior and focused `state_cmp` fixes have landed. The
-  remaining ready item is the clean quiescent-host full OpenSSL remeasure; do
-  not run it while load/security daemons are high.
-- **Decision gate** — after the clean full-corpus remeasure closes,
-  `perf_decide_next_track_after_profile_and_remeasure` should prune obsolete
-  placeholders and choose the next concrete track.
-- **Correctness parity** — store-textual sweep-level deltas are accepted and
-  documented above (LEAK and UAF totals now match expected; NPE +9 over
-  expected, dominated by `angelism.c +5` and `nullptr.c +3` from the
-  `cluster_a_taint_initial_formal_preeval_gap` pre-evaluation surface). Reopen
-  parity work only for new sweep regressions or a real Textual/export-fidelity
-  project. Procedure-level summary parity is tracked separately by the C-suite
-  triage track above.
+  remaining item is the quiescent-host full OpenSSL remeasure, pending a corpus
+  parity decision because the Linux sample (`74` `.sil` / `150` procs) is not
+  directly comparable to the macOS dashboard sample (`74` `.sil` / `446`
+  procs). Do not run it while load/security daemons are high.
+- **Decision gate** — after the clean, corpus-comparable full-corpus remeasure
+  closes, `perf_decide_next_track_after_profile_and_remeasure` should prune
+  obsolete placeholders and choose the next concrete track.
+- **Correctness parity** — store-textual sweep-level Linux totals are exact and
+  documented above (NPE `131/131`, LEAK `20/20`, UAF `7/7`; the macOS NPE `+9`
+  remains only a historical per-host caveat). Reopen parity work only for new
+  sweep regressions or a real Textual/export-fidelity project. Procedure-level
+  summary parity is tracked separately by the C-suite triage track above.
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
   work (`perf_component_clone_reduction`), Textual enhancements, and accepted
   parity limits (`parity_sizeof_type_eval`) are parked with explicit
