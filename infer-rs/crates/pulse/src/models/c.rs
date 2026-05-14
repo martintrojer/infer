@@ -187,12 +187,17 @@ fn dispatch_with_config(
     if name == "getcwd" {
         return Some(getcwd_model(ret_id, args, loc, state));
     }
+    if matches!(name, "fputc" | "putc" | "ungetc") {
+        // Cross-ref: OCaml PulseModelsC.ml models `fputc`/`putc` as
+        // `putc(c, stream)` and `ungetc` as `(c, stream)`: the FILE* is
+        // the second argument, not the first one.
+        return Some(check_file_arg_at(ret_id, args, 1, loc, state));
+    }
     if matches!(
         name,
         "fclose"
             | "fgetc"
             | "fgets"
-            | "fputc"
             | "fputs"
             | "fprintf"
             | "fseek"
@@ -205,10 +210,8 @@ fn dispatch_with_config(
             | "fsetpos"
             | "fileno"
             | "getc"
-            | "putc"
-            | "ungetc"
     ) {
-        return Some(check_file_arg(ret_id, args, loc, state));
+        return Some(check_file_arg_at(ret_id, args, 0, loc, state));
     }
 
     None
@@ -778,18 +781,19 @@ fn noreturn(state: AbductiveDomain) -> Vec<ExecutionDomain> {
 
 /// Model for stdio functions that dereference their FILE* argument.
 ///
-/// Checks the first argument for validity (FILE* is the first arg for most
-/// stdio functions). Reports NULL_DEREFERENCE if null, then returns fresh value.
-fn check_file_arg(
+/// Checks the requested FILE* argument for validity. Reports
+/// NULL_DEREFERENCE if null, then returns a fresh value.
+fn check_file_arg_at(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
+    file_arg_index: usize,
     loc: &Location,
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
     // Cross-ref: OCaml stdio models (e.g. `getc(FILE*)`) call `check_valid`
     // (NoAccess) on the FILE* argument; they do not require it to be
     // `MustBeInitialized` from the caller's perspective.
-    if let Some((arg_exp, _)) = args.first() {
+    if let Some((arg_exp, _)) = args.get(file_arg_index) {
         let addr = operations::eval_or_fresh(arg_exp, loc, &mut state);
         match operations::check_addr_access_no_init(addr, loc, &mut state) {
             PulseResult::FatalError(diag, _) => {
