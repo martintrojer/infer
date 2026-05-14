@@ -39,6 +39,7 @@ pub const MODELED_NAMES: &[&str] = &[
     "__delete_array",
     "memcpy",
     "memmove",
+    "memset",
     "realloc",
     "exit",
     "_exit",
@@ -152,6 +153,13 @@ fn dispatch_with_config(
     // Cross-ref: OCaml PulseModelsC.ml memcpy: check_valid dest, check_valid src.
     if matches!(name, "memcpy" | "memmove") {
         return Some(memcpy(ret_id, args, loc, state));
+    }
+    // memset: check dest validity, materialize scalar/pointer targets for the
+    // sized object, write the byte value through them, and return dest.
+    // Cross-ref: OCaml PulseModelsC.ml `memset` uses
+    // `AbductiveDomain.fold_pointer_targets` plus `PulseOperations.write_deref`.
+    if name == "memset" {
+        return Some(memset(env.tenv, ret_id, args, loc, state));
     }
     // realloc(ptr, size): free old ptr, then allocate-or-null.
     // Cross-ref: OCaml PulseModelsC.ml realloc_common.
@@ -317,10 +325,21 @@ fn fold_pointer_targets(
     typ: &Typ,
     loc: &Location,
 ) {
+    fold_pointer_targets_with(tenv, state, addr, typ, loc, &mut |state, target, _loc| {
+        state.add_attr(target, Attribute::Uninitialized);
+    });
+}
+
+fn fold_pointer_targets_with(
+    tenv: Option<&Tenv>,
+    state: &mut AbductiveDomain,
+    addr: AbstractValue,
+    typ: &Typ,
+    loc: &Location,
+    f: &mut impl FnMut(&mut AbductiveDomain, AbstractValue, &Location),
+) {
     match typ.desc.as_ref() {
-        TypeDesc::Tint(_) | TypeDesc::Tfloat(_) | TypeDesc::Tptr(..) => {
-            state.add_attr(addr, Attribute::Uninitialized);
-        }
+        TypeDesc::Tint(_) | TypeDesc::Tfloat(_) | TypeDesc::Tptr(..) => f(state, addr, loc),
         TypeDesc::Tstruct(type_name) if !should_walk_struct_name(type_name) => {}
         TypeDesc::Tstruct(type_name) => {
             let Some(strukt) = tenv.and_then(|tenv| tenv.lookup(type_name)) else {
@@ -341,7 +360,7 @@ fn fold_pointer_targets(
                     crate::access::Access::FieldAccess(field.name.clone()),
                     crate::value_history::ValueWithHistory::new(field_addr, field_history),
                 );
-                fold_pointer_targets(tenv, state, field_addr, &field.typ, loc);
+                fold_pointer_targets_with(tenv, state, field_addr, &field.typ, loc, f);
             }
         }
         TypeDesc::Tarray { .. } | TypeDesc::Tvoid | TypeDesc::Tfun(_) | TypeDesc::TVar(_) => {}
@@ -884,6 +903,69 @@ fn realloc_with_allocator(
     }
 
     results
+}
+
+/// Model: `memset(dest, value, size)`.
+///
+/// Cross-ref: OCaml PulseModelsC.ml `memset`: after `check_valid dest`, it
+/// folds the sized object's pointer targets and writes `value` through each
+/// target with `PulseOperations.write_deref`, then returns `dest`.
+fn memset(
+    tenv: Option<&Tenv>,
+    ret_id: &Ident,
+    args: &[(Exp, Typ)],
+    loc: &Location,
+    mut state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    let Some((dest_exp, _)) = args.first() else {
+        let ret_val = AbstractValue::mk_fresh();
+        operations::write_id(ret_id, ret_val, &mut state);
+        return vec![ExecutionDomain::ContinueProgram(state)];
+    };
+
+    let dest = operations::eval_or_fresh_with_history(dest_exp, loc, &mut state);
+    match operations::check_addr_access_no_init_with_history(dest.clone(), loc, &mut state) {
+        PulseResult::FatalError(diag, _) => {
+            return vec![ExecutionDomain::AbortProgram {
+                state: Box::new(state),
+                diagnostic: Box::new(diag),
+            }];
+        }
+        PulseResult::Recoverable((), errors) => {
+            operations::write_id_with_history(ret_id, dest, &mut state);
+            return stopped_results_from_recoverable_errors(state, errors);
+        }
+        PulseResult::Ok(()) => {}
+    }
+
+    let value = args
+        .get(1)
+        .map(|(value_exp, _)| operations::eval_or_fresh_with_history(value_exp, loc, &mut state))
+        .unwrap_or_else(|| {
+            crate::value_history::ValueWithHistory::new(
+                AbstractValue::mk_fresh(),
+                ValueHistory::assignment(loc.clone()),
+            )
+        });
+    if let Some(size_exp) = args.get(2).map(|(exp, _)| exp) {
+        if let Some(typ) = malloced_object_type(size_exp) {
+            let mut write_value = |state: &mut AbductiveDomain, target, loc: &Location| {
+                let _ = operations::write_deref_with_history(
+                    crate::value_history::ValueWithHistory::new(
+                        target,
+                        ValueHistory::assignment(loc.clone()),
+                    ),
+                    value.clone(),
+                    loc,
+                    state,
+                );
+            };
+            fold_pointer_targets_with(tenv, &mut state, dest.addr, &typ, loc, &mut write_value);
+        }
+    }
+
+    operations::write_id_with_history(ret_id, dest, &mut state);
+    vec![ExecutionDomain::ContinueProgram(state)]
 }
 
 /// Model: `memcpy(dest, src, size)` / `memmove(dest, src, size)`.

@@ -3483,13 +3483,15 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
 
     // Cross-ref: OCaml uses `Ident.name_return` / `Pvar.get_ret_pvar`, whose
     // mangled name is `return`; `PulseAbductiveDomain.filter_for_summary`
-    // preserves that return value as part of the caller-visible summary. Rust's
-    // Textual-to-SIL lowering uses `__return` for hand-written `ret`
-    // terminators, while OCaml store-textual C procedures write through a local
-    // `return` pvar. Treat both spellings as real return slots so pure
-    // return-value facts such as `return >= 0`, `return == 0`, and specialized
-    // constants are imported at callers instead of being dropped and later
-    // published as infeasible null dereferences.
+    // preserves that return value as part of the caller-visible summary, and
+    // `PulseInterproc.read_return_value` follows its `Dereference` edge
+    // unconditionally. Rust's Textual-to-SIL lowering uses `__return` for
+    // hand-written `ret` terminators, while OCaml store-textual C procedures
+    // write through a local `return` pvar. Treat both spellings as real return
+    // slots so pure return-value facts such as `return >= 0`, `return == 0`,
+    // null-return facts from wrappers, and specialized constants are imported
+    // at callers instead of being dropped and later published as infeasible
+    // null dereferences.
     for return_name in ["return", "__return"] {
         let ret_pvar = Pvar::mk(
             sil::mangled::Mangled::from_string(return_name),
@@ -3650,6 +3652,26 @@ mod tests {
         assert!(astate.path_condition.and_equal_const(return_value, 0).is_sat());
 
         assert_eq!(find_return_value(&astate, &pdesc), Some(return_value));
+    }
+
+    #[test]
+    fn test_find_return_value_uses_ocaml_return_slot_for_null_fact() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::mk_ptr(Typ::void());
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_pvar = Pvar::mk(Mangled::from_string("return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(10);
+        let returned_value = AbstractValue::of_raw(11);
+
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, returned_value);
+        assert!(astate.and_equal_const(returned_value, 0).is_sat());
+
+        assert_eq!(find_return_value(&astate, &pdesc), Some(returned_value));
     }
 
     #[test]
