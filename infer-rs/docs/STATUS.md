@@ -14,7 +14,7 @@ mu task list -w infer-rs --status OPEN
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `139` (`+8` over expected, measured with upstream `--no-pulse-force-continue` test config) |
+| NPE count | expected `131`, found `138` (`+7` net over expected; `+8` positive overreport surface, measured with upstream `--no-pulse-force-continue` test config) |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
@@ -25,7 +25,7 @@ mu task list -w infer-rs --status OPEN
 
 ### NPE issue-count deltas (current Linux)
 
-Current Linux store-textual NPE count is expected `131`, found `139` (`+8`
+Current Linux store-textual NPE count is expected `131`, found `138` (`+7`
 net over expected), measured by
 `INFER_BIN=/home/mtrojer/infer/infer/bin/infer RUST_TEST_THREADS=1 cargo test --test end_to_end test_store_textual_sweep -- --ignored --nocapture`.
 The sweep harness now mirrors the upstream C Pulse test Makefile's
@@ -33,14 +33,19 @@ The sweep harness now mirrors the upstream C Pulse test Makefile's
 That semantic test-config alignment fixes the previous `var_arg.c` `+2` by
 preventing force-continue fallback after the bounded `sum` summary rejects the
 `n == 4` call sites, but it also exposes the still-open `angelism.c` Rust-only
-surface under the real upstream config.
+surface under the real upstream config. The positive-overreport/macOS-style
+surface is now `+8`, not the previous `+9`: the canonical formula-var summary
+import fix removed one spurious latent NPE on the apps.sil `set_multi_opts` ->
+`set_name_ex` caller-chain shape, showing up in this C sweep as `nullptr.c`
+`+2` -> `+1`.
 
 - `angelism.c`: `+5` (present under upstream `--no-pulse-force-continue`; the
   earlier closure was measured under the production force-continue default).
 - `latent.c`: `-1` (still present; producer classification, partly addressed;
   deferred `cluster_latent_record_post_for_address_porting` tracks the deeper
   port).
-- `nullptr.c`: `+2` (still present; mixed publication/suppression mix).
+- `nullptr.c`: `+1` (was `+2` before the formula-var summary-import fix;
+  mixed publication/suppression mix remains).
 - `sizeof.c`: `+2` (still present; accepted Textual fidelity).
 - `var_arg.c`: `0` (fixed by aligning the Rust store-textual sweep harness with
   the upstream test config, not by suppressing the `FN_*` diagnostics).
@@ -63,6 +68,21 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze. Today's Linux session additions:
 
+- `3368d70702` / `bfb235e881` — pulse maps canonical formula vars on summary
+  import, fixing the formula-substitution panic on the apps.sil
+  `set_multi_opts` -> `set_name_ex` caller chain and dropping the measured NPE
+  sweep to `131/138`.
+- `51b68ec816` — bench caps OpenSSL partial invocations with explicit
+  `--pulse-max-heap-mb` / `--pulse-max-wall-secs` args and rejects conflicting
+  `EXTRA_ARGS`.
+- `9a80eb9be7` — bench detects the host time flag for OpenSSL partial runs
+  (Linux GNU `time -v` vs macOS BSD `time -l`).
+- `266a17dd9d` / `a733b0a513` — cleanup removes unused formula helpers (47
+  deletions).
+- `02a79d2833` / `e4e4bc887e` / `e5c09cef7c` — docs add the OpenSSL Linux perf
+  attack-surface map and experiment plan under `docs/plans/`.
+- `1295efbfbc` / `74a5f5a959` — docs add the Linux profiling tool quick
+  reference to `docs/TESTING.md`.
 - `502236c5b2` — sweep harness pre-warm to avoid first-run TIMEOUT races on
   cold caches (worker-1, `scout_sweep_cold_start_timeout_audit`).
 - `e7dd96291a` — `cluster_latent_witness_routing_surface`: comparator-side
@@ -89,7 +109,9 @@ now analyze. Today's Linux session additions:
 - `cluster_var_arg_fn_overreports` — store-textual harness passes
   `--pulse-force-continue=false`, matching upstream C Pulse Makefiles' semantic
   test config. `var_arg.c` moves `6→4`; LEAK remains `20/20`, UAF `7/7`, full
-  sweep remains `52/0/0`. NPE is now measured as `131/139` under that config.
+  sweep remains `52/0/0`. NPE was measured as `131/139` under that config
+  before the canonical formula-var summary-import fix; current measurement is
+  `131/138`.
 
 ### C-suite OCaml↔Rust Pulse summary parity (`90 matching / 47 diffs`)
 
@@ -184,8 +206,9 @@ live in
 
 Current residual work is the parked `cluster_latent_record_post_for_address_porting`
 deep porting track for the remaining `latent.c` producer/record-post shape,
-the current Linux NPE `+3` per-file surface documented above, and the
-`specialization.c` `may_double_free_if_alias` force-continue track.
+the current Linux NPE `+7` net / `+8` positive-overreport surface documented
+above, and the `specialization.c` `may_double_free_if_alias` force-continue
+track.
 
 ## OpenSSL benchmark dashboard
 
@@ -281,9 +304,10 @@ Live themes (track headlines, not exhaustive task lists):
   Current full-suite total is `90 matching / 47 diffs` (`+40/-40` vs original
   `50/87` baseline), with `latent.c` `6/8`, `memory_leak.c` `27/19`, and
   `specialization.c` `20/1`.
-- **In-flight correctness follow-ups** — current Linux NPE is now the `+3`
-  per-file surface documented above; worker-2 is pursuing the
-  `specialization.c` `may_double_free_if_alias` force-continue residual.
+- **In-flight correctness follow-ups** — current Linux NPE is now the `+7`
+  net / `+8` positive-overreport per-file surface documented above; worker-2
+  is pursuing the `specialization.c` `may_double_free_if_alias` force-continue
+  residual.
 - **Parked correctness backlog** — `cluster_latent_record_post_for_address_porting`
   is deferred as multi-day deep porting despite high ROI (`11.7`).
 - **OpenSSL perf / benchmark hygiene** — the benchmark script has stricter
@@ -296,10 +320,10 @@ Live themes (track headlines, not exhaustive task lists):
   closes, `perf_decide_next_track_after_profile_and_remeasure` should prune
   obsolete placeholders and choose the next concrete track.
 - **Correctness parity** — store-textual sweep-level Linux totals are documented
-  above (NPE expected `131`, found `~134` after today's angelism.c closure;
-  LEAK `20/20` exact; UAF `7/7` exact). Reopen parity work only for new sweep
-  regressions or a real Textual/export-fidelity project. Procedure-level
-  summary parity is tracked separately by the C-suite triage track above.
+  above (NPE expected `131`, found `138`; LEAK `20/20` exact; UAF `7/7`
+  exact). Reopen parity work only for new sweep regressions or a real
+  Textual/export-fidelity project. Procedure-level summary parity is tracked
+  separately by the C-suite triage track above.
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
   work (`perf_component_clone_reduction`), Textual enhancements, and accepted
   parity limits (`parity_sizeof_type_eval`) are parked with explicit
