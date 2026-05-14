@@ -614,12 +614,17 @@ impl PrePost {
         );
         reachable.extend(always_reachable);
 
-        let post_canonical_reachable: HashSet<_> = reachable
+        let mut post_canonical_reachable: HashSet<_> = reachable
             .iter()
             .map(|addr| self.post.path_condition.get_var_repr(*addr))
             .collect();
         let mut post_heap_reachable = reachable.clone();
         post_heap_reachable.extend(post_canonical_reachable.iter().copied());
+        // Cross-ref: OCaml `GraphVisit.visit_access` treats `ArrayAccess`
+        // indices as reachable addresses. Keep their attributes too so
+        // integer literal indices retain `Invalid(ConstantDereference k)` on
+        // the exported summary surface.
+        post_canonical_reachable.extend(self.collect_reachable_array_indices(&post_heap_reachable));
         let pre_reachable = self.collect_reachable_from_seeds(
             self.pre.stack.iter().map(|(_, addr)| *addr),
             true,
@@ -4142,7 +4147,20 @@ mod tests {
         let array_stack_addr = astate.post.stack.find(&array_var).unwrap();
         let array_val = astate.read_heap(array_stack_addr, Access::Dereference);
         let index = AbstractValue::mk_fresh();
+        let index_loc = Location {
+            line: 42,
+            col: 7,
+            ..Location::dummy()
+        };
         let _ = astate.and_equal_const(index, 42);
+        astate.invalidate(
+            index,
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42)),
+            ValueHistory::invalidated(
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42)),
+                index_loc,
+            ),
+        );
         let allocated = AbstractValue::mk_fresh();
         astate.write_heap(
             array_val,
@@ -4166,6 +4184,20 @@ mod tests {
             pp.post.get_const(index),
             Some(42),
             "array index constants on retained heap accesses should survive summary normalization"
+        );
+        let index = pp.post.path_condition.get_var_repr(index);
+        assert!(
+            pp.post
+                .post
+                .attrs
+                .get(&index)
+                .and_then(|attrs| attrs.get_invalid())
+                .is_some_and(|(inv, _)| matches!(
+                    inv,
+                    crate::invalidation::Invalidation::ConstantDereference(value)
+                        if *value == IntLit::of_int(42)
+                )),
+            "array index invalidation attrs should be retained like OCaml GraphVisit reachability"
         );
     }
 
