@@ -3227,15 +3227,14 @@ fn test_e2e_memory_leak_realloc_reports_both_null_origins() {
     );
 }
 
-/// Regression: keep reporting the real null dereference in
-/// `FN_nullptr_deref_old_bad`, even though OCaml's `issues.exp` intentionally
-/// omits it as a known false negative caused by recency forgetting.
+/// Regression: with OCaml-compatible `--pulse-recency-limit` defaulting to 32,
+/// `FN_nullptr_deref_old_bad` should be forgotten like OCaml's `issues.exp`.
 ///
 /// Run explicitly:
-///   cargo test -p pulse --test end_to_end test_e2e_nullptr_old_vector_element_is_still_tracked -- --ignored --nocapture
+///   cargo test -p pulse --test end_to_end test_e2e_nullptr_old_vector_element_is_forgotten_by_default_recency -- --ignored --nocapture
 #[test]
 #[ignore]
-fn test_e2e_nullptr_old_vector_element_is_still_tracked() {
+fn test_e2e_nullptr_old_vector_element_is_forgotten_by_default_recency() {
     use test_harness::infer_runner::InferRunner;
 
     let Some(runner) = InferRunner::new() else {
@@ -3262,12 +3261,12 @@ fn test_e2e_nullptr_old_vector_element_is_still_tracked() {
 
     assert_eq!(
         report.matches(proc_marker).count(),
-        1,
-        "FN_nullptr_deref_old_bad should stay reported as a real bug, got:\n{report}"
+        0,
+        "FN_nullptr_deref_old_bad should be forgotten under the default recency limit, got:\n{report}"
     );
     assert!(
-        report.matches(qualifier).count() == 1,
-        "missing expected old-element null-deref qualifier:\n{report}"
+        report.matches(qualifier).count() == 0,
+        "old-element null-deref qualifier should not be reported under default recency:\n{report}"
     );
 }
 

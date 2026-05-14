@@ -90,9 +90,6 @@ pub struct InferConfig {
 
     /// Maximum number of recently modified heap edges retained per address.
     /// OCaml flag: `--pulse-recency-limit` (default 32).
-    /// Rust leaves this unset by default to preserve the current
-    /// correctness-positive behavior until that precision tradeoff is chosen
-    /// explicitly.
     #[serde(rename = "pulse-recency-limit")]
     pub pulse_recency_limit: Option<usize>,
 
@@ -321,7 +318,7 @@ impl Default for InferConfig {
             pulse_max_heap_mb: default_pulse_max_heap_mb(),
             pulse_max_wall_secs: default_pulse_max_wall_secs(),
             pulse_intraprocedural_only: false,
-            pulse_recency_limit: None,
+            pulse_recency_limit: Some(32),
             pulse_formal_preeval: true,
             pulse_only: false,
             liveness_only: false,
@@ -428,7 +425,7 @@ mod tests {
         assert_eq!(config.pulse_max_wall_secs, Some(60));
         assert_eq!(config.max_widens, 10_000);
         assert!(!config.pulse_intraprocedural_only);
-        assert_eq!(config.pulse_recency_limit, None);
+        assert_eq!(config.pulse_recency_limit, Some(32));
         assert!(!config.pulse_only);
         assert!(!config.liveness_only);
         assert!(!config.pulse_report_issues_for_tests);
