@@ -401,6 +401,17 @@ impl PrePost {
             }
             return;
         };
+        if pre_edges.is_empty() {
+            // Cross-ref: OCaml's `restore_formals_for_summary` removes the
+            // post cell when a local/by-value formal subtree reaches a leaf in
+            // the pre-state. Rust's heap can retain registered empty cells in
+            // `pre`, so handle `Some(empty)` the same way as `None`; otherwise
+            // writes to fields of a by-value struct formal leak into callers.
+            if !is_value_visible_outside {
+                self.post.post.heap.remove(addr);
+            }
+            return;
+        }
 
         let post_has_edge =
             |post: &crate::base_memory::BaseMemory, src: AbstractValue, access: &Access| {
@@ -3910,6 +3921,86 @@ mod tests {
         assert_eq!(summary.pre_posts[0].formals.len(), 2);
         assert_eq!(format!("{}", summary.pre_posts[0].formals[0].0.name), "x");
         assert_eq!(format!("{}", summary.pre_posts[0].formals[1].0.name), "y");
+    }
+
+    #[test]
+    fn test_summary_restores_by_value_struct_formal_leaf_writes() {
+        let pname = Procname::c_from_string("struct_formal");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("a"),
+            Typ::mk_struct(TypeName::CStruct(QualifiedCppName::from_string("s"))),
+            Default::default(),
+        )];
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("a"), pname);
+        let formal_addr = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar)))
+            .expect("formal should be bound");
+
+        let s_name = TypeName::CStruct(QualifiedCppName::from_string("s"));
+        let inlined_name = TypeName::CStruct(QualifiedCppName::from_string("inlined"));
+        let i_field = Access::FieldAccess(Fieldname::make(s_name.clone(), "i"));
+        let f_field = Access::FieldAccess(Fieldname::make(s_name, "f"));
+        let x_field = Access::FieldAccess(Fieldname::make(inlined_name.clone(), "x"));
+        let y_field = Access::FieldAccess(Fieldname::make(inlined_name, "y"));
+
+        let i_addr = AbstractValue::mk_fresh();
+        let x_addr = AbstractValue::mk_fresh();
+        let y_addr = AbstractValue::mk_fresh();
+        let f_addr = AbstractValue::mk_fresh();
+        let x_value = AbstractValue::mk_fresh();
+        let y_written_value = AbstractValue::mk_fresh();
+        let f_written_value = AbstractValue::mk_fresh();
+
+        for heap in [&mut state.pre.heap, &mut state.post.heap] {
+            heap.add_edge(formal_addr, i_field.clone(), i_addr);
+            heap.add_edge(formal_addr, f_field.clone(), f_addr);
+            heap.add_edge(i_addr, x_field.clone(), x_addr);
+            heap.add_edge(i_addr, y_field.clone(), y_addr);
+            heap.add_edge(x_addr, Access::Dereference, x_value);
+        }
+        // Leaves that are read/valid in the callee pre can be registered as
+        // empty cells. They still represent by-value struct-local storage and
+        // must not keep callee writes in the exported post.
+        state.pre.heap.register_address(y_addr);
+        state.pre.heap.register_address(f_addr);
+        state
+            .post
+            .heap
+            .add_edge(y_addr, Access::Dereference, y_written_value);
+        state
+            .post
+            .heap
+            .add_edge(f_addr, Access::Dereference, f_written_value);
+
+        let summary = PulseSummary::of_proc(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(state)],
+            vec![],
+            false,
+        );
+        let pp = summary
+            .pre_posts
+            .first()
+            .expect("summary should have a row");
+        assert_eq!(
+            pp.post.post.heap.find_edge(x_addr, &Access::Dereference),
+            Some(x_value),
+            "read pre leaf should stay restored"
+        );
+        assert_eq!(
+            pp.post.post.heap.find_edge(y_addr, &Access::Dereference),
+            None,
+            "write to by-value nested struct field must not leak to callers"
+        );
+        assert_eq!(
+            pp.post.post.heap.find_edge(f_addr, &Access::Dereference),
+            None,
+            "write to by-value struct field must not leak to callers"
+        );
     }
 
     #[test]
