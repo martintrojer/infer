@@ -32,6 +32,10 @@
 #
 # Other knobs:
 #   DRY_RUN=1          print resolved config + planned command and exit 0
+#
+# Timing:
+#   auto-detects /usr/bin/time -l (BSD/macOS) vs -v (GNU/Linux);
+#   summary.tsv records max_rss with an explicit max_rss_unit column.
 
 set -euo pipefail
 
@@ -55,6 +59,17 @@ DRY_RUN="${DRY_RUN:-0}"
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   awk '/^set -euo pipefail$/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
   exit 0
+fi
+
+if /usr/bin/time -l true 2>/dev/null; then
+  TIME_FLAG="-l"
+  TIME_KIND="bsd"
+elif /usr/bin/time -v true 2>/dev/null; then
+  TIME_FLAG="-v"
+  TIME_KIND="gnu"
+else
+  echo "ERROR: /usr/bin/time supports neither -l nor -v" >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -170,10 +185,11 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "  RUNS=$RUNS JOBS=$JOBS"
   echo "  EXTRA_ARGS=$EXTRA_ARGS"
   echo "  RUST_LOG=$RUST_LOG_VALUE"
+  echo "  TIME=/usr/bin/time $TIME_FLAG ($TIME_KIND)"
   echo "  STRICT=$STRICT PERMISSIVE=$PERMISSIVE"
   echo "  flags checked: ${always_flags[*]} ${extra_flag_tokens[*]:-} ${explicit_required[*]:-}"
   echo "[bench] would run (per iteration):"
-  echo "  RUST_LOG=$RUST_LOG_VALUE /usr/bin/time -l \\"
+  echo "  RUST_LOG=$RUST_LOG_VALUE /usr/bin/time $TIME_FLAG \\"
   echo "    $BIN --pulse-only --quiet --trace-ondemand -j $JOBS ${cap_args[*]} $EXTRA_ARGS \\"
   echo "    <${#sil_files[@]} .sil files>"
   exit 0
@@ -181,7 +197,7 @@ fi
 
 mkdir -p "$OUT_DIR"
 SUMMARY="$OUT_DIR/summary.tsv"
-printf 'run\texit\treal_s\tuser_s\tsys_s\tmax_rss_bytes\tpeak_footprint_bytes\taborts\tmax_visit_count\tanalyzed\tlog\n' > "$SUMMARY"
+printf 'run\texit\treal_s\tuser_s\tsys_s\tmax_rss\tmax_rss_unit\tpeak_footprint_bytes\taborts\tmax_visit_count\tanalyzed\tlog\n' > "$SUMMARY"
 
 if (( RUNS <= 0 )); then
   echo "[bench] RUNS=$RUNS, wrote empty summary: $SUMMARY"
@@ -192,27 +208,51 @@ extract_metrics() {
   local run="$1"
   local exit_code="$2"
   local log="$3"
-  python3 - "$run" "$exit_code" "$log" "$SUMMARY" <<'PY'
+  python3 - "$run" "$exit_code" "$log" "$SUMMARY" "$TIME_KIND" <<'PY'
 import pathlib
 import re
 import sys
 
-run, exit_code, log_path, summary_path = sys.argv[1:]
+run, exit_code, log_path, summary_path, time_kind = sys.argv[1:]
 text = pathlib.Path(log_path).read_text(errors="replace")
 lines = text.splitlines()
 
+def elapsed_to_seconds(value):
+    parts = value.split(":")
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return float(minutes) * 60 + float(seconds)
+    return float(value)
+
 real_s = user_s = sys_s = ""
 max_rss = peak = ""
+max_rss_unit = "bytes" if time_kind == "bsd" else "KiB"
 for line in lines:
-    m = re.search(r"\s*([0-9.]+)\s+real\s+([0-9.]+)\s+user\s+([0-9.]+)\s+sys", line)
-    if m:
-        real_s, user_s, sys_s = m.groups()
-    m = re.search(r"\s*([0-9]+)\s+maximum resident set size", line)
-    if m:
-        max_rss = m.group(1)
-    m = re.search(r"\s*([0-9]+)\s+peak memory footprint", line)
-    if m:
-        peak = m.group(1)
+    if time_kind == "bsd":
+        m = re.search(r"\s*([0-9.]+)\s+real\s+([0-9.]+)\s+user\s+([0-9.]+)\s+sys", line)
+        if m:
+            real_s, user_s, sys_s = m.groups()
+        m = re.search(r"\s*([0-9]+)\s+maximum resident set size", line)
+        if m:
+            max_rss = m.group(1)
+        m = re.search(r"\s*([0-9]+)\s+peak memory footprint", line)
+        if m:
+            peak = m.group(1)
+    else:
+        m = re.search(r"User time \(seconds\):\s*([0-9.]+)", line)
+        if m:
+            user_s = m.group(1)
+        m = re.search(r"System time \(seconds\):\s*([0-9.]+)", line)
+        if m:
+            sys_s = m.group(1)
+        if line.startswith("Elapsed "):
+            real_s = f"{elapsed_to_seconds(line.rsplit(': ', 1)[1]):.2f}"
+        m = re.search(r"Maximum resident set size \(kbytes\):\s*([0-9]+)", line)
+        if m:
+            max_rss = m.group(1)
 
 aborts = sum(1 for line in lines if "[pulse-progress] proc=" in line and " aborted at " in line)
 visits = [int(m.group(1)) for m in re.finditer(r"max_visit_count=([0-9]+)", text)]
@@ -225,7 +265,7 @@ for line in lines:
         analyzed = m.group(1)
 
 with open(summary_path, "a", encoding="utf-8") as out:
-    out.write("\t".join(map(str, [run, exit_code, real_s, user_s, sys_s, max_rss, peak, aborts, max_visit, analyzed, log_path])) + "\n")
+    out.write("\t".join(map(str, [run, exit_code, real_s, user_s, sys_s, max_rss, max_rss_unit, peak, aborts, max_visit, analyzed, log_path])) + "\n")
 
 # Also emit a slow-proc table next to the log.
 slow = []
@@ -257,7 +297,7 @@ for run in $(seq 1 "$RUNS"); do
   log="$OUT_DIR/run-$run.log"
   echo "[bench] run=$run/$RUNS jobs=$JOBS log=$log"
   set +e
-  RUST_LOG="$RUST_LOG_VALUE" /usr/bin/time -l "$BIN" \
+  RUST_LOG="$RUST_LOG_VALUE" /usr/bin/time "$TIME_FLAG" "$BIN" \
     --pulse-only --quiet --trace-ondemand -j "$JOBS" "${cap_args[@]}" $EXTRA_ARGS \
     "${sil_files[@]}" > "$log" 2>&1
   code=$?
