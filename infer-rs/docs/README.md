@@ -35,6 +35,12 @@ Current status and active work are intentionally separated:
   — C-suite OCaml↔Rust Pulse summary mismatch triage. Per-cluster status
   and remeasure totals after the initial cluster pass.
 
+### Linux session 2026-05-14
+
+- OpenSSL Linux perf push is in flight with dedicated planning docs:
+  [`plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md`](plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md)
+  and [`plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md`](plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md).
+
 ## Archived plans and findings
 
 Files under [`plans/`](plans/) are historical records, not the live task list.
