@@ -18,8 +18,12 @@ INFER_BIN: /Users/mtrojer/infer/infer/bin/infer (v1.2.0-e0d18cf1b6)
 
 Notes
 - "wallclock" is dominated by OCaml `infer capture` + analyze (~20s each).
-- nullptr.c: Rust Pulse hangs (>240s). Already documented in
-  infer-rs/docs/STATUS.md as a `1 TIMEOUT (known recursion hang)`.
+- nullptr.c: 2026-05-11 run hung in the summary triage harness (>240s) and
+  was documented then as `1 TIMEOUT (known recursion hang)`. 2026-05-14
+  correction: standalone Rust analysis of nullptr.c completes under the normal
+  caps; the failure mode was an in-process triage-harness OOM/timeout, not a
+  standalone Pulse recursion hang. The old-vector NPE portion was also affected
+  by the `pulse_recency_limit` default mismatch fixed in `459ec03492`.
 - `rust_only` procs are mostly Pulse models that OCaml drops on the floor:
   `random` (declared via `__attribute__((__pure__))`), `realloc`/`a_malloc`/
   `my_free`/`my_malloc`/`my_realloc` (assigned via function pointers).
@@ -151,8 +155,10 @@ Notes
 
 ## Out-of-scope but observed
 
-- nullptr.c hangs Rust Pulse (already tracked elsewhere); did NOT
-  re-investigate the cause here.
+- 2026-05-11 historical note: nullptr.c was thought to hang Rust Pulse
+  (already tracked elsewhere); this pass did NOT re-investigate the cause.
+  2026-05-14 correction: standalone nullptr.c does not hang under caps; the
+  observed failure was the in-process summary triage harness OOM/timeout.
 - `infer/bin/infer` is empty in this checkout. INFER_BIN env points
   at the user's installed tree at `/Users/mtrojer/infer/infer/bin/infer`
   (Infer v1.2.0-e0d18cf1b6) and the harness handles that fine.
@@ -212,6 +218,15 @@ be `71 matching / 66 diffs`, i.e. `+21 matching / -21 diffs` vs the original
 | F — witness atoms in `conditions` vs `phi` | Landed `cluster_f_route_witness_atoms_through` (`ee3116407c`). | No open `cluster_f_residual_*` task. |
 | G — closure-call return equality | Landed `cluster_g_preserve_closure_call_return` (`cdd901797f`) and partial residual fix `cluster_g_residual_funptr_return_export` (`563749a94a`). | Open: `cluster_g_residual_funptr_apply_post_canonical_edges`. |
 | H — linear equalities across summaries | Landed `cluster_h_keep_linear_equalities_across` (`66fb6444d0`). | Open: `cluster_h_residual_inequality_witness_export`. |
+
+> **2026-05-14 Cluster A correction.** The issue-count hypothesis that the
+> macOS `angelism.c` `+5` and `nullptr.c` `+3` NPE deltas were
+> `cluster_a_taint_initial_formal_preeval_gap` pre-eval surface was invalidated:
+> worker-1's recency triage showed those deltas were the Rust/OCaml
+> `pulse_recency_limit` default mismatch. After `459ec03492`, `angelism.c`
+> moved `+5 → 0`, and `nullptr.c` moved `+3 → +1` (the old-vector recency
+> portion dropped; remaining `nullptr.c` differences are separate
+> over-report/suppressed-publication surfaces).
 
 ### Remaining residuals
 
@@ -303,8 +318,11 @@ Residual-track fixes landed on top of the initial cluster pass:
 
 ### Open residuals after this pass
 
-- `cluster_a_taint_initial_formal_preeval_gap` follow-on residuals are folded
-  into the broader memory_leak.c residual; no separate task.
+- `cluster_a_taint_initial_formal_preeval_gap` follow-on summary-surface
+  residuals are folded into the broader memory_leak.c residual; no separate
+  task. 2026-05-14 correction: the previously associated angelism.c/nullptr.c
+  NPE issue-count deltas are now classified as recency-limit drift, not Cluster
+  A evidence.
 - The single remaining specialization.c diff stays on `may_double_free_if_alias`
   (latent kind/post-attr drift), unchanged across this pass.
 
@@ -338,8 +356,10 @@ Branch: `infer-rs` at `56f496f878` after the secondary residual stack landed:
 
 ### Open residuals after this pass
 
-- `cluster_a_taint_initial_formal_preeval_gap` follow-on residuals folded into
-  the broader memory_leak.c residual; no separate task.
+- `cluster_a_taint_initial_formal_preeval_gap` follow-on summary-surface
+  residuals folded into the broader memory_leak.c residual; no separate task.
+  2026-05-14 correction: angelism.c/nullptr.c NPE issue-count deltas are
+  recency-limit drift, not Cluster A evidence.
 - `may_double_free_if_alias` is the only remaining specialization.c diff (latent
   kind/post-attr drift); accepted, no follow-up planned at this checkpoint.
 - Remaining latent.c rows (`traverse_and_crash_if_equal_to_root`,
@@ -395,3 +415,56 @@ top-level diffs are concentrated in:
 - memory_leak.c — array/index heap shape, malloc/realloc branch-count surface,
   and recursion self-cycle/value-shape differences.
 - specialization.c — single accepted residual on `may_double_free_if_alias`.
+
+---
+
+## Postscript 2026-05-14
+
+Today's scoped follow-up work keeps the six-file summary-triage track moving,
+and also corrects one important issue-count attribution from the original macOS
+notes. The latest scoped numbers are:
+
+| File              | baseline matching | baseline diffs | latest matching | latest diffs | delta matching | delta diffs | note |
+|-------------------|------------------:|---------------:|----------------:|-------------:|---------------:|------------:|------|
+| arithmetic.c      |                 4 |              7 |               6 |            5 |             +2 |          -2 | unchanged since H residual / return-slot fixes did not move the summary row |
+| funptr.c          |                10 |             18 |              20 |            8 |            +10 |         -10 | unchanged in today's scoped notes |
+| interprocedural.c |                 6 |             11 |              11 |            6 |             +5 |          -5 | includes `cluster_latent_witness_routing_surface` side effect |
+| latent.c          |                 1 |             13 |               6 |            8 |             +5 |          -5 | `cluster_latent_witness_routing_surface` moved latent.c `5/9 → 6/8`; producer heap-shape residual remains |
+| memory_leak.c     |                 9 |             37 |              27 |           19 |            +18 |         -18 | `cluster_memory_leak_array_index_residual` moved `25/21 → 27/19` |
+| specialization.c  |                20 |              1 |              20 |            1 |             +0 |          -0 | still only `may_double_free_if_alias` |
+| **total**         |            **50** |         **87** |          **90** |       **47** |        **+40** |     **-40** | latest scoped-note roll-up |
+
+Relevant commits landed today:
+
+- `e7dd96291a` — `cluster_latent_witness_routing_surface`: comparator-side
+  `LatentAbortProgram` diagnostic routing plus `UsedAsBranchCond` normalization
+  on aliased heap-path values. Six-file total moved `86/51 → 88/49`; latent.c
+  moved `5/9 → 6/8`, and interprocedural.c `10/7 → 11/6`.
+- `9078f04176` — `bug_store_textual_leak_dead_root_parity`: align LEAK
+  publication with OCaml dead-root checking (`astate_before_filter`), import
+  allocator returns to callers, and carry `BasedOn` pointer-arithmetic
+  provenance. Store-textual LEAK is exact at `20/20`.
+- `459ec03492` — `bug_align_pulse_recency_limit_default`: set Rust's default
+  `pulse_recency_limit` to `Some(32)`, matching OCaml. This is the correction
+  that invalidated the earlier angelism.c/nullptr.c pre-eval issue-count
+  hypothesis: `angelism.c` NPE moved `+5 → 0`, and `nullptr.c` moved `+3 → +1`
+  by dropping the old-vector recency mismatch.
+- `6d2ce94de3` — `cluster_memory_leak_array_index_residual`: retain
+  `ArrayAccess` index attrs during summary normalization, matching OCaml graph
+  reachability for array-index values. memory_leak.c moved `25/21 → 27/19`.
+- `f78e622ff1` — `bug_recency_shift_overreports`: preserve the C textual
+  `return` slot in summary return-value discovery. This fixed the recency-shift
+  NPE over-reports in arithmetic.c (`+2 → 0`), compound_literal.c (`+1 → 0`),
+  and specialization.c (`+4 → 0`) without moving specialization.c's summary
+  guard (`20/1`).
+- `7e28401d3d` — `bug_recency_shift_new_false_negatives`: restore ordinary C
+  `return` facts through summaries and add the missing Rust C `memset` model;
+  this restored the targeted NPE false negatives in memory_leak/funptr/
+  interprocedural/nullptr_more/shift/uninit while keeping LEAK `20/20`, UAF
+  `7/7`, and specialization summary `20/1`.
+
+Historical correction to keep in mind when reading the older sections above:
+`cluster_a_taint_initial_formal_preeval_gap` is still part of the summary-surface
+history, but the macOS dashboard's `angelism.c +5` and `nullptr.c +3` NPE deltas
+were not evidence for that hypothesis. They were the `pulse_recency_limit`
+default mismatch all along.
