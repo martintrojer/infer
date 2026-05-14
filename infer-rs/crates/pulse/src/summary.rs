@@ -3649,7 +3649,10 @@ mod tests {
             .post
             .heap
             .add_edge(return_addr, Access::Dereference, return_value);
-        assert!(astate.path_condition.and_equal_const(return_value, 0).is_sat());
+        assert!(astate
+            .path_condition
+            .and_equal_const(return_value, 0)
+            .is_sat());
 
         assert_eq!(find_return_value(&astate, &pdesc), Some(return_value));
     }

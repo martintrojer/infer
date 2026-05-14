@@ -20,7 +20,6 @@ use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::Allocator;
-use crate::attribute::Attribute;
 use crate::diagnostic::Diagnostic;
 use crate::formula::Operand;
 use crate::invalidation::Invalidation;
@@ -105,32 +104,6 @@ fn check_validity_and_record_access(
         }
     }
     valid
-}
-
-fn pointer_arithmetic_base(
-    op: &sil::binop::Binop,
-    lhs: AbstractValue,
-    rhs: AbstractValue,
-    state: &AbductiveDomain,
-) -> Option<AbstractValue> {
-    // Cross-ref: OCaml `PulseAbductiveDomain.check_memory_leaks` walks
-    // field/array-only paths from an allocated base to detect live interior
-    // pointers. Record pointer-arithmetic bases so Rust can recover the same
-    // connection when the interior pointer itself is returned.
-    let is_allocated = |addr| {
-        state
-            .post
-            .attrs
-            .get(&state.path_condition.get_var_repr(addr))
-            .is_some_and(|attrs| attrs.get_allocated().is_some())
-    };
-    let base = match op {
-        sil::binop::Binop::PlusPI | sil::binop::Binop::MinusPI => lhs,
-        sil::binop::Binop::PlusA(_) if is_allocated(lhs) => lhs,
-        sil::binop::Binop::PlusA(_) if is_allocated(rhs) => rhs,
-        _ => return None,
-    };
-    Some(state.path_condition.get_var_repr(base))
 }
 
 /// Evaluate a SIL expression to an abstract value.
@@ -310,9 +283,6 @@ pub(crate) fn eval_with_history_mode(
                 other => return other,
             };
             let result = AbstractValue::mk_fresh();
-            if let Some(base) = pointer_arithmetic_base(bop, lhs_val.addr, rhs_val.addr, state) {
-                state.post.attrs.add_one(result, Attribute::BasedOn(base));
-            }
             // Record the arithmetic relationship
             let _ = state.and_equal_binop(
                 result,

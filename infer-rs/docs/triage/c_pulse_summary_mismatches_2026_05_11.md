@@ -441,9 +441,8 @@ Relevant commits landed today:
   on aliased heap-path values. Six-file total moved `86/51 → 88/49`; latent.c
   moved `5/9 → 6/8`, and interprocedural.c `10/7 → 11/6`.
 - `9078f04176` — `bug_store_textual_leak_dead_root_parity`: align LEAK
-  publication with OCaml dead-root checking (`astate_before_filter`), import
-  allocator returns to callers, and carry `BasedOn` pointer-arithmetic
-  provenance. Store-textual LEAK is exact at `20/20`.
+  publication with OCaml dead-root checking (`astate_before_filter`) and import
+  allocator returns to callers. Store-textual LEAK is exact at `20/20`.
 - `459ec03492` — `bug_align_pulse_recency_limit_default`: set Rust's default
   `pulse_recency_limit` to `Some(32)`, matching OCaml. This is the correction
   that invalidated the earlier angelism.c/nullptr.c pre-eval issue-count

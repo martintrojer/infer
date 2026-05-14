@@ -59,10 +59,8 @@ now analyze. Today's Linux session additions:
   heap-path values (worker-2).
 - `9078f04176` — `bug_store_textual_leak_dead_root_parity`: dead-root leak
   inspection (mirrors OCaml `check_memory_leaks` over
-  `astate_before_filter`), allocator-return import to caller, and `BasedOn`
-  pointer-arithmetic provenance for `reaches_into`-style suppression. LEAK
-  moved from the first Linux `20/15` measurement to `20/20` exact with three
-  concept additions (worker-leak).
+  `astate_before_filter`) plus allocator-return import to caller. LEAK moved
+  from the first Linux `20/15` measurement to `20/20` exact (worker-leak).
 - `76f3cf9380` — docs refresh for the Linux correctness checkpoint and the
   `nullptr.c` harness-OOM framing.
 - `459ec03492` — `bug_align_pulse_recency_limit_default`: set Rust's default
@@ -157,9 +155,8 @@ Latent.c-focused fourth pass also landed:
 Store-textual LEAK fifth pass also landed:
 
 - `bug_store_textual_leak_dead_root_parity` — dead-root leak inspection
-  mirroring OCaml `check_memory_leaks` over `astate_before_filter`,
-  allocator-return import to caller, and `BasedOn` pointer-arithmetic
-  provenance for `reaches_into`-style suppression.
+  mirroring OCaml `check_memory_leaks` over `astate_before_filter`, plus
+  allocator-return import to caller.
 
 Full six-file triage delta vs original 2026-05-11 baseline
 (`50 matching / 87 diffs`) is now `90 matching / 47 diffs`

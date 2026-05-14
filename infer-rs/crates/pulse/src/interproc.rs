@@ -1786,10 +1786,6 @@ fn translate_attribute(
     loc: Option<&Location>,
 ) -> Attribute {
     match attr {
-        // Cross-ref: OCaml substitutes attribute payload addresses when
-        // applying summaries; keep Rust's pointer-arithmetic base relation in
-        // caller space for later leak reachability checks.
-        Attribute::BasedOn(addr) => Attribute::BasedOn(resolve_mut(subst, *addr)),
         Attribute::ReturnedFromUnknown(values) => {
             Attribute::ReturnedFromUnknown(values.iter().map(|v| resolve_mut(subst, *v)).collect())
         }
