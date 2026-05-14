@@ -8,8 +8,11 @@
 # Examples:
 #   scripts/bench_openssl_partial.sh
 #   RUNS=3 JOBS=4 scripts/bench_openssl_partial.sh
-#   EXTRA_ARGS="--pulse-max-wall-secs 60" scripts/bench_openssl_partial.sh
+#   EXTRA_ARGS="--source-override crypto/foo.c" scripts/bench_openssl_partial.sh
 #   BENCH_DIR=~/infer-rs-bench/openssl-20260501-084151 OUT_DIR=/tmp/bench scripts/bench_openssl_partial.sh
+#
+# Fixed safety caps (always passed; not overridable via EXTRA_ARGS):
+#   --pulse-max-heap-mb 2048 --pulse-max-wall-secs 60
 #
 # Preflight knobs:
 #   SKIP_FRESHNESS=1   skip the stale-binary check
@@ -99,14 +102,26 @@ fi
 # Preflight 2: required flags
 # ---------------------------------------------------------------------------
 # Built-in flags the script always passes:
-declare -a always_flags=(--pulse-only --quiet --trace-ondemand -j)
+declare -a cap_args=(--pulse-max-heap-mb 2048 --pulse-max-wall-secs 60)
+declare -a always_flags=(--pulse-only --quiet --trace-ondemand -j --pulse-max-heap-mb --pulse-max-wall-secs)
 # Pull --foo / -x tokens out of EXTRA_ARGS so a typo'd flag fails before the
-# benchmark spends an hour ignoring it.
+# benchmark spends an hour ignoring it.  The safety caps and worker count are
+# fixed here; do not allow EXTRA_ARGS to replace them with weaker values.
 declare -a extra_flag_tokens=()
 # shellcheck disable=SC2206  # word-splitting is intentional here
 extra_arg_words=( $EXTRA_ARGS )
 for tok in "${extra_arg_words[@]:-}"; do
   case "$tok" in
+    --pulse-max-heap-mb|--pulse-max-heap-mb=*|--pulse-max-wall-secs|--pulse-max-wall-secs=*)
+      echo "error: OpenSSL bench safety caps are fixed: ${cap_args[*]}" >&2
+      echo "hint:  remove $tok from EXTRA_ARGS" >&2
+      exit 2
+      ;;
+    -j|-j[0-9]*|--jobs|--jobs=*)
+      echo "error: OpenSSL bench worker count is controlled by JOBS=$JOBS" >&2
+      echo "hint:  remove $tok from EXTRA_ARGS and set JOBS=N instead" >&2
+      exit 2
+      ;;
     --*) extra_flag_tokens+=("$tok") ;;
   esac
 done
@@ -159,7 +174,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "  flags checked: ${always_flags[*]} ${extra_flag_tokens[*]:-} ${explicit_required[*]:-}"
   echo "[bench] would run (per iteration):"
   echo "  RUST_LOG=$RUST_LOG_VALUE /usr/bin/time -l \\"
-  echo "    $BIN --pulse-only --quiet --trace-ondemand -j $JOBS $EXTRA_ARGS \\"
+  echo "    $BIN --pulse-only --quiet --trace-ondemand -j $JOBS ${cap_args[*]} $EXTRA_ARGS \\"
   echo "    <${#sil_files[@]} .sil files>"
   exit 0
 fi
@@ -243,7 +258,7 @@ for run in $(seq 1 "$RUNS"); do
   echo "[bench] run=$run/$RUNS jobs=$JOBS log=$log"
   set +e
   RUST_LOG="$RUST_LOG_VALUE" /usr/bin/time -l "$BIN" \
-    --pulse-only --quiet --trace-ondemand -j "$JOBS" $EXTRA_ARGS \
+    --pulse-only --quiet --trace-ondemand -j "$JOBS" "${cap_args[@]}" $EXTRA_ARGS \
     "${sil_files[@]}" > "$log" 2>&1
   code=$?
   set -e
