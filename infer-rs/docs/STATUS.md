@@ -14,7 +14,7 @@ mu task list -w infer-rs --status OPEN
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `~139` (`+8` over expected; per-file triage in `bug_npe_per_file_triage_after_return_slot_fix`) |
+| NPE count | expected `131`, found `~134` (`+3` over expected; next sweep should reflect this after today's angelism.c closure) |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
@@ -25,14 +25,22 @@ mu task list -w infer-rs --status OPEN
 
 ### NPE issue-count deltas (current Linux)
 
-Current Linux store-textual NPE count is expected `131`, found `~139` (`+8`
-net over expected). Per-file triage is in flight under
-`bug_npe_per_file_triage_after_return_slot_fix`; do not treat this as a
-classified parity limit yet. The `+8` includes false negatives restored by
-`bug_recency_shift_new_false_negatives` (commit `7e28401d3d`) plus the original
-macOS-style baseline drift that remains after recency-limit alignment
-(`459ec03492`) and return-slot preservation (`f78e622ff1`). Await the per-file
-classification before updating accepted/bug attribution.
+Current Linux store-textual NPE count is expected `131`, found `~134` (`+3`
+net over expected). This is the post-today equivalent of the historical macOS
+surface after recency-limit alignment (`459ec03492`), return-slot preservation
+(`f78e622ff1`), and sideband follow-ups; the next sweep, when run, should
+reflect `131/134` or thereabouts (do not infer a new measured sweep here).
+
+- `angelism.c`: `0` (was historical macOS `+5`; closed today by recency-limit
+  + return-slot + sideband fixes, confirmed by single-file capped triage).
+- `fopen.c`: `-3` (still present; stdio model gap).
+- `latent.c`: `-1` (still present; producer classification, partly addressed;
+  deferred `cluster_latent_record_post_for_address_porting` tracks the deeper
+  port).
+- `nullptr.c`: `+2` (still present; mixed publication/suppression mix).
+- `sizeof.c`: `+2` (still present; accepted Textual fidelity).
+- `struct_values.c`: `+1` (still present; by-value struct surface).
+- `var_arg.c`: `+2` (still present; vararg loop `FN_*` patterns).
 
 Leak per-file detail: LEAK now matches expected exactly per file after
 `bug_store_textual_leak_dead_root_parity` (commit `9078f04176`).
@@ -169,8 +177,8 @@ live in
 
 Current residual work is the parked `cluster_latent_record_post_for_address_porting`
 deep porting track for the remaining `latent.c` producer/record-post shape,
-`bug_npe_per_file_triage_after_return_slot_fix` for the current Linux NPE `+8`,
-and the `specialization.c` `may_double_free_if_alias` force-continue track.
+the current Linux NPE `+3` per-file surface documented above, and the
+`specialization.c` `may_double_free_if_alias` force-continue track.
 
 ## OpenSSL benchmark dashboard
 
@@ -266,9 +274,9 @@ Live themes (track headlines, not exhaustive task lists):
   Current full-suite total is `90 matching / 47 diffs` (`+40/-40` vs original
   `50/87` baseline), with `latent.c` `6/8`, `memory_leak.c` `27/19`, and
   `specialization.c` `20/1`.
-- **In-flight correctness follow-ups** — `bug_npe_per_file_triage_after_return_slot_fix`
-  (worker-1) is classifying the current Linux NPE `+8`; worker-2 is pursuing
-  the `specialization.c` `may_double_free_if_alias` force-continue residual.
+- **In-flight correctness follow-ups** — current Linux NPE is now the `+3`
+  per-file surface documented above; worker-2 is pursuing the
+  `specialization.c` `may_double_free_if_alias` force-continue residual.
 - **Parked correctness backlog** — `cluster_latent_record_post_for_address_porting`
   is deferred as multi-day deep porting despite high ROI (`11.7`).
 - **OpenSSL perf / benchmark hygiene** — the benchmark script has stricter
@@ -281,10 +289,10 @@ Live themes (track headlines, not exhaustive task lists):
   closes, `perf_decide_next_track_after_profile_and_remeasure` should prune
   obsolete placeholders and choose the next concrete track.
 - **Correctness parity** — store-textual sweep-level Linux totals are documented
-  above (NPE expected `131`, found `~139`; LEAK `20/20` exact; UAF `7/7`
-  exact). Reopen parity work only for new sweep regressions or a real
-  Textual/export-fidelity project. Procedure-level summary parity is tracked
-  separately by the C-suite triage track above.
+  above (NPE expected `131`, found `~134` after today's angelism.c closure;
+  LEAK `20/20` exact; UAF `7/7` exact). Reopen parity work only for new sweep
+  regressions or a real Textual/export-fidelity project. Procedure-level
+  summary parity is tracked separately by the C-suite triage track above.
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
   work (`perf_component_clone_reduction`), Textual enhancements, and accepted
   parity limits (`parity_sizeof_type_eval`) are parked with explicit

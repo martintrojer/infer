@@ -467,3 +467,12 @@ Historical correction to keep in mind when reading the older sections above:
 history, but the macOS dashboard's `angelism.c +5` and `nullptr.c +3` NPE deltas
 were not evidence for that hypothesis. They were the `pulse_recency_limit`
 default mismatch all along.
+
+2026-05-14 postscript: after the later recency-limit + return-slot + sideband
+fixes, worker-1 rechecked `angelism.c` with single-file capped store-textual
+triage and found it exact (`7/7`, `0` delta); all five historical Rust-only
+`*_ok` angelism procedures reported no issues. This fully invalidates the
+original `cluster_a_taint_initial_formal_preeval_gap` issue-count hypothesis for
+`angelism.c`. The next full sweep, when someone runs it, should therefore reflect
+NPE expected `131`, found about `134` rather than the earlier `139/140`-range
+snapshots; no new sweep was run for this doc refresh.
