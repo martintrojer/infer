@@ -39,7 +39,12 @@ regressions and single-file debugging.
 ## Compliance comparison
 
 The store-textual sweep compares `NULLPTR_DEREFERENCE`, `MEMORY_LEAK_C`, and
-`USE_AFTER_FREE` counts per file against OCaml expected issues.
+`USE_AFTER_FREE` counts per file against OCaml expected issues. Since
+`d9da630ae7`, `test_store_textual_sweep` also acts as a baseline regression
+asserting 52 OK files, 0 analysis failures, and 0 timeouts. It pins
+`MEMORY_LEAK_C` parity at 20/20 and `USE_AFTER_FREE` parity at 7/7, both in
+total and per file, while `NULLPTR_DEREFERENCE` only asserts found >= expected
+(currently 131) so over-reports remain allowed and tracked in `STATUS.md`.
 
 ```sh
 cd infer-rs
