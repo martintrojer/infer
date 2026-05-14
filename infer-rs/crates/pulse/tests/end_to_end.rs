@@ -4406,45 +4406,83 @@ fn test_store_textual_sweep() {
 
     // Compare against issues.exp
     let exp_path = c_dir.join("issues.exp");
-    if exp_path.exists() {
-        let expected = test_harness::fixtures::parse_issues_exp(&exp_path);
+    assert!(
+        exp_path.exists(),
+        "issues.exp should exist at {}",
+        exp_path.display()
+    );
+    let expected = test_harness::fixtures::parse_issues_exp(&exp_path);
 
-        for (type_id, label) in [
-            (IssueTypeId::NullptrDereference, "NPE"),
-            (IssueTypeId::MemoryLeakC, "LEAK"),
-            (IssueTypeId::UseAfterFree, "UAF"),
-        ] {
-            let id_str = type_id.id();
-            let mut total_expected = 0;
-            let mut total_found = 0;
-            let mut diffs = Vec::new();
-            for (filename, rust_issues) in &file_results {
-                let exp = test_harness::fixtures::issues_for_file(&expected, filename);
-                let exp_count = exp.iter().filter(|e| e.issue_type == id_str).count();
-                let rust_count = rust_issues.iter().filter(|i| i.as_str() == id_str).count();
-                total_expected += exp_count;
-                total_found += rust_count;
-                if exp_count != rust_count {
-                    diffs.push(format!(
-                        "    {filename}: expected {exp_count}, found {rust_count}"
-                    ));
-                }
+    let mut npe_expected = None;
+    let mut npe_found = None;
+    for (type_id, label) in [
+        (IssueTypeId::NullptrDereference, "NPE"),
+        (IssueTypeId::MemoryLeakC, "LEAK"),
+        (IssueTypeId::UseAfterFree, "UAF"),
+    ] {
+        let id_str = type_id.id();
+        let mut total_expected = 0;
+        let mut total_found = 0;
+        let mut diffs = Vec::new();
+        for (filename, rust_issues) in &file_results {
+            let exp = test_harness::fixtures::issues_for_file(&expected, filename);
+            let exp_count = exp.iter().filter(|e| e.issue_type == id_str).count();
+            let rust_count = rust_issues.iter().filter(|i| i.as_str() == id_str).count();
+            total_expected += exp_count;
+            total_found += rust_count;
+            if exp_count != rust_count {
+                diffs.push(format!(
+                    "    {filename}: expected {exp_count}, found {rust_count}"
+                ));
             }
-            eprintln!("\n=== {label}: expected {total_expected}, found {total_found} ===");
-            if !diffs.is_empty() {
-                diffs.sort();
-                eprintln!("  Differences:");
-                for d in &diffs {
-                    eprintln!("{d}");
-                }
+        }
+        eprintln!("\n=== {label}: expected {total_expected}, found {total_found} ===");
+        if !diffs.is_empty() {
+            diffs.sort();
+            eprintln!("  Differences:");
+            for d in &diffs {
+                eprintln!("{d}");
             }
+        }
+
+        match type_id {
+            IssueTypeId::NullptrDereference => {
+                npe_expected = Some(total_expected);
+                npe_found = Some(total_found);
+            }
+            IssueTypeId::MemoryLeakC | IssueTypeId::UseAfterFree => {
+                assert_eq!(
+                    total_found, total_expected,
+                    "{label} total mismatch: found {total_found}, expected {total_expected}"
+                );
+                assert!(
+                    diffs.is_empty(),
+                    "{label} per-file mismatch (found {total_found}, expected {total_expected}):\n{}",
+                    diffs.join("\n")
+                );
+            }
+            _ => {}
         }
     }
 
     eprintln!("\n=== Store-textual sweep ===");
     eprintln!("  OK: {ok}, FAIL_ANALYZE: {fail_analyze}, TIMEOUT: {fail_timeout}");
     eprintln!("  {total_procs} procs analyzed, {total_issues} issues found");
-    assert!(ok > 0, "should have at least one passing file");
+    assert_eq!(ok, 52, "OK count mismatch: got {ok}, expected 52");
+    assert_eq!(
+        fail_analyze, 0,
+        "FAIL_ANALYZE count mismatch: got {fail_analyze}, expected 0"
+    );
+    assert_eq!(
+        fail_timeout, 0,
+        "TIMEOUT count mismatch: got {fail_timeout}, expected 0"
+    );
+    let npe_expected = npe_expected.expect("NPE expected count should have been computed");
+    let npe_found = npe_found.expect("NPE found count should have been computed");
+    assert!(
+        npe_found >= npe_expected,
+        "NPE total regressed: found {npe_found}, expected at least {npe_expected}"
+    );
 }
 
 /// Scout brief perf_explore_linear_const_audit (2026-05-10) FIRST EXPERIMENT
