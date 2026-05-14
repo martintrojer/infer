@@ -3482,12 +3482,15 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
     }
 
     // Cross-ref: OCaml uses `Ident.name_return` / `Pvar.get_ret_pvar`, whose
-    // mangled name is `return`, while Rust's Textual-to-SIL lowering uses
-    // `__return` for Ret terminators. The OCaml-exported C sweep historically
-    // reached NPE parity without importing arbitrary `return` values here, so
-    // only use the OCaml spelling for allocation-related values needed by
-    // `PulseAbductiveDomain.check_memory_leaks` parity.
-    for (return_name, require_allocation_related) in [("return", true), ("__return", false)] {
+    // mangled name is `return`; `PulseAbductiveDomain.filter_for_summary`
+    // preserves that return value as part of the caller-visible summary. Rust's
+    // Textual-to-SIL lowering uses `__return` for hand-written `ret`
+    // terminators, while OCaml store-textual C procedures write through a local
+    // `return` pvar. Treat both spellings as real return slots so pure
+    // return-value facts such as `return >= 0`, `return == 0`, and specialized
+    // constants are imported at callers instead of being dropped and later
+    // published as infeasible null dereferences.
+    for return_name in ["return", "__return"] {
         let ret_pvar = Pvar::mk(
             sil::mangled::Mangled::from_string(return_name),
             pdesc.proc_name.clone(),
@@ -3500,9 +3503,7 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
                 .heap
                 .find_edge(addr, &crate::access::Access::Dereference)
                 .unwrap_or(addr);
-            if !require_allocation_related || value_is_allocation_related_return(astate, value) {
-                return Some(value);
-            }
+            return Some(value);
         }
     }
 
@@ -3513,54 +3514,6 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
     // they appear later in `pdesc.nodes` than the actual return path.
     fallback_return_id_from_exit_predecessors(pdesc)
         .and_then(|id| astate.post.stack.find(&Var::LogicalVar(id)))
-}
-
-fn value_is_allocation_related_return(astate: &AbductiveDomain, value: AbstractValue) -> bool {
-    let value = astate.path_condition.get_var_repr(value);
-    if astate
-        .post
-        .attrs
-        .get(&value)
-        .is_some_and(|attrs| attrs.get_allocated().is_some())
-    {
-        return true;
-    }
-
-    let mut visited = std::collections::HashSet::new();
-    let mut worklist = vec![value];
-    while let Some(addr) = worklist.pop() {
-        let addr = astate.path_condition.get_var_repr(addr);
-        if !visited.insert(addr) {
-            continue;
-        }
-        if let Some(attrs) = astate.post.attrs.get(&addr) {
-            if attrs.get_allocated().is_some() {
-                return true;
-            }
-            if let Some(base) = attrs.get_based_on() {
-                worklist.push(base);
-            }
-        }
-        if let Some(edges) = astate.post.heap.get_edges(addr) {
-            for (access, target) in edges.iter() {
-                if matches!(access, Access::FieldAccess(_) | Access::ArrayAccess(_, _)) {
-                    worklist.push(*target);
-                }
-            }
-        }
-        for (src, edges) in astate.post.heap.iter() {
-            let src = astate.path_condition.get_var_repr(*src);
-            for (access, target) in edges.iter() {
-                let target = astate.path_condition.get_var_repr(*target);
-                if target == addr
-                    && matches!(access, Access::FieldAccess(_) | Access::ArrayAccess(_, _))
-                {
-                    worklist.push(src);
-                }
-            }
-        }
-    }
-    false
 }
 
 fn fallback_return_id_from_exit_predecessors(pdesc: &Procdesc) -> Option<sil::ident::Ident> {
@@ -3677,6 +3630,26 @@ mod tests {
         tm.cfg
             .proc_descs
             .retain(|pname, _| keep.contains(format!("{pname}").as_str()));
+    }
+
+    #[test]
+    fn test_find_return_value_accepts_ocaml_store_textual_return_slot_for_scalar_facts() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+        let return_pvar = Pvar::mk(Mangled::from_string("return"), pdesc.proc_name.clone());
+        let return_var = Var::ProgramVar(Box::new(return_pvar));
+        let return_addr = AbstractValue::of_raw(30);
+        let return_value = AbstractValue::of_raw(10);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        astate.post.stack.add(return_var, return_addr);
+        astate
+            .post
+            .heap
+            .add_edge(return_addr, Access::Dereference, return_value);
+        assert!(astate.path_condition.and_equal_const(return_value, 0).is_sat());
+
+        assert_eq!(find_return_value(&astate, &pdesc), Some(return_value));
     }
 
     #[test]
