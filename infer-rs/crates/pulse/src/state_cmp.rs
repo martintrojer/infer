@@ -148,7 +148,7 @@ struct CanonAttrEntry {
 
 /// Structural canonical attribute.
 ///
-/// Variants that carry `AbstractValue`s (`ReturnedFromUnknown`) are
+/// Variants that carry `AbstractValue`s (`BasedOn`, `ReturnedFromUnknown`) are
 /// mapped through `ValueSortKey` so the result is alpha-invariant.
 /// Variants that carry a `Timestamp` (`MustBeValid` / `MustBeInitialized`
 /// / `WrittenTo`) drop the timestamp — the per-state
@@ -164,6 +164,7 @@ struct CanonAttrEntry {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(clippy::large_enum_variant)]
 enum CanonAttribute {
+    BasedOn(ValueSortKey),
     ReturnedFromUnknown(Vec<ValueSortKey>),
     MustBeValid(Location, Option<MustBeValidReason>),
     MustBeInitialized(Location),
@@ -1239,6 +1240,7 @@ impl Canonicalizer {
     /// `CanonAttribute` doc comment.
     fn partial_attribute_key(&self, attr: &Attribute) -> CanonAttribute {
         match attr {
+            Attribute::BasedOn(addr) => CanonAttribute::BasedOn(self.partial_value_key(*addr)),
             Attribute::ReturnedFromUnknown(values) => CanonAttribute::ReturnedFromUnknown(
                 values.iter().map(|v| self.partial_value_key(*v)).collect(),
             ),
@@ -1634,6 +1636,7 @@ fn format_canon_access(access: &AccessSortKey) -> String {
 
 fn format_canon_attribute(attr: &CanonAttribute) -> String {
     match attr {
+        CanonAttribute::BasedOn(addr) => format!("BasedOn({})", format_value_key(addr)),
         CanonAttribute::ReturnedFromUnknown(values) => {
             let values = values
                 .iter()

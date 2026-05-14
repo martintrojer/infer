@@ -1786,6 +1786,10 @@ fn translate_attribute(
     loc: Option<&Location>,
 ) -> Attribute {
     match attr {
+        // Cross-ref: OCaml substitutes attribute payload addresses when
+        // applying summaries; keep Rust's pointer-arithmetic base relation in
+        // caller space for later leak reachability checks.
+        Attribute::BasedOn(addr) => Attribute::BasedOn(resolve_mut(subst, *addr)),
         Attribute::ReturnedFromUnknown(values) => {
             Attribute::ReturnedFromUnknown(values.iter().map(|v| resolve_mut(subst, *v)).collect())
         }
@@ -1963,6 +1967,65 @@ mod tests {
             let ret_addr = s.post.stack.find(&ret_var);
             assert!(ret_addr.is_some(), "return value should be bound");
         }
+    }
+
+    #[test]
+    fn test_apply_summary_propagates_returned_allocation_attr() {
+        let callee_pname = Procname::c_from_string("alloc_wrapper");
+        let callee_pdesc = Procdesc::new(
+            callee_pname,
+            Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+            Location::dummy(),
+        );
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let ret_val = AbstractValue::mk_fresh();
+        callee_state.allocate(
+            ret_val,
+            crate::attribute::Allocator::CMalloc,
+            Location::dummy(),
+        );
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![],
+            result: Some(ret_val),
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname, Typ::void(), Location::dummy());
+        let caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let ret_id = Ident::create_normal(IdentName::from_string("n"), 0);
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &ret_id,
+            &[],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let Some(ExecutionDomain::ContinueProgram(state)) =
+            results.iter().find(|result| result.is_continue())
+        else {
+            panic!("expected a continuing result");
+        };
+        let ret_addr = state
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("return id should be written");
+        assert!(
+            state
+                .post
+                .attrs
+                .get(&ret_addr)
+                .is_some_and(|attrs| attrs.get_allocated().is_some()),
+            "returned allocation attr should be imported onto the caller result"
+        );
     }
 
     #[test]

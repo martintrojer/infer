@@ -47,6 +47,7 @@ enum AttributeRank {
     MustBeAwaited,
     MustBeInitialized,
     MustBeValid,
+    BasedOn,
     ReturnedFromUnknown,
     StaticType,
     StdMoved,
@@ -119,6 +120,11 @@ pub enum Attribute {
     MustBeInitialized(Timestamp, Location),
     /// Must be valid (dereferenceable) when accessed.
     MustBeValid(Timestamp, Location, Option<MustBeValidReason>),
+    /// Value is derived from a base pointer by pointer arithmetic.
+    /// Cross-ref: OCaml `PulseAbductiveDomain.check_memory_leaks` suppresses
+    /// leaks when a live value reaches into an allocated base via arithmetic;
+    /// Rust records that relation explicitly for summary leak checks.
+    BasedOn(AbstractValue),
     /// Returned from an unknown function.
     ReturnedFromUnknown(Vec<AbstractValue>),
     /// Static type information.
@@ -173,6 +179,7 @@ impl Attribute {
             Self::MustBeAwaited => AttributeRank::MustBeAwaited,
             Self::MustBeInitialized(_, _) => AttributeRank::MustBeInitialized,
             Self::MustBeValid(_, _, _) => AttributeRank::MustBeValid,
+            Self::BasedOn(_) => AttributeRank::BasedOn,
             Self::ReturnedFromUnknown(_) => AttributeRank::ReturnedFromUnknown,
             Self::StaticType(_) => AttributeRank::StaticType,
             Self::StdMoved => AttributeRank::StdMoved,
@@ -301,6 +308,13 @@ impl Attributes {
     pub fn get_must_be_valid(&self) -> Option<(Timestamp, &Location, &Option<MustBeValidReason>)> {
         self.0.iter().find_map(|a| match a {
             Attribute::MustBeValid(ts, loc, reason) => Some((*ts, loc, reason)),
+            _ => None,
+        })
+    }
+
+    pub fn get_based_on(&self) -> Option<AbstractValue> {
+        self.0.iter().find_map(|a| match a {
+            Attribute::BasedOn(addr) => Some(*addr),
             _ => None,
         })
     }

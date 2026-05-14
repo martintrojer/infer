@@ -641,7 +641,15 @@ impl PrePost {
             &pre_reachable,
         ));
 
-        let leaks = self.check_memory_leaks(&formula_reachable, &locally_reachable);
+        let mut leak_candidates: HashSet<_> = locally_reachable
+            .iter()
+            .map(|addr| self.post.path_condition.get_var_repr(*addr))
+            .collect();
+        leak_candidates.extend(self.post.post.attrs.iter().filter_map(|(addr, attrs)| {
+            let addr = self.post.path_condition.get_var_repr(*addr);
+            (attrs.get_allocated().is_some() && !formula_reachable.contains(&addr)).then_some(addr)
+        }));
+        let leaks = self.check_memory_leaks(&formula_reachable, &leak_candidates);
 
         // Cross-ref: OCaml `discard_unreachable_ ~for_summary:true` keeps the
         // exported precondition stricter than the summarized post. Post-only
@@ -807,29 +815,29 @@ impl PrePost {
         self.post.post.attrs.remove_empty_entries();
     }
 
-    /// Check for memory leaks among locally-reachable but summary-unreachable addresses.
+    /// Check for memory leaks among candidate allocated addresses that are not
+    /// reachable from the exported summary.
     ///
     /// An address is a leak if:
     /// 1. It has an Allocated attribute (was malloc'd/new'd)
-    /// 2. It IS reachable from local variables (was used in this procedure)
+    /// 2. It is either still reachable from local variables or was discarded as
+    ///    dead-but-allocated during summary filtering
     /// 3. It is NOT reachable from the summary (formals, return value)
     /// 4. It is NOT freed/invalidated (no matching CFree/CppDelete)
     ///
-    /// Cross-ref: OCaml PulseAbductiveDomain.ml check_memory_leaks +
-    /// PulseAttribute.ml get_allocated_not_freed.
+    /// Cross-ref: OCaml PulseAbductiveDomain.ml `filter_for_summary` /
+    /// `discard_unreachable_` pass discarded post-attribute addresses to
+    /// `check_memory_leaks`, which then inspects the pre-filter state.
+    /// PulseAttribute.ml `get_allocated_not_freed` performs the freed check.
     fn check_memory_leaks(
         &self,
         summary_reachable: &std::collections::HashSet<AbstractValue>,
-        locally_reachable: &std::collections::HashSet<AbstractValue>,
+        leak_candidates: &std::collections::HashSet<AbstractValue>,
     ) -> Vec<Diagnostic> {
         let mut leaks = Vec::new();
-        let canonical_locally_reachable: std::collections::HashSet<_> = locally_reachable
-            .iter()
-            .map(|addr| self.post.path_condition.get_var_repr(*addr))
-            .collect();
         for (addr, attrs) in self.post.post.attrs.iter() {
             let addr = self.post.path_condition.get_var_repr(*addr);
-            if !canonical_locally_reachable.contains(&addr) {
+            if !leak_candidates.contains(&addr) {
                 continue;
             }
             if summary_reachable.contains(&addr) {
@@ -865,6 +873,18 @@ impl PrePost {
             return true;
         }
 
+        let root = self.post.path_condition.get_var_repr(root);
+        let live_heap_addrs: std::collections::HashSet<_> = self
+            .post
+            .post
+            .heap
+            .iter()
+            .filter_map(|(addr, _)| {
+                let addr = self.post.path_condition.get_var_repr(*addr);
+                live_addresses.contains(&addr).then_some(addr)
+            })
+            .collect();
+
         let mut visited = std::collections::HashSet::new();
         let mut worklist = vec![root];
 
@@ -880,7 +900,7 @@ impl PrePost {
                 match access {
                     Access::FieldAccess(_) | Access::ArrayAccess(_, _) => {
                         let target = self.post.path_condition.get_var_repr(*target);
-                        if live_addresses.contains(&target) {
+                        if live_addresses.contains(&target) || live_heap_addrs.contains(&target) {
                             return true;
                         }
                         worklist.push(target);
@@ -3442,8 +3462,9 @@ fn walk_heap_for_specialization(
 
 /// Try to find the return value in the abstract state.
 ///
-/// Looks for the SIL return variable (`__return`) or falls back to finding
-/// the last logical variable written by a Load or Call instruction.
+/// Looks for the SIL return variable (`__return` in Rust-lowered textual, or
+/// allocation-related `return` values in OCaml-exported textual) or falls back
+/// to finding the last logical variable written by a Load or Call instruction.
 /// Only applies to non-void procedures — void procedures have no return value,
 /// and the fallback heuristic would incorrectly pick up malloc/call results,
 /// making them summary-reachable and hiding leaks.
@@ -3455,24 +3476,29 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
         return None;
     }
 
-    // Check for __return pvar (set by Ret → Store conversion in to_sil).
-    // The return value is stored via `Store { __return <- val }`, which means
-    // the actual value is behind a Dereference edge from __return's address.
-    let ret_pvar = Pvar::mk(
-        sil::mangled::Mangled::from_string("__return"),
-        pdesc.proc_name.clone(),
-    );
-    let ret_var = Var::ProgramVar(Box::new(ret_pvar));
-    if let Some(addr) = astate.post.stack.find(&ret_var) {
-        // Follow the dereference edge to get the actual return value
-        if let Some(val) = astate
-            .post
-            .heap
-            .find_edge(addr, &crate::access::Access::Dereference)
-        {
-            return Some(val);
+    // Cross-ref: OCaml uses `Ident.name_return` / `Pvar.get_ret_pvar`, whose
+    // mangled name is `return`, while Rust's Textual-to-SIL lowering uses
+    // `__return` for Ret terminators. The OCaml-exported C sweep historically
+    // reached NPE parity without importing arbitrary `return` values here, so
+    // only use the OCaml spelling for allocation-related values needed by
+    // `PulseAbductiveDomain.check_memory_leaks` parity.
+    for (return_name, require_allocation_related) in [("return", true), ("__return", false)] {
+        let ret_pvar = Pvar::mk(
+            sil::mangled::Mangled::from_string(return_name),
+            pdesc.proc_name.clone(),
+        );
+        let ret_var = Var::ProgramVar(Box::new(ret_pvar));
+        if let Some(addr) = astate.post.stack.find(&ret_var) {
+            // Follow the dereference edge to get the actual return value.
+            let value = astate
+                .post
+                .heap
+                .find_edge(addr, &crate::access::Access::Dereference)
+                .unwrap_or(addr);
+            if !require_allocation_related || value_is_allocation_related_return(astate, value) {
+                return Some(value);
+            }
         }
-        return Some(addr);
     }
 
     // Fallback: some hand-built/direct SIL tests do not materialize the
@@ -3482,6 +3508,54 @@ fn find_return_value(astate: &AbductiveDomain, pdesc: &Procdesc) -> Option<Abstr
     // they appear later in `pdesc.nodes` than the actual return path.
     fallback_return_id_from_exit_predecessors(pdesc)
         .and_then(|id| astate.post.stack.find(&Var::LogicalVar(id)))
+}
+
+fn value_is_allocation_related_return(astate: &AbductiveDomain, value: AbstractValue) -> bool {
+    let value = astate.path_condition.get_var_repr(value);
+    if astate
+        .post
+        .attrs
+        .get(&value)
+        .is_some_and(|attrs| attrs.get_allocated().is_some())
+    {
+        return true;
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut worklist = vec![value];
+    while let Some(addr) = worklist.pop() {
+        let addr = astate.path_condition.get_var_repr(addr);
+        if !visited.insert(addr) {
+            continue;
+        }
+        if let Some(attrs) = astate.post.attrs.get(&addr) {
+            if attrs.get_allocated().is_some() {
+                return true;
+            }
+            if let Some(base) = attrs.get_based_on() {
+                worklist.push(base);
+            }
+        }
+        if let Some(edges) = astate.post.heap.get_edges(addr) {
+            for (access, target) in edges.iter() {
+                if matches!(access, Access::FieldAccess(_) | Access::ArrayAccess(_, _)) {
+                    worklist.push(*target);
+                }
+            }
+        }
+        for (src, edges) in astate.post.heap.iter() {
+            let src = astate.path_condition.get_var_repr(*src);
+            for (access, target) in edges.iter() {
+                let target = astate.path_condition.get_var_repr(*target);
+                if target == addr
+                    && matches!(access, Access::FieldAccess(_) | Access::ArrayAccess(_, _))
+                {
+                    worklist.push(src);
+                }
+            }
+        }
+    }
+    false
 }
 
 fn fallback_return_id_from_exit_predecessors(pdesc: &Procdesc) -> Option<sil::ident::Ident> {
@@ -3947,6 +4021,33 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_reports_allocated_attr_dead_before_summary_filter() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let allocated = AbstractValue::mk_fresh();
+
+        astate.allocate(allocated, Allocator::CMalloc, Location::dummy());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let leaks = pp.normalize();
+
+        assert!(
+            leaks
+                .iter()
+                .any(|diag| matches!(diag, Diagnostic::MemoryLeak { .. })),
+            "OCaml checks discarded allocated post-attrs from the pre-filter state"
+        );
+    }
+
+    #[test]
     fn test_normalize_drops_unreachable_formula_constraints() {
         let pdesc = make_pdesc_with_formals(&[]);
         let mut astate = AbductiveDomain::mk_initial(&pdesc);
@@ -4101,6 +4202,43 @@ mod tests {
             leaks.iter()
                 .all(|diag| !matches!(diag, Diagnostic::MemoryLeak { .. })),
             "an allocated root should not leak if a returned field can still reach it via pointer arithmetic"
+        );
+    }
+
+    #[test]
+    fn test_normalize_suppresses_leak_when_return_points_inside_allocation() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let allocated = AbstractValue::mk_fresh();
+        let returned_inner = AbstractValue::mk_fresh();
+        let return_root = AbstractValue::mk_fresh();
+        let field = sil::fieldname::Fieldname::make(
+            sil::typ::TypeName::CStruct(sil::qualified_cpp_name::QualifiedCppName::from_string(
+                "fat_ptr",
+            )),
+            "data",
+        );
+
+        astate.allocate(allocated, Allocator::CMalloc, Location::dummy());
+        astate.write_heap(allocated, Access::FieldAccess(field), returned_inner);
+        astate.write_heap(return_root, Access::Dereference, returned_inner);
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![],
+            result: Some(return_root),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let leaks = pp.normalize();
+
+        assert!(
+            leaks
+                .iter()
+                .all(|diag| !matches!(diag, Diagnostic::MemoryLeak { .. })),
+            "OCaml `reaches_into` suppresses leaks when a live post root points inside the allocation"
         );
     }
 
