@@ -13,32 +13,37 @@ mu task list -w infer-rs --status OPEN
 
 | area | current status |
 |---|---|
-| Store-textual C Pulse sweep | `501` procs analyzed; `185` issues; `51` OK / `0` FAIL_ANALYZE / `1` TIMEOUT (known recursion hang) |
-| NPE count | expected `127`, found `130` |
-| Leak count | expected `20`, found `16` (see baseline note below) |
-| UAF count | expected `7`, found `7` |
+| Store-textual C Pulse sweep | `52` OK / `0` FAIL_ANALYZE / `0` TIMEOUT |
+| NPE count | expected `131`, found `140` (+9, see deltas below) |
+| Leak count | expected `20`, found `20` (matches expected) |
+| UAF count | expected `7`, found `7` (matches expected) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
-| specialization summary harness | `21 / 21` procedures match; specialized-summary checkpoint has no diffs |
+| specialization summary harness | `20 / 20` procedures match (only `may_double_free_if_alias` residual) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
+| C-suite OCaml↔Rust Pulse summary triage | `86 matching / 51 diffs` (+36/-36 vs original `50/87` baseline) |
 
-Accepted current count deltas (NPE, +3 over expected):
+Accepted current NPE deltas (`+9` over expected):
 
+- `angelism.c`: `+5` (Pulse pre-evaluation surface from
+  `cluster_a_taint_initial_formal_preeval_gap`).
 - `fopen.c`: `-3`
-- `nullptr.c`: `+1` real-bug divergence (`FN_nullptr_deref_old_bad`).
-- `sizeof.c`: `+2` exported-Textual fidelity limit, not a Pulse workaround target.
+- `latent.c`: `-1`
+- `nullptr.c`: `+3` (real-bug divergence + pre-eval surface)
+- `sizeof.c`: `+2` exported-Textual fidelity limit.
 - `struct_values.c`: `+1`
 - `var_arg.c`: `+2`
 
-Leak count deltas (-4 vs expected):
+Leak per-file detail (totals match):
 
-- `memory_leak.c`: `-3`
-- `nullptr.c`: `-1`
+- `memory_leak.c`: `-1` vs expected
+- `memory_leak_more.c`: `+1` vs expected
 
-LEAK baseline note: the previous `expected 20` figure was stale/aspirational —
-`worker-leak-1`'s bisect across 50+ commits (5 sample points) showed the actual
-sweep result has been ~`12-16` for the entire window. The dashboard now uses
-the actual sweep number as baseline.
+(Net `0` — the sweep total now matches the expected `20` exactly.)
+
+LEAK baseline note (historical): the previous `expected 20 / found 16` row was
+recovered after the cluster A/B/C/D pass landed. Numbers above are the live
+sweep, not aspirational targets.
 
 Recent correctness work that should stay in place mirrors OCaml's dynamic-type
 specialization path, direct known-call unknown fallback for resolved
@@ -213,13 +218,13 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **C-suite OCaml↔Rust Pulse summary parity** — initial 8-cluster pass
-  landed with measurable diff reduction (see the section above). Active work
-  is now the residual deeper traces: `cluster_d_residual_*`,
-  `cluster_e_residual_cycle_eq_repr`,
-  `cluster_g_residual_funptr_apply_post_canonical_edges`,
-  `cluster_h_residual_inequality_witness_export`,
-  `cluster_specialization_residual_post_overflow_fix`.
+- **C-suite OCaml↔Rust Pulse summary parity** — four passes landed with
+  measurable diff reduction; current full-suite total is `86 matching / 51
+  diffs` (`+36/-36` vs original `50/87` baseline). No open `cluster_*`
+  residual tasks. Remaining diffs are concentrated in latent.c heap-shape rows
+  (`traverse_and_crash_if_equal_to_root` family), memory_leak.c array/index
+  shape, and the single accepted `may_double_free_if_alias` residual. Future
+  work would be a fresh trace, not a queued cluster.
 - **OpenSSL perf / benchmark hygiene** — the benchmark script has stricter
   preflight/failure behavior and focused `state_cmp` fixes have landed. The
   remaining ready item is the clean quiescent-host full OpenSSL remeasure; do
@@ -228,9 +233,12 @@ Live themes (track headlines, not exhaustive task lists):
   `perf_decide_next_track_after_profile_and_remeasure` should prune obsolete
   placeholders and choose the next concrete track.
 - **Correctness parity** — store-textual sweep-level deltas are accepted and
-  documented above. Reopen parity work only for new sweep regressions or a real
-  Textual/export-fidelity project. Procedure-level summary parity is tracked
-  separately by the C-suite triage track above.
+  documented above (LEAK and UAF totals now match expected; NPE +9 over
+  expected, dominated by `angelism.c +5` and `nullptr.c +3` from the
+  `cluster_a_taint_initial_formal_preeval_gap` pre-evaluation surface). Reopen
+  parity work only for new sweep regressions or a real Textual/export-fidelity
+  project. Procedure-level summary parity is tracked separately by the C-suite
+  triage track above.
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
   work (`perf_component_clone_reduction`), Textual enhancements, and accepted
   parity limits (`parity_sizeof_type_eval`) are parked with explicit

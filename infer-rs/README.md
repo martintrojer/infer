@@ -8,9 +8,11 @@ iterate on in Rust.
 
 The authoritative dashboard is [`docs/STATUS.md`](docs/STATUS.md). At a glance:
 
-- Store-textual C Pulse sweep: `501` procedures analyzed, `185` issues, `51 OK` /
-  `0 FAIL_ANALYZE` / `1 TIMEOUT` (known recursion hang).
-- Active C-suite OCaml↔Rust Pulse summary parity work: see
+- Store-textual C Pulse sweep: `52 OK / 0 FAIL_ANALYZE / 0 TIMEOUT`. NPE
+  `expected 131, found 140` (deltas documented in STATUS); LEAK `20/20` and
+  UAF `7/7` match.
+- C-suite OCaml↔Rust Pulse summary parity: `86 matching / 51 diffs` (`+36/-36`
+  vs original `50/87` baseline). Per-pass narrative and per-file breakdown in
   [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](docs/triage/c_pulse_summary_mismatches_2026_05_11.md).
 - Latest OpenSSL partial-corpus performance dashboard lives in
   [`docs/STATUS.md`](docs/STATUS.md).
