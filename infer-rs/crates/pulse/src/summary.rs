@@ -132,6 +132,16 @@ struct NormalizedSummaryInfo {
     summary_eq_zero_must_be_valid: std::collections::HashSet<AbstractValue>,
 }
 
+struct SummaryReachability {
+    post_heap_reachable: HashSet<AbstractValue>,
+    post_canonical_reachable: HashSet<AbstractValue>,
+    pre_heap_reachable: HashSet<AbstractValue>,
+    pre_canonical_reachable: HashSet<AbstractValue>,
+    precondition_vocabulary: HashSet<AbstractValue>,
+    formula_reachable: HashSet<AbstractValue>,
+    witness_targets: HashSet<AbstractValue>,
+}
+
 struct PotentialInvalidAccessSummaryCandidate {
     diagnostic: Diagnostic,
     recovered_from_summary_eq_zero: bool,
@@ -484,6 +494,66 @@ impl PrePost {
             .collect()
     }
 
+    fn summary_roots(&self) -> Vec<AbstractValue> {
+        let mut roots: Vec<_> = self.pre.stack.iter().map(|(_, addr)| *addr).collect();
+        roots.extend(self.post.post.stack.iter().map(|(_, addr)| *addr));
+        roots.extend(self.formals.iter().map(|(_, addr)| *addr));
+        roots.extend(self.result);
+        roots
+    }
+
+    /// Cross-ref: OCaml `PulseAbductiveDomain.discard_unreachable_` roots the
+    /// exported summary in caller-visible stack values, while
+    /// `GraphVisit.visit_access` keeps array-access indices reachable.
+    fn collect_summary_reachability(&self) -> SummaryReachability {
+        let mut reachable = self.collect_reachable_from_seeds(self.summary_roots(), true, true);
+        reachable.extend(self.collect_reachable_from_seeds(
+            self.collect_always_reachable_from_post_attrs(),
+            false,
+            true,
+        ));
+
+        let mut post_canonical_reachable: HashSet<_> = reachable
+            .iter()
+            .map(|addr| self.post.path_condition.get_var_repr(*addr))
+            .collect();
+        let mut post_heap_reachable = reachable.clone();
+        post_heap_reachable.extend(post_canonical_reachable.iter().copied());
+        post_canonical_reachable.extend(self.collect_reachable_array_indices(&post_heap_reachable));
+
+        let pre_reachable = self.collect_reachable_from_seeds(
+            self.pre.stack.iter().map(|(_, addr)| *addr),
+            true,
+            false,
+        );
+        let pre_canonical_reachable: HashSet<_> = pre_reachable
+            .iter()
+            .map(|addr| self.post.path_condition.get_var_repr(*addr))
+            .collect();
+        let mut pre_heap_reachable = pre_reachable.clone();
+        pre_heap_reachable.extend(pre_canonical_reachable.iter().copied());
+
+        let mut formula_seeds = post_canonical_reachable.clone();
+        formula_seeds.extend(self.collect_reachable_array_indices(&post_heap_reachable));
+        let witness_targets = formula_seeds.clone();
+        let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
+        let mut precondition_vocabulary = pre_reachable.clone();
+        precondition_vocabulary.extend(expand_formula_reachable(
+            &self.post.path_condition,
+            &pre_reachable,
+        ));
+
+        SummaryReachability {
+            post_heap_reachable,
+            post_canonical_reachable,
+            pre_heap_reachable,
+            pre_canonical_reachable,
+            precondition_vocabulary,
+            formula_reachable,
+            witness_targets,
+        }
+    }
+
     /// Cross-ref: OCaml normal evaluation records every integer literal as
     /// `Invalid(ConstantDereference k)`. When a caller-visible summary value is
     /// only known equal to a constant through phi (for example after
@@ -594,57 +664,7 @@ impl PrePost {
         self.post.post.attrs.retain_for_post_summary();
         self.add_pre_stack_for_global_function_pointer_values();
 
-        // The caller-visible summary surface is rooted in the visible stack:
-        // restored pre bindings, globals, and the return slot. After
-        // restore_formals_for_summary() there are no arbitrary post locals
-        // left, so the remaining post stack bindings should stay reachable.
-        let mut summary_roots: Vec<AbstractValue> =
-            self.pre.stack.iter().map(|(_, addr)| *addr).collect();
-        summary_roots.extend(self.post.post.stack.iter().map(|(_, addr)| *addr));
-        summary_roots.extend(self.formals.iter().map(|(_, addr)| *addr));
-        if let Some(rv) = self.result {
-            summary_roots.push(rv);
-        }
-
-        let mut reachable = self.collect_reachable_from_seeds(summary_roots, true, true);
-        let always_reachable = self.collect_reachable_from_seeds(
-            self.collect_always_reachable_from_post_attrs(),
-            false,
-            true,
-        );
-        reachable.extend(always_reachable);
-
-        let mut post_canonical_reachable: HashSet<_> = reachable
-            .iter()
-            .map(|addr| self.post.path_condition.get_var_repr(*addr))
-            .collect();
-        let mut post_heap_reachable = reachable.clone();
-        post_heap_reachable.extend(post_canonical_reachable.iter().copied());
-        // Cross-ref: OCaml `GraphVisit.visit_access` treats `ArrayAccess`
-        // indices as reachable addresses. Keep their attributes too so
-        // integer literal indices retain `Invalid(ConstantDereference k)` on
-        // the exported summary surface.
-        post_canonical_reachable.extend(self.collect_reachable_array_indices(&post_heap_reachable));
-        let pre_reachable = self.collect_reachable_from_seeds(
-            self.pre.stack.iter().map(|(_, addr)| *addr),
-            true,
-            false,
-        );
-        let pre_canonical_reachable: HashSet<_> = pre_reachable
-            .iter()
-            .map(|addr| self.post.path_condition.get_var_repr(*addr))
-            .collect();
-        let mut pre_heap_reachable = pre_reachable.clone();
-        pre_heap_reachable.extend(pre_canonical_reachable.iter().copied());
-        let mut formula_seeds = post_canonical_reachable.clone();
-        formula_seeds.extend(self.collect_reachable_array_indices(&post_heap_reachable));
-        let witness_targets = formula_seeds.clone();
-        let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
-        let mut precondition_vocabulary = pre_reachable.clone();
-        precondition_vocabulary.extend(expand_formula_reachable(
-            &self.post.path_condition,
-            &pre_reachable,
-        ));
+        let reachability = self.collect_summary_reachability();
 
         let mut leak_candidates: HashSet<_> = locally_reachable
             .iter()
@@ -652,28 +672,36 @@ impl PrePost {
             .collect();
         leak_candidates.extend(self.post.post.attrs.iter().filter_map(|(addr, attrs)| {
             let addr = self.post.path_condition.get_var_repr(*addr);
-            (attrs.get_allocated().is_some() && !formula_reachable.contains(&addr)).then_some(addr)
+            (attrs.get_allocated().is_some() && !reachability.formula_reachable.contains(&addr))
+                .then_some(addr)
         }));
-        let leaks = self.check_memory_leaks(&formula_reachable, &leak_candidates);
+        let leaks = self.check_memory_leaks(&reachability.formula_reachable, &leak_candidates);
 
         // Cross-ref: OCaml `discard_unreachable_ ~for_summary:true` keeps the
         // exported precondition stricter than the summarized post. Post-only
         // values can stay in the post, but they must not leak into `pre`.
-        self.pre.heap.retain_reachable(&pre_heap_reachable);
-        self.pre.attrs.retain_reachable(&pre_canonical_reachable);
+        self.pre
+            .heap
+            .retain_reachable(&reachability.pre_heap_reachable);
+        self.pre
+            .attrs
+            .retain_reachable(&reachability.pre_canonical_reachable);
         self.pre.attrs.retain_for_pre_summary();
-        self.post.post.heap.retain_reachable(&post_heap_reachable);
+        self.post
+            .post
+            .heap
+            .retain_reachable(&reachability.post_heap_reachable);
         self.post
             .post
             .attrs
-            .retain_reachable(&post_canonical_reachable);
+            .retain_reachable(&reachability.post_canonical_reachable);
         self.post.post.attrs.retain_for_post_summary();
         self.post
             .must_be_valid
-            .retain(|addr| post_canonical_reachable.contains(addr));
+            .retain(|addr| reachability.post_canonical_reachable.contains(addr));
         self.post
             .need_dynamic_type_specialization
-            .retain(|addr| post_canonical_reachable.contains(addr));
+            .retain(|addr| reachability.post_canonical_reachable.contains(addr));
 
         let summary_eq_zero_must_be_valid = self
             .post
@@ -683,8 +711,8 @@ impl PrePost {
             .filter(|addr| {
                 self.post.path_condition.is_known_zero_for_summary(
                     *addr,
-                    &precondition_vocabulary,
-                    &formula_reachable,
+                    &reachability.precondition_vocabulary,
+                    &reachability.formula_reachable,
                 )
             })
             .collect();
@@ -697,12 +725,12 @@ impl PrePost {
         self.post
             .path_condition
             .simplify_for_summary_with_witness_targets(
-                &precondition_vocabulary,
-                &formula_reachable,
-                &witness_targets,
+                &reachability.precondition_vocabulary,
+                &reachability.formula_reachable,
+                &reachability.witness_targets,
             );
         self.restore_direct_cycle_edges_for_summary();
-        self.materialize_visible_constant_invalidations(&post_canonical_reachable);
+        self.materialize_visible_constant_invalidations(&reachability.post_canonical_reachable);
         self.align_function_pointer_closure_summary_surface();
 
         NormalizedSummaryInfo {
@@ -2149,16 +2177,8 @@ fn prune_later_direct_formal_artifacts_for_potential_invalid_access(
         pre_post.post.post.attrs.remove_addr(addr);
     }
 
-    let mut summary_roots: Vec<AbstractValue> =
-        pre_post.pre.stack.iter().map(|(_, addr)| *addr).collect();
-    summary_roots.extend(pre_post.post.post.stack.iter().map(|(_, addr)| *addr));
-    summary_roots.extend(pre_post.formals.iter().map(|(_, addr)| *addr));
-    if let Some(result) = pre_post.result {
-        summary_roots.push(result);
-    }
-
     let post_reachable: std::collections::HashSet<_> = pre_post
-        .collect_reachable_from_seeds(summary_roots, true, true)
+        .collect_reachable_from_seeds(pre_post.summary_roots(), true, true)
         .into_iter()
         .filter(|addr| !later_reachable.contains(&pre_post.post.path_condition.get_var_repr(*addr)))
         .collect();
@@ -3468,8 +3488,8 @@ fn walk_heap_for_specialization(
 /// Try to find the return value in the abstract state.
 ///
 /// Looks for the SIL return variable (`__return` in Rust-lowered textual, or
-/// allocation-related `return` values in OCaml-exported textual) or falls back
-/// to finding the last logical variable written by a Load or Call instruction.
+/// `return` in OCaml-exported textual) or falls back to finding the last logical
+/// variable written by a Load or Call instruction.
 /// Only applies to non-void procedures — void procedures have no return value,
 /// and the fallback heuristic would incorrectly pick up malloc/call results,
 /// making them summary-reachable and hiding leaks.
