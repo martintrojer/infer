@@ -1368,6 +1368,15 @@ fn rust_summary_to_canonical(
 fn rust_pre_post_to_raw(
     pre_post: &pulse::summary::PrePost,
 ) -> test_harness::summary_compare::RawPrePost {
+    let diagnostic = match pre_post.kind {
+        // Cross-ref: OCaml `PulseExecutionDomain.LatentAbortProgram` stores
+        // its issue in the `latent_issue` sideband, not in a `diagnostic`
+        // field on the summarized pre/post JSON shape consumed by this
+        // comparator. Rust keeps the same sideband in `PrePost::diagnostic`
+        // for summary application, so hide it only in the comparison surface.
+        pulse::summary::PrePostKind::LatentAbortProgram => None,
+        _ => pre_post.diagnostic.as_ref().map(format_rust_diagnostic),
+    };
     test_harness::summary_compare::RawPrePost {
         kind: format!("{:?}", pre_post.kind),
         pre_stack: rust_stack_entries(&pre_post.pre.stack),
@@ -1378,7 +1387,7 @@ fn rust_pre_post_to_raw(
         post_attrs: rust_attrs(&pre_post.post.post.attrs),
         conditions: rust_conditions(&pre_post.post.path_condition),
         phi: rust_phi_items(&pre_post.post.path_condition),
-        diagnostic: pre_post.diagnostic.as_ref().map(format_rust_diagnostic),
+        diagnostic,
     }
 }
 

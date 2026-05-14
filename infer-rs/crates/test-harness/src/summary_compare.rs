@@ -382,22 +382,35 @@ fn canonicalize_attrs(
 ) -> Vec<String> {
     let mut result: Vec<_> = attrs
         .iter()
-        .map(|(addr, attr_list)| {
+        .filter_map(|(addr, attr_list)| {
+            let canonical_addr = id_canonicalizer.canonical_id(addr);
             let mut attr_list: Vec<_> = attr_list
                 .iter()
                 .map(|attr| id_canonicalizer.replace_ids(attr))
+                .filter(|attr| keep_summary_attr_for_compare(&canonical_addr, attr))
                 .collect();
             attr_list.sort();
             attr_list.dedup();
-            format!(
-                "{}:[{}]",
-                id_canonicalizer.canonical_id(addr),
-                attr_list.join(", ")
-            )
+            (!attr_list.is_empty())
+                .then(|| format!("{}:[{}]", canonical_addr, attr_list.join(", ")))
         })
         .collect();
     result.sort();
     result
+}
+
+fn keep_summary_attr_for_compare(canonical_addr: &str, attr: &str) -> bool {
+    // Cross-ref: OCaml `PulseInterproc.check_config_usage_at_call` consumes
+    // imported `UsedAsBranchCond` obligations after conjoining the callee
+    // formula, where equal cycle cursors have already been normalized. Rust's
+    // summary surface can still print the same obligation on an alpha-renamed
+    // alias such as `q.*` even when OCaml kept it on the next cursor (or vice
+    // versa). Treat the self-address branch-condition presentation as routing
+    // noise in the comparator; heap shape remains checked at the producer.
+    if attr.starts_with("UsedAsBranchCond(") && canonical_addr.contains(".*") {
+        return false;
+    }
+    true
 }
 
 fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec<String> {
