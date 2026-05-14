@@ -44,14 +44,6 @@ impl Term {
         Term::Var(v)
     }
 
-    pub fn zero() -> Self {
-        Term::Const(0)
-    }
-
-    pub fn one() -> Self {
-        Term::Const(1)
-    }
-
     /// Try to extract the constant value of a term.
     pub fn as_const(&self) -> Option<i64> {
         match self {
@@ -64,11 +56,6 @@ impl Term {
             Term::IsZero(t) => Some(if t.as_const()? == 0 { 1 } else { 0 }),
             Term::Var(_) => None,
         }
-    }
-
-    /// Check if this term is a constant zero.
-    pub fn is_zero(&self) -> bool {
-        matches!(self, Term::Const(0))
     }
 
     /// Collect all variables mentioned in this term.

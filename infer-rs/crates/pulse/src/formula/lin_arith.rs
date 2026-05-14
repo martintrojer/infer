@@ -106,11 +106,6 @@ impl LinArith {
         self.vars.get(&v)
     }
 
-    /// Get the simplest variable (smallest by AbstractValue ordering).
-    pub fn get_simplest(&self) -> Option<AbstractValue> {
-        self.vars.keys().next().copied()
-    }
-
     /// Addition: l₁ + l₂.
     pub fn add(&self, other: &Self) -> Self {
         let mut result = self.clone();
@@ -174,11 +169,6 @@ impl LinArith {
         }
     }
 
-    /// Solve `self = other` by solving `self - other = 0`.
-    pub fn solve_eq(&self, other: &Self) -> SatUnsat<Option<(AbstractValue, LinArith)>> {
-        self.sub(other).solve_eq_zero()
-    }
-
     /// Solve `self = 0` for a chosen variable.
     pub fn solve_eq_zero_for(&self, x: AbstractValue) -> Option<LinArith> {
         let coeff = self.vars.get(&x)?;
@@ -221,11 +211,6 @@ impl LinArith {
     /// Get all variables in this expression.
     pub fn get_variables(&self) -> impl Iterator<Item = AbstractValue> + '_ {
         self.vars.keys().copied()
-    }
-
-    /// Translate all variables using a mapping function.
-    pub fn translate(&self, f: impl Fn(AbstractValue) -> AbstractValue) -> Self {
-        self.subst_variables(|v| Self::of_var(f(v)))
     }
 
     /// Substitute every variable with a linear expression.
@@ -336,25 +321,6 @@ mod tests {
             SatUnsat::Sat(Some((x, solution))) => {
                 assert_eq!(x, v);
                 assert_eq!(solution.get_as_const(), Some(Q::from_integer(-3)));
-            }
-            other => panic!("expected Sat(Some), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_solve_eq() {
-        // x = y + 1 → solve x - y - 1 = 0
-        let x = AbstractValue::of_raw(1);
-        let y = AbstractValue::of_raw(2);
-        let lx = LinArith::of_var(x);
-        let ly_plus_1 = LinArith::of_var(y).add(&LinArith::of_int(1));
-
-        match lx.solve_eq(&ly_plus_1) {
-            SatUnsat::Sat(Some((solved_var, solution))) => {
-                assert_eq!(solved_var, x); // x is simpler (lower id)
-                                           // solution should be y + 1
-                assert_eq!(solution.get_coefficient(y), Some(&Q::one()));
-                assert_eq!(*solution.get_constant_part(), Q::from_integer(1));
             }
             other => panic!("expected Sat(Some), got {other:?}"),
         }
