@@ -207,6 +207,37 @@ cost from retained-state storage cost.
   full-corpus `-j4` run that reached about 160 GB RSS and was SIGTERM-killed.
   Prefer single-file invocations or the bench script for corpus experiments.
 
+## Profiling tools (Linux)
+
+Audit from devvm36499 (CentOS Stream 9) on 2026-05-14. Profile only one
+`.sil` file at a time and keep the same safety caps as
+[`scripts/bench_openssl_partial.sh`](../scripts/bench_openssl_partial.sh):
+`--pulse-max-heap-mb 2048 --pulse-max-wall-secs 60 -j 1`. The orchestrator
+killed two exploratory runs around 160 GB RSS, so do not profile full corpora.
+If `/proc/sys/kernel/perf_event_paranoid` is greater than `2`, `perf`-based
+profilers need root or `sudo sysctl kernel.perf_event_paranoid=1`; devvm36499
+currently has `1`, which is usable by unprivileged users.
+
+Set a shell helper before running the examples:
+
+```bash
+BIN=target/release/infer-rs
+ARGS="--pulse-only --pulse-max-heap-mb 2048 --pulse-max-wall-secs 60 -j 1 textual-out/one.sil"
+```
+
+| Tool | devvm36499 status | Quick command, output, and hint |
+|---|---|---|
+| `perf` | installed: `perf version 6.19.0-rc6` | `perf record -g --call-graph dwarf -o perf.data -- $BIN $ARGS`; open with `perf report -i perf.data`; sort by children/self time for wall-CPU hotspots. |
+| `cargo flamegraph` | not installed | Install with `cargo install flamegraph`; then `cargo flamegraph --output flamegraph.svg -- $BIN $ARGS`; output SVG shows wide stacks as hot paths. |
+| `heaptrack` / `heaptrack_print` | not installed | Install with `sudo dnf install heaptrack` (or `sudo apt install heaptrack`); run `heaptrack --output heaptrack.gz -- $BIN $ARGS`; inspect with `heaptrack_print heaptrack.gz` or GUI for allocation hot spots. |
+| `valgrind --tool=massif` | installed via `valgrind-3.22.0` | `valgrind --tool=massif --massif-out-file=massif.out -- $BIN $ARGS`; output is heap snapshots; inspect peaks with `ms_print massif.out` where available. |
+| `valgrind --tool=callgrind` | installed via `valgrind-3.22.0` | `valgrind --tool=callgrind --callgrind-out-file=callgrind.out -- $BIN $ARGS`; very slow; inspect inclusive instruction counts with `callgrind_annotate`/KCachegrind. |
+| `dhat` crate | Cargo dependency, not a system tool | Add a feature-gated dep such as `dhat = "0.3"`, install `#[global_allocator] static ALLOC: dhat::Alloc = dhat::Alloc;`, and guard `let _profiler = dhat::Profiler::new_heap();`; output JSON/terminal heap profile when the feature is enabled. |
+| `bytehound` | not installed | Build from source (`git clone https://github.com/koute/bytehound && cd bytehound && cargo build --release`) or use distro packages if available; run with `LD_PRELOAD=.../libbytehound.so $BIN $ARGS`; view recorded allocation data with the `bytehound` UI/server. |
+| `samply` | not installed | Install with `cargo install samply`; run `samply record --save-only --output profile.json -- $BIN $ARGS`; open with `samply load profile.json` for a browser timeline/flame graph. |
+| `/usr/bin/time -v` | installed: GNU Time 1.9 | `/usr/bin/time -v $BIN $ARGS 2>time.txt`; `Maximum resident set size` is max RSS and `Elapsed` is wall time. |
+| `strace -c` | installed: `strace -- version 6.12` | `strace -c -o strace-counts.txt -- $BIN $ARGS`; output ranks syscall count/time/errors, useful for I/O or process-spawn suspicion. |
+
 ## Determinism
 
 Analysis results are deterministic across runs:
