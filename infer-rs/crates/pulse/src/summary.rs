@@ -590,6 +590,8 @@ impl PrePost {
                 continue;
             }
 
+            let invalidation =
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(constant));
             if self
                 .post
                 .post
@@ -600,9 +602,42 @@ impl PrePost {
                 continue;
             }
 
-            let invalidation =
-                crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(constant));
             let history = self.post.history_of_value(repr).unwrap_or_default();
+            let has_literal_history = history.contains_invalidation(&invalidation);
+            let has_literal_attr = self.post.post.attrs.iter().any(|(_addr, attrs)| {
+                attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        Attribute::Invalid(found, _) if found == &invalidation
+                    )
+                })
+            });
+            let has_equal_const_condition =
+                self.post.path_condition.conditions().keys().any(|atom| {
+                    matches!(
+                        atom,
+                        Atom::Equal(Term::Var(v), Term::Const(c))
+                            | Atom::Equal(Term::Const(c), Term::Var(v))
+                            if self.post.path_condition.get_var_repr(*v) == repr && *c == constant
+                    )
+                });
+            // OCaml `eval_const` records `Invalid(ConstantDereference k)`, but prune-only
+            // equality conditions such as `a == 4` or `random() == 5` do not. Only recreate
+            // the attr when a real literal invalidation is still visible in the value provenance
+            // or attrs. Recursive unknown-call specialization keeps OCaml's non-equality
+            // `i - 1` invalidation surface via ReturnedFromUnknown.
+            let value_has_returned_unknown = self.post.post.attrs.get(&repr).is_some_and(|attrs| {
+                attrs
+                    .iter()
+                    .any(|attr| matches!(attr, Attribute::ReturnedFromUnknown(_)))
+            });
+            if !has_literal_history
+                && !has_literal_attr
+                && has_equal_const_condition
+                && !value_has_returned_unknown
+            {
+                continue;
+            }
             let location = history
                 .last_location()
                 .cloned()
@@ -4963,7 +4998,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_materializes_nonzero_constant_invalid_for_visible_value() {
+    fn test_normalize_materializes_nonzero_constant_invalid_for_literal_value() {
         let mut pdesc = make_pdesc_with_formals(&[]);
         pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
 
@@ -4972,12 +5007,17 @@ mod tests {
         let return_var = Var::ProgramVar(Box::new(return_pvar));
         let return_addr = AbstractValue::of_raw(30);
         let result = AbstractValue::of_raw(2);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::one());
 
         astate.post.stack.add(return_var, return_addr);
-        astate
-            .post
-            .heap
-            .add_edge(return_addr, Access::Dereference, result);
+        astate.post.heap.add_edge_with_history(
+            return_addr,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(
+                result,
+                ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+            ),
+        );
         astate.initialize(return_addr);
         astate.initialize(result);
         assert!(astate.path_condition.and_equal_const(result, 1).is_sat());
@@ -5007,7 +5047,51 @@ mod tests {
                     _
                 ) if *value == IntLit::one()
             )),
-            "summary export should recreate OCaml's constant invalidation surface for visible non-zero values"
+            "summary export should recreate OCaml's constant invalidation surface for literal non-zero values"
+        );
+    }
+
+    #[test]
+    fn test_normalize_does_not_materialize_branch_only_constant_invalid_for_visible_value() {
+        let mut pdesc = make_pdesc_with_formals(&["a"]);
+        pdesc.ret_type = Typ::void();
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let a_pvar = Pvar::mk(Mangled::from_string("a"), pdesc.proc_name.clone());
+        let a_var = Var::ProgramVar(Box::new(a_pvar.clone()));
+        let a_addr = astate.eval_var(&a_var);
+        let a_value = astate.read_heap(a_addr, Access::Dereference);
+        assert!(astate
+            .path_condition
+            .prune_eq_const(a_value, 4, false)
+            .is_sat());
+
+        let mut pp = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(a_pvar, a_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let _ = pp.normalize();
+
+        let repr = pp.post.path_condition.get_var_repr(a_value);
+        let has_branch_only_invalid = pp.post.post.attrs.get(&repr).is_some_and(|attrs| {
+            attrs.iter().any(|attr| {
+                matches!(
+                    attr,
+                    crate::attribute::Attribute::Invalid(
+                        crate::invalidation::Invalidation::ConstantDereference(value),
+                        _
+                    ) if *value == IntLit::of_int(4)
+                )
+            })
+        });
+        assert!(
+            !has_branch_only_invalid,
+            "branch/prune facts such as a == 4 should not synthesize OCaml-invisible constant invalidations"
         );
     }
 

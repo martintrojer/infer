@@ -177,6 +177,16 @@ impl HistoryPath {
         })
     }
 
+    fn contains_invalidation(&self, invalidation: &Invalidation) -> bool {
+        self.0.iter().any(|event| match event {
+            HistoryEvent::Invalidated {
+                invalidation: found,
+                ..
+            } => found == invalidation,
+            _ => false,
+        })
+    }
+
     fn contains_invalidation_of_same_type(&self, invalidation: &Invalidation) -> bool {
         self.0.iter().any(|event| match event {
             HistoryEvent::Invalidated {
@@ -391,6 +401,12 @@ impl ValueHistory {
 
     pub fn first_invalidation(&self) -> Option<(&Invalidation, &Location)> {
         self.0.iter().find_map(HistoryPath::first_invalidation)
+    }
+
+    pub fn contains_invalidation(&self, invalidation: &Invalidation) -> bool {
+        self.0
+            .iter()
+            .any(|path| path.contains_invalidation(invalidation))
     }
 
     pub fn contains_invalidation_of_same_type(&self, invalidation: &Invalidation) -> bool {
