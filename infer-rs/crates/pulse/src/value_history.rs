@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -229,8 +230,32 @@ impl fmt::Display for HistoryPath {
 
 /// A value can have more than one provenance path after branch or equality
 /// merges, so keep a small set of canonical paths.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ValueHistory(BTreeSet<HistoryPath>);
+///
+/// Wrap the set in `Arc` to mirror OCaml's cheap sharing of immutable history
+/// values. `BaseMemory`/`BaseStack` cloning is frequent at hot fixpoint nodes;
+/// with an owned `BTreeSet`, every `ValueWithHistory` clone recursively copied
+/// every path/event vector even when the clone was only being retained as an
+/// identical snapshot.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValueHistory(Arc<BTreeSet<HistoryPath>>);
+
+impl Clone for ValueHistory {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Serialize for ValueHistory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ValueHistory {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(Arc::new(BTreeSet::deserialize(deserializer)?)))
+    }
+}
 
 impl Default for ValueHistory {
     fn default() -> Self {
@@ -242,13 +267,13 @@ impl ValueHistory {
     pub fn epoch() -> Self {
         let mut paths = BTreeSet::new();
         paths.insert(HistoryPath::empty());
-        Self(paths)
+        Self(Arc::new(paths))
     }
 
     pub fn from_event(event: HistoryEvent) -> Self {
         let mut paths = BTreeSet::new();
         paths.insert(HistoryPath(vec![event]));
-        Self(paths)
+        Self(Arc::new(paths))
     }
 
     pub fn formal_argument(pvar: Pvar) -> Self {
@@ -284,7 +309,7 @@ impl ValueHistory {
             .iter()
             .map(|path| path.append(event.clone()))
             .collect();
-        Self(paths)
+        Self(Arc::new(paths))
     }
 
     pub fn prepend_event(&self, event: HistoryEvent) -> Self {
@@ -293,7 +318,7 @@ impl ValueHistory {
             .iter()
             .map(|path| path.prepend(event.clone()))
             .collect();
-        Self(paths)
+        Self(Arc::new(paths))
     }
 
     pub fn append_assignment(&self, location: Location) -> Self {
@@ -310,13 +335,13 @@ impl ValueHistory {
             .iter()
             .map(|path| path.wrap_call(proc, location))
             .collect();
-        Self(paths)
+        Self(Arc::new(paths))
     }
 
     pub fn merge(&self, other: &Self) -> Self {
-        let mut paths = self.0.clone();
+        let mut paths = self.0.as_ref().clone();
         paths.extend(other.0.iter().cloned());
-        Self(paths)
+        Self(Arc::new(paths))
     }
 
     pub fn map_formals(
@@ -332,7 +357,7 @@ impl ValueHistory {
         callsite: Option<Location>,
     ) -> Self {
         let mut translated = BTreeSet::new();
-        for path in &self.0 {
+        for path in self.0.iter() {
             let mut partials = vec![HistoryPath::empty()];
             for event in &path.0 {
                 match event {
@@ -340,7 +365,7 @@ impl ValueHistory {
                         if let Some(history) = formal_histories.get(pvar) {
                             let mut next = Vec::new();
                             for prefix in &partials {
-                                for suffix in &history.0 {
+                                for suffix in history.0.iter() {
                                     let mut events = prefix.0.clone();
                                     events.push(HistoryEvent::ActualArgument(
                                         pvar.clone(),
@@ -366,7 +391,7 @@ impl ValueHistory {
             }
             translated.extend(partials);
         }
-        Self(translated)
+        Self(Arc::new(translated))
     }
 
     pub fn first_invalidation_before_call(&self) -> Option<(&Invalidation, &Location)> {
