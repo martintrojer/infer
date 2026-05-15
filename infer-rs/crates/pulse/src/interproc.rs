@@ -291,66 +291,33 @@ pub(crate) fn apply_summary_with_aliasing(
     // the callee pre but disappears from the callee post, we must delete the
     // corresponding caller edge. Cross-ref: OCaml PulseInterproc.ml
     // `delete_edges_in_callee_pre_from_caller` + `record_post_cell`.
-    let mut processed_pre_cells = HashSet::new();
-    for (callee_addr, pre_edges) in pre_post.pre.heap.iter() {
-        // Cross-ref: OCaml materializes actuals from the dereferenced formal
-        // value, not by replaying the callee formal stack cell onto the
-        // caller. Re-applying that bookkeeping cell after Step 1a would turn
-        // by-value actuals into bogus self-edges such as `v -*-> v`.
-        if value_actual_formal_stack_addrs.contains(callee_addr) {
-            continue;
-        }
-        let Some(&caller_addr) = subst.get(callee_addr) else {
-            continue;
-        };
-        let caller_addr = canonicalize_imported_actual_value(
-            &callee_actual_value_addrs,
-            *callee_addr,
-            caller_addr,
-            &caller_state,
-        );
-        let post_edges = pre_post.post.post.heap.get_edges(*callee_addr);
-        if !callee_cell_is_read_only(Some(pre_edges), post_edges, pre_post, *callee_addr) {
-            apply_post_cell(
-                caller_addr,
-                Some(pre_edges),
-                post_edges,
-                &mut subst,
-                &callee_actual_value_addrs,
-                &hist_map,
-                callee_procname.as_ref(),
-                loc,
-                &mut caller_state,
-            );
-        }
-        processed_pre_cells.insert(*callee_addr);
-    }
-
-    for (callee_addr, post_edges) in pre_post.post.post.heap.iter() {
-        if value_actual_formal_stack_addrs.contains(callee_addr) {
-            continue;
-        }
-        if processed_pre_cells.contains(callee_addr) {
-            continue;
-        }
-        let caller_addr = resolve_for_post(
-            &mut subst,
-            *callee_addr,
-            &callee_actual_value_addrs,
-            &caller_state,
-        );
-        apply_post_cell(
-            caller_addr,
-            None,
-            Some(post_edges),
-            &mut subst,
-            &callee_actual_value_addrs,
-            &hist_map,
-            callee_procname.as_ref(),
-            loc,
-            &mut caller_state,
-        );
-    }
+    let mut post_visited = HashSet::new();
+    let mut subst_histories =
+        initial_post_subst_histories(&subst, &callee_actual_value_addrs, &caller_state);
+    apply_post_from_callee_pre(
+        pre_post,
+        &value_actual_formal_stack_addrs,
+        &callee_actual_value_addrs,
+        &hist_map,
+        callee_procname.as_ref(),
+        loc,
+        &mut post_visited,
+        &mut subst,
+        &mut subst_histories,
+        &mut caller_state,
+    );
+    apply_post_from_callee_post(
+        pre_post,
+        &value_actual_formal_stack_addrs,
+        &callee_actual_value_addrs,
+        &hist_map,
+        callee_procname.as_ref(),
+        loc,
+        &mut post_visited,
+        &mut subst,
+        &mut subst_histories,
+        &mut caller_state,
+    );
 
     // Step 4: Resolve the return value after formula translation and post
     // application, mirroring OCaml `read_return_value`. `resolve_mut` returns
@@ -1324,7 +1291,7 @@ fn callee_cell_is_read_only(
     let Some(post_edges) = post_edges_opt else {
         return false;
     };
-    if pre_edges.len() != post_edges.len() {
+    if pre_edges.is_empty() && !post_edges.is_empty() {
         return false;
     }
     !pre_post
@@ -1335,12 +1302,264 @@ fn callee_cell_is_read_only(
         .is_some_and(|attrs| attrs.iter().any(Attribute::is_modified))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_post_cell(
-    caller_addr: AbstractValue,
-    pre_edges_opt: Option<&crate::base_memory::Edges>,
-    post_edges_opt: Option<&crate::base_memory::Edges>,
+fn initial_post_subst_histories(
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    caller_state: &AbductiveDomain,
+) -> HashMap<AbstractValue, ValueHistory> {
+    subst
+        .iter()
+        .map(|(&callee_addr, &caller_addr)| {
+            let caller_addr = canonicalize_imported_actual_value(
+                callee_actual_value_addrs,
+                callee_addr,
+                caller_addr,
+                caller_state,
+            );
+            let history = caller_state
+                .history_of_value(caller_addr)
+                .unwrap_or_else(ValueHistory::epoch);
+            (callee_addr, history)
+        })
+        .collect()
+}
+
+fn history_for_post_subst(
+    subst_histories: &HashMap<AbstractValue, ValueHistory>,
+    callee_addr: AbstractValue,
+    fallback: &ValueHistory,
+) -> ValueHistory {
+    subst_histories
+        .get(&callee_addr)
+        .cloned()
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn resolve_for_post_with_history(
     subst: &mut HashMap<AbstractValue, AbstractValue>,
+    subst_histories: &mut HashMap<AbstractValue, ValueHistory>,
+    callee_val: AbstractValue,
+    default_history: &ValueHistory,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    caller_state: &AbductiveDomain,
+) -> (AbstractValue, ValueHistory) {
+    if let Some(&caller_val) = subst.get(&callee_val) {
+        let caller_val = canonicalize_imported_actual_value(
+            callee_actual_value_addrs,
+            callee_val,
+            caller_val,
+            caller_state,
+        );
+        let history = history_for_post_subst(subst_histories, callee_val, default_history);
+        (caller_val, history)
+    } else {
+        let caller_val = callee_val.mk_fresh_same_kind();
+        subst.insert(callee_val, caller_val);
+        subst_histories.insert(callee_val, default_history.clone());
+        (caller_val, default_history.clone())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_post_from_callee_pre(
+    pre_post: &PrePost,
+    value_actual_formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    hist_map: &BTreeMap<CellId, ValueHistory>,
+    callee_procname: Option<&Procname>,
+    loc: &Location,
+    visited: &mut HashSet<AbstractValue>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    subst_histories: &mut HashMap<AbstractValue, ValueHistory>,
+    caller_state: &mut AbductiveDomain,
+) {
+    for (callee_addr, _pre_edges) in pre_post.pre.heap.iter() {
+        if value_actual_formal_stack_addrs.contains(callee_addr)
+            && pre_post.post.post.heap.get_edges(*callee_addr).is_none()
+        {
+            continue;
+        }
+        let Some(&caller_addr) = subst.get(callee_addr) else {
+            continue;
+        };
+        let caller_addr = canonicalize_imported_actual_value(
+            callee_actual_value_addrs,
+            *callee_addr,
+            caller_addr,
+            caller_state,
+        );
+        let caller_history =
+            history_for_post_subst(subst_histories, *callee_addr, &ValueHistory::epoch());
+        record_post_for_address(
+            pre_post,
+            *callee_addr,
+            caller_addr,
+            caller_history,
+            value_actual_formal_stack_addrs,
+            callee_actual_value_addrs,
+            hist_map,
+            callee_procname,
+            loc,
+            visited,
+            subst,
+            subst_histories,
+            caller_state,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_post_from_callee_post(
+    pre_post: &PrePost,
+    value_actual_formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    hist_map: &BTreeMap<CellId, ValueHistory>,
+    callee_procname: Option<&Procname>,
+    loc: &Location,
+    visited: &mut HashSet<AbstractValue>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    subst_histories: &mut HashMap<AbstractValue, ValueHistory>,
+    caller_state: &mut AbductiveDomain,
+) {
+    let default_history = ValueHistory::epoch();
+    for (callee_addr, _post_edges) in pre_post.post.post.heap.iter() {
+        if visited.contains(callee_addr) {
+            continue;
+        }
+        let (caller_addr, caller_history) = resolve_for_post_with_history(
+            subst,
+            subst_histories,
+            *callee_addr,
+            &default_history,
+            callee_actual_value_addrs,
+            caller_state,
+        );
+        record_post_for_address(
+            pre_post,
+            *callee_addr,
+            caller_addr,
+            caller_history,
+            value_actual_formal_stack_addrs,
+            callee_actual_value_addrs,
+            hist_map,
+            callee_procname,
+            loc,
+            visited,
+            subst,
+            subst_histories,
+            caller_state,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_post_for_address(
+    pre_post: &PrePost,
+    callee_addr: AbstractValue,
+    caller_addr: AbstractValue,
+    caller_history: ValueHistory,
+    value_actual_formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    hist_map: &BTreeMap<CellId, ValueHistory>,
+    callee_procname: Option<&Procname>,
+    loc: &Location,
+    visited: &mut HashSet<AbstractValue>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    subst_histories: &mut HashMap<AbstractValue, ValueHistory>,
+    caller_state: &mut AbductiveDomain,
+) {
+    if !visited.insert(callee_addr) {
+        return;
+    }
+
+    let mut caller_addr = caller_addr;
+    let mut caller_history = caller_history;
+    let edges_callee_post_opt = pre_post.post.post.heap.get_edges(callee_addr);
+    let edges_pre_opt = pre_post.pre.heap.get_edges(callee_addr);
+    if value_actual_formal_stack_addrs.contains(&callee_addr) {
+        let Some(edges_callee_post) = edges_callee_post_opt else {
+            return;
+        };
+        let Some((_, first_value)) = edges_callee_post.iter_with_history().next() else {
+            return;
+        };
+        let resolved = resolve_for_post_with_history(
+            subst,
+            subst_histories,
+            first_value.addr,
+            &caller_history,
+            callee_actual_value_addrs,
+            caller_state,
+        );
+        caller_addr = resolved.0;
+        caller_history = resolved.1;
+    }
+    let Some(edges_callee_post) = edges_callee_post_opt else {
+        if edges_pre_opt.is_some() {
+            let post_edges_minus_pre = delete_edges_in_callee_pre_from_caller(
+                edges_pre_opt,
+                caller_addr,
+                subst,
+                caller_state,
+            );
+            caller_state
+                .post
+                .heap
+                .set_edges(caller_addr, post_edges_minus_pre);
+        }
+        return;
+    };
+    if !callee_cell_is_read_only(edges_pre_opt, edges_callee_post_opt, pre_post, callee_addr) {
+        record_post_cell(
+            caller_addr,
+            caller_history.clone(),
+            edges_pre_opt,
+            edges_callee_post,
+            subst,
+            subst_histories,
+            callee_actual_value_addrs,
+            hist_map,
+            callee_procname,
+            loc,
+            caller_state,
+        );
+    }
+
+    for (_access, callee_value) in edges_callee_post.iter_with_history() {
+        let (caller_dest, caller_dest_history) = resolve_for_post_with_history(
+            subst,
+            subst_histories,
+            callee_value.addr,
+            &caller_history,
+            callee_actual_value_addrs,
+            caller_state,
+        );
+        record_post_for_address(
+            pre_post,
+            callee_value.addr,
+            caller_dest,
+            caller_dest_history,
+            value_actual_formal_stack_addrs,
+            callee_actual_value_addrs,
+            hist_map,
+            callee_procname,
+            loc,
+            visited,
+            subst,
+            subst_histories,
+            caller_state,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_post_cell(
+    caller_addr: AbstractValue,
+    caller_history: ValueHistory,
+    pre_edges_opt: Option<&crate::base_memory::Edges>,
+    post_edges: &crate::base_memory::Edges,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    subst_histories: &mut HashMap<AbstractValue, ValueHistory>,
     callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
     hist_map: &BTreeMap<CellId, ValueHistory>,
     callee_procname: Option<&Procname>,
@@ -1348,29 +1567,25 @@ fn apply_post_cell(
     caller_state: &mut AbductiveDomain,
 ) {
     let mut translated_post_edges = crate::base_memory::Edges::empty();
-    if let Some(post_edges) = post_edges_opt {
-        for (access, callee_value) in post_edges.iter_with_history() {
-            let caller_target = resolve_for_post(
-                subst,
-                callee_value.addr,
-                callee_actual_value_addrs,
-                caller_state,
-            );
-            let caller_access = translate_access_to_caller(subst, access, caller_state);
-            let history = restore_history_from_cell_ids(&callee_value.history, hist_map)
-                .unwrap_or_else(|| {
-                    caller_state
-                        .history_of_value(caller_target)
-                        .unwrap_or_else(|| ValueHistory::assignment(loc.clone()))
-                });
-            translated_post_edges.add_with_history(
-                caller_access,
-                crate::value_history::ValueWithHistory::new(
-                    caller_target,
-                    wrap_imported_history(history, callee_procname, loc),
-                ),
-            );
-        }
+    for (access, callee_value) in post_edges.iter_with_history() {
+        let (caller_target, current_history) = resolve_for_post_with_history(
+            subst,
+            subst_histories,
+            callee_value.addr,
+            &caller_history,
+            callee_actual_value_addrs,
+            caller_state,
+        );
+        let caller_access = translate_access_to_caller(subst, access, caller_state);
+        let history = restore_history_from_cell_ids(&callee_value.history, hist_map)
+            .unwrap_or(current_history);
+        translated_post_edges.add_with_history(
+            caller_access,
+            crate::value_history::ValueWithHistory::new(
+                caller_target,
+                wrap_imported_history(history, callee_procname, loc),
+            ),
+        );
     }
 
     let post_edges_minus_pre =
