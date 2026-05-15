@@ -35,11 +35,16 @@ Current status and active work are intentionally separated:
   — C-suite OCaml↔Rust Pulse summary mismatch triage. Per-cluster status
   and remeasure totals after the initial cluster pass.
 
-### Linux session 2026-05-14
+### Linux session 2026-05-14/15
 
-- OpenSSL Linux perf push is in flight with dedicated planning docs:
-  [`plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md`](plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md)
-  and [`plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md`](plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md).
+- OpenSSL Linux perf wave docs:
+  [`plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md`](plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md),
+  [`plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md`](plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md),
+  [`plans/OPENSSL_LINUX_PERF_BASELINE_RESULTS_2026_05.md`](plans/OPENSSL_LINUX_PERF_BASELINE_RESULTS_2026_05.md),
+  and [`plans/OPENSSL_LINUX_PERF_POST_WAVE_2026_05.md`](plans/OPENSSL_LINUX_PERF_POST_WAVE_2026_05.md).
+  The live dashboard row is in [`STATUS.md`](STATUS.md): canonical Linux
+  post-wave `RUNS=3 JOBS=4` median `4:47.79`, `5.70 GiB`, `445/445`, `6`
+  aborts.
 
 ## Archived plans and findings
 
