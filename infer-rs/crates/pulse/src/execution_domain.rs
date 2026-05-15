@@ -133,15 +133,13 @@ impl Comparable for ExecutionDomain {
             | (ExitProgram(lhs), ExitProgram(rhs)) => crate::state_cmp::alpha_equivalent(lhs, rhs),
             (
                 AbortProgram {
-                    state: lhs_state,
-                    diagnostic: lhs_diag,
+                    state: lhs_state, ..
                 },
                 AbortProgram {
-                    state: rhs_state,
-                    diagnostic: rhs_diag,
+                    state: rhs_state, ..
                 },
-            )
-            | (
+            ) => crate::state_cmp::alpha_equivalent(lhs_state, rhs_state),
+            (
                 LatentAbortProgram {
                     state: lhs_state,
                     diagnostic: lhs_diag,
@@ -163,7 +161,7 @@ impl Comparable for ExecutionDomain {
                     state: rhs_state,
                     diagnostic: rhs_diag,
                 },
-            ) => diagnostics_compatible_semantic(lhs_state, lhs_diag, rhs_state, rhs_diag),
+            ) => latent_invalid_access_leq(lhs_state, lhs_diag, rhs_state, rhs_diag),
             _ => false,
         }
     }
@@ -229,17 +227,8 @@ impl ExecutionDomain {
             (ContinueProgram(_), ContinueProgram(_))
             | (ExceptionRaised(_), ExceptionRaised(_))
             | (ExitProgram(_), ExitProgram(_)) => eq_canonical(lhs_canon, rhs_canon),
+            (AbortProgram { .. }, AbortProgram { .. }) => eq_canonical(lhs_canon, rhs_canon),
             (
-                AbortProgram {
-                    diagnostic: lhs_diag,
-                    ..
-                },
-                AbortProgram {
-                    diagnostic: rhs_diag,
-                    ..
-                },
-            )
-            | (
                 LatentAbortProgram {
                     diagnostic: lhs_diag,
                     ..
@@ -251,16 +240,16 @@ impl ExecutionDomain {
             ) => eq_canonical(lhs_canon, rhs_canon) && diagnostics_compatible(lhs_diag, rhs_diag),
             (
                 LatentInvalidAccess {
+                    state: lhs_state,
                     diagnostic: lhs_diag,
-                    ..
                 },
                 LatentInvalidAccess {
+                    state: rhs_state,
                     diagnostic: rhs_diag,
-                    ..
                 },
-            ) => {
-                diagnostics_compatible_semantic_canonical(lhs_canon, lhs_diag, rhs_canon, rhs_diag)
-            }
+            ) => latent_invalid_access_leq_canonical(
+                lhs_state, lhs_canon, lhs_diag, rhs_state, rhs_canon, rhs_diag,
+            ),
             _ => false,
         }
     }
@@ -320,7 +309,20 @@ fn latent_invalid_access_diagnostics_compatible(lhs: &Diagnostic, rhs: &Diagnost
     }
 }
 
-fn diagnostics_compatible_semantic(
+fn must_be_valid_reason(
+    state: &AbductiveDomain,
+    addr: crate::abstract_value::AbstractValue,
+) -> Option<crate::invalidation::MustBeValidReason> {
+    let repr = state.path_condition.get_var_repr(addr);
+    state
+        .pre
+        .attrs
+        .get(&repr)
+        .and_then(|attrs| attrs.get_must_be_valid())
+        .and_then(|(_, _, reason)| reason.clone())
+}
+
+fn latent_invalid_access_leq(
     lhs_state: &AbductiveDomain,
     lhs: &Diagnostic,
     rhs_state: &AbductiveDomain,
@@ -328,73 +330,33 @@ fn diagnostics_compatible_semantic(
 ) -> bool {
     match (lhs, rhs) {
         (
-            Diagnostic::AccessToInvalidAddress {
-                addr: lhs_addr,
-                invalidation: lhs_invalidation,
-                access_location: lhs_access_location,
-                trace_access_location: None,
-                access_history: lhs_access_history,
-                invalidation_history: lhs_invalidation_history,
-                ..
-            },
-            Diagnostic::AccessToInvalidAddress {
-                addr: rhs_addr,
-                invalidation: rhs_invalidation,
-                access_location: rhs_access_location,
-                trace_access_location: None,
-                access_history: rhs_access_history,
-                invalidation_history: rhs_invalidation_history,
-                ..
-            },
+            Diagnostic::AccessToInvalidAddress { addr: lhs_addr, .. },
+            Diagnostic::AccessToInvalidAddress { addr: rhs_addr, .. },
         ) => {
             crate::state_cmp::alpha_equivalent_value(lhs_state, *lhs_addr, rhs_state, *rhs_addr)
-                && lhs_invalidation == rhs_invalidation
-                && lhs_access_location == rhs_access_location
-                && lhs_access_history == rhs_access_history
-                && lhs_invalidation_history == rhs_invalidation_history
+                && must_be_valid_reason(lhs_state, *lhs_addr)
+                    == must_be_valid_reason(rhs_state, *rhs_addr)
         }
         _ => diagnostics_compatible(lhs, rhs),
     }
 }
 
-/// Pre-canonicalised counterpart of [`diagnostics_compatible_semantic`].
-///
-/// Identical to the original except the `alpha_equivalent_value` call
-/// is replaced with `eq_canonical_with_value` over the supplied
-/// canonical states. The fall-through arm (`diagnostics_compatible`)
-/// does not touch state, so it is reused unchanged.
-fn diagnostics_compatible_semantic_canonical(
+fn latent_invalid_access_leq_canonical(
+    lhs_state: &AbductiveDomain,
     lhs_canon: &CanonicalAbductive,
     lhs: &Diagnostic,
+    rhs_state: &AbductiveDomain,
     rhs_canon: &CanonicalAbductive,
     rhs: &Diagnostic,
 ) -> bool {
     match (lhs, rhs) {
         (
-            Diagnostic::AccessToInvalidAddress {
-                addr: lhs_addr,
-                invalidation: lhs_invalidation,
-                access_location: lhs_access_location,
-                trace_access_location: None,
-                access_history: lhs_access_history,
-                invalidation_history: lhs_invalidation_history,
-                ..
-            },
-            Diagnostic::AccessToInvalidAddress {
-                addr: rhs_addr,
-                invalidation: rhs_invalidation,
-                access_location: rhs_access_location,
-                trace_access_location: None,
-                access_history: rhs_access_history,
-                invalidation_history: rhs_invalidation_history,
-                ..
-            },
+            Diagnostic::AccessToInvalidAddress { addr: lhs_addr, .. },
+            Diagnostic::AccessToInvalidAddress { addr: rhs_addr, .. },
         ) => {
             eq_canonical_with_value(lhs_canon, *lhs_addr, rhs_canon, *rhs_addr)
-                && lhs_invalidation == rhs_invalidation
-                && lhs_access_location == rhs_access_location
-                && lhs_access_history == rhs_access_history
-                && lhs_invalidation_history == rhs_invalidation_history
+                && must_be_valid_reason(lhs_state, *lhs_addr)
+                    == must_be_valid_reason(rhs_state, *rhs_addr)
         }
         _ => diagnostics_compatible(lhs, rhs),
     }
