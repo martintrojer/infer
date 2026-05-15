@@ -849,14 +849,6 @@ struct AliasConflict {
     other_callee_addr: AbstractValue,
 }
 
-#[derive(Default)]
-struct CallerAliasRoots {
-    // Callee roots that have their own heap cell in the summary pre.
-    pre_backed: HashMap<AbstractValue, Option<HeapPath>>,
-    // Callee roots that have their own heap cell in the summary post.
-    post_backed: HashMap<AbstractValue, Option<HeapPath>>,
-}
-
 struct AliasingCheck<'a> {
     callee_pre: &'a crate::base_domain::BaseDomain,
     callee_post: &'a AbductiveDomain,
@@ -904,106 +896,206 @@ fn canonicalize_alias_groups(mut groups: Vec<Vec<HeapPath>>) -> Vec<Vec<HeapPath
     groups
 }
 
-fn record_conflicting_paths(
-    seen: &HashMap<AbstractValue, Option<HeapPath>>,
-    caller_repr: AbstractValue,
+fn add_alias_group(
+    alias_groups: &mut HashMap<HeapPath, HashSet<HeapPath>>,
+    current_head: &HeapPath,
+    new_elem: &HeapPath,
+) {
+    alias_groups
+        .entry(current_head.clone())
+        .or_default()
+        .insert(new_elem.clone());
+}
+
+fn sorted_alias_groups_from_ocaml_map(
+    alias_groups: HashMap<HeapPath, HashSet<HeapPath>>,
+) -> Vec<Vec<HeapPath>> {
+    canonicalize_alias_groups(
+        alias_groups
+            .into_iter()
+            .map(|(head, mut elems)| {
+                elems.insert(head);
+                elems.into_iter().collect()
+            })
+            .collect(),
+    )
+}
+
+fn subst_get_canonical(
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    caller_state: &AbductiveDomain,
     callee_addr: AbstractValue,
-    current_path: Option<&HeapPath>,
-    alias_groups: &mut HashMap<AbstractValue, HashSet<HeapPath>>,
-    first_conflict: &mut Option<AliasConflict>,
+) -> Option<AbstractValue> {
+    subst
+        .get(&callee_addr)
+        .copied()
+        .map(|caller_addr| caller_state.get_var_repr(caller_addr))
+}
+
+fn rev_subst_insert_canonical(
+    rev_subst: &mut HashMap<AbstractValue, (AbstractValue, Option<HeapPath>)>,
+    subst: &HashMap<AbstractValue, AbstractValue>,
+    caller_state: &AbductiveDomain,
+    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    callee_addr: AbstractValue,
+    path: Option<HeapPath>,
+) {
+    if formal_stack_addrs.contains(&callee_addr) {
+        return;
+    }
+    if let Some(caller_addr) = subst_get_canonical(subst, caller_state, callee_addr) {
+        rev_subst.insert(caller_addr, (callee_addr, path));
+    }
+}
+
+fn canonicalize_rev_subst(
+    rev_subst: &mut HashMap<AbstractValue, (AbstractValue, Option<HeapPath>)>,
+    caller_state: &AbductiveDomain,
+) {
+    let entries: Vec<_> = rev_subst
+        .drain()
+        .map(|(caller_addr, callee_and_path)| {
+            (caller_state.get_var_repr(caller_addr), callee_and_path)
+        })
+        .collect();
+    for (caller_repr, callee_and_path) in entries {
+        rev_subst.entry(caller_repr).or_insert(callee_and_path);
+    }
+}
+
+fn apply_aliasing_arith(
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    rev_subst: &mut HashMap<AbstractValue, (AbstractValue, Option<HeapPath>)>,
+    callee_heap_paths: &HashMap<AbstractValue, Option<HeapPath>>,
+    caller_state: &mut AbductiveDomain,
+    formal_stack_addrs: &std::collections::HashSet<AbstractValue>,
+    callee_addr: AbstractValue,
+    caller_addr: AbstractValue,
 ) -> Result<(), AliasConflict> {
-    for (&other_callee_addr, other_path) in seen {
-        if other_callee_addr == callee_addr {
-            continue;
-        }
-        let conflict = AliasConflict {
-            caller_addr: caller_repr,
-            callee_addr,
-            other_callee_addr,
-        };
-        first_conflict.get_or_insert(conflict);
-        match (current_path, other_path.as_ref()) {
-            (Some(current_path), Some(other_path)) => {
-                let group = alias_groups.entry(caller_repr).or_default();
-                group.insert(current_path.clone());
-                group.insert(other_path.clone());
+    match subst_get_canonical(subst, caller_state, callee_addr) {
+        Some(existing) if existing != caller_addr => {
+            if caller_state.and_equal(existing, caller_addr).is_unsat() {
+                return Err(AliasConflict {
+                    caller_addr,
+                    callee_addr,
+                    other_callee_addr: callee_addr,
+                });
             }
-            _ => return Err(conflict),
+            canonicalize_rev_subst(rev_subst, caller_state);
+        }
+        Some(_) => {}
+        None => {
+            subst.insert(callee_addr, caller_addr);
+            rev_subst_insert_canonical(
+                rev_subst,
+                subst,
+                caller_state,
+                formal_stack_addrs,
+                callee_addr,
+                callee_heap_paths.get(&callee_addr).cloned().flatten(),
+            );
         }
     }
     Ok(())
 }
 
-/// Detect when multiple distinct callee heap roots collapse onto the same
-/// caller representative.
+/// Visit one callee address during pre-materialization.
 ///
-/// Cross-ref: OCaml `PulseInterproc.visit` records alias groups in
-/// `call_state.aliases` and `apply_summary` rejects the unspecialized summary
-/// with `AliasingWithAllAliases`. The Rust port keeps the check smaller: once
-/// two distinct callee addresses that both own heap structure in the same
-/// summary phase (pre or post) map to one caller representative, we reject the
-/// unspecialized pre/post and let higher-level specialization logic handle the
-/// aliased call.
-///
-/// The tracking is keyed by the caller representative rather than traversal
-/// order so the result stays deterministic even when the initial substitution
-/// is explored in a different order.
-fn find_aliasing_contradiction(
+/// Cross-ref: OCaml `PulseInterproc.visit`. In addition to the callee→caller
+/// substitution, keep the caller→callee reverse substitution keyed by caller
+/// representatives. When two different callee heap roots resolve to the same
+/// caller representative and both are heap-backed in the same summary phase,
+/// record a supported heap-path alias group and stop traversing the duplicate
+/// root. Unsupported paths still produce the smaller aliasing contradiction
+/// pruning introduced for canonical heap aliases.
+#[allow(clippy::too_many_arguments)]
+fn visit_pre_address(
     aliasing: &AliasingCheck<'_>,
-    caller_alias_roots: &mut HashMap<AbstractValue, CallerAliasRoots>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    rev_subst: &mut HashMap<AbstractValue, (AbstractValue, Option<HeapPath>)>,
     callee_heap_paths: &HashMap<AbstractValue, Option<HeapPath>>,
-    alias_groups: &mut HashMap<AbstractValue, HashSet<HeapPath>>,
+    alias_groups: &mut HashMap<HeapPath, HashSet<HeapPath>>,
     first_conflict: &mut Option<AliasConflict>,
-    caller_repr: AbstractValue,
+    visited: &mut HashSet<AbstractValue>,
+    caller_state: &mut AbductiveDomain,
     callee_addr: AbstractValue,
-) -> Result<(), AliasConflict> {
+    caller_addr: AbstractValue,
+) -> Result<bool, AliasConflict> {
     if aliasing.formal_stack_addrs.contains(&callee_addr) {
-        return Ok(());
-    }
-
-    let in_pre = callee_heap_contains(&aliasing.callee_pre.heap, callee_addr);
-    let in_post = callee_heap_contains(&aliasing.callee_post.post.heap, callee_addr);
-    if !in_pre && !in_post {
-        // OCaml only raises the alias contradiction when the aliased callee
-        // values are meaningful heap roots in the summary; otherwise equality
-        // can be handled as normal caller-side aliasing.
-        return Ok(());
-    }
-
-    let seen = caller_alias_roots.entry(caller_repr).or_default();
-    let current_path = callee_heap_paths
-        .get(&callee_addr)
-        .and_then(|path| path.as_ref());
-
-    if in_pre {
-        record_conflicting_paths(
-            &seen.pre_backed,
-            caller_repr,
+        apply_aliasing_arith(
+            subst,
+            rev_subst,
+            callee_heap_paths,
+            caller_state,
+            aliasing.formal_stack_addrs,
             callee_addr,
-            current_path,
-            alias_groups,
-            first_conflict,
+            caller_addr,
         )?;
-        seen.pre_backed
-            .entry(callee_addr)
-            .or_insert_with(|| current_path.cloned());
+        return Ok(visited.insert(callee_addr));
     }
 
-    if in_post {
-        record_conflicting_paths(
-            &seen.post_backed,
-            caller_repr,
+    let caller_repr = caller_state.get_var_repr(caller_addr);
+    if let Some((other_callee_addr, other_path)) = rev_subst.get(&caller_repr).cloned() {
+        if other_callee_addr != callee_addr {
+            let callee_in_pre = callee_heap_contains(&aliasing.callee_pre.heap, callee_addr);
+            let other_in_pre = callee_heap_contains(&aliasing.callee_pre.heap, other_callee_addr);
+            let callee_in_post = callee_heap_contains(&aliasing.callee_post.post.heap, callee_addr);
+            let other_in_post =
+                callee_heap_contains(&aliasing.callee_post.post.heap, other_callee_addr);
+            if (callee_in_pre && other_in_pre) || (callee_in_post && other_in_post) {
+                let conflict = AliasConflict {
+                    caller_addr: caller_repr,
+                    callee_addr,
+                    other_callee_addr,
+                };
+                first_conflict.get_or_insert(conflict);
+                let current_path = callee_heap_paths
+                    .get(&callee_addr)
+                    .and_then(|path| path.as_ref());
+                match (current_path, other_path.as_ref()) {
+                    (Some(current_path), Some(other_path)) => {
+                        add_alias_group(alias_groups, other_path, current_path);
+                        return Ok(false);
+                    }
+                    _ => return Err(conflict),
+                }
+            }
+
+            apply_aliasing_arith(
+                subst,
+                rev_subst,
+                callee_heap_paths,
+                caller_state,
+                aliasing.formal_stack_addrs,
+                other_callee_addr,
+                caller_repr,
+            )?;
+        }
+    }
+
+    apply_aliasing_arith(
+        subst,
+        rev_subst,
+        callee_heap_paths,
+        caller_state,
+        aliasing.formal_stack_addrs,
+        callee_addr,
+        caller_addr,
+    )?;
+
+    if visited.insert(callee_addr) {
+        rev_subst_insert_canonical(
+            rev_subst,
+            subst,
+            caller_state,
+            aliasing.formal_stack_addrs,
             callee_addr,
-            current_path,
-            alias_groups,
-            first_conflict,
-        )?;
-        seen.post_backed
-            .entry(callee_addr)
-            .or_insert_with(|| current_path.cloned());
+            callee_heap_paths.get(&callee_addr).cloned().flatten(),
+        );
+        Ok(true)
+    } else {
+        Ok(false)
     }
-
-    Ok(())
 }
 
 fn materialize_pre(
@@ -1021,8 +1113,8 @@ fn materialize_pre(
         loc,
     } = ctx;
     let mut visited = std::collections::HashSet::new();
-    let mut caller_alias_roots: HashMap<AbstractValue, CallerAliasRoots> = HashMap::new();
-    let mut alias_groups: HashMap<AbstractValue, HashSet<HeapPath>> = HashMap::new();
+    let mut rev_subst = HashMap::new();
+    let mut alias_groups: HashMap<HeapPath, HashSet<HeapPath>> = HashMap::new();
     let mut first_alias_conflict = None;
     let aliasing = AliasingCheck {
         callee_pre,
@@ -1037,28 +1129,32 @@ fn materialize_pre(
     let mut first_error: Option<Box<crate::diagnostic::Diagnostic>> = None;
 
     while let Some(callee_addr) = worklist.pop() {
-        if !visited.insert(callee_addr) {
-            continue;
-        }
-
         let caller_addr = resolve_mut(subst, callee_addr);
-        let caller_repr = caller_state.get_var_repr(caller_addr);
-        record_cell_id_history(callee_pre, callee_addr, caller_addr, caller_state, hist_map);
-        if let Err(conflict) = find_aliasing_contradiction(
+        let should_visit = match visit_pre_address(
             &aliasing,
-            &mut caller_alias_roots,
+            subst,
+            &mut rev_subst,
             callee_heap_paths,
             &mut alias_groups,
             &mut first_alias_conflict,
-            caller_repr,
+            &mut visited,
+            caller_state,
             callee_addr,
+            caller_addr,
         ) {
-            return PreMaterializeResult::AliasingContradiction {
-                caller_addr: conflict.caller_addr,
-                callee_addr: conflict.callee_addr,
-                other_callee_addr: conflict.other_callee_addr,
-                alias_groups: None,
-            };
+            Ok(should_visit) => should_visit,
+            Err(conflict) => {
+                return PreMaterializeResult::AliasingContradiction {
+                    caller_addr: conflict.caller_addr,
+                    callee_addr: conflict.callee_addr,
+                    other_callee_addr: conflict.other_callee_addr,
+                    alias_groups: None,
+                };
+            }
+        };
+        record_cell_id_history(callee_pre, callee_addr, caller_addr, caller_state, hist_map);
+        if !should_visit {
+            continue;
         }
 
         let callee_pre_attrs = callee_pre.attrs.get(&callee_addr);
@@ -1144,7 +1240,6 @@ fn materialize_pre(
                 callee_heap_paths
                     .entry(*callee_target)
                     .or_insert(child_path);
-
                 if !visited.contains(callee_target) {
                     worklist.push(*callee_target);
                 }
@@ -1153,12 +1248,7 @@ fn materialize_pre(
     }
 
     if !alias_groups.is_empty() {
-        let alias_groups = canonicalize_alias_groups(
-            alias_groups
-                .into_values()
-                .map(|group| group.into_iter().collect())
-                .collect(),
-        );
+        let alias_groups = sorted_alias_groups_from_ocaml_map(alias_groups);
         if !alias_groups.is_empty() {
             let conflict = first_alias_conflict.expect("alias groups should have a first conflict");
             return PreMaterializeResult::AliasingContradiction {
@@ -2878,6 +2968,93 @@ mod tests {
                 format!(
                     "{}",
                     HeapPath::FieldAccess(next_field.clone(), Box::new(pvar_heap_path(&p_pvar)))
+                )
+            ]]
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_reports_all_heap_path_alias_specializations() {
+        let node_struct = sil::typ::TypeName::CStruct(QualifiedCppName::from_string("node"));
+        let next_field = Fieldname::make(node_struct.clone(), "next");
+        let prev_field = Fieldname::make(node_struct, "prev");
+
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        let next_val = callee_state.read_heap(p_val, Access::FieldAccess(next_field.clone()));
+        let prev_val = callee_state.read_heap(p_val, Access::FieldAccess(prev_field.clone()));
+        callee_state.read_heap(next_val, Access::Dereference);
+        callee_state.read_heap(prev_val, Access::Dereference);
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(p_pvar.clone(), p_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let x_addr = AbstractValue::mk_fresh();
+        caller_state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(x_pvar.clone())), x_addr);
+        caller_state
+            .post
+            .heap
+            .add_edge(x_addr, Access::FieldAccess(next_field.clone()), x_addr);
+        caller_state
+            .post
+            .heap
+            .add_edge(x_addr, Access::FieldAccess(prev_field.clone()), x_addr);
+
+        let outcome = apply_summary_with_aliasing(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Lvar(x_pvar), Typ::mk_ptr(Typ::void()))],
+            &Location::dummy(),
+            caller_state,
+            false,
+        );
+
+        let alias_groups = outcome
+            .alias_specialization
+            .expect("all supported heap-path aliases should request specialization");
+        let alias_groups: Vec<Vec<String>> = alias_groups
+            .into_iter()
+            .map(|group| group.into_iter().map(|path| format!("{path}")).collect())
+            .collect();
+        assert_eq!(
+            alias_groups,
+            vec![vec![
+                format!("{}", pvar_heap_path(&p_pvar)),
+                format!(
+                    "{}",
+                    HeapPath::FieldAccess(next_field, Box::new(pvar_heap_path(&p_pvar)))
+                ),
+                format!(
+                    "{}",
+                    HeapPath::FieldAccess(prev_field, Box::new(pvar_heap_path(&p_pvar)))
                 )
             ]]
         );
