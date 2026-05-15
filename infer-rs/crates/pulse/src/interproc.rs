@@ -11,7 +11,7 @@
 //! `apply_summary` maps the callee's effects (heap writes, invalidations,
 //! constraints) into the caller's abstract state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sil::exp::Exp;
 use sil::ident::Ident;
@@ -32,7 +32,7 @@ use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
 use crate::operations;
 use crate::summary::PrePost;
-use crate::value_history::{HistoryEvent, ValueHistory};
+use crate::value_history::{CellId, HistoryEvent, ValueHistory};
 
 #[derive(Debug, Default)]
 pub(crate) struct ApplySummaryOutcome {
@@ -88,8 +88,8 @@ pub(crate) fn apply_summary_with_aliasing(
     let mut callee_heap_paths: HashMap<AbstractValue, Option<HeapPath>> = HashMap::new();
     let mut value_actual_formal_stack_addrs = std::collections::HashSet::new();
     let mut callee_actual_value_addrs = std::collections::HashSet::new();
-    let mut formal_histories: std::collections::BTreeMap<Pvar, ValueHistory> =
-        std::collections::BTreeMap::new();
+    let mut formal_histories: BTreeMap<Pvar, ValueHistory> = BTreeMap::new();
+    let mut hist_map: BTreeMap<CellId, ValueHistory> = BTreeMap::new();
 
     for (i, (formal_pvar, formal_addr)) in pre_post.formals.iter().enumerate() {
         if let Some((actual_exp, _typ)) = actuals.get(i) {
@@ -190,6 +190,7 @@ pub(crate) fn apply_summary_with_aliasing(
             value_actual_formal_stack_addrs: &value_actual_formal_stack_addrs,
             subst: &mut subst,
             callee_heap_paths: &mut callee_heap_paths,
+            hist_map: &mut hist_map,
             caller_state: &mut caller_state,
             loc,
         },
@@ -316,6 +317,9 @@ pub(crate) fn apply_summary_with_aliasing(
                 post_edges,
                 &mut subst,
                 &callee_actual_value_addrs,
+                &hist_map,
+                callee_procname.as_ref(),
+                loc,
                 &mut caller_state,
             );
         }
@@ -341,6 +345,9 @@ pub(crate) fn apply_summary_with_aliasing(
             Some(post_edges),
             &mut subst,
             &callee_actual_value_addrs,
+            &hist_map,
+            callee_procname.as_ref(),
+            loc,
             &mut caller_state,
         );
     }
@@ -356,8 +363,12 @@ pub(crate) fn apply_summary_with_aliasing(
         let ret_history = pre_post
             .post
             .history_of_value(*ret_addr)
-            .map(|history| history.map_formals(&formal_histories))
+            .map(|history| {
+                restore_history_from_cell_ids(&history, &hist_map)
+                    .unwrap_or_else(|| history.map_formals(&formal_histories))
+            })
             .unwrap_or_else(|| ValueHistory::assignment(loc.clone()));
+        let ret_history = wrap_imported_history(ret_history, callee_procname.as_ref(), loc);
         operations::write_id_with_history(
             ret_id,
             crate::value_history::ValueWithHistory::new(caller_ret, ret_history),
@@ -393,10 +404,10 @@ pub(crate) fn apply_summary_with_aliasing(
             &caller_state,
         );
         for attr in attrs.iter() {
-            caller_state.post.attrs.add_one(
-                caller_addr,
-                translate_attribute(&mut subst, attr, callee_procname.as_ref(), Some(loc)),
-            );
+            caller_state
+                .post
+                .attrs
+                .add_one(caller_addr, translate_attribute(&mut subst, attr));
         }
     }
 
@@ -859,6 +870,7 @@ struct MaterializePreContext<'a> {
     value_actual_formal_stack_addrs: &'a std::collections::HashSet<AbstractValue>,
     subst: &'a mut HashMap<AbstractValue, AbstractValue>,
     callee_heap_paths: &'a mut HashMap<AbstractValue, Option<HeapPath>>,
+    hist_map: &'a mut BTreeMap<CellId, ValueHistory>,
     caller_state: &'a mut AbductiveDomain,
     loc: &'a Location,
 }
@@ -1037,6 +1049,7 @@ fn materialize_pre(
         value_actual_formal_stack_addrs,
         subst,
         callee_heap_paths,
+        hist_map,
         caller_state,
         loc,
     } = ctx;
@@ -1063,6 +1076,7 @@ fn materialize_pre(
 
         let caller_addr = resolve_mut(subst, callee_addr);
         let caller_repr = caller_state.get_var_repr(caller_addr);
+        record_cell_id_history(callee_pre, callee_addr, caller_addr, caller_state, hist_map);
         if let Err(conflict) = find_aliasing_contradiction(
             &aliasing,
             &mut caller_alias_roots,
@@ -1293,7 +1307,7 @@ fn import_callee_pre_attributes(
             caller_state
                 .pre
                 .attrs
-                .add_one(caller_addr, translate_attribute(subst, attr, None, None));
+                .add_one(caller_addr, translate_attribute(subst, attr));
         }
     }
 }
@@ -1321,12 +1335,16 @@ fn callee_cell_is_read_only(
         .is_some_and(|attrs| attrs.iter().any(Attribute::is_modified))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_post_cell(
     caller_addr: AbstractValue,
     pre_edges_opt: Option<&crate::base_memory::Edges>,
     post_edges_opt: Option<&crate::base_memory::Edges>,
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    hist_map: &BTreeMap<CellId, ValueHistory>,
+    callee_procname: Option<&Procname>,
+    loc: &Location,
     caller_state: &mut AbductiveDomain,
 ) {
     let mut caller_edges = caller_state
@@ -1344,19 +1362,77 @@ fn apply_post_cell(
     }
 
     if let Some(post_edges) = post_edges_opt {
-        for (access, callee_target) in post_edges.iter() {
+        for (access, callee_value) in post_edges.iter_with_history() {
             let caller_target = resolve_for_post(
                 subst,
-                *callee_target,
+                callee_value.addr,
                 callee_actual_value_addrs,
                 caller_state,
             );
             let caller_access = translate_access(subst, access, caller_state);
-            caller_edges.add(caller_access, caller_target);
+            let history = restore_history_from_cell_ids(&callee_value.history, hist_map)
+                .unwrap_or_else(|| {
+                    caller_state
+                        .history_of_value(caller_target)
+                        .unwrap_or_else(|| ValueHistory::assignment(loc.clone()))
+                });
+            caller_edges.add_with_history(
+                caller_access,
+                crate::value_history::ValueWithHistory::new(
+                    caller_target,
+                    wrap_imported_history(history, callee_procname, loc),
+                ),
+            );
         }
     }
 
     caller_state.post.heap.set_edges(caller_addr, caller_edges);
+}
+
+fn record_cell_id_history(
+    callee_pre: &crate::base_domain::BaseDomain,
+    callee_addr: AbstractValue,
+    caller_addr: AbstractValue,
+    caller_state: &AbductiveDomain,
+    hist_map: &mut BTreeMap<CellId, ValueHistory>,
+) {
+    let Some(history) = callee_pre
+        .history_of_value(callee_addr)
+        .or_else(|| callee_pre.history_of_heap_value(callee_addr))
+    else {
+        return;
+    };
+    let Some(cell_ids) = history.get_cell_ids() else {
+        return;
+    };
+    let caller_history = caller_state
+        .history_of_value(caller_addr)
+        .unwrap_or_else(ValueHistory::epoch);
+    for cell_id in cell_ids {
+        hist_map
+            .entry(*cell_id)
+            .or_insert_with(|| caller_history.clone());
+    }
+}
+
+fn restore_history_from_cell_ids(
+    history: &ValueHistory,
+    hist_map: &BTreeMap<CellId, ValueHistory>,
+) -> Option<ValueHistory> {
+    history
+        .get_cell_ids()
+        .and_then(|cell_ids| ValueHistory::of_cell_ids_in_map(hist_map, cell_ids))
+}
+
+fn wrap_imported_history(
+    history: ValueHistory,
+    callee_procname: Option<&Procname>,
+    loc: &Location,
+) -> ValueHistory {
+    match callee_procname {
+        Some(procname) => history.wrap_call(procname, loc),
+        None => history,
+    }
 }
 
 fn canonicalize_imported_actual_value(
@@ -1852,19 +1928,13 @@ fn translate_access(
 fn translate_attribute(
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     attr: &Attribute,
-    callee_procname: Option<&Procname>,
-    loc: Option<&Location>,
 ) -> Attribute {
     match attr {
         Attribute::ReturnedFromUnknown(values) => {
             Attribute::ReturnedFromUnknown(values.iter().map(|v| resolve_mut(subst, *v)).collect())
         }
         Attribute::Invalid(invalidation, history) => {
-            let history = match (callee_procname, loc) {
-                (Some(proc_name), Some(loc)) => history.wrap_call(proc_name, loc),
-                _ => history.clone(),
-            };
-            Attribute::Invalid(invalidation.clone(), history)
+            Attribute::Invalid(invalidation.clone(), history.clone())
         }
         other => other.clone(),
     }
@@ -1884,6 +1954,14 @@ mod tests {
     use sil::pvar::Pvar;
     use sil::qualified_cpp_name::QualifiedCppName;
     use sil::var::Var;
+
+    fn loc(line: i32) -> Location {
+        Location {
+            line,
+            col: 0,
+            ..Location::dummy()
+        }
+    }
 
     fn invalidation_history(invalidation: &crate::invalidation::Invalidation) -> ValueHistory {
         ValueHistory::invalidated(invalidation.clone(), Location::dummy())
@@ -2634,6 +2712,126 @@ mod tests {
         } else {
             panic!("summary should still apply when only one aliased formal is heap-backed");
         }
+    }
+
+    #[test]
+    fn test_apply_summary_restores_post_edge_history_from_callee_pre_cell_id() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), loc(1));
+        callee_pdesc.formals = vec![
+            (
+                Mangled::from_string("p"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+            (
+                Mangled::from_string("q"),
+                Typ::mk_ptr(Typ::void()),
+                Default::default(),
+            ),
+        ];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname.clone());
+        let q_pvar = Pvar::mk(Mangled::from_string("q"), callee_pname.clone());
+        let p_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .unwrap();
+        let q_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(q_pvar.clone())))
+            .unwrap();
+        let p_val = callee_state.read_heap(p_addr, Access::Dereference);
+        let q_val = callee_state.read_heap(q_addr, Access::Dereference);
+        let q_pointee = callee_state.read_heap(q_val, Access::Dereference);
+        let out_slot = callee_state.read_heap(p_val, Access::Dereference);
+        let q_pointee_history = callee_state
+            .post
+            .history_of_value(q_pointee)
+            .expect("callee pre read should carry a cell id in post history");
+        assert!(
+            q_pointee_history.get_cell_ids().is_some(),
+            "callee pre read should be tagged with a bounded cell id"
+        );
+        callee_state.write_heap_with_history(
+            out_slot,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(q_pointee, q_pointee_history),
+        );
+        callee_state.post.attrs.mark_written_to(out_slot, 0, loc(2));
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(p_pvar, p_addr), (q_pvar, q_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), loc(10));
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let out_actual_pvar = Pvar::mk(Mangled::from_string("out"), caller_pname.clone());
+        let src_actual_pvar = Pvar::mk(Mangled::from_string("src"), caller_pname.clone());
+        let out_actual = AbstractValue::mk_fresh();
+        let src_actual = AbstractValue::mk_fresh();
+        caller_state.post.stack.add(
+            Var::ProgramVar(Box::new(out_actual_pvar.clone())),
+            out_actual,
+        );
+        caller_state.post.stack.add(
+            Var::ProgramVar(Box::new(src_actual_pvar.clone())),
+            src_actual,
+        );
+        let out_pointee = AbstractValue::mk_fresh();
+        let src_pointee = AbstractValue::mk_fresh();
+        let src_history = ValueHistory::assignment(loc(99));
+        caller_state.pre.heap.register_address(out_actual);
+        caller_state.pre.heap.register_address(src_actual);
+        caller_state
+            .post
+            .heap
+            .add_edge(out_actual, Access::Dereference, out_pointee);
+        caller_state.post.heap.add_edge_with_history(
+            src_actual,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(src_pointee, src_history.clone()),
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[
+                (Exp::Lvar(out_actual_pvar), Typ::mk_ptr(Typ::void())),
+                (Exp::Lvar(src_actual_pvar), Typ::mk_ptr(Typ::void())),
+            ],
+            &loc(42),
+            caller_state,
+        );
+
+        let ExecutionDomain::ContinueProgram(state) = &results[0] else {
+            panic!("expected continue result, got {results:?}");
+        };
+        let written = state
+            .post
+            .heap
+            .find_edge_with_history(out_pointee, &Access::Dereference)
+            .expect("callee post edge should be replayed into caller");
+        assert_eq!(written.addr, src_pointee);
+        assert!(
+            written.history.signature().contains("assign@:99:0"),
+            "post edge history should be restored from the caller source cell, got {}",
+            written.history.signature()
+        );
+        assert!(
+            written.history.signature().contains("call callee@:42:0"),
+            "restored history should still be wrapped in the callee call, got {}",
+            written.history.signature()
+        );
     }
 
     #[test]

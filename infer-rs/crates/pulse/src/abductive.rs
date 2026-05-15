@@ -30,7 +30,19 @@ use crate::formula::lin_arith::LinArith;
 use crate::formula::{Formula, NewEq, Operand};
 use crate::invalidation::Invalidation;
 use crate::sat_unsat::SatUnsat;
-use crate::value_history::{ValueHistory, ValueWithHistory};
+use crate::value_history::{CellId, ValueHistory, ValueWithHistory};
+
+thread_local! {
+    static NEXT_VALUE_HISTORY_CELL_ID: std::cell::Cell<CellId> = const { std::cell::Cell::new(1) };
+}
+
+fn fresh_value_history_cell_id() -> CellId {
+    NEXT_VALUE_HISTORY_CELL_ID.with(|counter| {
+        let id = counter.get();
+        counter.set(id.saturating_add(1));
+        id
+    })
+}
 
 /// The abductive domain: pre-state + post-state + path condition.
 ///
@@ -463,7 +475,17 @@ impl AbductiveDomain {
         }
 
         let target = AbstractValue::mk_fresh();
-        let value = ValueWithHistory::new(target, src.history.clone());
+        let src_addr = self.path_condition.get_var_repr(src.addr);
+        let (post_history, pre_history) = if self.pre.heap.get_edges(src_addr).is_some() {
+            let cell_id = fresh_value_history_cell_id();
+            (
+                src.history.with_cell_id(cell_id),
+                ValueHistory::epoch().with_cell_id(cell_id),
+            )
+        } else {
+            (src.history.clone(), src.history.clone())
+        };
+        let value = ValueWithHistory::new(target, post_history);
         self.post
             .heap
             .add_edge_with_history(src.addr, access.clone(), value.clone());
@@ -471,10 +493,12 @@ impl AbductiveDomain {
         // Mirror OCaml's SafeMemory.eval_edge: only abduce reads rooted in the
         // existing pre-state, and never overwrite the original pre-edge on
         // subsequent reads after the post-state has diverged.
-        if self.pre.heap.get_edges(src.addr).is_some() {
-            self.pre
-                .heap
-                .add_edge_with_history(src.addr, access, value.clone());
+        if self.pre.heap.get_edges(src_addr).is_some() {
+            self.pre.heap.add_edge_with_history(
+                src_addr,
+                access,
+                ValueWithHistory::new(target, pre_history),
+            );
             self.pre.heap.register_address(target);
         }
 

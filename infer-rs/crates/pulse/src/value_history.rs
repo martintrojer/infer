@@ -33,6 +33,17 @@ use crate::invalidation::Invalidation;
 /// path.
 const MAX_MERGED_HISTORY_PATHS: usize = 2;
 const MAX_HISTORY_EVENTS_PER_PATH: usize = 8;
+const MAX_CELL_IDS_PER_HISTORY: usize = 8;
+
+/// Opaque callee-pre memory-cell provenance marker.
+///
+/// Cross-ref: OCaml `PulseValueHistory.CellId`. When a read abduces a fresh
+/// pre edge, the target history is tagged with a cell id. During summary
+/// application, pre-materialization records `cell_id -> caller history` so
+/// replaying post edges and return values can recover the caller-side
+/// provenance of the precise pre cell even if several callee values share one
+/// substitution address.
+pub type CellId = u64;
 
 /// One step in a value's provenance path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -292,6 +303,19 @@ fn cap_merged_paths(mut paths: BTreeSet<Arc<HistoryPath>>) -> BTreeSet<Arc<Histo
     candidates.into_iter().collect()
 }
 
+fn cap_cell_ids(mut cell_ids: BTreeSet<CellId>) -> BTreeSet<CellId> {
+    if cell_ids.len() <= MAX_CELL_IDS_PER_HISTORY {
+        return cell_ids;
+    }
+
+    let first_retained = cell_ids
+        .iter()
+        .copied()
+        .nth(cell_ids.len() - MAX_CELL_IDS_PER_HISTORY)
+        .expect("oversized cell id set should be non-empty");
+    cell_ids.split_off(&first_retained)
+}
+
 impl fmt::Display for HistoryPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, event) in self.0.iter().enumerate() {
@@ -330,31 +354,58 @@ impl fmt::Display for HistoryPath {
 /// of materializing fresh copies of their event lists, so Rust should not deep
 /// clone every `HistoryPath` just to union two provenance sets.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ValueHistory(Arc<BTreeSet<Arc<HistoryPath>>>);
+pub struct ValueHistory {
+    cell_ids: Arc<BTreeSet<CellId>>,
+    paths: Arc<BTreeSet<Arc<HistoryPath>>>,
+}
 
 impl Clone for ValueHistory {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        Self {
+            cell_ids: Arc::clone(&self.cell_ids),
+            paths: Arc::clone(&self.paths),
+        }
     }
+}
+
+#[derive(Serialize)]
+struct ValueHistorySerde<'a> {
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    cell_ids: &'a BTreeSet<CellId>,
+    paths: Vec<&'a HistoryPath>,
 }
 
 impl Serialize for ValueHistory {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0
-            .iter()
-            .map(Arc::as_ref)
-            .collect::<Vec<_>>()
-            .serialize(serializer)
+        ValueHistorySerde {
+            cell_ids: &self.cell_ids,
+            paths: self.paths.iter().map(Arc::as_ref).collect(),
+        }
+        .serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for ValueHistory {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let paths = BTreeSet::<HistoryPath>::deserialize(deserializer)?
-            .into_iter()
-            .map(Arc::new)
-            .collect();
-        Ok(Self(Arc::new(paths)))
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Current {
+                #[serde(default)]
+                cell_ids: BTreeSet<CellId>,
+                paths: Vec<HistoryPath>,
+            },
+            Legacy(Vec<HistoryPath>),
+        }
+
+        let (cell_ids, paths) = match Repr::deserialize(deserializer)? {
+            Repr::Current { cell_ids, paths } => (cell_ids, paths),
+            Repr::Legacy(paths) => (BTreeSet::new(), paths),
+        };
+        Ok(Self::from_raw_parts(
+            cell_ids,
+            paths.into_iter().map(Arc::new).collect(),
+        ))
     }
 }
 
@@ -365,16 +416,30 @@ impl Default for ValueHistory {
 }
 
 impl ValueHistory {
+    fn from_raw_parts(cell_ids: BTreeSet<CellId>, paths: BTreeSet<Arc<HistoryPath>>) -> Self {
+        Self {
+            cell_ids: Arc::new(cap_cell_ids(cell_ids)),
+            paths: Arc::new(cap_merged_paths(paths)),
+        }
+    }
+
+    fn from_paths(paths: BTreeSet<Arc<HistoryPath>>) -> Self {
+        Self {
+            cell_ids: Arc::new(BTreeSet::new()),
+            paths: Arc::new(paths),
+        }
+    }
+
     pub fn epoch() -> Self {
         let mut paths = BTreeSet::new();
         paths.insert(Arc::new(HistoryPath::empty()));
-        Self(Arc::new(paths))
+        Self::from_paths(paths)
     }
 
     pub fn from_event(event: HistoryEvent) -> Self {
         let mut paths = BTreeSet::new();
         paths.insert(Arc::new(HistoryPath::new_capped(vec![event])));
-        Self(Arc::new(paths))
+        Self::from_paths(paths)
     }
 
     pub fn formal_argument(pvar: Pvar) -> Self {
@@ -400,26 +465,64 @@ impl ValueHistory {
         })
     }
 
+    pub fn from_cell_id(cell_id: CellId, history: &Self) -> Self {
+        let mut cell_ids = history.cell_ids.as_ref().clone();
+        cell_ids.insert(cell_id);
+        Self {
+            cell_ids: Arc::new(cap_cell_ids(cell_ids)),
+            paths: Arc::clone(&history.paths),
+        }
+    }
+
+    pub fn with_cell_id(&self, cell_id: CellId) -> Self {
+        Self::from_cell_id(cell_id, self)
+    }
+
+    pub fn get_cell_ids(&self) -> Option<&BTreeSet<CellId>> {
+        (!self.cell_ids.is_empty()).then_some(self.cell_ids.as_ref())
+    }
+
+    pub fn of_cell_ids_in_map(
+        hist_map: &std::collections::BTreeMap<CellId, ValueHistory>,
+        cell_ids: &BTreeSet<CellId>,
+    ) -> Option<Self> {
+        let mut histories = cell_ids.iter().filter_map(|cell_id| hist_map.get(cell_id));
+        let first = histories.next()?.clone();
+        Some(histories.fold(first, |acc, history| acc.merge_owned(history)))
+    }
+
     pub fn is_epoch(&self) -> bool {
-        self.0.len() == 1 && self.0.iter().next().is_some_and(|path| path.0.is_empty())
+        self.cell_ids.is_empty()
+            && self.paths.len() == 1
+            && self
+                .paths
+                .iter()
+                .next()
+                .is_some_and(|path| path.0.is_empty())
     }
 
     pub fn append_event(&self, event: HistoryEvent) -> Self {
         let paths = self
-            .0
+            .paths
             .iter()
             .map(|path| Arc::new(path.append(event.clone())))
             .collect();
-        Self(Arc::new(paths))
+        Self {
+            cell_ids: Arc::clone(&self.cell_ids),
+            paths: Arc::new(paths),
+        }
     }
 
     pub fn prepend_event(&self, event: HistoryEvent) -> Self {
         let paths = self
-            .0
+            .paths
             .iter()
             .map(|path| Arc::new(path.prepend(event.clone())))
             .collect();
-        Self(Arc::new(paths))
+        Self {
+            cell_ids: Arc::clone(&self.cell_ids),
+            paths: Arc::new(paths),
+        }
     }
 
     pub fn append_assignment(&self, location: Location) -> Self {
@@ -432,78 +535,118 @@ impl ValueHistory {
 
     pub fn wrap_call(&self, proc: &Procname, location: &Location) -> Self {
         let paths = self
-            .0
+            .paths
             .iter()
             .map(|path| Arc::new(path.wrap_call(proc, location)))
             .collect();
-        Self(Arc::new(paths))
+        Self {
+            cell_ids: Arc::clone(&self.cell_ids),
+            paths: Arc::new(paths),
+        }
+    }
+
+    fn merged_cell_ids(&self, other: &Self) -> BTreeSet<CellId> {
+        let mut cell_ids = self.cell_ids.as_ref().clone();
+        cell_ids.extend(other.cell_ids.iter().copied());
+        cap_cell_ids(cell_ids)
     }
 
     pub fn merge(&self, other: &Self) -> Self {
-        if Arc::ptr_eq(&self.0, &other.0) || self == other {
+        if (Arc::ptr_eq(&self.paths, &other.paths) && Arc::ptr_eq(&self.cell_ids, &other.cell_ids))
+            || self == other
+        {
             return self.clone();
         }
 
-        let self_len = self.0.len();
-        let other_len = other.0.len();
-        if other_len <= self_len && other.0.is_subset(&self.0) {
+        let self_paths_len = self.paths.len();
+        let other_paths_len = other.paths.len();
+        let self_cell_superset = other.cell_ids.is_subset(&self.cell_ids);
+        let other_cell_superset = self.cell_ids.is_subset(&other.cell_ids);
+        if other_paths_len <= self_paths_len
+            && other.paths.is_subset(&self.paths)
+            && self_cell_superset
+        {
             return self.clone();
         }
-        if self_len <= other_len && self.0.is_subset(&other.0) {
+        if self_paths_len <= other_paths_len
+            && self.paths.is_subset(&other.paths)
+            && other_cell_superset
+        {
             return other.clone();
         }
 
-        let (base, extra) = if self_len >= other_len {
-            (&self.0, &other.0)
+        let (base, extra) = if self_paths_len >= other_paths_len {
+            (&self.paths, &other.paths)
         } else {
-            (&other.0, &self.0)
+            (&other.paths, &self.paths)
         };
         let mut paths = base.as_ref().clone();
         paths.extend(extra.iter().cloned());
-        Self(Arc::new(cap_merged_paths(paths)))
+        Self {
+            cell_ids: Arc::new(self.merged_cell_ids(other)),
+            paths: Arc::new(cap_merged_paths(paths)),
+        }
     }
 
     /// Variant for hot left-fold style call sites. When the accumulator is
     /// uniquely owned, extend it in place with `Arc::make_mut` and only copy
     /// path handles from the other history.
     pub fn merge_owned(mut self, other: &Self) -> Self {
-        if Arc::ptr_eq(&self.0, &other.0) || self == *other {
+        if (Arc::ptr_eq(&self.paths, &other.paths) && Arc::ptr_eq(&self.cell_ids, &other.cell_ids))
+            || self == *other
+        {
             return self;
         }
 
-        let self_len = self.0.len();
-        let other_len = other.0.len();
-        if other_len <= self_len && other.0.is_subset(&self.0) {
+        let self_paths_len = self.paths.len();
+        let other_paths_len = other.paths.len();
+        let self_cell_superset = other.cell_ids.is_subset(&self.cell_ids);
+        let other_cell_superset = self.cell_ids.is_subset(&other.cell_ids);
+        if other_paths_len <= self_paths_len
+            && other.paths.is_subset(&self.paths)
+            && self_cell_superset
+        {
             return self;
         }
-        if self_len <= other_len && self.0.is_subset(&other.0) {
+        if self_paths_len <= other_paths_len
+            && self.paths.is_subset(&other.paths)
+            && other_cell_superset
+        {
             return other.clone();
         }
 
-        if Arc::strong_count(&self.0) == 1 {
-            let paths = Arc::make_mut(&mut self.0);
-            paths.extend(other.0.iter().cloned());
+        let merged_cell_ids = Arc::new(self.merged_cell_ids(other));
+        if Arc::strong_count(&self.paths) == 1 && self_paths_len >= other_paths_len {
+            let paths = Arc::make_mut(&mut self.paths);
+            paths.extend(other.paths.iter().cloned());
+            self.cell_ids = merged_cell_ids;
             if paths.len() <= MAX_MERGED_HISTORY_PATHS {
                 return self;
             }
-            self.0 = Arc::new(cap_merged_paths(std::mem::take(paths)));
+            self.paths = Arc::new(cap_merged_paths(std::mem::take(paths)));
             return self;
         }
 
-        if self_len >= other_len {
-            let mut paths = self.0.as_ref().clone();
-            paths.extend(other.0.iter().cloned());
-            Self(Arc::new(cap_merged_paths(paths)))
+        if self_paths_len >= other_paths_len {
+            let mut paths = self.paths.as_ref().clone();
+            paths.extend(other.paths.iter().cloned());
+            Self {
+                cell_ids: merged_cell_ids,
+                paths: Arc::new(cap_merged_paths(paths)),
+            }
         } else {
-            let mut paths = other.0.as_ref().clone();
-            paths.extend(self.0.iter().cloned());
-            Self(Arc::new(cap_merged_paths(paths)))
+            let mut paths = other.paths.as_ref().clone();
+            paths.extend(self.paths.iter().cloned());
+            Self {
+                cell_ids: merged_cell_ids,
+                paths: Arc::new(cap_merged_paths(paths)),
+            }
         }
     }
 
     #[cfg(test)]
     fn path_count(&self) -> usize {
-        self.0.len()
+        self.paths.len()
     }
 
     pub fn map_formals(
@@ -519,15 +662,17 @@ impl ValueHistory {
         callsite: Option<Location>,
     ) -> Self {
         let mut translated = BTreeSet::new();
-        for path in self.0.iter() {
+        let mut translated_cell_ids = self.cell_ids.as_ref().clone();
+        for path in self.paths.iter() {
             let mut partials = vec![HistoryPath::empty()];
             for event in &path.0 {
                 match event {
                     HistoryEvent::FormalArgument(pvar, formal_loc) => {
                         if let Some(history) = formal_histories.get(pvar) {
+                            translated_cell_ids.extend(history.cell_ids.iter().copied());
                             let mut next = Vec::new();
                             for prefix in &partials {
-                                for suffix in history.0.iter() {
+                                for suffix in history.paths.iter() {
                                     let mut events = prefix.0.clone();
                                     events.push(HistoryEvent::ActualArgument(
                                         pvar.clone(),
@@ -551,72 +696,76 @@ impl ValueHistory {
                     }
                 }
             }
-            translated.extend(partials.into_iter().map(Arc::new));
+            translated.extend(
+                partials
+                    .into_iter()
+                    .map(|partial| Arc::new(HistoryPath::new_capped(partial.0))),
+            );
         }
-        Self(Arc::new(translated))
+        Self::from_raw_parts(translated_cell_ids, translated)
     }
 
     pub fn first_invalidation_before_call(&self) -> Option<(&Invalidation, &Location)> {
-        self.0
+        self.paths
             .iter()
             .find_map(|path| path.first_invalidation_before_call())
     }
 
     pub fn caller_argument_invalidation(&self) -> Option<(&Invalidation, &Location)> {
-        self.0
+        self.paths
             .iter()
             .find_map(|path| path.caller_argument_invalidation())
     }
 
     pub fn first_call_before_invalidation(&self) -> Option<(&Procname, &Location)> {
-        self.0
+        self.paths
             .iter()
             .find_map(|path| path.first_call_before_invalidation())
     }
 
     pub fn last_call_before_invalidation(&self) -> Option<(&Procname, &Location)> {
-        self.0
+        self.paths
             .iter()
             .find_map(|path| path.last_call_before_invalidation())
     }
 
     pub fn has_call_at_location_before_invalidation(&self, location: &Location) -> bool {
-        self.0
+        self.paths
             .iter()
             .any(|path| path.has_call_at_location_before_invalidation(location))
     }
 
     pub fn first_invalidation(&self) -> Option<(&Invalidation, &Location)> {
-        self.0.iter().find_map(|path| path.first_invalidation())
+        self.paths.iter().find_map(|path| path.first_invalidation())
     }
 
     pub fn contains_invalidation(&self, invalidation: &Invalidation) -> bool {
-        self.0
+        self.paths
             .iter()
             .any(|path| path.contains_invalidation(invalidation))
     }
 
     pub fn contains_invalidation_of_same_type(&self, invalidation: &Invalidation) -> bool {
-        self.0
+        self.paths
             .iter()
             .any(|path| path.contains_invalidation_of_same_type(invalidation))
     }
 
     pub fn contains_formal_origin(&self) -> bool {
-        self.0.iter().any(|path| path.contains_formal_origin())
+        self.paths.iter().any(|path| path.contains_formal_origin())
     }
 
     pub fn last_location(&self) -> Option<&Location> {
-        self.0.iter().find_map(|path| path.last_location())
+        self.paths.iter().find_map(|path| path.last_location())
     }
 
     pub fn signature(&self) -> String {
-        let parts: Vec<String> = self.0.iter().map(|path| path.to_string()).collect();
+        let parts: Vec<String> = self.paths.iter().map(|path| path.to_string()).collect();
         parts.join(" || ")
     }
 
     pub(crate) fn primary_path(&self) -> Option<&HistoryPath> {
-        self.0.iter().next().map(Arc::as_ref)
+        self.paths.iter().next().map(Arc::as_ref)
     }
 
     pub(crate) fn first_actual_argument(&self) -> Option<&Pvar> {

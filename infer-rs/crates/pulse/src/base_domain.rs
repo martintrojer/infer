@@ -10,9 +10,11 @@
 use std::fmt;
 
 use crate::abstract_value::AbstractValue;
+use crate::attribute::Attribute;
 use crate::base_attrs::BaseAddressAttributes;
 use crate::base_memory::BaseMemory;
 use crate::base_stack::BaseStack;
+use crate::value_history::ValueHistory;
 
 /// The base abstract state: stack, heap, and address attributes.
 ///
@@ -28,6 +30,60 @@ pub struct BaseDomain {
 impl BaseDomain {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Best-effort provenance lookup for an address in this raw domain.
+    pub fn history_of_value(&self, addr: AbstractValue) -> Option<ValueHistory> {
+        let mut history: Option<ValueHistory> = None;
+
+        for (_var, value) in self.stack.iter_with_history() {
+            if value.addr == addr {
+                history = Some(match history {
+                    Some(existing) => existing.merge(&value.history),
+                    None => value.history.clone(),
+                });
+            }
+        }
+
+        for (_src, edges) in self.heap.iter() {
+            for (_access, value) in edges.iter_with_history() {
+                if value.addr == addr {
+                    history = Some(match history {
+                        Some(existing) => existing.merge(&value.history),
+                        None => value.history.clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(attrs) = self.attrs.get(&addr) {
+            for attr in attrs.iter() {
+                if let Attribute::Invalid(_, invalidation_history) = attr {
+                    history = Some(match history {
+                        Some(existing) => existing.merge(invalidation_history),
+                        None => invalidation_history.clone(),
+                    });
+                }
+            }
+        }
+
+        history
+    }
+
+    /// Best-effort provenance lookup for the value carried by an outgoing heap
+    /// cell of `addr`. This is useful for callee-pre cell-id tags: the cell id
+    /// often lives on the edge payload from the cell, not on another reference
+    /// to the cell address itself.
+    pub fn history_of_heap_value(&self, addr: AbstractValue) -> Option<ValueHistory> {
+        let mut history: Option<ValueHistory> = None;
+        let edges = self.heap.get_edges(addr)?;
+        for (_access, value) in edges.iter_with_history() {
+            history = Some(match history {
+                Some(existing) => existing.merge(&value.history),
+                None => value.history.clone(),
+            });
+        }
+        history
     }
 
     /// Substitute an abstract value: replace `old` with `new` everywhere.
