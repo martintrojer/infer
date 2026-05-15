@@ -1167,6 +1167,9 @@ impl PulseSummary {
                     continue;
                 }
             }
+            if pp.kind == PrePostKind::ContinueProgram {
+                coalesce_zero_direct_formals_for_continue_export(pdesc, &mut pp);
+            }
             // Only report leaks from ordinary ContinueProgram paths — latent /
             // error paths (ExitProgram/AbortProgram/Latent*) typically
             // produce spurious leaks.
@@ -1920,6 +1923,26 @@ fn normalize_direct_formal_latent_invalid_access_shape(
     coalesce_zero_direct_formals_for_export(pdesc, pre_post, addr);
     drop_selected_null_invalidation(pre_post, addr);
     true
+}
+
+/// Cross-ref: OCaml's summary export canonicalizes direct formal values that
+/// are both proven zero onto a single visible summary value. For ordinary
+/// Continue rows, do this only after latent-invalid candidate filtering has
+/// already decided whether to keep a Continue fallback; otherwise the
+/// `FN_nonlatent_*` mixed independent-branch guard would become path-local and
+/// incorrectly publish as a latent invalid access.
+fn coalesce_zero_direct_formals_for_continue_export(pdesc: &Procdesc, pre_post: &mut PrePost) {
+    let mut local_zero_direct_formals: Vec<_> = local_zero_direct_formals(pdesc, pre_post)
+        .into_iter()
+        .collect();
+    local_zero_direct_formals.sort();
+    if let Some(selected_addr) = local_zero_direct_formals.into_iter().next() {
+        coalesce_zero_direct_formals_for_export(pdesc, pre_post, selected_addr);
+        // The zero fact is already exported in the path condition/phi. OCaml's
+        // Continue summary for these coalesced direct-formal rows does not also
+        // keep a synthetic null-dereference invalidation on the written value.
+        drop_selected_null_invalidation(pre_post, selected_addr);
+    }
 }
 
 /// Cross-ref: OCaml's surviving `latent_use_after_free` latent-invalid
