@@ -18,10 +18,10 @@ mu task list -w infer-rs --status OPEN
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
-| specialization summary harness | `20 matching / 1 diff` (only `may_double_free_if_alias` residual) |
+| specialization summary harness | `20 / 20` (held; C-suite `may_double_free_if_alias` residual deferred to the apply-post deep port) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `96 matching / 41 diffs` (+9/-9 today from the `87/50` session start; +46/-46 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `107 matching / 30 diffs` (+20/-20 today from the `87/50` session start; +57/-57 vs original `50/87`) |
 
 ### NPE issue-count deltas (current Linux)
 
@@ -90,6 +90,9 @@ now analyze. Today's Linux session additions:
   this specialized abort propagation is a real catch.
 - `3b7b90f1a9` — avoid branch-only constant invalidation attrs;
   `interprocedural.c` summary parity moves `11/6` -> `15/2`.
+- `e18143e41d` — preserve benign `Continue` summary duplicates;
+  `memory_leak.c` summary parity moves `27/19` -> `37/9`, and
+  `interprocedural.c` moves `15/2` -> `16/1`.
 - `a625c0dd55` / `fe0e95be3e` — stdio FILE-argument modeling and
   report-location dedup keep NPE deltas aligned with the per-file scout
   classification.
@@ -99,8 +102,12 @@ now analyze. Today's Linux session additions:
   experiment plan, worker-1 regrew the Linux corpus to `74` `.sil` / `454`
   procs at `~/infer-rs-bench/openssl-20260514-121752/`, and `006b39cd2b`
   records the guarded Linux perf scout results.
+- `b512df2924` — align stopped latent leq with OCaml; the specialized
+  `OBJ_bsearch_` analysis converges in `24.31s` combined, and the OpenSSL
+  Linux bench reaches the end of corpus at `445/445` procs (`4:17.11` wall,
+  `26.3 GiB` max RSS, `27` aborts, max visit count `4`).
 
-### C-suite OCaml↔Rust Pulse summary parity (`96 matching / 41 diffs`)
+### C-suite OCaml↔Rust Pulse summary parity (`107 matching / 30 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -190,35 +197,40 @@ Function-pointer abort propagation also landed:
   preserving duplicate callee-local manifest-abort suppression. `funptr.c` moves
   `20/8` -> `22/6`; specialization remains `20/1`.
 
-Interprocedural branch-only attr cleanup also landed:
+Interprocedural branch-only attr cleanup and Continue summary dedup also landed:
 
 - `3b7b90f1a9` — avoid branch-only constant invalidation attrs on summary
   surfaces. `interprocedural.c` moves `11/6` -> `15/2`.
+- `e18143e41d` — preserve benign `Continue` summary duplicates.
+  `memory_leak.c` moves `27/19` -> `37/9`, and `interprocedural.c` moves
+  `15/2` -> `16/1`.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `96 matching / 41 diffs`
-(`+46 matching / -46 diffs`). Today's Linux session started at `87/50` and
-closed at `96/41` (`+9 matching / -9 diffs`). Current scoped per-file totals:
+(`50 matching / 87 diffs`) is now `107 matching / 30 diffs`
+(`+57 matching / -57 diffs`). Today's Linux session started at `87/50`, moved
+through `96/41`, and is now `107/30` (`+20 matching / -20 diffs`). Current
+scoped per-file totals:
 
 | file | matching / diffs | residual |
 |---|---:|---|
 | `arithmetic.c` | `6/5` | OCaml `NonDisjDomain` non-disj sideband mechanism; follow-up `arithmetic_ocaml_non_disj_summary_fallback` filed by worker-leak |
 | `funptr.c` | `22/6` | `cluster_funptr_abort_propagation_specialized` residuals are closed; remaining surface is callback `Closure` plus minor issues |
-| `interprocedural.c` | `15/2` | `test_modified_value_then_error_bad` keeps `ConstantDereference(5)` on the `Continue` path; `trace_correctly_through_wrappers_bad` summary multiplicity |
+| `interprocedural.c` | `16/1` | remaining residual: `trace_correctly_through_wrappers_bad` summary multiplicity |
 | `latent.c` | `6/8` | producer-side cycle-cursor; deferred deep port plus new disjunct-dedup scout in flight |
-| `memory_leak.c` | `27/19` | array/index loop value-shape, realloc fail/success branch counts, `alias_ptr_free` flag, mutual-recursion shape, `alloc_ref_counted_arith` pointer arithmetic |
-| `specialization.c` | `20/1` | `may_double_free_if_alias` summary-surface; deferred |
-| **total** | **`96/41`** | **+9 matching / -9 diffs from session start `87/50`; +46/-46 vs original `50/87`** |
+| `memory_leak.c` | `37/9` | remaining surface after benign `Continue` duplicate preservation: array/index loop value-shape, realloc fail/success branch counts, `alias_ptr_free` flag, mutual-recursion shape, `alloc_ref_counted_arith` pointer arithmetic |
+| `specialization.c` | `20/1` | `may_double_free_if_alias` summary-surface; deferred to apply-post deep port |
+| **total** | **`107/30`** | **+20 matching / -20 diffs from session start `87/50`; +57/-57 vs original `50/87`** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 
 Current residual work is split between the closed funptr abort-propagation
 surface after `a8b8fe7bde`, the remaining callback `Closure`/minor funptr
-surface, `interprocedural.c`'s two residuals after `3b7b90f1a9`, the parked
-`cluster_latent_record_post_for_address_porting` deep porting track for the
-remaining `latent.c` producer/record-post shape, and the sweep-level NPE
-`131/140` correctness-aligned delta documented above.
+surface, `interprocedural.c`'s remaining summary-multiplicity residual after
+`e18143e41d`, the parked `cluster_latent_record_post_for_address_porting` deep
+porting track for the remaining `latent.c` producer/record-post shape and
+`may_double_free_if_alias`, and the sweep-level NPE `131/140`
+correctness-aligned delta documented above.
 
 ## OpenSSL benchmark dashboard
 
@@ -268,7 +280,7 @@ Historical interpretation:
   `DES_ede3_cfb_encrypt` from `~40.2s` after the first structural fixes to
   `~21.8s` after cached propagation sort keys and flat-slab `CanonTerm`).
 
-### Linux baseline (in flight)
+### Linux baseline (established)
 
 Current Linux corpus: `~/infer-rs-bench/openssl-20260514-121752/`, built by
 worker-1 from OpenSSL 1.0.2d with the partial benchmark subset regrown to
@@ -278,25 +290,33 @@ the full-corpus dynamic run). Hotspots `OBJ_bsearch_ex_` (`obj_dat.sil`) and
 
 Worker-1's guarded scout results are recorded in
 [`docs/plans/OPENSSL_LINUX_PERF_BASELINE_RESULTS_2026_05.md`](plans/OPENSSL_LINUX_PERF_BASELINE_RESULTS_2026_05.md)
-(commit `006b39cd2b`). The planned `RUNS=3 JOBS=4` Linux baseline did **not**
-produce a publishable median: the final `a8b8fe7bde` full-corpus attempt tripped
-the 650s outer guard at roughly `407/445` procs analyzed (`405/445` completed in
-the log), with `OBJ_bsearch_sn` / `OBJ_bsearch_ln` active and repeated
-`OBJ_bsearch_ex_` live-fixpoint growth. Treat the Linux Rust/OCaml ratio as
-unavailable; the only honest lower bound from the guard is `>650s / 42.9s`, and
-the run is dominated by the OBJ convergence gate rather than a completed
-whole-corpus baseline.
+(commit `006b39cd2b`). That scout initially found no publishable median: the
+final `a8b8fe7bde` full-corpus attempt tripped the 650s outer guard at roughly
+`407/445` procs analyzed (`405/445` completed in the log), with
+`OBJ_bsearch_sn` / `OBJ_bsearch_ln` active and repeated `OBJ_bsearch_ex_`
+live-fixpoint growth.
 
-Open fix tasks from the scout:
+Commit `b512df2924` (`pulse: align stopped latent leq with OCaml`) closed the
+OBJ convergence gate. Specialized `OBJ_bsearch_` analysis now converges in
+`24.31s` combined (previously timing out at `90s` with max visit count `>51`
+and growing), and the full Linux bench reaches end of corpus:
 
-1. `fix_openssl_obj_bsearch_interproc_convergence` — highest priority, owned by
-   worker-1; explain why isolated OBJ filters complete quickly while the
-   full-corpus specialized/import environment drives `OBJ_bsearch_*` long-tail
-   convergence.
-2. `fix_state_cmp_canonicalizer_attr_memory_sortkeys` — profile-driven CPU fix
+| corpus | run config | wall | max RSS | procs | aborts | max visit count |
+|---|---|---:|---:|---:|---:|---:|
+| `~/infer-rs-bench/openssl-20260514-121752/` (`74` `.sil` / `454` Textual procs) | `JOBS=4 RUNS=1` | `4:17.11` | `26.3 GiB` | `445/445` | `27` | `4` |
+
+This is the current Linux Rust baseline. It is corpus-comparable to the
+historical macOS-derived Rust reference (`244.70s` wall, `16.79 GiB` max RSS,
+`446` procs analyzed), and the Rust/OCaml wall ratio is now
+`4:17 / 0:42.9 ≈ 5.99×`.
+
+Remaining OpenSSL perf tasks:
+
+1. `fix_state_cmp_canonicalizer_attr_memory_sortkeys` — profile-driven CPU fix
    for duplicate canonicalizer sorting/key construction and attr/memory
-   propagation allocation (`state_cmp::canonicalize` dominates OBJ/SHA512 CPU).
-3. `fix_value_history_base_memory_clone_pressure` — retained-state/RAM fix after
+   propagation allocation (`state_cmp::canonicalize` dominates OBJ/SHA512 CPU),
+   in flight with worker-1.
+2. `fix_value_history_base_memory_clone_pressure` — retained-state/RAM fix after
    the OBJ wall gate; Massif points at `ValueHistory` / `BaseMemory` clone paths
    under DES/hash procs near the 2 GiB per-proc cap.
 
@@ -327,27 +347,32 @@ Live themes (track headlines, not exhaustive task lists):
   attr cleanup (`3b7b90f1a9`), OpenSSL corpus regrowth to
   `~/infer-rs-bench/openssl-20260514-121752/`, perf tooling docs
   (`1295efbfbc`), attack-surface map (`02a79d2833`), experiment plan
-  (`e4e4bc887e`), and guarded Linux baseline scout (`006b39cd2b`).
+  (`e4e4bc887e`), guarded Linux baseline scout (`006b39cd2b`), OBJ_bsearch
+  convergence and OpenSSL Linux reach-end (`b512df2924`), and memory-leak
+  `Continue` summary dedup (`e18143e41d`).
 - **C-suite OCaml↔Rust Pulse summary parity** — current totals are
-  `96 matching / 41 diffs`, up from today's `87/50` start (`+9/-9`). Per-file:
-  arithmetic `6/5`, funptr `22/6`, interproc `15/2`, latent `6/8`,
-  memory_leak `27/19`, specialization `20/1`.
+  `107 matching / 30 diffs`, up from today's `87/50` start (`+20/-20`) and the
+  mid-session `96/41` checkpoint. Per-file: arithmetic `6/5`, funptr `22/6`,
+  interproc `16/1`, latent `6/8`, memory_leak `37/9`, specialization `20/1`.
 - **Sweep correctness checkpoint** — store-textual sweep is `52` OK / `0` FAIL /
   `0` TIMEOUT; NPE expected `131` / found `140` (`+9`, classified as
   correctness-aligned with OCaml direct or Rust-strictly-more-precise by
   `scout_npe_per_file_full_remeasure`); LEAK `20/20` exact; UAF `7/7` exact.
 - **In-flight correctness/perf follow-ups** —
-  `fix_openssl_obj_bsearch_interproc_convergence` is with worker-1; the funptr
+  `fix_state_cmp_canonicalizer_attr_memory_sortkeys` is in flight with
+  worker-1; latent `ValueHistory` dedup is in flight with worker-2. The funptr
   abort-propagation residuals are closed after `a8b8fe7bde`, with callback
   `Closure`/minor funptr surface remaining.
+- **Queued perf follow-up** — `fix_value_history_base_memory_clone_pressure` is
+  queued now that the OBJ wall gate is unblocked.
 - **Parked correctness backlog** — `cluster_latent_record_post_for_address_porting`
-  is deferred as a three-day deep porting track despite high ROI (`11.7`).
+  is deferred as a three-day deep porting track despite high ROI (`11.7`), and
+  covers the remaining latent plus `may_double_free_if_alias` residuals.
 - **OpenSSL perf / benchmark hygiene** — Linux now has a corpus-comparable
-  `74` `.sil` / `454` proc artifact, but the baseline is blocked by
-  `OBJ_bsearch_*` convergence at the 650s guard. Use the worker-1 scout doc and
-  the three fix tasks above before publishing Linux median numbers.
-- **Decision gate** — after the OBJ gate is fixed and a clean, corpus-comparable
-  full-corpus remeasure closes,
+  reach-end baseline on the `74` `.sil` / `454` proc artifact: `445/445` procs,
+  `4:17.11` wall, `26.3 GiB` max RSS, `27` aborts, max visit count `4`.
+- **Decision gate** — after the in-flight state-cmp and ValueHistory follow-ups
+  land and a clean, corpus-comparable full-corpus remeasure closes,
   `perf_decide_next_track_after_profile_and_remeasure` should prune obsolete
   placeholders and choose the next concrete track.
 - **Deferred backlog** — micro-cleanups (`code_*`), speculative representation
