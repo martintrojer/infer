@@ -15,7 +15,7 @@ use sil::location::Location;
 
 use crate::abstract_value::AbstractValue;
 use crate::attribute::{Attribute, Attributes, InitializationError};
-use crate::invalidation::Invalidation;
+use crate::invalidation::{Invalidation, MustBeValidReason};
 use crate::value_history::ValueHistory;
 
 /// Maps abstract addresses to their attribute sets.
@@ -108,6 +108,16 @@ impl BaseAddressAttributes {
         self.map
             .get(&addr)
             .and_then(|attrs| attrs.get_closure_proc_name())
+    }
+
+    /// Find the local EqZero `PotentialInvalidAccess` sideband, if any.
+    pub fn get_potential_invalid_access(
+        &self,
+        addr: AbstractValue,
+    ) -> Option<(&Location, &Option<MustBeValidReason>)> {
+        self.map
+            .get(&addr)
+            .and_then(|attrs| attrs.get_potential_invalid_access())
     }
 
     /// Mark an address as invalid.
