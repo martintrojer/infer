@@ -1232,14 +1232,20 @@ impl PulseSummary {
             pre_posts.extend(recovered_invalid_accesses);
         }
 
-        // Keep the summary surface deterministic and close to OCaml: once a
-        // disjunct has been normalized and classified, an exact duplicate does
-        // not carry extra information and only inflates the exported summary.
+        // Keep the summary surface deterministic: exact latent/abort
+        // duplicates from Rust recovery/twin paths do not carry information.
+        //
+        // Narrow OCaml-aligned exception: `PulseSummary.of_posts` preserves the
+        // list multiplicity returned by `PulseAbductiveDomain.Summary.of_post`.
+        // That matters for C leak/realloc paths whose null/success branches
+        // normalize to identical ordinary Continue rows. Preserve only benign
+        // Continue duplicates with no formula/diagnostic/latent surface.
         let mut deduped_pre_posts = Vec::with_capacity(pre_posts.len());
         for pre_post in pre_posts.drain(..) {
-            if deduped_pre_posts
-                .iter()
-                .any(|existing| existing == &pre_post)
+            if !preserve_exact_duplicate_pre_post(&pre_post)
+                && deduped_pre_posts
+                    .iter()
+                    .any(|existing| existing == &pre_post)
             {
                 continue;
             }
@@ -3463,6 +3469,48 @@ fn alloc_free_match(
     )
 }
 
+fn attr_is_benign_continue_surface(attr: &Attribute) -> bool {
+    matches!(
+        attr,
+        Attribute::Initialized
+            | Attribute::MustBeInitialized(..)
+            | Attribute::MustBeValid(..)
+            | Attribute::WrittenTo(..)
+    )
+}
+
+fn attrs_are_benign_continue_surface(attrs: &crate::base_attrs::BaseAddressAttributes) -> bool {
+    attrs
+        .iter()
+        .all(|(_addr, attrs)| attrs.iter().all(attr_is_benign_continue_surface))
+}
+
+fn pre_post_is_benign_continue_summary_row(pre_post: &PrePost) -> bool {
+    let phi = pre_post.post.path_condition.phi();
+    pre_post.kind == PrePostKind::ContinueProgram
+        && pre_post.diagnostic.is_none()
+        && pre_post.post.path_condition.conditions().is_empty()
+        && phi.var_eqs.is_empty()
+        && phi.linear_eqs.is_empty()
+        && phi.atoms.is_empty()
+        && phi.term_eqs.is_empty()
+        && phi.intervals.is_empty()
+        && phi.is_int_vars.is_empty()
+        && phi.iter_fn_app_eqs().next().is_none()
+        && pre_post.post.need_dynamic_type_specialization.is_empty()
+        && attrs_are_benign_continue_surface(&pre_post.pre.attrs)
+        && attrs_are_benign_continue_surface(&pre_post.post.post.attrs)
+        && pre_post
+            .post
+            .iter_dynamic_types()
+            .next()
+            .is_none()
+}
+
+fn preserve_exact_duplicate_pre_post(pre_post: &PrePost) -> bool {
+    pre_post_is_benign_continue_summary_row(pre_post)
+}
+
 /// Compute heap paths leading to addresses that need dynamic type specialization.
 ///
 /// Walks the pre-state heap from stack variables, following Dereference and
@@ -4097,6 +4145,46 @@ mod tests {
 
         let summary = PulseSummary::of_proc(&pdesc, &states, vec![], false);
         assert_eq!(summary.pre_posts.len(), 2, "should keep both disjuncts");
+    }
+
+    #[test]
+    fn test_summary_preserves_benign_continue_multiplicity_only() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let benign_continue = AbductiveDomain::mk_initial(&pdesc);
+        let diagnostic = dummy_invalid_access_diagnostic(
+            AbstractValue::of_raw(1),
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+        );
+        let abort = ExecutionDomain::AbortProgram {
+            state: Box::new(benign_continue.clone()),
+            diagnostic: Box::new(diagnostic),
+        };
+        let states = vec![
+            ExecutionDomain::ContinueProgram(benign_continue.clone()),
+            ExecutionDomain::ContinueProgram(benign_continue),
+            abort.clone(),
+            abort,
+        ];
+
+        let summary = PulseSummary::of_proc(&pdesc, &states, vec![], false);
+        assert_eq!(
+            summary
+                .pre_posts
+                .iter()
+                .filter(|pp| pp.kind == PrePostKind::ContinueProgram)
+                .count(),
+            2,
+            "OCaml preserves normalized benign Continue row multiplicity"
+        );
+        assert_eq!(
+            summary
+                .pre_posts
+                .iter()
+                .filter(|pp| pp.kind == PrePostKind::AbortProgram)
+                .count(),
+            1,
+            "latent/abort diagnostics should still be exact-deduped"
+        );
     }
 
     #[test]
