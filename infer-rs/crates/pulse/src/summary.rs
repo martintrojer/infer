@@ -1670,18 +1670,14 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
         latent_invalid_access_diagnostics_from_normalized_pre_post(pdesc, pre_post, excluded_addr)
     {
         let diagnostic_key = diagnostic.dedup_key();
-        let recovered_key = format!("{diagnostic_key}|{addr}");
         if existing_latent_invalid_access_keys.contains(&diagnostic_key)
-            || !seen.insert(recovered_key)
+            || !seen.insert(diagnostic_key)
         {
             continue;
         }
 
         let mut latent_state = pre_post.post.clone();
-        if latent_state
-            .and_equal_const_for_summary_recovery(addr, 0)
-            .is_unsat()
-        {
+        if latent_state.and_equal_const(addr, 0).is_unsat() {
             continue;
         }
 
@@ -2953,10 +2949,7 @@ pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
     let mut candidates: Vec<_> = pre_post.post.must_be_valid.iter().copied().collect();
     candidates.sort();
 
-    let mut best: Option<(
-        (usize, sil::location::Location, u64, AbstractValue),
-        Diagnostic,
-    )> = None;
+    let mut best: Option<((sil::location::Location, u64, AbstractValue), Diagnostic)> = None;
     let mut seen = std::collections::HashSet::new();
     for addr in candidates {
         let repr = pre_post.post.path_condition.get_var_repr(addr);
@@ -2982,7 +2975,6 @@ pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
             continue;
         }
 
-        let known_zero = pre_post.post.path_condition.is_known_zero(repr);
         let access_history = pre_post.post.history_of_value(repr).unwrap_or_default();
         if !caller_controlled.contains(&repr) && !access_history.contains_formal_origin() {
             continue;
@@ -3020,7 +3012,7 @@ pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
         if preferred_addr == Some(repr) {
             return Some(diagnostic);
         }
-        let key = (usize::from(!known_zero), location, timestamp, repr);
+        let key = (location, timestamp, repr);
         match &best {
             Some((best_key, _)) if &key >= best_key => {}
             _ => best = Some((key, diagnostic)),
@@ -3030,7 +3022,7 @@ pub(crate) fn latent_invalid_access_diagnostic_from_summary_state(
     if preferred_addr.is_some() {
         return None;
     }
-    best.map(|((_zero_rank, _location, _timestamp, _addr), diagnostic)| diagnostic)
+    best.map(|((_location, _timestamp, _addr), diagnostic)| diagnostic)
 }
 
 pub(crate) fn latent_invalid_access_report_key(pre_post: &PrePost) -> Option<String> {
@@ -6169,136 +6161,6 @@ mod tests {
         assert!(
             latent_invalid_access_diagnostic_from_exported_pre_post(latent).is_some(),
             "callers should still be able to reconstruct the latent invalid-access diagnostic"
-        );
-    }
-
-    #[test]
-    fn test_deref_then_free_then_deref_bad_no_local_invalid_zero() {
-        let mut pdesc = make_pdesc_with_formals(&["x"]);
-        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
-        let store_loc = Location {
-            line: 28,
-            col: 3,
-            ..Location::dummy()
-        };
-        let free_loc = Location {
-            line: 29,
-            col: 3,
-            ..Location::dummy()
-        };
-        let store_node = pdesc.add_node(
-            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
-            vec![sil::instr::Instr::Store {
-                e1: Box::new(sil::exp::Exp::Lvar(x_pvar.clone())),
-                typ: Typ::int(sil::typ::IKind::IInt),
-                e2: Box::new(sil::exp::Exp::Const(sil::const_val::Const::Cint(
-                    IntLit::of_int(42),
-                ))),
-                loc: store_loc.clone(),
-            }],
-            store_loc.clone(),
-        );
-        let free_node = pdesc.add_node(
-            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
-            vec![sil::instr::Instr::Call {
-                ret: (Ident::create_none(), Typ::void()),
-                fun_exp: sil::exp::Exp::Const(sil::const_val::Const::Cfun(
-                    sil::builtin_decl::free(),
-                )),
-                args: vec![(
-                    sil::exp::Exp::Lvar(x_pvar.clone()),
-                    Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
-                )],
-                loc: free_loc,
-                flags: sil::call_flags::CallFlags::default(),
-            }],
-            Location::dummy(),
-        );
-        pdesc.set_succs(0, vec![store_node]);
-        pdesc.set_succs(store_node, vec![free_node]);
-        pdesc.set_succs(free_node, vec![1]);
-
-        let mut astate = AbductiveDomain::mk_initial(&pdesc);
-        let x_addr = astate
-            .post
-            .stack
-            .find(&Var::ProgramVar(Box::new(x_pvar)))
-            .unwrap();
-        let x_value = astate.read_heap(x_addr, Access::Dereference);
-        astate.mark_must_be_valid_at(x_value, &store_loc);
-        astate
-            .post
-            .attrs
-            .mark_written_to(x_value, 1, store_loc.clone());
-        let stored_const = AbstractValue::mk_fresh();
-        let stored_invalidation =
-            crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42));
-        astate.write_heap_with_history(
-            x_value,
-            Access::Dereference,
-            crate::value_history::ValueWithHistory::new(
-                stored_const,
-                ValueHistory::invalidated(stored_invalidation.clone(), store_loc.clone()),
-            ),
-        );
-        astate.initialize(stored_const);
-        astate.invalidate(
-            stored_const,
-            stored_invalidation,
-            ValueHistory::invalidated(
-                crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42)),
-                store_loc,
-            ),
-        );
-        assert!(astate.and_equal_const(x_value, 0).is_sat());
-
-        let summary = PulseSummary::of_proc(
-            &pdesc,
-            &[ExecutionDomain::ContinueProgram(astate)],
-            vec![],
-            false,
-        );
-
-        let latent = summary
-            .pre_posts
-            .iter()
-            .find(|pp| pp.kind == PrePostKind::LatentInvalidAccess)
-            .expect("free(NULL) split should export a latent invalid-access row");
-        let x_repr = latent.post.path_condition.get_var_repr(x_value);
-        let x_invalids: Vec<_> = latent
-            .post
-            .post
-            .attrs
-            .get(&x_repr)
-            .map(|attrs| attrs.iter().cloned().collect())
-            .unwrap_or_default();
-        assert!(
-            !x_invalids.iter().any(|attr| matches!(
-                attr,
-                Attribute::Invalid(crate::invalidation::Invalidation::ConstantDereference(value), _)
-                    if *value == IntLit::zero()
-            )),
-            "local EqZero sideband must not persist as a synthetic Invalid(0) on x.*: {x_invalids:?}"
-        );
-        let stored_repr = latent.post.path_condition.get_var_repr(stored_const);
-        assert!(
-            latent
-                .post
-                .post
-                .attrs
-                .get(&stored_repr)
-                .is_some_and(|attrs| {
-                    attrs.iter().any(|attr| {
-                        matches!(
-                            attr,
-                            Attribute::Invalid(
-                                crate::invalidation::Invalidation::ConstantDereference(value),
-                                _
-                            ) if *value == IntLit::of_int(42)
-                        )
-                    })
-                }),
-            "ordinary stored-constant Invalid(42) attrs must still be retained"
         );
     }
 
