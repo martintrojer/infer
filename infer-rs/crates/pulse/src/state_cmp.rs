@@ -734,6 +734,8 @@ impl CanonicalizedState {
 #[derive(Default)]
 struct Canonicalizer {
     values: BTreeMap<AbstractValue, CanonValue>,
+    restricted_values: Vec<AbstractValue>,
+    unrestricted_values: Vec<AbstractValue>,
     next_unrestricted: u32,
     next_restricted: u32,
 }
@@ -754,9 +756,11 @@ impl Canonicalizer {
 
         let canon = if value.is_restricted() {
             self.next_restricted += 1;
+            self.restricted_values.push(value);
             CanonValue::Restricted(self.next_restricted)
         } else {
             self.next_unrestricted += 1;
+            self.unrestricted_values.push(value);
             CanonValue::Unrestricted(self.next_unrestricted)
         };
         self.values.insert(value, canon);
@@ -775,45 +779,55 @@ impl Canonicalizer {
     }
 
     fn propagate_memory(&mut self, memory: &BaseMemory) {
-        let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
-        // `sort_by_cached_key` evaluates `partial_value_key` exactly once
-        // per entry instead of O(N log N) times for `sort_by_key`. Sort
-        // order is unchanged because the cached key is identical.
-        entries.sort_by_cached_key(|(src, _)| self.partial_value_key(*src));
-        for (src, edges) in entries {
-            if self.get(src).is_none() {
-                continue;
+        // Cross-ref: OCaml `GraphComparison.isograph_map_from_stack` grows only
+        // from already-mapped graph roots; avoid sorting unmapped heap cells.
+        self.propagate_mapped_values(|this, src| this.propagate_memory_source(memory, src));
+    }
+
+    fn propagate_mapped_values(&mut self, mut f: impl FnMut(&mut Self, AbstractValue)) {
+        let mut i = 0;
+        while i < self.restricted_values.len() {
+            let value = self.restricted_values[i];
+            f(self, value);
+            i += 1;
+        }
+        let mut i = 0;
+        while i < self.unrestricted_values.len() {
+            let value = self.unrestricted_values[i];
+            f(self, value);
+            i += 1;
+        }
+    }
+
+    fn propagate_memory_source(&mut self, memory: &BaseMemory, src: AbstractValue) {
+        let Some(edges) = memory.get_edges(src) else {
+            return;
+        };
+        let mut edge_entries: Vec<_> = edges
+            .iter()
+            .map(|(access, target)| (access, *target))
+            .collect();
+        edge_entries.sort_by_cached_key(|(access, target)| self.partial_edge_key(access, *target));
+        for (access, target) in edge_entries {
+            if let Access::ArrayAccess(_, index) = access {
+                self.map_value(*index);
             }
-            let mut edge_entries: Vec<_> = edges
-                .iter()
-                .map(|(access, target)| (access, *target))
-                .collect();
-            // `partial_edge_key` allocates a fresh `AccessSortKey` per
-            // call; cache it once per entry.
-            edge_entries
-                .sort_by_cached_key(|(access, target)| self.partial_edge_key(access, *target));
-            for (access, target) in edge_entries {
-                if let Access::ArrayAccess(_, index) = access {
-                    self.map_value(*index);
-                }
-                self.map_value(target);
-            }
+            self.map_value(target);
         }
     }
 
     fn propagate_attrs(&mut self, attrs: &BaseAddressAttributes) {
-        let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
-        // Cache `partial_value_key` per entry; identical sort order.
-        entries.sort_by_cached_key(|(addr, _)| self.partial_value_key(*addr));
-        for (addr, attrs) in entries {
-            if self.get(addr).is_none() {
-                continue;
-            }
-            for attr in attrs.iter() {
-                if let Attribute::ReturnedFromUnknown(values) = attr {
-                    for value in values {
-                        self.map_value(*value);
-                    }
+        self.propagate_mapped_values(|this, addr| this.propagate_attrs_addr(attrs, addr));
+    }
+
+    fn propagate_attrs_addr(&mut self, attrs: &BaseAddressAttributes, addr: AbstractValue) {
+        let Some(attrs) = attrs.get(&addr) else {
+            return;
+        };
+        for attr in attrs.iter() {
+            if let Attribute::ReturnedFromUnknown(values) = attr {
+                for value in values {
+                    self.map_value(*value);
                 }
             }
         }
