@@ -1937,11 +1937,12 @@ fn coalesce_zero_direct_formals_for_continue_export(pdesc: &Procdesc, pre_post: 
         .collect();
     local_zero_direct_formals.sort();
     if let Some(selected_addr) = local_zero_direct_formals.into_iter().next() {
-        coalesce_zero_direct_formals_for_export(pdesc, pre_post, selected_addr);
-        // The zero fact is already exported in the path condition/phi. OCaml's
-        // Continue summary for these coalesced direct-formal rows does not also
-        // keep a synthetic null-dereference invalidation on the written value.
-        drop_selected_null_invalidation(pre_post, selected_addr);
+        if coalesce_zero_direct_formals_for_export(pdesc, pre_post, selected_addr) {
+            // The zero fact is already exported in the path condition/phi. OCaml's
+            // Continue summary for these coalesced direct-formal rows does not also
+            // keep a synthetic null-dereference invalidation on the written value.
+            drop_selected_null_invalidation(pre_post, selected_addr);
+        }
     }
 }
 
@@ -1955,16 +1956,16 @@ fn coalesce_zero_direct_formals_for_export(
     pdesc: &Procdesc,
     pre_post: &mut PrePost,
     selected_addr: AbstractValue,
-) {
+) -> bool {
     let selected_repr = pre_post.post.path_condition.get_var_repr(selected_addr);
     let local_zero_direct_formals = local_zero_direct_formals(pdesc, pre_post);
     if !local_zero_direct_formals.contains(&selected_repr) {
-        return;
+        return false;
     }
 
     let zero_direct_formals = zero_direct_formals(pdesc, pre_post);
     if zero_direct_formals.len() < 2 || !zero_direct_formals.contains(&selected_repr) {
-        return;
+        return false;
     }
 
     let zero_condition_depths: std::collections::HashMap<AbstractValue, usize> = pre_post
@@ -2005,10 +2006,10 @@ fn coalesce_zero_direct_formals_for_export(
         })
         .next();
     let Some(canonical_zero_formal) = canonical_zero_formal else {
-        return;
+        return false;
     };
     let Some(&canonical_zero_depth) = zero_condition_depths.get(&canonical_zero_formal) else {
-        return;
+        return false;
     };
 
     let filtered_conditions: std::collections::BTreeMap<_, _> = pre_post
@@ -2035,7 +2036,7 @@ fn coalesce_zero_direct_formals_for_export(
             .and_equal(addr, canonical_zero_formal)
             .is_unsat()
         {
-            return;
+            return false;
         }
     }
 
@@ -2044,7 +2045,7 @@ fn coalesce_zero_direct_formals_for_export(
         .canonicalize_with_current_path_condition_or_unsat()
         .is_unsat()
     {
-        return;
+        return false;
     }
     pre_post.pre = pre_post.post.pre.clone();
     for (_formal, addr) in &mut pre_post.formals {
@@ -2066,6 +2067,7 @@ fn coalesce_zero_direct_formals_for_export(
         .post
         .path_condition
         .replace_conditions(rewritten_conditions);
+    true
 }
 
 /// Cross-ref: the remaining OCaml direct-formal latent-invalid summaries in
@@ -6657,7 +6659,10 @@ mod tests {
             y_loc,
         ));
 
-        coalesce_zero_direct_formals_for_export(&pdesc, &mut pre_post, y_val);
+        assert!(
+            coalesce_zero_direct_formals_for_export(&pdesc, &mut pre_post, y_val),
+            "two zero direct formals should be coalesced"
+        );
 
         let direct_formal_values: std::collections::HashSet<_> = pre_post
             .formals
@@ -6699,6 +6704,83 @@ mod tests {
             Some(Diagnostic::AccessToInvalidAddress { addr, .. })
                 if direct_formal_values.contains(&pre_post.post.path_condition.get_var_repr(addr))
         ));
+    }
+
+    #[test]
+    fn test_continue_zero_direct_formal_keeps_null_invalidation_without_coalescing() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let x_var = Var::ProgramVar(Box::new(x_pvar.clone()));
+        let x_formal_addr = astate.post.stack.find(&x_var).unwrap();
+        let x_val = astate.read_heap(x_formal_addr, Access::Dereference);
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+
+        assert!(astate
+            .path_condition
+            .prune_eq_const(x_val, 0, false)
+            .is_sat());
+        astate.post.attrs.invalidate(
+            x_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation, Location::dummy()),
+        );
+        let mut pre_post = PrePost {
+            pre: astate.pre.clone(),
+            post: astate,
+            formals: vec![(x_pvar, x_formal_addr)],
+            result: None,
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        coalesce_zero_direct_formals_for_continue_export(&pdesc, &mut pre_post);
+
+        assert!(
+            post_addr_has_visible_null_invalidation(&pre_post, x_val),
+            "a single zero direct formal is not actually coalesced, so OCaml keeps its null invalidation"
+        );
+    }
+
+    #[test]
+    fn test_continue_zero_direct_formal_coalescing_drops_null_invalidation() {
+        let (pdesc, mut pre_post, x_val, y_val, _x_loc, _y_loc) =
+            make_continue_pre_post_with_two_direct_formals();
+        let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+
+        assert!(pre_post
+            .post
+            .path_condition
+            .prune_eq_const(x_val, 0, false)
+            .is_sat());
+        assert!(pre_post
+            .post
+            .path_condition
+            .prune_eq_const(y_val, 0, false)
+            .is_sat());
+        pre_post.post.post.attrs.invalidate(
+            x_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), Location::dummy()),
+        );
+        pre_post.post.post.attrs.invalidate(
+            y_val,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation, Location::dummy()),
+        );
+
+        coalesce_zero_direct_formals_for_continue_export(&pdesc, &mut pre_post);
+        let x_repr = pre_post.post.path_condition.get_var_repr(x_val);
+        let y_repr = pre_post.post.path_condition.get_var_repr(y_val);
+
+        assert_eq!(
+            x_repr, y_repr,
+            "two zero direct formals should be coalesced onto one exported value"
+        );
+        assert!(
+            !post_addr_has_visible_null_invalidation(&pre_post, x_repr),
+            "actual zero-direct-formal coalescing should still drop the synthetic null invalidation"
+        );
     }
 
     #[test]
