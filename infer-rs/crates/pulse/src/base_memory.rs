@@ -54,18 +54,14 @@ impl Edges {
             .retain(|access, _| tracked_new.contains(access) || tracked_old.contains(access));
     }
 
-    fn recency_bindings_cloned(&self) -> Vec<(Access, ValueWithHistory)> {
+    fn recency_bindings(&self) -> Vec<(&Access, &ValueWithHistory)> {
         if self.new_keys.is_empty() && self.old_keys.is_empty() {
-            return self
-                .values
-                .iter()
-                .map(|(access, value)| (access.clone(), value.clone()))
-                .collect();
+            return self.values.iter().collect();
         }
         let mut bindings = Vec::with_capacity(self.values.len());
         for access in &self.new_keys {
             if let Some(value) = self.values.get(access) {
-                bindings.push((access.clone(), value.clone()));
+                bindings.push((access, value));
             }
         }
         for access in &self.old_keys {
@@ -73,10 +69,17 @@ impl Edges {
                 continue;
             }
             if let Some(value) = self.values.get(access) {
-                bindings.push((access.clone(), value.clone()));
+                bindings.push((access, value));
             }
         }
         bindings
+    }
+
+    fn recency_bindings_cloned(&self) -> Vec<(Access, ValueWithHistory)> {
+        self.recency_bindings()
+            .into_iter()
+            .map(|(access, value)| (access.clone(), value.clone()))
+            .collect()
     }
 
     fn from_recency_bindings_limited(
@@ -183,28 +186,83 @@ impl Edges {
         self.values.len()
     }
 
-    /// Rewrite edge targets/access indices through an arbitrary value mapper.
-    pub fn map_values(&mut self, mut f: impl FnMut(AbstractValue) -> AbstractValue) {
-        let rewritten = self
-            .recency_bindings_cloned()
-            .into_iter()
-            .map(|(access, mut value)| {
-                let access = match access {
-                    Access::ArrayAccess(typ, index) => Access::ArrayAccess(typ, f(index)),
-                    Access::FieldAccess(_) | Access::Dereference => access,
-                };
-                value.addr = f(value.addr);
-                (access, value)
-            })
-            .collect();
-        *self = match Self::configured_limit() {
+    fn first_mapping_change(
+        &self,
+        mut f: impl FnMut(AbstractValue) -> AbstractValue,
+    ) -> Option<(AbstractValue, AbstractValue)> {
+        for (access, value) in self.iter_with_history() {
+            if let Access::ArrayAccess(_, index) = access {
+                let new_index = f(*index);
+                if new_index != *index {
+                    return Some((*index, new_index));
+                }
+            }
+            let new_addr = f(value.addr);
+            if new_addr != value.addr {
+                return Some((value.addr, new_addr));
+            }
+        }
+        None
+    }
+
+    fn mapped_values(&self, mut f: impl FnMut(AbstractValue) -> AbstractValue) -> Option<Self> {
+        let mut changed = false;
+        let mut access_changed = false;
+        let mut rewritten = Vec::with_capacity(self.values.len());
+
+        for (access, value) in self.recency_bindings() {
+            let access = match access {
+                Access::ArrayAccess(typ, index) => {
+                    let index = *index;
+                    let new_index = f(index);
+                    if new_index != index {
+                        changed = true;
+                        access_changed = true;
+                    }
+                    Access::ArrayAccess(typ.clone(), new_index)
+                }
+                Access::FieldAccess(_) | Access::Dereference => access.clone(),
+            };
+            let mut value = value.clone();
+            let new_addr = f(value.addr);
+            if new_addr != value.addr {
+                changed = true;
+                value.addr = new_addr;
+            }
+            rewritten.push((access, value));
+        }
+
+        if !changed {
+            return None;
+        }
+
+        if !access_changed {
+            let mut edges = self.clone();
+            for (access, value) in rewritten {
+                if let Some(existing) = edges.values.get_mut(&access) {
+                    existing.addr = value.addr;
+                }
+            }
+            return Some(edges);
+        }
+
+        Some(match Self::configured_limit() {
             Some(limit) => Self::from_recency_bindings_limited(rewritten, limit),
             None => Self {
                 new_keys: Vec::new(),
                 old_keys: Vec::new(),
                 values: rewritten.into_iter().collect(),
             },
+        })
+    }
+
+    /// Rewrite edge targets/access indices through an arbitrary value mapper.
+    pub fn map_values(&mut self, f: impl FnMut(AbstractValue) -> AbstractValue) -> bool {
+        let Some(rewritten) = self.mapped_values(f) else {
+            return false;
         };
+        *self = rewritten;
+        true
     }
 
     /// Substitute abstract values in edge targets.
@@ -378,15 +436,70 @@ impl BaseMemory {
         self.graph.is_empty()
     }
 
-    /// Rewrite every heap source/target/index through an arbitrary value mapper.
-    pub fn map_values(&mut self, mut f: impl FnMut(AbstractValue) -> AbstractValue) {
-        let mut rewritten = BTreeMap::new();
-        for (src, edges) in self.iter() {
-            let mut edges = edges.clone();
-            edges.map_values(&mut f);
-            rewritten.insert(f(*src), Arc::new(edges));
+    pub fn first_mapping_change(
+        &self,
+        mut f: impl FnMut(AbstractValue) -> AbstractValue,
+    ) -> Option<(AbstractValue, AbstractValue)> {
+        for (src, edges) in self.graph.iter() {
+            let new_src = f(*src);
+            if new_src != *src {
+                return Some((*src, new_src));
+            }
+            if let Some(change) = edges.first_mapping_change(&mut f) {
+                return Some(change);
+            }
         }
-        *self.graph_mut() = rewritten;
+        None
+    }
+
+    /// Rewrite every heap source/target/index through an arbitrary value mapper.
+    pub fn map_values(&mut self, mut f: impl FnMut(AbstractValue) -> AbstractValue) -> bool {
+        let mut changed = false;
+        let mut src_changed = false;
+        let mut rewritten = Vec::with_capacity(self.graph.len());
+
+        for (src, edges) in self.graph.iter() {
+            let mapped_edges = edges.mapped_values(&mut f);
+            let new_src = f(*src);
+            if new_src != *src {
+                changed = true;
+                src_changed = true;
+            }
+            if mapped_edges.is_some() {
+                changed = true;
+            }
+            rewritten.push((*src, new_src, mapped_edges, Arc::clone(edges)));
+        }
+
+        if !changed {
+            return false;
+        }
+
+        if src_changed {
+            // This is a wholesale key rewrite. Assign a fresh Arc instead of
+            // going through graph_mut()/Arc::make_mut(), which would first
+            // clone the old BTreeMap only to overwrite it immediately.
+            self.graph = Arc::new(
+                rewritten
+                    .into_iter()
+                    .map(|(_src, new_src, mapped_edges, old_edges)| {
+                        (new_src, mapped_edges.map_or(old_edges, Arc::new))
+                    })
+                    .collect(),
+            );
+        } else {
+            // OCaml's persistent maps return the original node when an update
+            // is physically unchanged. Mirror that sharing here: when heap
+            // roots stay canonical, replace only the addresses whose edge
+            // bundle actually changed instead of rebuilding the whole graph.
+            let graph = self.graph_mut();
+            for (src, _new_src, mapped_edges, _old_edges) in rewritten {
+                if let Some(edges) = mapped_edges {
+                    graph.insert(src, Arc::new(edges));
+                }
+            }
+        }
+        true
     }
 
     /// Substitute abstract values: replace `old` with `new` in both

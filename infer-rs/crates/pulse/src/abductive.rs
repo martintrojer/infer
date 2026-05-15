@@ -1050,9 +1050,20 @@ impl AbductiveDomain {
     /// facts on values such as `x.* = 0` until summary export can root them.
     pub fn preserve_canonical_heap_targets(&mut self) {
         let path_condition = &self.path_condition;
-        self.post
+        let Some((first_old, first_repr)) = self
+            .post
             .heap
-            .map_values(|value| path_condition.get_var_repr(value));
+            .first_mapping_change(|value| path_condition.get_var_repr(value))
+        else {
+            return;
+        };
+        self.post.heap.map_values(|value| {
+            if value == first_old {
+                first_repr
+            } else {
+                path_condition.get_var_repr(value)
+            }
+        });
     }
 
     /// Rewrite the current state to the formula's canonical representatives.
