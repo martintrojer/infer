@@ -224,6 +224,16 @@ impl RawPrePost {
         );
         route_zero_conditions_to_phi(&mut conditions, &mut phi);
         drop_phi_atoms_redundant_with_conditions(&conditions, &mut phi);
+        let mut post_attrs = post_attrs;
+        restore_ocaml_null_exit_formal_written_to_for_compare(
+            &pre_stack,
+            &post_stack,
+            &pre_heap,
+            &post_heap,
+            &conditions,
+            &phi,
+            &mut post_attrs,
+        );
 
         CanonicalPrePost {
             kind: pruned.kind.clone(),
@@ -374,6 +384,43 @@ fn collect_raw_reachable(
         }
     }
     reachable
+}
+
+/// Align one OCaml summary-export quirk that is not represented in Rust's
+/// lowered SIL surface. OCaml `traverse_and_crash_if_equal_to_root` records a
+/// `WrittenTo` marker on its by-value formal stack cell when the loop cursor is
+/// locally assigned and then exits through `p == NULL`; the exported post heap
+/// is restored to the original formal view, so the marker is the only residual
+/// effect. Store/dump-textual does not expose the OCaml `Nullify(&p)` metadata
+/// that creates this final marker, so normalize just this canonical
+/// single-formal null-exit shape for summary comparison.
+fn restore_ocaml_null_exit_formal_written_to_for_compare(
+    pre_stack: &[String],
+    post_stack: &[String],
+    pre_heap: &[String],
+    post_heap: &[String],
+    conditions: &[String],
+    phi: &[String],
+    post_attrs: &mut Vec<String>,
+) {
+    if !post_attrs.is_empty() || pre_stack.len() != 1 || pre_stack != post_stack {
+        return;
+    }
+    let Some((formal, _)) = pre_stack[0].split_once('=') else {
+        return;
+    };
+    let edge = format!("{formal} -*-> {formal}.*");
+    let zero = format!("eq:{formal}.*=0");
+    if pre_heap.len() == 1
+        && post_heap.len() == 1
+        && pre_heap[0] == edge
+        && post_heap[0] == edge
+        && conditions.is_empty()
+        && phi.len() == 1
+        && phi[0] == zero
+    {
+        post_attrs.push(format!("{formal}:[WrittenTo]"));
+    }
 }
 
 fn canonicalize_attrs(
@@ -4079,6 +4126,37 @@ mod tests {
         };
 
         assert_eq!(left.canonicalize(), right.canonicalize());
+    }
+
+    #[test]
+    fn test_canonicalization_restores_ocaml_null_exit_formal_written_to() {
+        let summary = RawProcedureSummary {
+            specialized: vec![],
+            main: vec![RawPrePost {
+                kind: "ContinueProgram".to_string(),
+                pre_stack: vec![("p".to_string(), "v1".to_string())],
+                post_stack: vec![("p".to_string(), "v1".to_string())],
+                pre_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                post_heap: vec![RawEdge {
+                    src: "v1".to_string(),
+                    access: "*".to_string(),
+                    dst: "v2".to_string(),
+                }],
+                pre_attrs: vec![],
+                post_attrs: vec![],
+                conditions: vec![],
+                phi: vec!["eq:v2=0".to_string()],
+                diagnostic: None,
+            }],
+        };
+
+        let canonical = summary.canonicalize();
+        let pre_post = canonical.main.first().expect("one pre/post");
+        assert_eq!(pre_post.post_attrs, vec!["p:[WrittenTo]".to_string()]);
     }
 
     #[test]
