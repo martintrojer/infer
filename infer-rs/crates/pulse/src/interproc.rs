@@ -1266,6 +1266,12 @@ fn import_callee_pre_attributes(
             continue;
         };
         let caller_addr = caller_state.get_var_repr(caller_addr);
+        let was_written_to = caller_state
+            .post
+            .attrs
+            .get(&caller_addr)
+            .and_then(|attrs| attrs.get_written_to())
+            .is_some();
 
         // Cross-ref: OCaml `AddressAttributes.abduce_one` only keeps imported
         // pre attrs on addresses that already belong to the caller pre-state.
@@ -1274,6 +1280,16 @@ fn import_callee_pre_attributes(
         }
 
         for attr in attrs.iter() {
+            // Cross-ref: OCaml `SafeAttributes.abduce_one` does not abduce
+            // `MustBeInitialized` into the caller precondition when the
+            // caller has already written that address. This matters for
+            // callback fields: `set_callback` writes `callback->f`, then a
+            // specialized `apply_callback` reads it, but OCaml exports only
+            // the write-side `MustBeValid` obligation on `callback.*.f`, not
+            // a stale read-side `MustBeInitialized` requirement.
+            if matches!(attr, Attribute::MustBeInitialized(_, _)) && was_written_to {
+                continue;
+            }
             caller_state
                 .pre
                 .attrs
@@ -1792,7 +1808,16 @@ fn translate_formula(
         let Some(&caller_v) = subst.get(&callee_v) else {
             continue;
         };
+        let caller_v = caller_state.get_var_repr(caller_v);
         caller_state.add_dynamic_type_unsafe(caller_v, typ.clone());
+        if caller_state.get_closure_proc_name(caller_v).is_some()
+            && caller_state.and_positive(caller_v).is_unsat()
+        {
+            return TranslateFormulaResult::Unsat;
+        }
+        if let Some(attrs) = caller_state.post.attrs.get_mut(&caller_v) {
+            attrs.remove_closure_attrs();
+        }
     }
 
     // Cross-ref: OCaml `PulseFormula.and_callee_formula` also imports `IsInt`
@@ -4294,6 +4319,85 @@ mod tests {
                 .iter()
                 .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _))),
             "callee pre attrs without outgoing pre edges should still import into caller pre"
+        );
+    }
+
+    #[test]
+    fn test_apply_summary_skips_must_be_initialized_on_caller_written_address() {
+        let callee_pname = Procname::c_from_string("callee");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), Location::dummy());
+        callee_pdesc.formals = vec![(Mangled::from_string("p"), Typ::void(), Default::default())];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let formal_pvar = Pvar::mk(Mangled::from_string("p"), callee_pname);
+        let formal_addr = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(formal_pvar.clone())))
+            .unwrap();
+        let formal_val = callee_state.read_heap(formal_addr, Access::Dereference);
+        let read_loc = Location::dummy();
+        callee_state.mark_must_be_valid_at(formal_val, &read_loc);
+        callee_state.mark_must_be_initialized_at(formal_val, &read_loc);
+
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(formal_pvar, formal_addr)],
+            result: None,
+            kind: crate::summary::PrePostKind::ContinueProgram,
+            diagnostic: None,
+        };
+
+        let caller_pname = Procname::c_from_string("caller");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), Location::dummy());
+        caller_pdesc.formals = vec![(Mangled::from_string("x"), Typ::void(), Default::default())];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_formal_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_formal_addr = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_formal_pvar)))
+            .unwrap();
+        let caller_formal_val = caller_state.read_heap(caller_formal_addr, Access::Dereference);
+        caller_state
+            .post
+            .attrs
+            .mark_written_to(caller_formal_val, 0, Location::dummy());
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_formal_val,
+                ValueHistory::assignment(Location::dummy()),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(Exp::Var(actual_id), Typ::void())],
+            &Location::dummy(),
+            caller_state,
+        );
+
+        let ExecutionDomain::ContinueProgram(state) = &results[0] else {
+            panic!("expected continue result, got {results:?}");
+        };
+        let imported_attrs = state
+            .pre
+            .attrs
+            .get(&caller_formal_val)
+            .expect("caller pointee should keep imported validity attr");
+        assert!(imported_attrs
+            .iter()
+            .any(|attr| matches!(attr, Attribute::MustBeValid(_, _, _))));
+        assert!(
+            !imported_attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeInitialized(_, _))),
+            "OCaml SafeAttributes.abduce_one skips MustBeInitialized on caller-written addresses"
         );
     }
 

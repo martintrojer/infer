@@ -258,6 +258,10 @@ impl Attributes {
         self.0.remove(attr);
     }
 
+    pub fn remove_closure_attrs(&mut self) {
+        self.0.retain(|attr| !matches!(attr, Attribute::Closure(_)));
+    }
+
     pub fn contains(&self, attr: &Attribute) -> bool {
         self.0.contains(attr)
     }
