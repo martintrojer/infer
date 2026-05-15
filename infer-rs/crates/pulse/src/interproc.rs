@@ -11,7 +11,7 @@
 //! `apply_summary` maps the callee's effects (heap writes, invalidations,
 //! constraints) into the caller's abstract state.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sil::exp::Exp;
 use sil::ident::Ident;
@@ -1142,7 +1142,7 @@ fn materialize_pre(
             }
 
             for (access, callee_target) in edges.iter() {
-                let caller_access = translate_access(subst, access, caller_state);
+                let caller_access = translate_access_to_caller(subst, access, caller_state);
                 let caller_target = if value_actual_formal_stack_addrs.contains(&callee_addr) {
                     // Cross-ref: OCaml `materialize_pre_from_actual` starts
                     // from the dereferenced formal value for non-struct/value
@@ -1347,20 +1347,7 @@ fn apply_post_cell(
     loc: &Location,
     caller_state: &mut AbductiveDomain,
 ) {
-    let mut caller_edges = caller_state
-        .post
-        .heap
-        .get_edges(caller_addr)
-        .cloned()
-        .unwrap_or_default();
-
-    if let Some(pre_edges) = pre_edges_opt {
-        for (access, _) in pre_edges.iter() {
-            let caller_access = translate_access(subst, access, caller_state);
-            caller_edges.remove(&caller_access);
-        }
-    }
-
+    let mut translated_post_edges = crate::base_memory::Edges::empty();
     if let Some(post_edges) = post_edges_opt {
         for (access, callee_value) in post_edges.iter_with_history() {
             let caller_target = resolve_for_post(
@@ -1369,14 +1356,14 @@ fn apply_post_cell(
                 callee_actual_value_addrs,
                 caller_state,
             );
-            let caller_access = translate_access(subst, access, caller_state);
+            let caller_access = translate_access_to_caller(subst, access, caller_state);
             let history = restore_history_from_cell_ids(&callee_value.history, hist_map)
                 .unwrap_or_else(|| {
                     caller_state
                         .history_of_value(caller_target)
                         .unwrap_or_else(|| ValueHistory::assignment(loc.clone()))
                 });
-            caller_edges.add_with_history(
+            translated_post_edges.add_with_history(
                 caller_access,
                 crate::value_history::ValueWithHistory::new(
                     caller_target,
@@ -1386,7 +1373,40 @@ fn apply_post_cell(
         }
     }
 
+    let post_edges_minus_pre =
+        delete_edges_in_callee_pre_from_caller(pre_edges_opt, caller_addr, subst, caller_state);
+    let caller_edges = translated_post_edges.union_left_biased(&post_edges_minus_pre);
+
     caller_state.post.heap.set_edges(caller_addr, caller_edges);
+}
+
+fn delete_edges_in_callee_pre_from_caller(
+    edges_pre_opt: Option<&crate::base_memory::Edges>,
+    addr_caller: AbstractValue,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) -> crate::base_memory::Edges {
+    let Some(mut post_edges_minus_pre) = caller_state.post.heap.get_edges(addr_caller).cloned()
+    else {
+        return crate::base_memory::Edges::empty();
+    };
+    let Some(edges_pre) = edges_pre_opt else {
+        return post_edges_minus_pre;
+    };
+
+    let mut translated_accesses_pre = BTreeSet::new();
+    for (access_callee, _) in edges_pre.iter() {
+        let access_caller = translate_access_to_caller(subst, access_callee, caller_state);
+        translated_accesses_pre.insert(access_caller);
+    }
+    for access_caller in translated_accesses_pre {
+        // Delete exactly the caller accesses that correspond to callee-pre
+        // accesses. Values are left non-normalized just like OCaml's
+        // `delete_edges_in_callee_pre_from_caller`; reads canonicalize on
+        // demand when necessary.
+        post_edges_minus_pre.remove(&access_caller);
+    }
+    post_edges_minus_pre
 }
 
 fn record_cell_id_history(
@@ -1910,14 +1930,28 @@ fn translate_formula(
 }
 
 /// Translate a callee Access to a caller Access (substituting array indices).
-fn translate_access(
-    subst: &HashMap<AbstractValue, AbstractValue>,
+///
+/// Cross-ref: OCaml `PulseInterproc.translate_access_to_caller` uses
+/// `subst_find_or_new`, not a plain lookup. In particular, an array index that
+/// was not reached while materializing roots must still be mapped to a fresh
+/// caller value, and that binding must be reused by caller-edge deletion and
+/// post-edge replay.
+fn translate_access_to_caller(
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
     access: &Access,
     caller_state: &mut AbductiveDomain,
 ) -> Access {
     match access {
         Access::ArrayAccess(typ, idx) => {
-            let caller_idx = subst.get(idx).copied().unwrap_or(*idx);
+            let caller_idx = subst
+                .get(idx)
+                .copied()
+                .map(|idx| caller_state.get_var_repr(idx))
+                .unwrap_or_else(|| {
+                    let fresh = idx.mk_fresh_same_kind();
+                    subst.insert(*idx, fresh);
+                    fresh
+                });
             let caller_idx = caller_state.canonicalize_for_access(caller_idx);
             Access::ArrayAccess(typ.clone(), caller_idx)
         }

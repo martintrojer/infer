@@ -127,6 +127,99 @@ impl Edges {
         Self::remove_key(&mut self.old_keys, access);
     }
 
+    /// OCaml `RecencyMap.union_left_biased`: keep bindings from `self` when
+    /// both edge sets mention the same access, then fill remaining recency
+    /// budget from `right`.
+    pub fn union_left_biased(&self, right: &Self) -> Self {
+        let Some(limit) = Self::configured_limit() else {
+            let mut values = right.values.clone();
+            for (access, value) in self.iter_with_history() {
+                values.insert(access.clone(), value.clone());
+            }
+            return Self {
+                new_keys: Vec::new(),
+                old_keys: Vec::new(),
+                values,
+            };
+        };
+        let limit = limit.max(1);
+
+        fn concat_and_spill(
+            mut head: Vec<Access>,
+            mut count: usize,
+            tail: &[Access],
+            limit: usize,
+        ) -> (Vec<Access>, usize, Vec<Access>) {
+            if count == 0 {
+                return (tail.to_vec(), tail.len(), Vec::new());
+            }
+            if count == limit {
+                return (head, count, tail.to_vec());
+            }
+
+            let mut take = Vec::new();
+            let mut rest = Vec::new();
+            for access in tail {
+                if count + take.len() >= limit {
+                    rest.push(access.clone());
+                } else if head.iter().any(|existing| existing == access)
+                    || take.iter().any(|existing| existing == access)
+                {
+                    // Preserve OCaml's left bias when filling `new_`.
+                } else {
+                    take.push(access.clone());
+                }
+            }
+            count += take.len();
+            head.extend(take);
+            (head, count, rest)
+        }
+
+        // Rust's `recency_bindings` yields the same newest-first order as
+        // OCaml `bindings`; OCaml reverses it here because callers care about
+        // the recency partitioning, not only the map contents.
+        let mut left_keys: Vec<_> = self
+            .recency_bindings()
+            .into_iter()
+            .map(|(access, _)| access.clone())
+            .collect();
+        left_keys.reverse();
+        let left_count = left_keys.len();
+        let (mut new_keys, mut count_new, mut old_keys) = if left_count <= limit {
+            (left_keys, left_count, Vec::new())
+        } else {
+            let old_keys = left_keys.split_off(limit);
+            (left_keys, limit, old_keys)
+        };
+
+        if count_new < limit {
+            (new_keys, count_new, old_keys) =
+                concat_and_spill(new_keys, count_new, &right.new_keys, limit);
+        }
+        if count_new < limit {
+            let (filled_new_keys, _filled_count_new, filled_old_keys) =
+                concat_and_spill(new_keys, count_new, &right.old_keys, limit);
+            new_keys = filled_new_keys;
+            old_keys = filled_old_keys;
+        }
+
+        let mut values = BTreeMap::new();
+        for access in new_keys.iter().chain(old_keys.iter()) {
+            if let Some(value) = self
+                .find_with_history(access)
+                .or_else(|| right.find_with_history(access))
+            {
+                values.insert(access.clone(), value.clone());
+            }
+        }
+
+        Self {
+            new_keys,
+            old_keys,
+            values,
+        }
+    }
+
     pub fn find(&self, access: &Access) -> Option<AbstractValue> {
         self.find_with_history(access).map(|value| value.addr)
     }
@@ -687,6 +780,46 @@ mod tests {
         assert_eq!(edges.find(&field_access("a")), Some(v4));
         assert_eq!(edges.find(&field_access("b")), Some(v2));
         assert_eq!(edges.find(&field_access("c")), Some(v3));
+    }
+
+    #[test]
+    fn test_edges_union_left_biased_prefers_left() {
+        let mut left = Edges::empty();
+        let mut right = Edges::empty();
+        let a = field_access("a");
+        let b = field_access("b");
+        let c = field_access("c");
+        let v1 = AbstractValue::of_raw(1);
+        let v2 = AbstractValue::of_raw(2);
+        let v3 = AbstractValue::of_raw(3);
+        let v20 = AbstractValue::of_raw(20);
+
+        left.add_with_history_limited(
+            a.clone(),
+            ValueWithHistory::new(v1, ValueHistory::epoch()),
+            32,
+        );
+        left.add_with_history_limited(
+            b.clone(),
+            ValueWithHistory::new(v2, ValueHistory::epoch()),
+            32,
+        );
+        right.add_with_history_limited(
+            b.clone(),
+            ValueWithHistory::new(v20, ValueHistory::epoch()),
+            32,
+        );
+        right.add_with_history_limited(
+            c.clone(),
+            ValueWithHistory::new(v3, ValueHistory::epoch()),
+            32,
+        );
+
+        let union = left.union_left_biased(&right);
+
+        assert_eq!(union.find(&a), Some(v1));
+        assert_eq!(union.find(&b), Some(v2), "left edge should win");
+        assert_eq!(union.find(&c), Some(v3));
     }
 
     #[test]
