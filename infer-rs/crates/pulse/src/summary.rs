@@ -1232,20 +1232,30 @@ impl PulseSummary {
             pre_posts.extend(recovered_invalid_accesses);
         }
 
-        // Keep the summary surface deterministic: exact latent/abort
-        // duplicates from Rust recovery/twin paths do not carry information.
+        // Keep the summary surface deterministic and close to OCaml.
         //
-        // Narrow OCaml-aligned exception: `PulseSummary.of_posts` preserves the
-        // list multiplicity returned by `PulseAbductiveDomain.Summary.of_post`.
-        // That matters for C leak/realloc paths whose null/success branches
-        // normalize to identical ordinary Continue rows. Preserve only benign
-        // Continue duplicates with no formula/diagnostic/latent surface.
+        // Two complementary OCaml alignments apply here:
+        //
+        // 1. `PulseSummary.of_posts` preserves the list multiplicity returned
+        //    by `PulseAbductiveDomain.Summary.of_post`. That matters for C
+        //    leak/realloc paths whose null/success branches normalize to
+        //    identical ordinary Continue rows. Preserve only benign Continue
+        //    duplicates with no formula/diagnostic/latent surface — gated by
+        //    `preserve_exact_duplicate_pre_post`.
+        //
+        // 2. Cross-ref `PulseExecutionDomain.leq_stopped_execution`: stopped
+        //    states are subsumed by their summary field set, NOT by hidden
+        //    Rust ValueHistory/ValueWithHistory payloads. Worker-1's
+        //    b512df2924 mirrors that field set in execution-domain leq; mirror
+        //    it here at the summary export site too via
+        //    `pre_posts_equivalent_for_summary_export` so duplicate latent
+        //    rows that differ only on hidden history collapse.
         let mut deduped_pre_posts = Vec::with_capacity(pre_posts.len());
         for pre_post in pre_posts.drain(..) {
             if !preserve_exact_duplicate_pre_post(&pre_post)
                 && deduped_pre_posts
                     .iter()
-                    .any(|existing| existing == &pre_post)
+                    .any(|existing| pre_posts_equivalent_for_summary_export(existing, &pre_post))
             {
                 continue;
             }
@@ -1445,6 +1455,62 @@ impl PulseSummary {
     /// Check if the specialization limit has been reached.
     pub fn is_specialization_limit_reached(&self) -> bool {
         self.specialized.len() >= 5 // matches Config.pulse_specialization_limit default
+    }
+}
+
+fn pre_posts_equivalent_for_summary_export(lhs: &PrePost, rhs: &PrePost) -> bool {
+    if lhs == rhs {
+        return true;
+    }
+
+    // Keep the ValueHistory relaxation intentionally narrow.  OCaml
+    // `PulseExecutionDomain.leq_stopped_execution` compares LatentAbortProgram
+    // summary state plus latent issue (mirrored by worker-1's b512df2924), and
+    // OCaml's `PulseAbductiveDomain.GraphComparison.isograph_map_edges`
+    // ignores heap-edge histories.  Use that only for latent aborts whose
+    // invalidation is already visible in the exported summary state; otherwise
+    // the latent issue/history sideband can be the only caller-visible
+    // explanation, as in interprocedural.c:conditional_free_then_use_latent.
+    if !matches!(lhs.kind, PrePostKind::LatentAbortProgram)
+        || lhs.kind != rhs.kind
+        || lhs.diagnostic != rhs.diagnostic
+        || !latent_abort_has_visible_summary_invalidation(lhs)
+        || !latent_abort_has_visible_summary_invalidation(rhs)
+        || !crate::state_cmp::alpha_equivalent(&lhs.post, &rhs.post)
+    {
+        return false;
+    }
+
+    summary_export_formals_equivalent(lhs, rhs) && summary_export_results_equivalent(lhs, rhs)
+}
+
+fn latent_abort_has_visible_summary_invalidation(pre_post: &PrePost) -> bool {
+    pre_post.post.post.attrs.iter().any(|(_, attrs)| {
+        attrs
+            .iter()
+            .any(|attr| matches!(attr, Attribute::Invalid(_, _)))
+    })
+}
+
+fn summary_export_formals_equivalent(lhs: &PrePost, rhs: &PrePost) -> bool {
+    lhs.formals.len() == rhs.formals.len()
+        && lhs.formals.iter().zip(&rhs.formals).all(
+            |((lhs_pvar, lhs_addr), (rhs_pvar, rhs_addr))| {
+                lhs_pvar == rhs_pvar
+                    && crate::state_cmp::alpha_equivalent_value(
+                        &lhs.post, *lhs_addr, &rhs.post, *rhs_addr,
+                    )
+            },
+        )
+}
+
+fn summary_export_results_equivalent(lhs: &PrePost, rhs: &PrePost) -> bool {
+    match (lhs.result, rhs.result) {
+        (None, None) => true,
+        (Some(lhs_result), Some(rhs_result)) => {
+            crate::state_cmp::alpha_equivalent_value(&lhs.post, lhs_result, &rhs.post, rhs_result)
+        }
+        _ => false,
     }
 }
 
@@ -3874,6 +3940,52 @@ mod tests {
             })
             .collect();
         pdesc
+    }
+
+    #[test]
+    fn test_summary_export_dedup_ignores_hidden_heap_value_history() {
+        let (_pdesc, mut lhs, formal_value) = make_abort_pre_post_with_formal("x");
+        lhs.kind = PrePostKind::LatentAbortProgram;
+        lhs.post.post.attrs.invalidate(
+            formal_value,
+            crate::invalidation::Invalidation::CFree,
+            ValueHistory::invalidated(crate::invalidation::Invalidation::CFree, Location::dummy()),
+        );
+        let mut rhs = lhs.clone();
+        let formal_addr = lhs.formals[0].1;
+        let loc1 = Location {
+            line: 10,
+            col: 1,
+            ..Location::dummy()
+        };
+        let loc2 = Location {
+            line: 20,
+            col: 1,
+            ..Location::dummy()
+        };
+
+        lhs.post.pre.heap.add_edge_with_history(
+            formal_addr,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(
+                formal_value,
+                ValueHistory::assignment(loc1),
+            ),
+        );
+        rhs.post.pre.heap.add_edge_with_history(
+            formal_addr,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(
+                formal_value,
+                ValueHistory::assignment(loc2),
+            ),
+        );
+
+        assert_ne!(lhs, rhs, "structural PrePost equality sees hidden history");
+        assert!(
+            pre_posts_equivalent_for_summary_export(&lhs, &rhs),
+            "summary export should use OCaml's state/sideband field set, not hidden ValueHistory"
+        );
     }
 
     fn dummy_invalid_access_diagnostic(
