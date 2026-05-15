@@ -687,6 +687,20 @@ impl Hasher for FnvHasher {
     }
 }
 
+fn keyed_sorted_vec<T, K: Ord>(
+    items: impl Iterator<Item = T>,
+    mut key: impl FnMut(&T) -> K,
+) -> Vec<(K, T)> {
+    // `sort_by_cached_key` also computes each key once, but it allocates a
+    // second side vector for the cached keys.  The canonicalizer pass already
+    // needs a temporary ordered list, so store the key next to the borrowed
+    // item and sort that one vector instead.  `sort_by` is stable, preserving
+    // the previous tie behaviour for equal partial keys.
+    let mut entries: Vec<_> = items.map(|item| (key(&item), item)).collect();
+    entries.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+    entries
+}
+
 fn written_stack_roots(
     stack: &crate::base_stack::BaseStack,
     attrs: &crate::base_attrs::BaseAddressAttributes,
@@ -750,7 +764,7 @@ impl Canonicalizer {
     }
 
     fn map_value(&mut self, value: AbstractValue) -> CanonValue {
-        if let Some(existing) = self.get(value) {
+        if let Some(existing) = self.values.get(&value).copied() {
             return existing;
         }
 
@@ -767,14 +781,38 @@ impl Canonicalizer {
         canon
     }
 
+    fn map_returned_from_unknown_values(&mut self, attr: &Attribute) {
+        if let Attribute::ReturnedFromUnknown(values) = attr {
+            for value in values {
+                self.map_value(*value);
+            }
+        }
+    }
+
+    fn map_edge_values(&mut self, access: &Access, target: AbstractValue) {
+        if let Access::ArrayAccess(_, index) = access {
+            self.map_value(*index);
+        }
+        self.map_value(target);
+    }
+
+    fn map_term_eq_values(&mut self, lhs: AbstractValue, term_eq: &TermEq) {
+        self.map_value(lhs);
+        for value in operand_values(&term_eq.lhs) {
+            self.map_value(value);
+        }
+        for value in operand_values(&term_eq.rhs) {
+            self.map_value(value);
+        }
+    }
+
     fn seed_from_stack(&mut self, stack: &BaseStack) {
-        let mut entries: Vec<_> = stack
-            .iter()
-            .map(|(var, addr)| (format!("{var}"), *addr))
-            .collect();
-        entries.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
-        for (_, addr) in entries {
-            self.map_value(addr);
+        self.map_stack_addrs(stack);
+    }
+
+    fn map_stack_addrs(&mut self, stack: &BaseStack) {
+        for (_, (_, addr)) in keyed_sorted_vec(stack.iter(), |(var, _)| format!("{var}")) {
+            self.map_value(*addr);
         }
     }
 
@@ -803,17 +841,7 @@ impl Canonicalizer {
         let Some(edges) = memory.get_edges(src) else {
             return;
         };
-        let mut edge_entries: Vec<_> = edges
-            .iter()
-            .map(|(access, target)| (access, *target))
-            .collect();
-        edge_entries.sort_by_cached_key(|(access, target)| self.partial_edge_key(access, *target));
-        for (access, target) in edge_entries {
-            if let Access::ArrayAccess(_, index) = access {
-                self.map_value(*index);
-            }
-            self.map_value(target);
-        }
+        self.map_sorted_edges(edges.iter());
     }
 
     fn propagate_attrs(&mut self, attrs: &BaseAddressAttributes) {
@@ -825,47 +853,38 @@ impl Canonicalizer {
             return;
         };
         for attr in attrs.iter() {
-            if let Attribute::ReturnedFromUnknown(values) = attr {
-                for value in values {
-                    self.map_value(*value);
-                }
-            }
+            self.map_returned_from_unknown_values(attr);
         }
     }
 
     fn propagate_formula(&mut self, state: &AbductiveDomain) {
         let phi = state.path_condition.phi();
 
-        let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-        // Cached key = same tuple the old `sort_by_key` produced.
-        equalities.sort_by_cached_key(|(lhs, rhs)| {
+        for (_, (lhs, rhs)) in keyed_sorted_vec(phi.var_eqs.iter_equalities(), |(lhs, rhs)| {
             (self.partial_value_key(*lhs), self.partial_value_key(*rhs))
-        });
-        for (lhs, rhs) in equalities {
+        }) {
             if self.get(lhs).is_some() || self.get(rhs).is_some() {
                 self.map_value(lhs);
                 self.map_value(rhs);
             }
         }
 
-        let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-        linear_eqs.sort_by_cached_key(|(lhs, _)| self.partial_value_key(**lhs));
-        for (lhs, lin) in linear_eqs {
-            let vars: Vec<_> = std::iter::once(*lhs).chain(lin.get_variables()).collect();
-            if vars.iter().any(|value| self.get(*value).is_some()) {
-                for value in vars {
+        for (_, (lhs, lin)) in keyed_sorted_vec(phi.linear_eqs.iter(), |(lhs, _)| {
+            self.partial_value_key(**lhs)
+        }) {
+            if self.get(*lhs).is_some()
+                || lin.get_variables().any(|value| self.get(value).is_some())
+            {
+                self.map_value(*lhs);
+                for value in lin.get_variables() {
                     self.map_value(value);
                 }
             }
         }
 
-        let mut atoms: Vec<_> = phi.atoms.iter().collect();
         // Cross-ref: `partial_atom_key` is structural (no `String`
         // allocation), unlike the legacy `partial_atom_label`.
-        // `sort_by_cached_key` evaluates each key exactly once instead of
-        // the O(N log N) re-evaluations a plain `sort_by_key` would do.
-        atoms.sort_by_cached_key(|atom| self.partial_atom_key(atom));
-        for atom in atoms {
+        for (_, atom) in keyed_sorted_vec(phi.atoms.iter(), |atom| self.partial_atom_key(atom)) {
             let vars = atom.all_vars();
             if vars.iter().any(|value| self.get(*value).is_some()) {
                 for value in vars {
@@ -874,23 +893,29 @@ impl Canonicalizer {
             }
         }
 
-        let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_key(**lhs, term_eq));
-        for (lhs, term_eq) in term_eqs {
-            let vars: Vec<_> = std::iter::once(*lhs)
-                .chain(operand_values(&term_eq.lhs))
-                .chain(operand_values(&term_eq.rhs))
-                .collect();
-            if vars.iter().any(|value| self.get(*value).is_some()) {
-                for value in vars {
+        for (_, (lhs, term_eq)) in keyed_sorted_vec(phi.term_eqs.iter(), |(lhs, term_eq)| {
+            self.partial_term_eq_key(**lhs, term_eq)
+        }) {
+            let lhs_mapped = self.get(*lhs).is_some();
+            let lhs_values = operand_values(&term_eq.lhs);
+            let rhs_values = operand_values(&term_eq.rhs);
+            if lhs_mapped
+                || lhs_values.iter().any(|value| self.get(*value).is_some())
+                || rhs_values.iter().any(|value| self.get(*value).is_some())
+            {
+                self.map_value(*lhs);
+                for value in lhs_values {
+                    self.map_value(value);
+                }
+                for value in rhs_values {
                     self.map_value(value);
                 }
             }
         }
 
-        let mut intervals: Vec<_> = phi.intervals.iter().collect();
-        intervals.sort_by_cached_key(|(value, _)| self.partial_value_key(**value));
-        for (value, _) in intervals {
+        for (_, (value, _)) in keyed_sorted_vec(phi.intervals.iter(), |(value, _)| {
+            self.partial_value_key(**value)
+        }) {
             if self.get(*value).is_some() {
                 continue;
             }
@@ -903,9 +928,9 @@ impl Canonicalizer {
             }
         }
 
-        let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-        is_int_vars.sort_by_cached_key(|value| self.partial_value_key(*value));
-        for value in is_int_vars {
+        for (_, value) in keyed_sorted_vec(phi.is_int_vars.iter().copied(), |value| {
+            self.partial_value_key(*value)
+        }) {
             if self.get(value).is_some() {
                 continue;
             }
@@ -918,22 +943,22 @@ impl Canonicalizer {
             }
         }
 
-        let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-        fn_apps.sort_by_cached_key(|(_, ret)| self.partial_value_key(**ret));
-        for (key, ret) in fn_apps {
-            let vars: Vec<_> = key
-                .actuals
-                .iter()
-                .filter_map(|actual| match actual {
-                    FnAppActual::Const(_) => None,
-                    FnAppActual::Var(value) => Some(*value),
+        for (_, (key, ret)) in keyed_sorted_vec(phi.iter_fn_app_eqs(), |(_, ret)| {
+            self.partial_value_key(**ret)
+        }) {
+            let ret_mapped = self.get(*ret).is_some();
+            if ret_mapped
+                || key.actuals.iter().any(|actual| match actual {
+                    FnAppActual::Const(_) => false,
+                    FnAppActual::Var(value) => self.get(*value).is_some(),
                 })
-                .chain(std::iter::once(*ret))
-                .collect();
-            if vars.iter().any(|value| self.get(*value).is_some()) {
-                for value in vars {
-                    self.map_value(value);
+            {
+                for actual in &key.actuals {
+                    if let FnAppActual::Var(value) = actual {
+                        self.map_value(*value);
+                    }
                 }
+                self.map_value(*ret);
             }
         }
     }
@@ -954,13 +979,17 @@ impl Canonicalizer {
     }
 
     fn assign_remaining_stack(&mut self, stack: &BaseStack) {
-        let mut entries: Vec<_> = stack
-            .iter()
-            .map(|(var, addr)| (format!("{var}"), *addr))
-            .collect();
-        entries.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
-        for (_, addr) in entries {
-            self.map_value(addr);
+        self.map_stack_addrs(stack);
+    }
+
+    fn map_sorted_edges<'a>(
+        &mut self,
+        edges: impl Iterator<Item = (&'a Access, &'a AbstractValue)>,
+    ) {
+        for (_, (access, target)) in keyed_sorted_vec(edges, |(access, target)| {
+            self.partial_edge_key(access, **target)
+        }) {
+            self.map_edge_values(access, *target);
         }
     }
 
@@ -969,25 +998,14 @@ impl Canonicalizer {
         memory: &BaseMemory,
         reachable: &std::collections::HashSet<AbstractValue>,
     ) {
-        let mut entries: Vec<_> = memory.iter().map(|(src, edges)| (*src, edges)).collect();
-        entries.sort_by_cached_key(|(src, _)| self.partial_value_key(*src));
-        for (src, edges) in entries {
-            if !reachable.contains(&src) {
+        for (_, (src, edges)) in
+            keyed_sorted_vec(memory.iter(), |(src, _)| self.partial_value_key(**src))
+        {
+            if !reachable.contains(src) {
                 continue;
             }
-            self.map_value(src);
-            let mut edge_entries: Vec<_> = edges
-                .iter()
-                .map(|(access, target)| (access, *target))
-                .collect();
-            edge_entries
-                .sort_by_cached_key(|(access, target)| self.partial_edge_key(access, *target));
-            for (access, target) in edge_entries {
-                if let Access::ArrayAccess(_, index) = access {
-                    self.map_value(*index);
-                }
-                self.map_value(target);
-            }
+            self.map_value(*src);
+            self.map_sorted_edges(edges.iter());
         }
     }
 
@@ -996,19 +1014,15 @@ impl Canonicalizer {
         attrs: &BaseAddressAttributes,
         reachable: &std::collections::HashSet<AbstractValue>,
     ) {
-        let mut entries: Vec<_> = attrs.iter().map(|(addr, attrs)| (*addr, attrs)).collect();
-        entries.sort_by_cached_key(|(addr, _)| self.partial_value_key(*addr));
-        for (addr, attrs) in entries {
-            if !reachable.contains(&addr) {
+        for (_, (addr, attrs)) in
+            keyed_sorted_vec(attrs.iter(), |(addr, _)| self.partial_value_key(**addr))
+        {
+            if !reachable.contains(addr) {
                 continue;
             }
-            self.map_value(addr);
+            self.map_value(*addr);
             for attr in attrs.iter() {
-                if let Attribute::ReturnedFromUnknown(values) = attr {
-                    for value in values {
-                        self.map_value(*value);
-                    }
-                }
+                self.map_returned_from_unknown_values(attr);
             }
         }
     }
@@ -1016,64 +1030,52 @@ impl Canonicalizer {
     fn assign_remaining_formula(&mut self, state: &AbductiveDomain) {
         let phi = state.path_condition.phi();
 
-        let mut equalities: Vec<_> = phi.var_eqs.iter_equalities().collect();
-        equalities.sort_by_cached_key(|(lhs, rhs)| {
+        for (_, (lhs, rhs)) in keyed_sorted_vec(phi.var_eqs.iter_equalities(), |(lhs, rhs)| {
             (self.partial_value_key(*lhs), self.partial_value_key(*rhs))
-        });
-        for (lhs, rhs) in equalities {
+        }) {
             self.map_value(lhs);
             self.map_value(rhs);
         }
 
-        let mut linear_eqs: Vec<_> = phi.linear_eqs.iter().collect();
-        linear_eqs.sort_by_cached_key(|(lhs, lin)| self.partial_linear_eq_key(**lhs, lin));
-        for (lhs, lin) in linear_eqs {
+        for (_, (lhs, lin)) in keyed_sorted_vec(phi.linear_eqs.iter(), |(lhs, lin)| {
+            self.partial_linear_eq_key(**lhs, lin)
+        }) {
             self.map_value(*lhs);
             for value in lin.get_variables() {
                 self.map_value(value);
             }
         }
 
-        let mut atoms: Vec<_> = phi.atoms.iter().collect();
-        atoms.sort_by_cached_key(|atom| self.partial_atom_key(atom));
-        for atom in atoms {
+        for (_, atom) in keyed_sorted_vec(phi.atoms.iter(), |atom| self.partial_atom_key(atom)) {
             for value in atom.all_vars() {
                 self.map_value(value);
             }
         }
 
-        let mut term_eqs: Vec<_> = phi.term_eqs.iter().collect();
-        term_eqs.sort_by_cached_key(|(lhs, term_eq)| self.partial_term_eq_key(**lhs, term_eq));
-        for (lhs, term_eq) in term_eqs {
-            self.map_value(*lhs);
-            for value in operand_values(&term_eq.lhs) {
-                self.map_value(value);
-            }
-            for value in operand_values(&term_eq.rhs) {
-                self.map_value(value);
-            }
+        for (_, (lhs, term_eq)) in keyed_sorted_vec(phi.term_eqs.iter(), |(lhs, term_eq)| {
+            self.partial_term_eq_key(**lhs, term_eq)
+        }) {
+            self.map_term_eq_values(*lhs, term_eq);
         }
 
-        let mut intervals: Vec<_> = phi.intervals.iter().collect();
-        intervals.sort_by_cached_key(|(value, interval)| {
+        for (_, (value, _)) in keyed_sorted_vec(phi.intervals.iter(), |(value, interval)| {
             (
                 self.partial_value_key(**value),
                 CanonCItv::from_citv(interval),
             )
-        });
-        for (value, _) in intervals {
+        }) {
             self.map_value(*value);
         }
 
-        let mut is_int_vars: Vec<_> = phi.is_int_vars.iter().copied().collect();
-        is_int_vars.sort_by_cached_key(|value| self.partial_value_key(*value));
-        for value in is_int_vars {
+        for (_, value) in keyed_sorted_vec(phi.is_int_vars.iter().copied(), |value| {
+            self.partial_value_key(*value)
+        }) {
             self.map_value(value);
         }
 
-        let mut fn_apps: Vec<_> = phi.iter_fn_app_eqs().collect();
-        fn_apps.sort_by_cached_key(|(key, ret)| self.partial_fn_app_key(key, **ret));
-        for (key, ret) in fn_apps {
+        for (_, (key, ret)) in keyed_sorted_vec(phi.iter_fn_app_eqs(), |(key, ret)| {
+            self.partial_fn_app_key(key, **ret)
+        }) {
             for actual in &key.actuals {
                 if let FnAppActual::Var(value) = actual {
                     self.map_value(*value);
