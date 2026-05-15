@@ -1234,16 +1234,13 @@ impl PulseSummary {
             let latent_abort_twin = export_local_latent_abort_twin.then(|| {
                 let mut twin = pp.clone();
                 twin.kind = PrePostKind::LatentAbortProgram;
-                drop_potential_invalid_access_attrs(&mut twin);
                 twin
             });
-            drop_potential_invalid_access_attrs(&mut pp);
             pre_posts.push(pp);
             if let Some(twin) = latent_abort_twin {
                 pre_posts.push(twin);
             }
-            if let Some(mut latent_pp) = extra_continue_latent_invalid_access {
-                drop_potential_invalid_access_attrs(&mut latent_pp);
+            if let Some(latent_pp) = extra_continue_latent_invalid_access {
                 pre_posts.push(latent_pp);
             }
             for recovered in &recovered_invalid_accesses {
@@ -1252,10 +1249,6 @@ impl PulseSummary {
                         diagnostics.push(diag.clone());
                     }
                 }
-            }
-            let mut recovered_invalid_accesses = recovered_invalid_accesses;
-            for recovered in &mut recovered_invalid_accesses {
-                drop_potential_invalid_access_attrs(recovered);
             }
             pre_posts.extend(recovered_invalid_accesses);
         }
@@ -1518,37 +1511,6 @@ fn latent_abort_has_visible_summary_invalidation(pre_post: &PrePost) -> bool {
             .iter()
             .any(|attr| matches!(attr, Attribute::Invalid(_, _)))
     })
-}
-
-fn drop_potential_invalid_access_attrs(pre_post: &mut PrePost) {
-    let to_clean: Vec<_> = pre_post
-        .post
-        .post
-        .attrs
-        .iter()
-        .filter_map(|(addr, attrs)| {
-            attrs
-                .iter()
-                .any(|attr| matches!(attr, Attribute::PotentialInvalidAccess(..)))
-                .then_some(*addr)
-        })
-        .collect();
-    for addr in to_clean {
-        let Some(attrs) = pre_post.post.post.attrs.get_mut(&addr) else {
-            continue;
-        };
-        let attrs_to_remove: Vec<_> = attrs
-            .iter()
-            .filter(|attr| matches!(attr, Attribute::PotentialInvalidAccess(..)))
-            .cloned()
-            .collect();
-        for attr in attrs_to_remove {
-            attrs.remove(&attr);
-        }
-        if attrs.is_empty() {
-            pre_post.post.post.attrs.remove_addr(&addr);
-        }
-    }
 }
 
 fn summary_export_formals_equivalent(lhs: &PrePost, rhs: &PrePost) -> bool {

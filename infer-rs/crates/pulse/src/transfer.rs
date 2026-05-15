@@ -1290,19 +1290,20 @@ mod tests {
     }
 
     #[test]
-    fn test_store_to_formula_known_zero_with_compared_to_null_marker_detects_error() {
+    fn test_store_to_formula_known_zero_detects_error() {
         let mut state = mk_state();
-        let p_val = crate::abstract_value::AbstractValue::mk_fresh();
+        let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
+        let stack_addr = crate::abstract_value::AbstractValue::mk_fresh();
+        state
+            .post
+            .stack
+            .add(Var::ProgramVar(Box::new(pvar.clone())), stack_addr);
+        let p_val = state.read_heap(stack_addr, Access::Dereference);
+        let _heap_target = state.read_heap(p_val, Access::Dereference);
         assert!(state.and_equal_const(p_val, 0).is_sat());
-        state.invalidate(
-            p_val,
-            crate::invalidation::Invalidation::ComparedToNullInThisProcedure(Location::dummy()),
-            ValueHistory::invalidated(
-                crate::invalidation::Invalidation::ComparedToNullInThisProcedure(
-                    Location::dummy(),
-                ),
-                Location::dummy(),
-            ),
+        assert!(
+            state.check_valid(p_val).is_err(),
+            "EqZero should invalidate caller-visible heap values once the dereference path exists"
         );
 
         let id = Ident::create_normal(IdentName::from_string("n"), 0);
@@ -1325,7 +1326,7 @@ mod tests {
         });
         assert!(
             has_abort,
-            "storing through an address with an existing compared-to-null marker should abort"
+            "storing through an address that is provably null should abort"
         );
     }
 

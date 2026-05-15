@@ -4357,9 +4357,9 @@ mod tests {
             })
             .count();
 
-        assert!(
-            latent_null_derefs >= 1,
-            "expected the non-exit scan to recover a caller-controlled latent null dereference once the field write reaches its own CFG node, summary={summary:?}"
+        assert_eq!(
+            latent_null_derefs, 2,
+            "expected the non-exit scan to recover both `q == 0` and `q->next == 0` latent dereferences once the field write reaches its own CFG node, summary={summary:?}"
         );
         assert!(
             summary
@@ -4390,9 +4390,9 @@ mod tests {
             })
             .count();
 
-        assert!(
-            latent_null_derefs >= 1,
-            "expected abort-state summarization to preserve an earlier caller-controlled null dereference even when the block later aborts locally, summary={summary:?}"
+        assert_eq!(
+            latent_null_derefs, 2,
+            "expected abort-state summarization to preserve both earlier caller-controlled null dereferences even when the block later aborts locally, summary={summary:?}"
         );
         assert!(
             summary

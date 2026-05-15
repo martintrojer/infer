@@ -16,7 +16,7 @@ use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::var::Var;
 
-use crate::abductive::{AbductiveDomain, FormulaEffect};
+use crate::abductive::AbductiveDomain;
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::Allocator;
@@ -80,83 +80,6 @@ pub(crate) enum AccessMode {
     NoAccess,
 }
 
-pub(crate) fn diagnostic_from_invalid_access(
-    addr: &ValueWithHistory,
-    invalidation: Invalidation,
-    access_location: &Location,
-    invalidation_history: ValueHistory,
-) -> Diagnostic {
-    Diagnostic::AccessToInvalidAddress {
-        addr: addr.addr,
-        invalidation,
-        access_location: access_location.clone(),
-        trace_access_location: None,
-        access_history: addr.history.clone(),
-        invalidation_history,
-    }
-}
-
-pub(crate) fn diagnostic_from_potential_invalid_access(
-    addr: &ValueWithHistory,
-    access_location: &Location,
-    state: &AbductiveDomain,
-) -> Diagnostic {
-    let repr = state.path_condition.get_var_repr(addr.addr);
-    let potential_location = state
-        .post
-        .attrs
-        .get(&repr)
-        .and_then(|attrs| attrs.get_potential_invalid_access())
-        .map(|(loc, _reason)| loc.clone())
-        .filter(|loc| !loc.is_dummy())
-        .or_else(|| addr.history.last_location().cloned())
-        .unwrap_or_else(|| access_location.clone());
-    let invalidation = Invalidation::ConstantDereference(IntLit::zero());
-    let invalidation_history = addr.history.append_event(HistoryEvent::Invalidated {
-        invalidation: invalidation.clone(),
-        location: potential_location.clone(),
-    });
-    diagnostic_from_invalid_access(addr, invalidation, &potential_location, invalidation_history)
-}
-
-fn apply_access_side_effects(
-    addr: AbstractValue,
-    loc: &Location,
-    state: &mut AbductiveDomain,
-    mode: AccessMode,
-) {
-    match mode {
-        AccessMode::Read => {
-            let _ = state.record_read_access_at(addr, loc);
-        }
-        AccessMode::Write => state.record_write_access_at(addr),
-        AccessMode::NoAccess => {}
-    }
-}
-
-pub(crate) fn add_formula_condition_for_access(
-    addr: &ValueWithHistory,
-    loc: &Location,
-    state: &mut AbductiveDomain,
-    _mode: AccessMode,
-    f: impl FnOnce(
-        &mut crate::formula::Formula,
-    ) -> crate::sat_unsat::SatUnsat<Vec<crate::formula::NewEq>>,
-) -> crate::sat_unsat::SatUnsat<PulseResult<(), Diagnostic>> {
-    let result = f(&mut state.path_condition);
-    match state.apply_formula_result_with_effect(result) {
-        crate::sat_unsat::SatUnsat::Unsat => crate::sat_unsat::SatUnsat::Unsat,
-        crate::sat_unsat::SatUnsat::Sat(FormulaEffect::Sat) => {
-            crate::sat_unsat::SatUnsat::Sat(PulseResult::Ok(()))
-        }
-        crate::sat_unsat::SatUnsat::Sat(FormulaEffect::PotentialInvalidAccess(_)) => {
-            crate::sat_unsat::SatUnsat::Sat(PulseResult::fatal(
-                diagnostic_from_potential_invalid_access(addr, loc, state),
-            ))
-        }
-    }
-}
-
 fn check_validity_and_record_access(
     addr: &ValueWithHistory,
     loc: &Location,
@@ -172,7 +95,13 @@ fn check_validity_and_record_access(
     materialize_known_zero_invalid(addr.addr, &addr.history, loc, state);
     let valid = state.check_valid(addr.addr);
     if valid.is_ok() {
-        apply_access_side_effects(addr.addr, loc, state, mode);
+        match mode {
+            AccessMode::Read => {
+                let _ = state.record_read_access_at(addr.addr, loc);
+            }
+            AccessMode::Write => state.record_write_access_at(addr.addr),
+            AccessMode::NoAccess => {}
+        }
     }
     valid
 }
@@ -247,12 +176,14 @@ pub(crate) fn eval_with_history_mode(
                         AbstractValue::mk_fresh(),
                         ValueHistory::assignment(loc.clone()),
                     ),
-                    vec![diagnostic_from_invalid_access(
-                        &base,
+                    vec![Diagnostic::AccessToInvalidAddress {
+                        addr: base.addr,
                         invalidation,
-                        loc,
+                        access_location: loc.clone(),
+                        trace_access_location: None,
+                        access_history: base.history.clone(),
                         invalidation_history,
-                    )],
+                    }],
                 );
             }
             let field_access = Access::FieldAccess(field.clone());
@@ -275,12 +206,14 @@ pub(crate) fn eval_with_history_mode(
                         AbstractValue::mk_fresh(),
                         ValueHistory::assignment(loc.clone()),
                     ),
-                    vec![diagnostic_from_invalid_access(
-                        &base,
+                    vec![Diagnostic::AccessToInvalidAddress {
+                        addr: base.addr,
                         invalidation,
-                        loc,
+                        access_location: loc.clone(),
+                        trace_access_location: None,
+                        access_history: base.history.clone(),
                         invalidation_history,
-                    )],
+                    }],
                 );
             }
             let index = match eval_with_history(index_exp, loc, state) {
@@ -536,12 +469,14 @@ pub fn eval_deref_addr_with_history(
     // the dereference edge.
     if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::Read) {
         let (invalidation, invalidation_history) = *inv_info;
-        return PulseResult::fatal(diagnostic_from_invalid_access(
-            &addr,
+        return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
+            addr: addr.addr,
             invalidation,
-            loc,
+            access_location: loc.clone(),
+            trace_access_location: None,
+            access_history: addr.history.clone(),
             invalidation_history,
-        ));
+        });
     }
 
     let target = state.read_heap_with_history(addr, Access::Dereference);
@@ -570,12 +505,14 @@ pub fn check_addr_access_with_history(
 ) -> PulseResult<(), Diagnostic> {
     if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::Read) {
         let (invalidation, invalidation_history) = *inv_info;
-        return PulseResult::fatal(diagnostic_from_invalid_access(
-            &addr,
+        return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
+            addr: addr.addr,
             invalidation,
-            loc,
+            access_location: loc.clone(),
+            trace_access_location: None,
+            access_history: addr.history,
             invalidation_history,
-        ));
+        });
     }
     PulseResult::Ok(())
 }
@@ -607,12 +544,14 @@ pub fn check_addr_access_no_init_with_history(
     if let Err(inv_info) = check_validity_and_record_access(&addr, loc, state, AccessMode::NoAccess)
     {
         let (invalidation, invalidation_history) = *inv_info;
-        return PulseResult::fatal(diagnostic_from_invalid_access(
-            &addr,
+        return PulseResult::fatal(Diagnostic::AccessToInvalidAddress {
+            addr: addr.addr,
             invalidation,
-            loc,
+            access_location: loc.clone(),
+            trace_access_location: None,
+            access_history: addr.history,
             invalidation_history,
-        ));
+        });
     }
     PulseResult::Ok(())
 }
@@ -654,7 +593,14 @@ pub fn write_deref_with_history(
         Err(inv_info) => {
             let (invalidation, invalidation_history) = *inv_info;
             return PulseResult::FatalError(
-                diagnostic_from_invalid_access(&ref_addr, invalidation, loc, invalidation_history),
+                Diagnostic::AccessToInvalidAddress {
+                    addr: ref_addr.addr,
+                    invalidation,
+                    access_location: loc.clone(),
+                    trace_access_location: None,
+                    access_history: ref_addr.history.clone(),
+                    invalidation_history,
+                },
                 vec![],
             );
         }

@@ -47,7 +47,6 @@ enum AttributeRank {
     MustBeAwaited,
     MustBeInitialized,
     MustBeValid,
-    PotentialInvalidAccess,
     ReturnedFromUnknown,
     StaticType,
     StdMoved,
@@ -120,12 +119,6 @@ pub enum Attribute {
     MustBeInitialized(Timestamp, Location),
     /// Must be valid (dereferenceable) when accessed.
     MustBeValid(Timestamp, Location, Option<MustBeValidReason>),
-    /// Local EqZero sideband: this address is heap-allocated, must be valid,
-    /// and was later deduced to be null. This mirrors OCaml's
-    /// `PotentialInvalidAccess` error sideband for normal abductive analysis;
-    /// the summary-level `PotentialInvalidAccessSummary` path is intentionally
-    /// separate.
-    PotentialInvalidAccess(Location, Option<MustBeValidReason>),
     /// Returned from an unknown function.
     ReturnedFromUnknown(Vec<AbstractValue>),
     /// Static type information.
@@ -152,9 +145,6 @@ impl fmt::Display for Attribute {
             Attribute::Invalid(inv, history) => write!(f, "Invalid({inv}, {history})"),
             Attribute::MustBeValid(ts, loc, reason) => {
                 write!(f, "MustBeValid({ts}, {loc}, {reason:?})")
-            }
-            Attribute::PotentialInvalidAccess(_loc, reason) => {
-                write!(f, "PotentialInvalidAccess({reason:?})")
             }
             Attribute::Allocated(alloc, loc) => write!(f, "Allocated({alloc:?}, {loc})"),
             Attribute::Initialized => write!(f, "Initialized"),
@@ -183,7 +173,6 @@ impl Attribute {
             Self::MustBeAwaited => AttributeRank::MustBeAwaited,
             Self::MustBeInitialized(_, _) => AttributeRank::MustBeInitialized,
             Self::MustBeValid(_, _, _) => AttributeRank::MustBeValid,
-            Self::PotentialInvalidAccess(_, _) => AttributeRank::PotentialInvalidAccess,
             Self::ReturnedFromUnknown(_) => AttributeRank::ReturnedFromUnknown,
             Self::StaticType(_) => AttributeRank::StaticType,
             Self::StdMoved => AttributeRank::StdMoved,
@@ -227,7 +216,6 @@ impl Attribute {
                 | Attribute::MustBeAwaited
                 | Attribute::MustBeInitialized(_, _)
                 | Attribute::MustBeValid(_, _, _)
-                | Attribute::PotentialInvalidAccess(_, _)
                 | Attribute::UnreachableAt(_)
                 | Attribute::UsedAsBranchCond(_, _)
         )
@@ -325,14 +313,6 @@ impl Attributes {
     pub fn get_must_be_initialized(&self) -> Option<(Timestamp, &Location)> {
         self.0.iter().find_map(|a| match a {
             Attribute::MustBeInitialized(ts, loc) => Some((*ts, loc)),
-            _ => None,
-        })
-    }
-
-    /// Find the local EqZero `PotentialInvalidAccess` sideband, if any.
-    pub fn get_potential_invalid_access(&self) -> Option<(&Location, &Option<MustBeValidReason>)> {
-        self.0.iter().find_map(|a| match a {
-            Attribute::PotentialInvalidAccess(loc, reason) => Some((loc, reason)),
             _ => None,
         })
     }

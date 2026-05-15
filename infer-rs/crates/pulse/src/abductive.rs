@@ -14,6 +14,7 @@
 //! We simplify to post-state only for now (forward analysis without
 //! precondition inference).
 
+use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
@@ -84,19 +85,6 @@ pub struct AbductiveDomain {
     /// Monotonic attribute timestamp used to preserve path-local event order
     /// for exported summary attributes such as `MustBeValid`.
     next_attr_timestamp: crate::attribute::Timestamp,
-}
-
-/// Outcome of applying local formula equalities to an abductive state.
-///
-/// Cross-ref: OCaml `PulseAbductiveDomain.incorporate_new_eqs` returns a
-/// `PotentialInvalidAccess` sideband instead of materializing
-/// `Invalid(ConstantDereference(0))` when an `EqZero` meets a heap-allocated
-/// `MustBeValid` address. The summary-of-post variant is deliberately not
-/// modeled here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FormulaEffect {
-    Sat,
-    PotentialInvalidAccess(AbstractValue),
 }
 
 /// Outcome of applying callee-imported equalities to an abductive state.
@@ -695,17 +683,7 @@ impl AbductiveDomain {
     }
 
     fn apply_formula_result(&mut self, result: SatUnsat<Vec<NewEq>>) -> SatUnsat<()> {
-        self.apply_formula_result_with_effect(result).map(|_| ())
-    }
-
-    /// Apply local formula equalities and expose the OCaml
-    /// `PotentialInvalidAccess` sideband to callers that need to stop the
-    /// current path immediately (notably `free(NULL)` case splitting).
-    pub fn apply_formula_result_with_effect(
-        &mut self,
-        result: SatUnsat<Vec<NewEq>>,
-    ) -> SatUnsat<FormulaEffect> {
-        result.and_then(|new_eqs| self.incorporate_new_eqs_with_effect(new_eqs))
+        result.and_then(|new_eqs| self.incorporate_new_eqs(new_eqs))
     }
 
     /// Apply callee-imported formula equalities using OCaml's interproc
@@ -727,10 +705,7 @@ impl AbductiveDomain {
         })
     }
 
-    fn incorporate_new_eqs_with_effect(
-        &mut self,
-        new_eqs: Vec<NewEq>,
-    ) -> SatUnsat<FormulaEffect> {
+    fn incorporate_new_eqs(&mut self, new_eqs: Vec<NewEq>) -> SatUnsat<()> {
         for new_eq in new_eqs {
             match new_eq {
                 NewEq::Equal(old, new) if old == new => {}
@@ -745,19 +720,19 @@ impl AbductiveDomain {
                         return SatUnsat::Unsat;
                     }
                     if self.is_heap_allocated(repr) {
-                        if let Some((_timestamp, loc, reason)) = self.must_be_valid_info(repr) {
-                            self.post.attrs.add_one(
-                                repr,
-                                Attribute::PotentialInvalidAccess(loc, reason),
-                            );
-                            return SatUnsat::Sat(FormulaEffect::PotentialInvalidAccess(repr));
-                        }
-                        return SatUnsat::Unsat;
+                        self.post.attrs.invalidate(
+                            repr,
+                            Invalidation::ConstantDereference(IntLit::zero()),
+                            ValueHistory::invalidated(
+                                Invalidation::ConstantDereference(IntLit::zero()),
+                                Location::dummy(),
+                            ),
+                        );
                     }
                 }
             }
         }
-        SatUnsat::Sat(FormulaEffect::Sat)
+        SatUnsat::Sat(())
     }
 
     fn incorporate_new_eqs_for_summary_import(
@@ -906,28 +881,6 @@ impl AbductiveDomain {
             matches!(var, Var::ProgramVar(_))
                 && self.path_condition.get_var_repr(stack_addr) == addr
         })
-    }
-
-    fn must_be_valid_info(
-        &self,
-        addr: AbstractValue,
-    ) -> Option<(
-        crate::attribute::Timestamp,
-        Location,
-        Option<crate::invalidation::MustBeValidReason>,
-    )> {
-        let repr = self.path_condition.get_var_repr(addr);
-        if let Some((timestamp, loc, reason)) = self
-            .pre
-            .attrs
-            .get(&repr)
-            .and_then(|attrs| attrs.get_must_be_valid())
-        {
-            return Some((timestamp, loc.clone(), reason.clone()));
-        }
-        self.must_be_valid
-            .contains(&repr)
-            .then(|| (u64::MAX, Location::dummy(), None))
     }
 
     /// Record that two abstract values are equal.
@@ -1622,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_zero_records_potential_invalid_access_sideband_without_invalid_attr() {
+    fn test_eq_zero_marks_heap_allocated_value_invalid() {
         let pdesc = make_simple_pdesc();
         let mut state = AbductiveDomain::mk_initial(&pdesc);
         let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
@@ -1634,19 +1587,8 @@ mod tests {
         let _heap_target = state.read_heap(formal_val, Access::Dereference);
 
         state.mark_must_be_valid(formal_val);
-        let result = state.path_condition.and_equal_const(formal_val, 0);
-        assert!(matches!(
-            state.apply_formula_result_with_effect(result),
-            SatUnsat::Sat(FormulaEffect::PotentialInvalidAccess(addr))
-                if addr == state.get_var_repr(formal_val)
-        ));
-        assert!(
-            state.check_valid(formal_val).is_ok(),
-            "local EqZero + MustBeValid should record a sideband, not synthesize Invalid(0)"
-        );
-        assert!(state.post.attrs.get(&state.get_var_repr(formal_val)).is_some_and(|attrs| {
-            attrs.get_potential_invalid_access().is_some() && attrs.get_invalid().is_none()
-        }));
+        assert!(state.and_equal_const(formal_val, 0).is_sat());
+        assert!(state.check_valid(formal_val).is_err());
     }
 
     #[test]

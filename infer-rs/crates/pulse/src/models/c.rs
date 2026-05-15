@@ -627,43 +627,26 @@ fn free(
         let mut results = Vec::new();
 
         let mut null_state = state.clone();
-        match operations::add_formula_condition_for_access(
-            &addr,
-            loc,
-            &mut null_state,
-            operations::AccessMode::NoAccess,
-            |formula| {
-                formula.and_condition_direct(
-                    crate::formula::atom::Atom::Equal(
-                        crate::formula::term::Term::Var(addr.addr),
-                        crate::formula::term::Term::Const(0),
-                    ),
-                    0,
-                )
-            },
-        ) {
-            crate::sat_unsat::SatUnsat::Unsat => {}
-            crate::sat_unsat::SatUnsat::Sat(PulseResult::Ok(())) => {
-                let ret_val = AbstractValue::mk_fresh();
-                operations::write_id_with_history(
-                    ret_id,
-                    crate::value_history::ValueWithHistory::new(
-                        ret_val,
-                        ValueHistory::assignment(loc.clone()),
-                    ),
-                    &mut null_state,
-                );
-                results.push(ExecutionDomain::ContinueProgram(null_state));
-            }
-            crate::sat_unsat::SatUnsat::Sat(PulseResult::FatalError(diag, _)) => {
-                results.push(ExecutionDomain::LatentInvalidAccess {
-                    state: Box::new(null_state),
-                    diagnostic: Box::new(diag),
-                });
-            }
-            crate::sat_unsat::SatUnsat::Sat(PulseResult::Recoverable((), errors)) => {
-                results.extend(stopped_results_from_recoverable_errors(null_state, errors));
-            }
+        if null_state
+            .and_condition_direct(
+                crate::formula::atom::Atom::Equal(
+                    crate::formula::term::Term::Var(addr.addr),
+                    crate::formula::term::Term::Const(0),
+                ),
+                0,
+            )
+            .is_sat()
+        {
+            let ret_val = AbstractValue::mk_fresh();
+            operations::write_id_with_history(
+                ret_id,
+                crate::value_history::ValueWithHistory::new(
+                    ret_val,
+                    ValueHistory::assignment(loc.clone()),
+                ),
+                &mut null_state,
+            );
+            results.push(ExecutionDomain::ContinueProgram(null_state));
         }
 
         if state
