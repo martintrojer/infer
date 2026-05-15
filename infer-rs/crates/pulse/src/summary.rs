@@ -3566,11 +3566,7 @@ fn pre_post_is_benign_continue_summary_row(pre_post: &PrePost) -> bool {
         && pre_post.post.need_dynamic_type_specialization.is_empty()
         && attrs_are_benign_continue_surface(&pre_post.pre.attrs)
         && attrs_are_benign_continue_surface(&pre_post.post.post.attrs)
-        && pre_post
-            .post
-            .iter_dynamic_types()
-            .next()
-            .is_none()
+        && pre_post.post.iter_dynamic_types().next().is_none()
 }
 
 fn preserve_exact_duplicate_pre_post(pre_post: &PrePost) -> bool {

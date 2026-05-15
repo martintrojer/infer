@@ -498,29 +498,6 @@ impl Phi {
                 })
         }
 
-        fn coeff_term(coeff: &Q, term: Term) -> Term {
-            if *coeff == Q::from_integer(1) {
-                term
-            } else if *coeff == Q::from_integer(-1) {
-                Term::Neg(Box::new(term))
-            } else {
-                Term::Mult(
-                    Box::new(Term::Const(*coeff.numer() / *coeff.denom())),
-                    Box::new(term),
-                )
-            }
-        }
-
-        fn add_term(lhs: Option<Term>, rhs: Term) -> Term {
-            match lhs {
-                Some(lhs) => match (lhs.as_const(), rhs.as_const()) {
-                    (Some(x), Some(y)) => Term::Const(x + y),
-                    _ => Term::Add(Box::new(lhs), Box::new(rhs)),
-                },
-                None => rhs,
-            }
-        }
-
         fn simplify_visible_linear_term(
             phi: &Phi,
             v: AbstractValue,
@@ -538,19 +515,9 @@ impl Phi {
             }
 
             let simplified = phi.linear_eqs.get(&repr).and_then(|lin| {
-                let mut result = (!lin.constant.is_zero())
-                    .then_some(Term::Const(*lin.constant.numer() / *lin.constant.denom()));
-                for (&dep, coeff) in &lin.vars {
-                    let dep_term = simplify_visible_linear_term(
-                        phi,
-                        dep,
-                        precondition_vocabulary,
-                        keep,
-                        visited,
-                    )?;
-                    result = Some(add_term(result, coeff_term(coeff, dep_term)));
-                }
-                Some(result.unwrap_or(Term::Const(0)))
+                lin_arith_to_term_with(lin, LinearTermStyle::Condition, |dep| {
+                    simplify_visible_linear_term(phi, dep, precondition_vocabulary, keep, visited)
+                })
             });
 
             visited.remove(&repr);
@@ -1282,37 +1249,11 @@ impl Phi {
         t: &Term,
         visited: &mut std::collections::HashSet<AbstractValue>,
     ) -> Term {
-        fn coeff_term(coeff: &Q, term: Term) -> Term {
-            if *coeff == Q::from_integer(1) {
-                term
-            } else if *coeff == Q::from_integer(-1) {
-                Term::Neg(Box::new(term))
-            } else {
-                Term::Mult(
-                    Box::new(Term::Const(*coeff.numer() / *coeff.denom())),
-                    Box::new(term),
-                )
-            }
-        }
-
-        fn add_term(lhs: Option<Term>, rhs: Term) -> Term {
-            match lhs {
-                Some(lhs) => match (lhs.as_const(), rhs.as_const()) {
-                    (Some(x), Some(y)) => Term::Const(x + y),
-                    _ => Term::Add(Box::new(lhs), Box::new(rhs)),
-                },
-                None => rhs,
-            }
-        }
-
         fn lin_to_condition_term(phi: &Phi, lin: &LinArith) -> Term {
-            let mut result = (!lin.constant.is_zero())
-                .then_some(Term::Const(*lin.constant.numer() / *lin.constant.denom()));
-            for (&dep, coeff) in &lin.vars {
-                let dep_term = Term::Var(phi.get_repr(dep));
-                result = Some(add_term(result, coeff_term(coeff, dep_term)));
-            }
-            result.unwrap_or(Term::Const(0))
+            lin_arith_to_term_with(lin, LinearTermStyle::Condition, |dep| {
+                Some(Term::Var(phi.get_repr(dep)))
+            })
+            .unwrap_or(Term::Const(0))
         }
 
         match t {
@@ -1400,34 +1341,73 @@ impl Phi {
     }
 }
 
-/// Convert a LinArith to a Term (for atom substitution).
-fn lin_to_term(lin: &LinArith) -> Term {
-    let mut result: Option<Term> = None;
+#[derive(Clone, Copy)]
+enum LinearTermStyle {
+    /// Condition/export presentation: constants first, `-1*x` as `-x`, and
+    /// adjacent constants folded. This matches the local helper shape that
+    /// summary-condition simplification and condition-term resolution used.
+    Condition,
+    /// Atom-substitution presentation: variables first, constant last, and
+    /// `-1*x` preserved as multiplication. This keeps the former standalone
+    /// `lin_to_term` output shape byte-for-byte.
+    Substitution,
+}
+
+/// Convert a linear expression to a `Term` while preserving the two existing
+/// presentation modes. OCaml keeps linear terms as `Term.Linear` and calls
+/// `Term.simplify_linear`; Rust has no linear `Term` variant, so this helper is
+/// the shared Rust-side builder for the equivalent affine term surfaces.
+fn lin_arith_to_term_with(
+    lin: &LinArith,
+    style: LinearTermStyle,
+    mut var_to_term: impl FnMut(AbstractValue) -> Option<Term>,
+) -> Option<Term> {
+    let const_term = |q: &Q| Term::Const(*q.numer() / *q.denom());
+    let scaled_term = |coeff: &Q, term: Term| {
+        if *coeff == Q::from_integer(1) {
+            term
+        } else if matches!(style, LinearTermStyle::Condition) && *coeff == Q::from_integer(-1) {
+            Term::Neg(Box::new(term))
+        } else {
+            Term::Mult(Box::new(const_term(coeff)), Box::new(term))
+        }
+    };
+    let add_term = |lhs: Option<Term>, rhs: Term| match lhs {
+        Some(lhs) => {
+            if matches!(style, LinearTermStyle::Condition) {
+                match (lhs.as_const(), rhs.as_const()) {
+                    (Some(x), Some(y)) => Term::Const(x + y),
+                    _ => Term::Add(Box::new(lhs), Box::new(rhs)),
+                }
+            } else {
+                Term::Add(Box::new(lhs), Box::new(rhs))
+            }
+        }
+        None => rhs,
+    };
+
+    let mut result = if matches!(style, LinearTermStyle::Condition) && !lin.constant.is_zero() {
+        Some(const_term(&lin.constant))
+    } else {
+        None
+    };
 
     for (&v, coeff) in &lin.vars {
-        let var_term = if *coeff == Q::from_integer(1) {
-            Term::Var(v)
-        } else {
-            Term::Mult(
-                Box::new(Term::Const(*coeff.numer() / *coeff.denom())),
-                Box::new(Term::Var(v)),
-            )
-        };
-        result = Some(match result {
-            None => var_term,
-            Some(acc) => Term::Add(Box::new(acc), Box::new(var_term)),
-        });
+        let var_term = var_to_term(v)?;
+        result = Some(add_term(result, scaled_term(coeff, var_term)));
     }
 
-    if !lin.constant.is_zero() {
-        let const_term = Term::Const(*lin.constant.numer() / *lin.constant.denom());
-        result = Some(match result {
-            None => const_term,
-            Some(acc) => Term::Add(Box::new(acc), Box::new(const_term)),
-        });
+    if matches!(style, LinearTermStyle::Substitution) && !lin.constant.is_zero() {
+        result = Some(add_term(result, const_term(&lin.constant)));
     }
 
-    result.unwrap_or(Term::Const(0))
+    Some(result.unwrap_or(Term::Const(0)))
+}
+
+/// Convert a LinArith to a Term (for atom substitution).
+fn lin_to_term(lin: &LinArith) -> Term {
+    lin_arith_to_term_with(lin, LinearTermStyle::Substitution, |v| Some(Term::Var(v)))
+        .unwrap_or(Term::Const(0))
 }
 
 #[cfg(test)]
