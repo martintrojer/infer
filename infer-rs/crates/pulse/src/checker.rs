@@ -1044,7 +1044,9 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
                         recovered_non_exit_disjuncts.push(d.clone());
                     }
                 }
-                ExecutionDomain::ContinueProgram(astate) if !exit_has_normal_path => {
+                ExecutionDomain::ContinueProgram(astate)
+                    if !exit_has_normal_path && !pulse_tf.aborted.get() =>
+                {
                     let recover_start = Instant::now();
                     let recovered_candidates =
                         crate::summary::recovered_invalid_accesses_from_continue_state(

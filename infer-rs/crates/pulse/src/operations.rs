@@ -302,7 +302,7 @@ pub(crate) fn eval_with_history_mode(
             let canonical = state.canonicalize_for_access(result);
             PulseResult::Ok(ValueWithHistory::new(
                 canonical,
-                lhs_val.history.merge(&rhs_val.history),
+                lhs_val.history.merge_owned(&rhs_val.history),
             ))
         }
         Exp::Cast(_, inner) => eval_with_history(inner, loc, state),
