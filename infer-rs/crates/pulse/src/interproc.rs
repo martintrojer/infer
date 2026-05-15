@@ -371,10 +371,10 @@ pub(crate) fn apply_summary_with_aliasing(
             &caller_state,
         );
         for attr in attrs.iter() {
-            caller_state
-                .post
-                .attrs
-                .add_one(caller_addr, translate_attribute(&mut subst, attr));
+            caller_state.post.attrs.add_one(
+                caller_addr,
+                translate_attribute_with_call(&mut subst, attr, callee_procname.as_ref(), loc),
+            );
         }
     }
 
@@ -2178,13 +2178,23 @@ fn translate_attribute(
     subst: &mut HashMap<AbstractValue, AbstractValue>,
     attr: &Attribute,
 ) -> Attribute {
+    translate_attribute_with_call(subst, attr, None, &Location::dummy())
+}
+
+fn translate_attribute_with_call(
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    attr: &Attribute,
+    callee_procname: Option<&Procname>,
+    loc: &Location,
+) -> Attribute {
     match attr {
         Attribute::ReturnedFromUnknown(values) => {
             Attribute::ReturnedFromUnknown(values.iter().map(|v| resolve_mut(subst, *v)).collect())
         }
-        Attribute::Invalid(invalidation, history) => {
-            Attribute::Invalid(invalidation.clone(), history.clone())
-        }
+        Attribute::Invalid(invalidation, history) => Attribute::Invalid(
+            invalidation.clone(),
+            wrap_imported_history(history.clone(), callee_procname, loc),
+        ),
         other => other.clone(),
     }
 }
@@ -2203,6 +2213,14 @@ mod tests {
     use sil::pvar::Pvar;
     use sil::qualified_cpp_name::QualifiedCppName;
     use sil::var::Var;
+
+    fn has_call_event(history: &ValueHistory) -> bool {
+        history.primary_path().is_some_and(|path| {
+            path.events()
+                .iter()
+                .any(|event| matches!(event, HistoryEvent::Call { .. }))
+        })
+    }
 
     fn loc(line: i32) -> Location {
         Location {
@@ -2258,6 +2276,27 @@ mod tests {
 
         assert_eq!(subst.get(&canonical), Some(&caller_actual));
         assert_eq!(subst.get(&alias), Some(&caller_actual));
+    }
+
+    #[test]
+    fn test_translate_attribute_with_call_wraps_imported_invalid_history() {
+        let callee = Procname::c_from_string("latent_use_after_free");
+        let invalidation =
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42));
+        let history = ValueHistory::invalidated(invalidation.clone(), loc(18));
+        let attr = Attribute::Invalid(invalidation.clone(), history);
+        let mut subst = HashMap::new();
+
+        let translated = translate_attribute_with_call(&mut subst, &attr, Some(&callee), &loc(25));
+
+        let Attribute::Invalid(found_invalidation, found_history) = translated else {
+            panic!("expected Invalid attr to be preserved and wrapped, got {translated:?}");
+        };
+        assert_eq!(found_invalidation, invalidation);
+        assert!(
+            has_call_event(&found_history),
+            "imported Invalid attrs should keep the concrete invalidation and add call history: {found_history}"
+        );
     }
 
     #[test]
@@ -3562,6 +3601,123 @@ mod tests {
                     .iter()
                     .any(|result| matches!(result, ExecutionDomain::LatentInvalidAccess { .. })),
             "the coalesced latent-invalid path should either stay latent or become inapplicable at this caller boundary, but never reify a manifest null-deref: {results:?}"
+        );
+    }
+
+    #[test]
+    fn test_latent_use_after_free_imported_invalid_retention() {
+        let callee_pname = Procname::c_from_string("latent_use_after_free");
+        let mut callee_pdesc = Procdesc::new(callee_pname.clone(), Typ::void(), loc(10));
+        callee_pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+            Default::default(),
+        )];
+        let mut callee_state = AbductiveDomain::mk_initial(&callee_pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), callee_pname.clone());
+        let x_stack = callee_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(x_pvar.clone())))
+            .unwrap();
+        let x_value = callee_state.read_heap(x_stack, Access::Dereference);
+        let stored_const = AbstractValue::mk_fresh();
+        let invalidation =
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::of_int(42));
+        callee_state.write_heap_with_history(
+            x_value,
+            Access::Dereference,
+            crate::value_history::ValueWithHistory::new(
+                stored_const,
+                ValueHistory::invalidated(invalidation.clone(), loc(18)),
+            ),
+        );
+        callee_state.initialize(stored_const);
+        callee_state.invalidate(
+            stored_const,
+            invalidation.clone(),
+            ValueHistory::invalidated(invalidation.clone(), loc(18)),
+        );
+        let pre_post = PrePost {
+            pre: callee_state.pre.clone(),
+            post: callee_state,
+            formals: vec![(x_pvar, x_stack)],
+            result: None,
+            kind: crate::summary::PrePostKind::LatentInvalidAccess,
+            diagnostic: Some(dummy_invalid_access_diagnostic(
+                x_value,
+                crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
+            )),
+        };
+
+        let caller_pname = Procname::c_from_string("main");
+        let mut caller_pdesc = Procdesc::new(caller_pname.clone(), Typ::void(), loc(25));
+        caller_pdesc.formals = vec![(
+            Mangled::from_string("x"),
+            Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+            Default::default(),
+        )];
+        let mut caller_state = AbductiveDomain::mk_initial(&caller_pdesc);
+        let caller_x_pvar = Pvar::mk(Mangled::from_string("x"), caller_pname);
+        let caller_x_stack = caller_state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(caller_x_pvar)))
+            .unwrap();
+        let caller_x_value = caller_state.read_heap(caller_x_stack, Access::Dereference);
+        let actual_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        crate::operations::write_id_with_history(
+            &actual_id,
+            crate::value_history::ValueWithHistory::new(
+                caller_x_value,
+                ValueHistory::assignment(loc(25)),
+            ),
+            &mut caller_state,
+        );
+
+        let results = apply_summary(
+            &caller_pdesc,
+            &pre_post,
+            &Ident::create_none(),
+            &[(
+                Exp::Var(actual_id),
+                Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)),
+            )],
+            &loc(25),
+            caller_state,
+        );
+
+        let imported_state = results
+            .iter()
+            .find_map(|result| match result {
+                ExecutionDomain::AbortProgram { state, .. }
+                | ExecutionDomain::LatentInvalidAccess { state, .. } => Some(state.as_ref()),
+                _ => None,
+            })
+            .expect("applying the latent summary should keep a stopped caller state");
+        let caller_payload = imported_state
+            .post
+            .heap
+            .find_edge(
+                imported_state.path_condition.get_var_repr(caller_x_value),
+                &Access::Dereference,
+            )
+            .expect("callee post store through x should be replayed at the caller");
+        let attrs = imported_state
+            .post
+            .attrs
+            .get(&imported_state.path_condition.get_var_repr(caller_payload))
+            .expect("imported stored constant should keep its attrs");
+        let invalid_history = attrs
+            .iter()
+            .find_map(|attr| match attr {
+                Attribute::Invalid(found, history) if *found == invalidation => Some(history),
+                _ => None,
+            })
+            .expect("ordinary imported Invalid(ConstantDereference(42)) must be retained");
+        assert!(
+            has_call_event(invalid_history),
+            "imported Invalid attrs should be wrapped with call history, not stripped: {invalid_history}"
         );
     }
 

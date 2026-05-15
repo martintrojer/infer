@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_store_to_formula_known_zero_detects_error() {
+    fn test_store_to_explicit_invalid_zero_detects_error() {
         let mut state = mk_state();
         let pvar = Pvar::mk(Mangled::from_string("p"), Procname::c_from_string("test"));
         let stack_addr = crate::abstract_value::AbstractValue::mk_fresh();
@@ -1301,9 +1301,16 @@ mod tests {
         let p_val = state.read_heap(stack_addr, Access::Dereference);
         let _heap_target = state.read_heap(p_val, Access::Dereference);
         assert!(state.and_equal_const(p_val, 0).is_sat());
+        let null_invalidation =
+            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+        state.invalidate(
+            p_val,
+            null_invalidation.clone(),
+            ValueHistory::invalidated(null_invalidation, Location::dummy()),
+        );
         assert!(
             state.check_valid(p_val).is_err(),
-            "EqZero should invalidate caller-visible heap values once the dereference path exists"
+            "an explicit null Invalid attr should still make the store abort"
         );
 
         let id = Ident::create_normal(IdentName::from_string("n"), 0);

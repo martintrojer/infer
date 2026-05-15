@@ -14,7 +14,6 @@
 //! We simplify to post-state only for now (forward analysis without
 //! precondition inference).
 
-use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
@@ -85,6 +84,16 @@ pub struct AbductiveDomain {
     /// Monotonic attribute timestamp used to preserve path-local event order
     /// for exported summary attributes such as `MustBeValid`.
     next_attr_timestamp: crate::attribute::Timestamp,
+    /// Transient, non-exported sideband for local `EqZero + heap allocated +
+    /// MustBeValid` facts.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.incorporate_new_eqs` returns a
+    /// `PotentialInvalidAccess` sideband for this case instead of attaching a
+    /// concrete `Invalid(ConstantDereference(0))` attribute to the address.
+    /// Rust summary construction can reconstruct the latent obligation from
+    /// `must_be_valid + phi == 0`; this set keeps the local path distinction
+    /// explicit without leaking into persisted summaries.
+    local_potential_invalid_accesses: std::collections::HashSet<AbstractValue>,
 }
 
 /// Outcome of applying callee-imported equalities to an abductive state.
@@ -314,6 +323,7 @@ impl AbductiveDomain {
         self.pre = BaseDomain::empty();
         self.const_cache.clear();
         self.need_dynamic_type_specialization.clear();
+        self.local_potential_invalid_accesses.clear();
     }
 
     /// Create the initial state for analyzing a procedure.
@@ -330,6 +340,7 @@ impl AbductiveDomain {
             dynamic_types: std::collections::BTreeMap::new(),
             must_be_valid: std::collections::HashSet::new(),
             next_attr_timestamp: 1,
+            local_potential_invalid_accesses: std::collections::HashSet::new(),
         };
 
         // Bind each formal parameter to a fresh abstract value.
@@ -719,15 +730,8 @@ impl AbductiveDomain {
                     if self.is_stack_allocated(repr) {
                         return SatUnsat::Unsat;
                     }
-                    if self.is_heap_allocated(repr) {
-                        self.post.attrs.invalidate(
-                            repr,
-                            Invalidation::ConstantDereference(IntLit::zero()),
-                            ValueHistory::invalidated(
-                                Invalidation::ConstantDereference(IntLit::zero()),
-                                Location::dummy(),
-                            ),
-                        );
+                    if self.is_heap_allocated(repr) && self.must_be_valid.contains(&repr) {
+                        self.local_potential_invalid_accesses.insert(repr);
                     }
                 }
             }
@@ -824,6 +828,10 @@ impl AbductiveDomain {
     fn subst_auxiliary_value_maps(&mut self, old: AbstractValue, new: AbstractValue) {
         let must_be_valid = std::mem::take(&mut self.must_be_valid);
         self.must_be_valid = self.subst_value_set(must_be_valid, old, new);
+        let local_potential_invalid_accesses =
+            std::mem::take(&mut self.local_potential_invalid_accesses);
+        self.local_potential_invalid_accesses =
+            self.subst_value_set(local_potential_invalid_accesses, old, new);
         let need_dynamic_type_specialization =
             std::mem::take(&mut self.need_dynamic_type_specialization);
         self.need_dynamic_type_specialization =
@@ -893,6 +901,22 @@ impl AbductiveDomain {
     pub fn and_equal_const(&mut self, v: AbstractValue, c: i64) -> SatUnsat<()> {
         let result = self.path_condition.and_equal_const(v, c);
         self.apply_formula_result(result)
+    }
+
+    /// Record a summary-space zero equality without replaying the local
+    /// `EqZero` sideband into the state.
+    ///
+    /// Used when constructing recovered latent-invalid-access rows from an
+    /// abort state: those rows should carry the zero proof in phi but must not
+    /// mutate the original abort state's ordinary invalidation surface.
+    pub(crate) fn and_equal_const_for_summary_recovery(
+        &mut self,
+        v: AbstractValue,
+        c: i64,
+    ) -> SatUnsat<()> {
+        self.path_condition
+            .and_equal_const(v, c)
+            .and_then(|_| SatUnsat::Sat(()))
     }
 
     /// Get an abstract value for an integer literal, reusing an existing
@@ -1575,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_zero_marks_heap_allocated_value_invalid() {
+    fn test_eq_zero_heap_allocated_must_be_valid_stays_sideband_not_invalid_attr() {
         let pdesc = make_simple_pdesc();
         let mut state = AbductiveDomain::mk_initial(&pdesc);
         let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
@@ -1588,7 +1612,13 @@ mod tests {
 
         state.mark_must_be_valid(formal_val);
         assert!(state.and_equal_const(formal_val, 0).is_sat());
-        assert!(state.check_valid(formal_val).is_err());
+        assert!(
+            state.check_valid(formal_val).is_ok(),
+            "local EqZero should be a non-exported PotentialInvalidAccess sideband, not Invalid(0)"
+        );
+        assert!(state
+            .local_potential_invalid_accesses
+            .contains(&state.get_var_repr(formal_val)));
     }
 
     #[test]
