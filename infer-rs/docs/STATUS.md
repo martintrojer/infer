@@ -21,7 +21,7 @@ mu task list -w infer-rs --status OPEN
 | specialization summary harness | `20 matching / 1 diff` (only `may_double_free_if_alias` residual) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `92 matching / 45 diffs` (+6/-6 today from the `86/51` session start; +42/-42 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `96 matching / 41 diffs` (+9/-9 today from the `87/50` session start; +46/-46 vs original `50/87`) |
 
 ### NPE issue-count deltas (current Linux)
 
@@ -33,14 +33,15 @@ against `issues.exp`, and the regression guard now pins `52` OK / `0` FAIL /
 `0` TIMEOUT, exact LEAK/UAF parity, and `NPE >= expected` without pinning an
 exact NPE total.
 
-The last documented pre-function-pointer checkpoint after the formula-subst
-panic fix (`bfb235e881`) was `131/138`. The dynamic-type specialized abort
-propagation fix (`a8b8fe7bde`) moves the sweep to `131/140`; those `+2` are
-real catches from propagating specialized function-pointer aborts through
-callers, not duplicate callee-local manifest reports. The closed
-`scout_npe_per_file_full_remeasure` classification covers the remaining
-per-file surface: all live NPE deltas are either aligned with OCaml direct
-behavior under the test config or are Rust-strictly-more-precise catches.
+The current sweep state is held at NPE expected `131`, found `140` (`+9`),
+LEAK `20/20` EXACT, and UAF `7/7` EXACT; do not re-run sweeps for doc
+refreshes. The dynamic-type specialized abort propagation fix (`a8b8fe7bde`)
+contributed a real `+1` NPE catch by surfacing a specialized function-pointer
+abort that was previously dropped, not a duplicate callee-local manifest
+report. The closed `scout_npe_per_file_full_remeasure` classification covers
+the remaining per-file surface: all live NPE deltas are either aligned with
+OCaml direct behavior under the test config or are Rust-strictly-more-precise
+catches.
 
 Leak per-file detail: LEAK now matches expected exactly per file after
 `bug_store_textual_leak_dead_root_parity` (commit `9078f04176`).
@@ -81,11 +82,14 @@ now analyze. Today's Linux session additions:
 - `43a55e6f1d` — removes unused `BasedOn` summary provenance.
 - `3368d70702` / `bfb235e881` — map canonical formula vars on summary import,
   fixing the apps.sil `set_multi_opts` -> `set_name_ex` formula-substitution
-  panic and establishing the pre-funptr sweep checkpoint `131/138`.
+  panic while preserving the held sweep checkpoint.
 - `a8b8fe7bde` — propagate dynamic-type specialized function-pointer aborts
   through callers while still suppressing duplicate callee-local manifest aborts;
-  `funptr.c` summary parity moves `20/8` -> `22/6`, and the sweep moves
-  `131/138` -> `131/140` from two real catches.
+  `funptr.c` summary parity moves `20/8` -> `22/6`, and the held sweep state
+  remains NPE `131/140`, LEAK `20/20` EXACT, UAF `7/7` EXACT; the `+1` NPE from
+  this specialized abort propagation is a real catch.
+- `3b7b90f1a9` — avoid branch-only constant invalidation attrs;
+  `interprocedural.c` summary parity moves `11/6` -> `15/2`.
 - `a625c0dd55` / `fe0e95be3e` — stdio FILE-argument modeling and
   report-location dedup keep NPE deltas aligned with the per-file scout
   classification.
@@ -96,7 +100,7 @@ now analyze. Today's Linux session additions:
   procs at `~/infer-rs-bench/openssl-20260514-121752/`, and `006b39cd2b`
   records the guarded Linux perf scout results.
 
-### C-suite OCaml↔Rust Pulse summary parity (`92 matching / 45 diffs`)
+### C-suite OCaml↔Rust Pulse summary parity (`96 matching / 41 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -186,17 +190,32 @@ Function-pointer abort propagation also landed:
   preserving duplicate callee-local manifest-abort suppression. `funptr.c` moves
   `20/8` -> `22/6`; specialization remains `20/1`.
 
+Interprocedural branch-only attr cleanup also landed:
+
+- `3b7b90f1a9` — avoid branch-only constant invalidation attrs on summary
+  surfaces. `interprocedural.c` moves `11/6` -> `15/2`.
+
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `92 matching / 45 diffs`
-(`+42 matching / -42 diffs`). Today's Linux session started at `86/51` and
-closed at `92/45` (`+6 matching / -6 diffs`). Current scoped per-file totals:
-`arithmetic.c` `6/5`, `funptr.c` `22/6` after `a8b8fe7bde`,
-`interprocedural.c` `11/6`, `latent.c` `6/8`, `memory_leak.c` `27/19`, and
-`specialization.c` `20/1`. Per-file breakdown and per-pass narrative live in
+(`50 matching / 87 diffs`) is now `96 matching / 41 diffs`
+(`+46 matching / -46 diffs`). Today's Linux session started at `87/50` and
+closed at `96/41` (`+9 matching / -9 diffs`). Current scoped per-file totals:
+
+| file | matching / diffs | residual |
+|---|---:|---|
+| `arithmetic.c` | `6/5` | OCaml `NonDisjDomain` non-disj sideband mechanism; follow-up `arithmetic_ocaml_non_disj_summary_fallback` filed by worker-leak |
+| `funptr.c` | `22/6` | `cluster_funptr_abort_propagation_specialized` residuals are closed; remaining surface is callback `Closure` plus minor issues |
+| `interprocedural.c` | `15/2` | `test_modified_value_then_error_bad` keeps `ConstantDereference(5)` on the `Continue` path; `trace_correctly_through_wrappers_bad` summary multiplicity |
+| `latent.c` | `6/8` | producer-side cycle-cursor; deferred deep port plus new disjunct-dedup scout in flight |
+| `memory_leak.c` | `27/19` | array/index loop value-shape, realloc fail/success branch counts, `alias_ptr_free` flag, mutual-recursion shape, `alloc_ref_counted_arith` pointer arithmetic |
+| `specialization.c` | `20/1` | `may_double_free_if_alias` summary-surface; deferred |
+| **total** | **`96/41`** | **+9 matching / -9 diffs from session start `87/50`; +46/-46 vs original `50/87`** |
+
+Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 
-Current residual work is split between the in-flight funptr cleanup surface
-(worker-2 is idle after the `a8b8fe7bde` fix), the parked
+Current residual work is split between the closed funptr abort-propagation
+surface after `a8b8fe7bde`, the remaining callback `Closure`/minor funptr
+surface, `interprocedural.c`'s two residuals after `3b7b90f1a9`, the parked
 `cluster_latent_record_post_for_address_porting` deep porting track for the
 remaining `latent.c` producer/record-post shape, and the sweep-level NPE
 `131/140` correctness-aligned delta documented above.
@@ -303,14 +322,15 @@ Live themes (track headlines, not exhaustive task lists):
   preservation (`f78e622ff1`, `7e28401d3d`), struct/array index attrs
   (`dd4f671d96`, `83e63f2cb8`), force-continue test config (`11fa5b8649`),
   sweep regression guard (`d9da630ae7`, `48655710c4`), `BasedOn` removal
-  (`43a55e6f1d`), formula-subst panic fix (`bfb235e881`), funptr abort
-  propagation (`a8b8fe7bde`), OpenSSL corpus regrowth to
+  (`43a55e6f1d`), formula-subst panic fix (`3368d70702`, `bfb235e881`),
+  funptr abort propagation (`a8b8fe7bde`), branch-only constant invalidation
+  attr cleanup (`3b7b90f1a9`), OpenSSL corpus regrowth to
   `~/infer-rs-bench/openssl-20260514-121752/`, perf tooling docs
   (`1295efbfbc`), attack-surface map (`02a79d2833`), experiment plan
   (`e4e4bc887e`), and guarded Linux baseline scout (`006b39cd2b`).
 - **C-suite OCaml↔Rust Pulse summary parity** — current totals are
-  `92 matching / 45 diffs`, up from today's `86/51` start (`+6/-6`). Per-file:
-  arithmetic `6/5`, funptr `22/6`, interproc `11/6`, latent `6/8`,
+  `96 matching / 41 diffs`, up from today's `87/50` start (`+9/-9`). Per-file:
+  arithmetic `6/5`, funptr `22/6`, interproc `15/2`, latent `6/8`,
   memory_leak `27/19`, specialization `20/1`.
 - **Sweep correctness checkpoint** — store-textual sweep is `52` OK / `0` FAIL /
   `0` TIMEOUT; NPE expected `131` / found `140` (`+9`, classified as
@@ -318,7 +338,8 @@ Live themes (track headlines, not exhaustive task lists):
   `scout_npe_per_file_full_remeasure`); LEAK `20/20` exact; UAF `7/7` exact.
 - **In-flight correctness/perf follow-ups** —
   `fix_openssl_obj_bsearch_interproc_convergence` is with worker-1; the funptr
-  cluster cleanup surface remains after `a8b8fe7bde` but worker-2 is idle now.
+  abort-propagation residuals are closed after `a8b8fe7bde`, with callback
+  `Closure`/minor funptr surface remaining.
 - **Parked correctness backlog** — `cluster_latent_record_post_for_address_porting`
   is deferred as a three-day deep porting track despite high ROI (`11.7`).
 - **OpenSSL perf / benchmark hygiene** — Linux now has a corpus-comparable
