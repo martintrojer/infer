@@ -519,13 +519,60 @@ impl BaseMemory {
             Arc::make_mut(edges).subst_var(old, new);
         }
         if let Some(edges) = graph.remove(&old) {
-            // Merge with existing edges at `new` if any.
+            // Merge with existing edges at `new` if any. Summary export uses
+            // `subst_var_or_unsat` below when it needs OCaml's aliasing-
+            // contradiction pruning instead.
             let entry_arc = graph.entry(new).or_default();
             let entry = Arc::make_mut(entry_arc);
             for (access, value) in edges.iter_with_history() {
                 entry.add_with_history(access.clone(), value.clone());
             }
         }
+    }
+
+    /// Substitution with OCaml's aliasing-contradiction check.
+    ///
+    /// Cross-ref: `PulseBaseMemory.subst_var` / `PulseBaseMemory.canonicalize`.
+    /// If two distinct non-empty heap roots collapse to the same representative,
+    /// the path was treating equal values as disjoint allocated memory and is
+    /// unsatisfiable. The plain Rust `subst_var` above preserves the historical
+    /// merge behaviour for callers that cannot consume `Unsat`; equality
+    /// incorporation and summary export use this variant to prune the path.
+    pub fn subst_var_or_unsat(
+        &mut self,
+        old: AbstractValue,
+        new: AbstractValue,
+    ) -> crate::sat_unsat::SatUnsat<()> {
+        let needs_target_subst = self.graph.values().any(|edges| {
+            edges
+                .iter_with_history()
+                .any(|(access, value)| value.addr == old || access_mentions(access, old))
+        });
+        let needs_key_subst = self.graph.contains_key(&old);
+        if !needs_target_subst && !needs_key_subst {
+            return crate::sat_unsat::SatUnsat::Sat(());
+        }
+        let graph = self.graph_mut();
+        for edges in graph.values_mut() {
+            Arc::make_mut(edges).subst_var(old, new);
+        }
+        if let Some(edges) = graph.remove(&old) {
+            match graph.get(&new) {
+                Some(existing) if !existing.is_empty() && !edges.is_empty() => {
+                    graph.insert(old, edges);
+                    return crate::sat_unsat::SatUnsat::Unsat;
+                }
+                Some(existing) if !edges.is_empty() && existing.is_empty() => {
+                    graph.insert(new, edges);
+                }
+                Some(_) => {}
+                None if !edges.is_empty() => {
+                    graph.insert(new, edges);
+                }
+                None => {}
+            }
+        }
+        crate::sat_unsat::SatUnsat::Sat(())
     }
 }
 
@@ -698,5 +745,19 @@ mod tests {
             mem.find_edge(base, &Access::ArrayAccess(sil::typ::Typ::void(), old_idx)),
             None
         );
+    }
+
+    #[test]
+    fn test_subst_var_or_unsat_rejects_allocated_root_alias() {
+        let mut mem = BaseMemory::empty();
+        let old = AbstractValue::of_raw(1);
+        let new = AbstractValue::of_raw(2);
+        let old_target = AbstractValue::of_raw(3);
+        let new_target = AbstractValue::of_raw(4);
+
+        mem.add_edge(old, Access::Dereference, old_target);
+        mem.add_edge(new, Access::Dereference, new_target);
+
+        assert!(mem.subst_var_or_unsat(old, new).is_unsat());
     }
 }

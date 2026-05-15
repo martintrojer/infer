@@ -130,6 +130,7 @@ pub(crate) struct StoppedStateSummary {
 struct NormalizedSummaryInfo {
     leaks: Vec<Diagnostic>,
     summary_eq_zero_must_be_valid: std::collections::HashSet<AbstractValue>,
+    aliasing_contradiction: bool,
 }
 
 struct SummaryReachability {
@@ -332,8 +333,14 @@ impl PrePost {
     ///
     /// Cross-ref: OCaml `PulseAbductiveDomain.filter_for_summary` first calls
     /// `canonicalize`, then restores formals and discards unreachable state.
-    fn canonicalize_for_summary(&mut self) {
-        self.post.canonicalize_with_current_path_condition();
+    fn canonicalize_for_summary_or_unsat(&mut self) -> crate::sat_unsat::SatUnsat<()> {
+        if self
+            .post
+            .canonicalize_with_current_path_condition_or_unsat()
+            .is_unsat()
+        {
+            return crate::sat_unsat::SatUnsat::Unsat;
+        }
         // Keep the exported precondition in lock-step with the canonicalized
         // abductive state. OCaml `PulseAbductiveDomain.filter_for_summary`
         // canonicalizes the whole astate first, then `restore_formals_for_summary`
@@ -348,6 +355,7 @@ impl PrePost {
         if let Some(result) = &mut self.result {
             *result = self.post.path_condition.get_var_repr(*result);
         }
+        crate::sat_unsat::SatUnsat::Sat(())
     }
 
     /// Restore formal/global/return variable views in the post-state before
@@ -669,7 +677,13 @@ impl PrePost {
     fn normalize_with_summary_info(&mut self) -> NormalizedSummaryInfo {
         use std::collections::HashSet;
 
-        self.canonicalize_for_summary();
+        if self.canonicalize_for_summary_or_unsat().is_unsat() {
+            return NormalizedSummaryInfo {
+                leaks: Vec::new(),
+                summary_eq_zero_must_be_valid: HashSet::new(),
+                aliasing_contradiction: true,
+            };
+        }
 
         // OCaml checks leaks from the pre-filter state, before restoring and
         // trimming the post stack for summary creation.
@@ -782,6 +796,7 @@ impl PrePost {
         NormalizedSummaryInfo {
             leaks,
             summary_eq_zero_must_be_valid,
+            aliasing_contradiction: false,
         }
     }
 
@@ -1098,6 +1113,9 @@ impl PulseSummary {
             let mut pp =
                 build_pre_post(pdesc, state.get_astate().clone(), initial_kind, abort_diag);
             let info = pp.normalize_with_summary_info();
+            if info.aliasing_contradiction {
+                continue;
+            }
             let continue_fallback = (pp.kind == PrePostKind::ContinueProgram).then(|| pp.clone());
             let leak_diags = info.leaks;
             let potential_invalid_access = if pp.kind == PrePostKind::ContinueProgram {
@@ -1998,7 +2016,13 @@ fn coalesce_zero_direct_formals_for_export(
         }
     }
 
-    pre_post.post.canonicalize_with_current_path_condition();
+    if pre_post
+        .post
+        .canonicalize_with_current_path_condition_or_unsat()
+        .is_unsat()
+    {
+        return;
+    }
     pre_post.pre = pre_post.post.pre.clone();
     for (_formal, addr) in &mut pre_post.formals {
         *addr = pre_post.post.path_condition.get_var_repr(*addr);

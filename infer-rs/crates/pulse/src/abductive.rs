@@ -685,7 +685,11 @@ impl AbductiveDomain {
         for new_eq in new_eqs {
             match new_eq {
                 NewEq::Equal(old, new) if old == new => {}
-                NewEq::Equal(old, new) => self.subst_var(old, new),
+                NewEq::Equal(old, new) => {
+                    if self.subst_var_or_unsat(old, new).is_unsat() {
+                        return SatUnsat::Unsat;
+                    }
+                }
                 NewEq::EqZero(v) => {
                     let repr = self.path_condition.get_var_repr(v);
                     if self.is_stack_allocated(repr) {
@@ -718,7 +722,9 @@ impl AbductiveDomain {
             match new_eq {
                 NewEq::Equal(old, new) if old == new => {}
                 NewEq::Equal(old, new) => {
-                    self.subst_var(old, new);
+                    if self.subst_var_or_unsat(old, new).is_unsat() {
+                        return SatUnsat::Unsat;
+                    }
                     let updated = std::mem::take(imported_must_be_valid);
                     *imported_must_be_valid = self.subst_value_set(updated, old, new);
                     let updated = std::mem::take(stack_allocated_before_call);
@@ -779,10 +785,19 @@ impl AbductiveDomain {
         (stack_allocated, heap_allocated)
     }
 
-    fn subst_var(&mut self, old: AbstractValue, new: AbstractValue) {
+    fn subst_var_or_unsat(&mut self, old: AbstractValue, new: AbstractValue) -> SatUnsat<()> {
         let new = self.path_condition.get_var_repr(new);
-        self.pre.subst_var(old, new);
-        self.post.subst_var(old, new);
+        if self.pre.subst_var_or_unsat(old, new).is_unsat() {
+            return SatUnsat::Unsat;
+        }
+        if self.post.subst_var_or_unsat(old, new).is_unsat() {
+            return SatUnsat::Unsat;
+        }
+        self.subst_auxiliary_value_maps(old, new);
+        SatUnsat::Sat(())
+    }
+
+    fn subst_auxiliary_value_maps(&mut self, old: AbstractValue, new: AbstractValue) {
         let must_be_valid = std::mem::take(&mut self.must_be_valid);
         self.must_be_valid = self.subst_value_set(must_be_valid, old, new);
         let need_dynamic_type_specialization =
@@ -1072,7 +1087,10 @@ impl AbductiveDomain {
     /// `filter_for_summary`, so summary export does not keep stale heap roots
     /// or stack bindings after equalities have been learned only in the path
     /// condition.
-    pub(crate) fn canonicalize_with_current_path_condition(&mut self) {
+    /// Canonicalization that preserves OCaml's aliasing contradiction
+    /// semantics instead of merging colliding heap roots. See
+    /// `PulseBaseMemory.canonicalize`.
+    pub(crate) fn canonicalize_with_current_path_condition_or_unsat(&mut self) -> SatUnsat<()> {
         let mut rewrites = std::collections::BTreeSet::new();
         let mut collect = |v: AbstractValue| {
             let repr = self.path_condition.get_var_repr(v);
@@ -1114,8 +1132,11 @@ impl AbductiveDomain {
         }
 
         for (old, new) in rewrites {
-            self.subst_var(old, new);
+            if self.subst_var_or_unsat(old, new).is_unsat() {
+                return SatUnsat::Unsat;
+            }
         }
+        SatUnsat::Sat(())
     }
 
     /// Apply the effect of an unknown/external call on a value: havoc all

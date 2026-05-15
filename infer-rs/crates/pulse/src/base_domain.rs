@@ -36,6 +36,23 @@ impl BaseDomain {
         self.heap.subst_var(old, new);
         self.attrs.subst_var(old, new);
     }
+
+    /// Substitution with OCaml's heap aliasing-contradiction check. See
+    /// [`BaseMemory::subst_var_or_unsat`].
+    pub fn subst_var_or_unsat(
+        &mut self,
+        old: AbstractValue,
+        new: AbstractValue,
+    ) -> crate::sat_unsat::SatUnsat<()> {
+        self.stack.subst_var(old, new);
+        match self.heap.subst_var_or_unsat(old, new) {
+            crate::sat_unsat::SatUnsat::Sat(()) => {
+                self.attrs.subst_var(old, new);
+                crate::sat_unsat::SatUnsat::Sat(())
+            }
+            crate::sat_unsat::SatUnsat::Unsat => crate::sat_unsat::SatUnsat::Unsat,
+        }
+    }
 }
 
 impl fmt::Display for BaseDomain {
