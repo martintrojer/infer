@@ -950,7 +950,7 @@ impl AbductiveDomain {
         })
     }
 
-    fn record_pending_invalid_access_for_eq_zero(
+    pub(crate) fn record_pending_invalid_access_for_eq_zero(
         &mut self,
         addr: AbstractValue,
         location_hint: Option<Location>,

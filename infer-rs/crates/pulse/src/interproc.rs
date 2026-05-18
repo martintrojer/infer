@@ -1951,9 +1951,12 @@ fn translate_formula(
             }
             crate::sat_unsat::SatUnsat::Sat(ImportedFormulaEffect::PotentialInvalidAccess(
                 addr,
-            )) => TranslateFormulaResult::PotentialInvalidAccess(Box::new(
-                imported_potential_invalid_access_diagnostic(addr, loc, caller_state),
-            )),
+            )) => {
+                caller_state.record_pending_invalid_access_for_eq_zero(addr, Some(loc.clone()));
+                TranslateFormulaResult::PotentialInvalidAccess(Box::new(
+                    imported_potential_invalid_access_diagnostic(addr, loc, caller_state),
+                ))
+            }
         }
     }
 
@@ -4811,6 +4814,9 @@ mod tests {
                     diagnostic.as_ref(),
                     Diagnostic::AccessToInvalidAddress { addr, .. }
                         if state.check_valid(*addr).is_ok()
+                            && state.pending_invalid_accesses.iter().any(|pending| {
+                                state.get_var_repr(pending.addr) == state.get_var_repr(*addr)
+                            })
                 )
         ));
     }
@@ -4889,13 +4895,16 @@ mod tests {
 
         assert!(matches!(
             results.as_slice(),
-            [ExecutionDomain::LatentInvalidAccess { diagnostic, .. }]
+            [ExecutionDomain::LatentInvalidAccess { state, diagnostic }]
                 if matches!(
                     diagnostic.as_ref(),
                     Diagnostic::AccessToInvalidAddress {
                         invalidation: crate::invalidation::Invalidation::ConstantDereference(_),
+                        addr,
                         ..
-                    }
+                    } if state.pending_invalid_accesses.iter().any(|pending| {
+                        state.get_var_repr(pending.addr) == state.get_var_repr(*addr)
+                    })
                 )
         ));
     }
