@@ -1213,6 +1213,15 @@ impl PulseSummary {
                 }
             }
             if pp.kind == PrePostKind::ContinueProgram {
+                if let Some(latent_pp) = latent_pre_post_for_zero_direct_formal_continue(
+                    pdesc,
+                    &pp,
+                    info.summary_potential_invalid_access,
+                ) {
+                    pp = latent_pp;
+                }
+            }
+            if pp.kind == PrePostKind::ContinueProgram {
                 coalesce_zero_direct_formals_for_continue_export(pdesc, &mut pp);
             }
             // Only report leaks from ordinary ContinueProgram paths — latent /
@@ -1985,6 +1994,105 @@ fn potential_invalid_access_from_normalized_stopped_pre_post(
     potential_invalid_access_from_normalized_continue_pre_post(pdesc, pre_post, None)
 }
 
+fn latent_pre_post_for_zero_direct_formal_continue(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+    summary_potential_invalid_access: Option<AbstractValue>,
+) -> Option<PrePost> {
+    if pre_post.kind != PrePostKind::ContinueProgram {
+        return None;
+    }
+    let direct_formal_values = direct_formal_value_addrs(pdesc, pre_post);
+    let mut local_zero_direct_formals: Vec<_> = local_zero_direct_formals(pdesc, pre_post)
+        .into_iter()
+        .collect();
+    local_zero_direct_formals.sort();
+    let selected_addr = summary_potential_invalid_access
+        .map(|addr| pre_post.post.path_condition.get_var_repr(addr))
+        .filter(|addr| direct_formal_values.contains(addr))
+        .or_else(|| local_zero_direct_formals.first().copied())?;
+    if !direct_formal_values.contains(&selected_addr) {
+        return None;
+    }
+
+    if pre_post
+        .post
+        .post
+        .attrs
+        .get(&selected_addr)
+        .and_then(|attrs| attrs.get_invalid())
+        .is_some_and(|(inv, _history)| !inv.is_null_deref())
+    {
+        return None;
+    }
+
+    let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, pre_post);
+    if !caller_controlled.contains(&selected_addr) {
+        return None;
+    }
+
+    let access_history = pre_post
+        .post
+        .history_of_value(selected_addr)
+        .unwrap_or_default();
+    if latent_invalid_access_is_imported_from_call(pdesc, pre_post, selected_addr, &access_history)
+    {
+        return None;
+    }
+
+    let location = pre_post
+        .pre
+        .attrs
+        .get(&selected_addr)
+        .and_then(|attrs| attrs.get_must_be_valid())
+        .map(|(_ts, loc, _reason)| loc.clone())?;
+
+    let mut latent_pp = pre_post.clone();
+    let invalidation = crate::invalidation::Invalidation::ConstantDereference(IntLit::zero());
+    let invalidation_history = access_history
+        .clone()
+        .append_event(HistoryEvent::Invalidated {
+            invalidation: invalidation.clone(),
+            location: location.clone(),
+        });
+    latent_pp.kind = PrePostKind::LatentInvalidAccess;
+    latent_pp.diagnostic = Some(Diagnostic::AccessToInvalidAddress {
+        addr: selected_addr,
+        invalidation,
+        access_location: location,
+        trace_access_location: None,
+        access_history,
+        invalidation_history,
+    });
+    latent_pp
+        .post
+        .must_be_valid
+        .retain(|addr| latent_pp.post.path_condition.get_var_repr(*addr) == selected_addr);
+    latent_pp.pending_invalid_accesses.retain(|pending| {
+        latent_pp.post.path_condition.get_var_repr(pending.addr) == selected_addr
+    });
+    drop_selected_null_invalidation(&mut latent_pp, selected_addr);
+    prune_later_direct_formal_artifacts_for_potential_invalid_access(
+        pdesc,
+        &mut latent_pp,
+        selected_addr,
+    );
+    if !require_earlier_direct_formals_nonzero_for_potential_invalid_access(
+        pdesc,
+        &mut latent_pp,
+        selected_addr,
+    ) {
+        return None;
+    }
+    if latent_invalid_access_has_mixed_condition_depths(pdesc, &latent_pp)
+        || !latent_invalid_access_has_only_path_local_conditions(pdesc, &latent_pp, selected_addr)
+    {
+        return None;
+    }
+
+    Some(latent_pp)
+}
+
 fn drop_selected_null_invalidation(pre_post: &mut PrePost, addr: AbstractValue) {
     let repr = pre_post.post.path_condition.get_var_repr(addr);
     let Some(attrs) = pre_post.post.post.attrs.get_mut(&repr) else {
@@ -2248,10 +2356,47 @@ fn latent_invalid_access_has_only_path_local_conditions(
                 path_values.contains(&repr)
                     || (direct_formal_values.contains(&repr)
                         && (local_zero_direct_formals.contains(&repr)
+                            || earlier_direct_formal_success_guard(
+                                pdesc,
+                                pre_post,
+                                selected_repr,
+                                atom,
+                            )
                             || (selected_has_visible_null_invalidation
                                 && pre_post.post.path_condition.is_known_zero(repr))))
             })
         })
+}
+
+/// Earlier direct-formal reads are part of the path to a later
+/// `PotentialInvalidAccessSummary`: if `may_double_free_if_alias` publishes a
+/// latent access on `y`, the preceding successful read of `x` remains as the
+/// guard `0 < x`. Treat that guard as path-local to the later access rather
+/// than as an unrelated branch condition.
+fn earlier_direct_formal_success_guard(
+    pdesc: &Procdesc,
+    pre_post: &PrePost,
+    selected_addr: AbstractValue,
+    atom: &Atom,
+) -> bool {
+    let direct_formal_ordering = direct_formal_value_must_be_valid_ordering(pdesc, pre_post);
+    let Some(selected_order) = direct_formal_ordering
+        .get(&pre_post.post.path_condition.get_var_repr(selected_addr))
+        .cloned()
+    else {
+        return false;
+    };
+
+    let guard_var = match atom {
+        Atom::LessThan(Term::Const(0), Term::Var(var)) => {
+            pre_post.post.path_condition.get_var_repr(*var)
+        }
+        _ => return false,
+    };
+
+    direct_formal_ordering
+        .get(&guard_var)
+        .is_some_and(|order| *order < selected_order)
 }
 
 fn post_addr_has_visible_null_invalidation(pre_post: &PrePost, addr: AbstractValue) -> bool {

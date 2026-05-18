@@ -1183,13 +1183,8 @@ fn assert_specialization_summary_report_at_post_overflow_baseline(
 ) {
     assert_eq!(
         (report.matching, report.differences.len()),
-        (20, 1),
-        "specialization.c summary parity should stay at the post-overflow baseline\n{report}"
-    );
-    assert_eq!(
-        report.differences.first().map(|diff| diff.proc_name.as_str()),
-        Some("may_double_free_if_alias"),
-        "the only expected residual specialization.c diff should remain may_double_free_if_alias\n{report}"
+        (21, 0),
+        "specialization.c summary parity should stay closed\n{report}"
     );
 }
 
