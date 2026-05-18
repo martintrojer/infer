@@ -1374,7 +1374,8 @@ fn rust_pre_post_to_raw(
         // field on the summarized pre/post JSON shape consumed by this
         // comparator. Rust keeps the same sideband in `PrePost::diagnostic`
         // for summary application, so hide it only in the comparison surface.
-        pulse::summary::PrePostKind::LatentAbortProgram => None,
+        pulse::summary::PrePostKind::LatentAbortProgram
+        | pulse::summary::PrePostKind::LatentInvalidAccess => None,
         _ => pre_post.diagnostic.as_ref().map(format_rust_diagnostic),
     };
     test_harness::summary_compare::RawPrePost {
@@ -2057,6 +2058,17 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             actual_kinds, expected_kinds,
             "{proc_name} summary kinds diverged"
         );
+        for pp in summary
+            .pre_posts
+            .iter()
+            .filter(|pp| pp.kind == pulse::summary::PrePostKind::LatentInvalidAccess)
+        {
+            assert!(
+                pulse::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pp)
+                    .is_some(),
+                "{proc_name} should not export diagnostic-less latent invalid-access orphan rows"
+            );
+        }
 
         let issue_ids: Vec<_> = pulse::checker::to_issue_log_with_pdesc(&summary, pdesc)
             .issues
@@ -2981,8 +2993,8 @@ fn test_e2e_two_hop_field_write_keeps_null_derefs_latent() {
         })
         .count();
     assert_eq!(
-        latent_null_derefs, 2,
-        "expected one latent null deref for `q` and one for `q->next` once the field write reaches its own CFG node"
+        latent_null_derefs, 1,
+        "the explicit local EqZero sideband should avoid duplicate diagnostic-less latent orphan rows while preserving the representative caller-controlled null dereference"
     );
     assert!(
         summary
@@ -3775,14 +3787,62 @@ fn test_e2e_deref_then_free_then_deref_keeps_npe_latent() {
         !issue_types.contains(&IssueTypeId::NullptrDereference),
         "write-through on the pointee should not make the direct-formal null deref manifest: {issue_types:?}"
     );
+    let latent_npe = summary
+        .pre_posts
+        .iter()
+        .find(|pp| {
+            pp.kind == pulse::summary::PrePostKind::LatentInvalidAccess
+                && pp
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)
+        })
+        .expect("expected a latent NULL_DEREFERENCE pre/post to stay in the summary");
     assert!(
-        summary.pre_posts.iter().any(|pp| pp.kind
-            == pulse::summary::PrePostKind::LatentInvalidAccess
-            && pp
-                .diagnostic
-                .as_ref()
-                .is_some_and(|diag| diag.get_issue_type_id() == IssueTypeId::NullptrDereference)),
-        "expected a latent NULL_DEREFERENCE pre/post to stay in the summary"
+        !latent_npe.post.post.attrs.iter().any(|(_addr, attrs)| {
+            attrs.iter().any(|attr| {
+                matches!(
+                    attr,
+                    pulse::attribute::Attribute::Invalid(
+                        pulse::invalidation::Invalidation::ConstantDereference(value),
+                        _
+                    ) if value.is_zero()
+                )
+            })
+        }),
+        "local EqZero sideband should not synthesize an Invalid(ConstantDereference(0)) attr"
+    );
+    assert!(
+        summary.pre_posts.iter().any(|pp| {
+            pp.post.post.attrs.iter().any(|(_addr, attrs)| {
+                attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        pulse::attribute::Attribute::Invalid(
+                            pulse::invalidation::Invalidation::ConstantDereference(value),
+                            _
+                        ) if value.to_i64() == Some(42)
+                    )
+                })
+            })
+        }),
+        "ordinary stored ConstantDereference(42) attrs should remain ordinary attrs"
+    );
+    assert!(
+        summary.pre_posts.iter().any(|pp| {
+            pp.post.post.attrs.iter().any(|(_addr, attrs)| {
+                attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        pulse::attribute::Attribute::Invalid(
+                            pulse::invalidation::Invalidation::CFree,
+                            _
+                        )
+                    )
+                })
+            })
+        }),
+        "ordinary CFree attrs should remain ordinary attrs"
     );
 }
 

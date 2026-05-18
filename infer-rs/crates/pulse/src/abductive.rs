@@ -14,7 +14,6 @@
 //! We simplify to post-state only for now (forward analysis without
 //! precondition inference).
 
-use sil::int_lit::IntLit;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
@@ -30,7 +29,7 @@ use crate::formula::lin_arith::LinArith;
 use crate::formula::{Formula, NewEq, Operand};
 use crate::invalidation::Invalidation;
 use crate::sat_unsat::SatUnsat;
-use crate::value_history::{CellId, ValueHistory, ValueWithHistory};
+use crate::value_history::{CellId, HistoryEvent, ValueHistory, ValueWithHistory};
 
 thread_local! {
     static NEXT_VALUE_HISTORY_CELL_ID: std::cell::Cell<CellId> = const { std::cell::Cell::new(1) };
@@ -42,6 +41,23 @@ fn fresh_value_history_cell_id() -> CellId {
         counter.set(id.saturating_add(1));
         id
     })
+}
+
+/// Non-attribute sideband for a caller-reifiable invalid access discovered by
+/// local arithmetic (`EqZero`) on an address that was already known to be
+/// `MustBeValid`.
+///
+/// This deliberately is **not** an `Attribute::Invalid(ConstantDereference(0))`:
+/// OCaml carries this surface as `PotentialInvalidAccess{,Summary}` metadata so
+/// normal summary filtering can still preserve ordinary invalidation attrs from
+/// elsewhere without turning every local null equality into a synthetic null
+/// dereference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingInvalidAccess {
+    pub addr: AbstractValue,
+    pub must_be_valid_trace: ValueHistory,
+    pub location: Location,
+    pub access_history: ValueHistory,
 }
 
 /// The abductive domain: pre-state + post-state + path condition.
@@ -85,6 +101,9 @@ pub struct AbductiveDomain {
     /// Monotonic attribute timestamp used to preserve path-local event order
     /// for exported summary attributes such as `MustBeValid`.
     next_attr_timestamp: crate::attribute::Timestamp,
+    /// Local EqZero-on-MustBeValid obligations waiting to be reified by summary
+    /// export / stopped-state handling as `LatentInvalidAccess` diagnostics.
+    pub pending_invalid_accesses: Vec<PendingInvalidAccess>,
 }
 
 /// Outcome of applying callee-imported equalities to an abductive state.
@@ -202,7 +221,7 @@ impl AstateSizeStats {
             formula_intervals: phi.intervals.len(),
             formula_is_int_vars: phi.is_int_vars.len(),
             formula_equalities: phi.var_eqs.len(),
-            must_be_valid: astate.must_be_valid.len(),
+            must_be_valid: astate.must_be_valid.len() + astate.pending_invalid_accesses.len(),
             dynamic_types: astate.dynamic_types.len(),
             need_dynamic_type_specialization: astate.need_dynamic_type_specialization.len(),
             const_cache: astate.const_cache.len(),
@@ -330,6 +349,7 @@ impl AbductiveDomain {
             dynamic_types: std::collections::BTreeMap::new(),
             must_be_valid: std::collections::HashSet::new(),
             next_attr_timestamp: 1,
+            pending_invalid_accesses: Vec::new(),
         };
 
         // Bind each formal parameter to a fresh abstract value.
@@ -720,14 +740,7 @@ impl AbductiveDomain {
                         return SatUnsat::Unsat;
                     }
                     if self.is_heap_allocated(repr) {
-                        self.post.attrs.invalidate(
-                            repr,
-                            Invalidation::ConstantDereference(IntLit::zero()),
-                            ValueHistory::invalidated(
-                                Invalidation::ConstantDereference(IntLit::zero()),
-                                Location::dummy(),
-                            ),
-                        );
+                        self.record_pending_invalid_access_for_eq_zero(repr, None);
                     }
                 }
             }
@@ -830,6 +843,20 @@ impl AbductiveDomain {
             self.subst_value_set(need_dynamic_type_specialization, old, new);
         let dynamic_types = std::mem::take(&mut self.dynamic_types);
         self.dynamic_types = self.subst_typed_value_map(dynamic_types, old, new);
+        let pending_invalid_accesses = std::mem::take(&mut self.pending_invalid_accesses);
+        self.pending_invalid_accesses = pending_invalid_accesses
+            .into_iter()
+            .map(|mut pending| {
+                let addr = if pending.addr == old {
+                    new
+                } else {
+                    pending.addr
+                };
+                pending.addr = self.path_condition.get_var_repr(addr);
+                pending
+            })
+            .collect();
+        self.dedup_pending_invalid_accesses();
         for value in self.const_cache.values_mut() {
             let value0 = if *value == old { new } else { *value };
             *value = self.path_condition.get_var_repr(value0);
@@ -864,6 +891,80 @@ impl AbductiveDomain {
             result.entry(value).or_insert(typ);
         }
         result
+    }
+
+    fn path_condition_has_local_zero_condition(&self, addr: AbstractValue) -> bool {
+        self.path_condition.conditions().iter().any(|(atom, depth)| {
+            *depth == 0
+                && matches!(
+                    atom,
+                    Atom::Equal(crate::formula::term::Term::Var(v), crate::formula::term::Term::Const(0))
+                        | Atom::Equal(crate::formula::term::Term::Const(0), crate::formula::term::Term::Var(v))
+                        if self.path_condition.get_var_repr(*v) == addr
+                )
+        })
+    }
+
+    fn record_pending_invalid_access_for_eq_zero(
+        &mut self,
+        addr: AbstractValue,
+        location_hint: Option<Location>,
+    ) {
+        let repr = self.path_condition.get_var_repr(addr);
+        if !self.must_be_valid.contains(&repr) {
+            return;
+        }
+        if self
+            .post
+            .attrs
+            .get(&repr)
+            .and_then(|attrs| attrs.get_invalid())
+            .is_some()
+        {
+            return;
+        }
+        let (must_be_valid_trace, location) = self
+            .pre
+            .attrs
+            .get(&repr)
+            .and_then(|attrs| attrs.get_must_be_valid())
+            .map(|(_timestamp, loc, _reason)| {
+                (
+                    ValueHistory::from_event(HistoryEvent::Assignment(loc.clone())),
+                    loc.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                let history = self.history_of_value(repr).unwrap_or_default();
+                let location = location_hint
+                    .clone()
+                    .or_else(|| history.last_location().cloned())
+                    .unwrap_or_else(Location::dummy);
+                (history, location)
+            });
+        let access_history = self.history_of_value(repr).unwrap_or_default();
+        let pending = PendingInvalidAccess {
+            addr: repr,
+            must_be_valid_trace,
+            location,
+            access_history,
+        };
+        self.pending_invalid_accesses.push(pending);
+        self.dedup_pending_invalid_accesses();
+    }
+
+    fn dedup_pending_invalid_accesses(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.pending_invalid_accesses.retain(|pending| {
+            let addr = self.path_condition.get_var_repr(pending.addr);
+            seen.insert((addr, pending.location.clone()))
+        });
+    }
+
+    pub fn clear_pending_invalid_access_for_addr(&mut self, addr: AbstractValue) {
+        let repr = self.path_condition.get_var_repr(addr);
+        self.pending_invalid_accesses
+            .retain(|pending| self.path_condition.get_var_repr(pending.addr) != repr);
     }
 
     fn is_heap_allocated(&self, addr: AbstractValue) -> bool {
@@ -1005,6 +1106,12 @@ impl AbductiveDomain {
     pub fn mark_must_be_valid(&mut self, addr: AbstractValue) {
         let repr = self.path_condition.get_var_repr(addr);
         self.must_be_valid.insert(repr);
+        if self.path_condition.is_known_zero(repr)
+            && self.path_condition_has_local_zero_condition(repr)
+            && self.is_heap_allocated(repr)
+        {
+            self.record_pending_invalid_access_for_eq_zero(repr, None);
+        }
     }
 
     /// Record a must-be-valid access at a concrete program location.
@@ -1021,6 +1128,12 @@ impl AbductiveDomain {
             self.pre
                 .attrs
                 .add_one(repr, Attribute::MustBeValid(timestamp, loc.clone(), None));
+        }
+        if self.path_condition.is_known_zero(repr)
+            && self.path_condition_has_local_zero_condition(repr)
+            && self.is_heap_allocated(repr)
+        {
+            self.record_pending_invalid_access_for_eq_zero(repr, Some(loc.clone()));
         }
     }
 
@@ -1147,6 +1260,9 @@ impl AbductiveDomain {
         }
         for &addr in &self.must_be_valid {
             collect(addr);
+        }
+        for pending in &self.pending_invalid_accesses {
+            collect(pending.addr);
         }
         for &addr in &self.need_dynamic_type_specialization {
             collect(addr);
@@ -1575,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_zero_marks_heap_allocated_value_invalid() {
+    fn test_local_eq_zero_on_must_be_valid_uses_sideband_not_invalid_attr() {
         let pdesc = make_simple_pdesc();
         let mut state = AbductiveDomain::mk_initial(&pdesc);
         let formal_var = Var::ProgramVar(Box::new(Pvar::mk(
@@ -1586,9 +1702,17 @@ mod tests {
         let formal_val = state.read_heap(formal_addr, Access::Dereference);
         let _heap_target = state.read_heap(formal_val, Access::Dereference);
 
-        state.mark_must_be_valid(formal_val);
+        state.mark_must_be_valid_at(formal_val, &Location::dummy());
         assert!(state.and_equal_const(formal_val, 0).is_sat());
-        assert!(state.check_valid(formal_val).is_err());
+        assert!(
+            state.check_valid(formal_val).is_ok(),
+            "local EqZero must not synthesize Invalid(ConstantDereference(0))"
+        );
+        assert_eq!(state.pending_invalid_accesses.len(), 1);
+        assert_eq!(
+            state.pending_invalid_accesses[0].addr,
+            state.get_var_repr(formal_val)
+        );
     }
 
     #[test]

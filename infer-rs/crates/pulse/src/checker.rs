@@ -2794,6 +2794,7 @@ mod tests {
             result: None,
             kind: PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let alias_spec = PulseSpecialization {
@@ -2829,6 +2830,7 @@ mod tests {
                         result: None,
                         kind: PrePostKind::ContinueProgram,
                         diagnostic: None,
+                        pending_invalid_accesses: vec![],
                     }],
                     latent_abort_diagnostics: vec![None],
                     has_dropped_disjuncts: false,
@@ -2913,6 +2915,7 @@ mod tests {
                     result: None,
                     kind: PrePostKind::AbortProgram,
                     diagnostic: Some(diagnostic.clone()),
+                    pending_invalid_accesses: vec![],
                 }],
                 has_dropped_disjuncts,
                 specialized: vec![],
@@ -3287,6 +3290,7 @@ mod tests {
             result: None,
             kind: PrePostKind::LatentAbortProgram,
             diagnostic: Some(diagnostic),
+            pending_invalid_accesses: vec![],
         });
 
         let log = to_issue_log(&summary, "latent_abort");
@@ -4358,8 +4362,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            latent_null_derefs, 2,
-            "expected the non-exit scan to recover both `q == 0` and `q->next == 0` latent dereferences once the field write reaches its own CFG node, summary={summary:?}"
+            latent_null_derefs, 1,
+            "the explicit local EqZero sideband should avoid duplicate diagnostic-less latent orphan rows while preserving the representative caller-controlled null dereference, summary={summary:?}"
         );
         assert!(
             summary
@@ -4391,8 +4395,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            latent_null_derefs, 2,
-            "expected abort-state summarization to preserve both earlier caller-controlled null dereferences even when the block later aborts locally, summary={summary:?}"
+            latent_null_derefs, 1,
+            "the explicit local EqZero sideband should avoid duplicate diagnostic-less latent orphan rows while preserving the representative caller-controlled null dereference, summary={summary:?}"
         );
         assert!(
             summary

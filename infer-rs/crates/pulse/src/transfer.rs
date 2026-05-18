@@ -1302,8 +1302,8 @@ mod tests {
         let _heap_target = state.read_heap(p_val, Access::Dereference);
         assert!(state.and_equal_const(p_val, 0).is_sat());
         assert!(
-            state.check_valid(p_val).is_err(),
-            "EqZero should invalidate caller-visible heap values once the dereference path exists"
+            state.check_valid(p_val).is_ok(),
+            "local EqZero should no longer synthesize Invalid(ConstantDereference(0)); the invalid access is carried by sideband/summary reification"
         );
 
         let id = Ident::create_normal(IdentName::from_string("n"), 0);
@@ -1315,18 +1315,9 @@ mod tests {
             loc: Location::dummy(),
         };
         let results = exec_instr(&instr, state);
-        let has_abort = results.iter().any(|r| match r {
-            ExecutionDomain::AbortProgram { diagnostic, .. } => {
-                matches!(
-                    diagnostic.as_ref(),
-                    Diagnostic::AccessToInvalidAddress { .. }
-                )
-            }
-            _ => false,
-        });
         assert!(
-            has_abort,
-            "storing through an address that is provably null should abort"
+            !results.iter().any(|r| matches!(r, ExecutionDomain::AbortProgram { .. })),
+            "local EqZero should not abort immediately after synthesizing an Invalid(0) attr; summary export reifies the sideband instead"
         );
     }
 

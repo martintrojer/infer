@@ -2431,6 +2431,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         (pdesc, pre_post)
@@ -2490,6 +2491,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2545,6 +2547,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2601,6 +2604,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2663,6 +2667,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2720,6 +2725,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2777,6 +2783,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         // Caller: call callee(&x)
@@ -2859,6 +2866,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -2923,6 +2931,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3007,6 +3016,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3102,6 +3112,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3195,6 +3206,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3292,6 +3304,7 @@ mod tests {
             result: Some(result_addr),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3380,6 +3393,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3473,6 +3487,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3654,6 +3669,7 @@ mod tests {
                 shared_zero,
                 crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
             )),
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("main");
@@ -3768,6 +3784,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3835,6 +3852,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -3945,6 +3963,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let free_pname = Procname::c_from_string("free_slot");
@@ -3993,6 +4012,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4096,6 +4116,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4161,6 +4182,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::AbortProgram,
             diagnostic: Some(diagnostic.clone()),
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4221,6 +4243,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::LatentAbortProgram,
             diagnostic: Some(diagnostic.clone()),
+            pending_invalid_accesses: vec![],
         };
 
         (pre_post, diagnostic)
@@ -4263,6 +4286,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::LatentInvalidAccess,
             diagnostic: Some(diagnostic.clone()),
+            pending_invalid_accesses: vec![],
         };
 
         (pre_post, diagnostic, formal_pvar)
@@ -4296,6 +4320,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::LatentInvalidAccess,
             diagnostic: Some(diagnostic.clone()),
+            pending_invalid_accesses: vec![],
         };
 
         (pre_post, diagnostic)
@@ -4526,6 +4551,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("if_negative_then_crash_latent");
@@ -4652,6 +4678,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4736,6 +4763,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4824,8 +4852,8 @@ mod tests {
             .cloned()
             .expect("expected a latent invalid-access summary pre/post");
         assert!(
-            pre_post.diagnostic.is_none(),
-            "exported latent invalid-access summaries should omit the diagnostic payload"
+            pre_post.diagnostic.is_some(),
+            "local EqZero sideband should retain the diagnostic payload for exported latent invalid-access summaries"
         );
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4898,6 +4926,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -4970,6 +4999,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         };
 
         let caller_pname = Procname::c_from_string("caller");
@@ -5179,6 +5209,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         }
     }
 
@@ -5232,6 +5263,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            pending_invalid_accesses: vec![],
         }
     }
 

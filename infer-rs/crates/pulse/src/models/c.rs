@@ -637,6 +637,10 @@ fn free(
             )
             .is_sat()
         {
+            // `free(NULL)` is a no-op in C. If local EqZero recorded a
+            // pending invalid-access sideband for this same value, consume it
+            // on the null branch instead of exporting an orphan latent row.
+            null_state.clear_pending_invalid_access_for_addr(addr.addr);
             let ret_val = AbstractValue::mk_fresh();
             operations::write_id_with_history(
                 ret_id,
