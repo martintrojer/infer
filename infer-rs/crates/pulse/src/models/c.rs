@@ -265,7 +265,7 @@ pub(crate) fn fresh_or_null(
         ),
         &mut fail_state,
     );
-    let _ = fail_state.and_equal_const(null_val, 0);
+    let _ = fail_state.and_equal_const_with_constant_collision(null_val, 0);
     fail_state.post.attrs.add_one(
         null_val,
         crate::attribute::Attribute::Invalid(
@@ -471,7 +471,7 @@ fn allocate_or_null(
     );
     // Constrain null_val = 0 in the formula so prune(val ≠ 0) can eliminate it.
     // Matches OCaml's `and_eq_int ret_addr IntLit.zero` in alloc_common_dsl.
-    let _ = fail_state.and_equal_const(null_val, 0);
+    let _ = fail_state.and_equal_const_with_constant_collision(null_val, 0);
     fail_state.post.attrs.add_one(
         null_val,
         crate::attribute::Attribute::Invalid(

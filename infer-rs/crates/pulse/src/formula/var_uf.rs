@@ -95,6 +95,35 @@ impl VarUF {
         Some((merge, keep))
     }
 
+    /// Union two variables while explicitly preferring the representative of
+    /// `preferred` as the kept root.
+    ///
+    /// This is intentionally not the default: ordinary equalities mirror
+    /// OCaml's raw-id ordering via [`union`]. Constant term collisions in
+    /// PulseFormulaPhi are different: adding a fresh `x = c` when `c` is
+    /// already represented by `preferred` returns the existing term value and
+    /// substitutes the fresh one away, even if the fresh id is numerically
+    /// simpler.
+    pub fn union_prefer(
+        &mut self,
+        v: AbstractValue,
+        preferred: AbstractValue,
+    ) -> Option<(AbstractValue, AbstractValue)> {
+        let merge = self.find(v);
+        let keep = self.find(preferred);
+        if merge == keep {
+            return None;
+        }
+
+        self.parent.insert(merge, keep);
+        let rank_keep = self.rank.get(&keep).copied().unwrap_or(0);
+        let rank_merge = self.rank.get(&merge).copied().unwrap_or(0);
+        if rank_keep <= rank_merge {
+            self.rank.insert(keep, rank_merge + 1);
+        }
+        Some((merge, keep))
+    }
+
     /// Get the canonical representative without mutation.
     pub fn get_repr(&self, v: AbstractValue) -> AbstractValue {
         self.find_immut(v)
@@ -208,6 +237,17 @@ mod tests {
         );
         assert_eq!(uf.find(unrestricted), restricted);
         assert_eq!(uf.find(restricted), restricted);
+    }
+
+    #[test]
+    fn test_union_prefer_keeps_existing_representative() {
+        let mut uf = VarUF::new();
+        let existing = AbstractValue::of_raw(10);
+        let fresh = AbstractValue::of_raw(1);
+
+        assert_eq!(uf.union_prefer(fresh, existing), Some((fresh, existing)));
+        assert_eq!(uf.find(fresh), existing);
+        assert_eq!(uf.find(existing), existing);
     }
 
     #[test]

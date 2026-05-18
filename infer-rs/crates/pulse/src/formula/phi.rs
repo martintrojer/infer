@@ -59,6 +59,14 @@ pub struct Phi {
     /// path condition propagation (e.g., `r = (x < 0); prune(r)` → `x < 0`).
     /// Mirrors OCaml's `term_eqs` in `Formula.t`.
     pub term_eqs: BTreeMap<AbstractValue, TermEq>,
+    /// Reverse index for concrete integer constants: `c ↦ v` where `v = c`.
+    ///
+    /// OCaml stores integer constants in `term_eqs` too, keyed by the constant
+    /// term. Adding a second equality `fresh = 0` therefore collides with the
+    /// existing `0 ↦ v` entry and emits `Equal(fresh, v)`. Keep the same
+    /// producer-time sharing here instead of teaching `get_var_repr` to fold
+    /// constants globally (OCaml's `get_var_repr` remains UF-only).
+    constant_value_index: BTreeMap<i64, AbstractValue>,
     /// Concrete integer intervals: `v ∈ [l, u]` or `v ∉ [l, u]`.
     /// Cross-ref: OCaml's `PulseFormulaPhi.ml` `intervals` field,
     /// `PulseCItv.ml` for the interval type.
@@ -252,6 +260,19 @@ impl Phi {
         self.propagate_equality(merged, kept, &mut new_eqs)
     }
 
+    /// Record `v = existing` while preserving `existing`'s representative.
+    fn and_var_equal_prefer_existing(
+        &mut self,
+        v: AbstractValue,
+        existing: AbstractValue,
+    ) -> SatUnsat<Vec<NewEq>> {
+        let Some((merged, kept)) = self.var_eqs.union_prefer(v, existing) else {
+            return SatUnsat::Sat(Vec::new());
+        };
+        let mut new_eqs = vec![NewEq::Equal(merged, kept)];
+        self.propagate_equality(merged, kept, &mut new_eqs)
+    }
+
     /// Record that a variable equals a linear expression: v = lin.
     pub fn and_linear_eq(&mut self, v: AbstractValue, lin: LinArith) -> SatUnsat<Vec<NewEq>> {
         self.and_linear_eq_with_preferred(v, lin, None)
@@ -293,12 +314,59 @@ impl Phi {
         // CItv.equal_to for EqZero, and add_interval_ for constants.
         let repr = self.get_repr(v);
         if self
-            .add_interval(repr, super::citv::CItv::equal_to(c))
+            .add_interval_only(repr, super::citv::CItv::equal_to(c))
             .is_unsat()
         {
             return SatUnsat::Unsat;
         }
         self.and_linear_eq(v, LinArith::of_int(c))
+    }
+
+    /// Record `v = c`, preserving an existing zero representative when this
+    /// equality is produced by constant evaluation / model assignment rather
+    /// than by a branch prune.
+    pub fn and_const_eq_with_constant_collision(
+        &mut self,
+        v: AbstractValue,
+        c: i64,
+    ) -> SatUnsat<Vec<NewEq>> {
+        let repr = self.get_repr(v);
+        if self
+            .add_interval_only(repr, super::citv::CItv::equal_to(c))
+            .is_unsat()
+        {
+            return SatUnsat::Unsat;
+        }
+        if c == 0 {
+            if let Some(existing) = self.find_const_value(0) {
+                let existing = self.get_repr(existing);
+                if existing != repr {
+                    let mut new_eqs = vec![NewEq::EqZero(repr)];
+                    match self.and_var_equal_prefer_existing(repr, existing) {
+                        SatUnsat::Unsat => return SatUnsat::Unsat,
+                        SatUnsat::Sat(eqs) => new_eqs.extend(eqs),
+                    }
+                    return SatUnsat::Sat(new_eqs);
+                }
+            }
+        }
+        self.and_linear_eq(v, LinArith::of_int(c))
+    }
+
+    /// Look up the canonical value already used for integer constant `c`.
+    pub fn find_const_value(&self, c: i64) -> Option<AbstractValue> {
+        if let Some(stored) = self.constant_value_index.get(&c).copied() {
+            let stored = self.get_repr(stored);
+            if self.get_known_const(stored) == Some(Q::from_integer(c)) {
+                return Some(stored);
+            }
+        }
+
+        self.linear_eqs.iter().find_map(|(&v, lin)| {
+            lin.get_as_const()
+                .filter(|q| q.is_integer() && *q.numer() / *q.denom() == c)
+                .map(|_| self.get_repr(v))
+        })
     }
 
     /// Add or intersect an interval for a variable.
@@ -307,15 +375,10 @@ impl Phi {
     /// Cross-ref: OCaml `PulseFormulaPhi.add_interval_`.
     pub fn add_interval(&mut self, v: AbstractValue, citv: super::citv::CItv) -> SatUnsat<()> {
         let repr = self.get_repr(v);
-        let refined = if let Some(existing) = self.intervals.get(&repr) {
-            match existing.intersection(&citv) {
-                None => return SatUnsat::Unsat,
-                Some(better) => better,
-            }
-        } else {
-            citv
+        let refined = match self.add_interval_only(repr, citv) {
+            SatUnsat::Unsat => return SatUnsat::Unsat,
+            SatUnsat::Sat(refined) => refined,
         };
-        self.intervals.insert(repr, refined.clone());
 
         if let super::citv::CItv::Between(
             super::citv::Bound::Int(lower),
@@ -330,6 +393,24 @@ impl Phi {
             }
         }
         SatUnsat::Sat(())
+    }
+
+    fn add_interval_only(
+        &mut self,
+        v: AbstractValue,
+        citv: super::citv::CItv,
+    ) -> SatUnsat<super::citv::CItv> {
+        let repr = self.get_repr(v);
+        let refined = if let Some(existing) = self.intervals.get(&repr) {
+            match existing.intersection(&citv) {
+                None => return SatUnsat::Unsat,
+                Some(better) => better,
+            }
+        } else {
+            citv
+        };
+        self.intervals.insert(repr, refined.clone());
+        SatUnsat::Sat(refined)
     }
 
     /// Get the interval for a variable, if any.
@@ -834,6 +915,8 @@ impl Phi {
                     FnAppActual::Var(v) => is_reachable(*v),
                 })
         });
+        self.constant_value_index
+            .retain(|_, value| is_reachable(*value));
         let term_key_operand_is_reachable = |op: &TermKeyOperand| match op {
             TermKeyOperand::Const(_) => true,
             TermKeyOperand::Var(v) => is_reachable(*v),
@@ -917,6 +1000,8 @@ impl Phi {
                     FnAppActual::Var(v) => is_reachable(*v),
                 })
         });
+        self.constant_value_index
+            .retain(|_, value| is_reachable(*value));
         let term_key_operand_is_reachable = |op: &TermKeyOperand| match op {
             TermKeyOperand::Const(_) => true,
             TermKeyOperand::Var(v) => is_reachable(*v),
@@ -966,6 +1051,8 @@ impl Phi {
                     FnAppActual::Var(v) => !touches_ignored(*v),
                 })
         });
+        self.constant_value_index
+            .retain(|_, value| !touches_ignored(*value));
         let term_key_operand_touches_ignored = |op: &TermKeyOperand| match op {
             TermKeyOperand::Const(_) => false,
             TermKeyOperand::Var(v) => touches_ignored(*v),
@@ -1013,6 +1100,8 @@ impl Phi {
                     FnAppActual::Var(v) => !touches_ignored(*v),
                 })
         });
+        self.constant_value_index
+            .retain(|_, value| !touches_ignored(*value));
         let term_key_operand_touches_ignored = |op: &TermKeyOperand| match op {
             TermKeyOperand::Const(_) => false,
             TermKeyOperand::Var(v) => touches_ignored(*v),
@@ -1050,16 +1139,17 @@ impl Phi {
             }
         }
 
-        // Check if solution is just a constant
+        // Check if solution is just a constant.
         if let Some(q) = solution.get_as_const() {
+            let x_repr = self.get_repr(x);
             if q.is_zero() {
-                new_eqs.push(NewEq::EqZero(x));
+                new_eqs.push(NewEq::EqZero(x_repr));
             }
             // If x is known to be integer-typed but the solution is a
             // non-integer rational (e.g., 5/2 from 2x=5), the path is Unsat.
             // Cross-ref: OCaml PulseFormulaTerm.ml IsInt term evaluation
             // detects this when normalizing `IsInt(5/2)` → 0 ≠ 1.
-            if !q.is_integer() && self.is_marked_int(x) {
+            if !q.is_integer() && self.is_marked_int(x_repr) {
                 return SatUnsat::Unsat;
             }
         }
@@ -1107,9 +1197,24 @@ impl Phi {
         }
 
         // Store the equation
-        self.linear_eqs.insert(x, solution);
+        self.linear_eqs.insert(x, solution.clone());
+        self.register_constant_value(x, &solution);
 
         SatUnsat::Sat(new_eqs)
+    }
+
+    fn register_constant_value(&mut self, x: AbstractValue, solution: &LinArith) {
+        let Some(q) = solution.get_as_const() else {
+            return;
+        };
+        if !q.is_integer() {
+            return;
+        }
+        if !q.is_zero() {
+            return;
+        }
+        let repr = self.get_repr(x);
+        self.constant_value_index.entry(0).or_insert(repr);
     }
 
     /// Propagate an equality `merged = kept` through linear_eqs and atoms.
@@ -1494,6 +1599,25 @@ mod tests {
         let result = phi.and_const_eq(v, 0);
         assert!(result.is_sat());
         assert!(phi.is_known_zero(v));
+    }
+
+    #[test]
+    fn test_const_eq_collision_emits_equal_and_reuses_existing_repr() {
+        let mut phi = Phi::ttrue();
+        let existing = AbstractValue::of_raw(1);
+        let fresh_zero = AbstractValue::of_raw(7);
+
+        assert!(phi.and_const_eq(existing, 0).is_sat());
+        let result = phi.and_const_eq_with_constant_collision(fresh_zero, 0);
+
+        assert!(matches!(
+            result,
+            SatUnsat::Sat(ref eqs)
+                if eqs.iter().any(|eq| matches!(eq, NewEq::Equal(old, kept)
+                    if *old == fresh_zero && *kept == existing))
+        ));
+        assert_eq!(phi.get_repr(fresh_zero), existing);
+        assert_eq!(phi.find_const_value(0), Some(existing));
     }
 
     #[test]

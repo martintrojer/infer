@@ -314,8 +314,7 @@ pub(crate) fn eval_with_history_mode(
                 .map(|n| n as i64)
                 .or_else(|| data.typ.size_in_bytes());
             if let Some(n) = size {
-                let v = AbstractValue::mk_fresh();
-                state.and_equal_const(v, n);
+                let v = state.absval_of_int(n);
                 PulseResult::Ok(ValueWithHistory::new(
                     v,
                     ValueHistory::assignment(loc.clone()),

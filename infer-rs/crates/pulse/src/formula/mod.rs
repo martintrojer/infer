@@ -277,6 +277,16 @@ impl Formula {
         self.phi_mut().and_const_eq(v, c)
     }
 
+    /// Record a producer-time constant equality, preserving an existing zero
+    /// representative on collision (OCaml `term_eqs` constant collision).
+    pub fn and_equal_const_with_constant_collision(
+        &mut self,
+        v: AbstractValue,
+        c: i64,
+    ) -> SatUnsat<Vec<NewEq>> {
+        self.phi_mut().and_const_eq_with_constant_collision(v, c)
+    }
+
     /// Record a pure function application: ret_val = f(actuals).
     /// If the same function with same actuals was seen before, unify return values.
     pub fn and_fn_app(

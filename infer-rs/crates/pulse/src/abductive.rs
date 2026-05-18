@@ -1047,27 +1047,46 @@ impl AbductiveDomain {
     ///
     /// Cross-ref: OCaml `PulseFormula.absval_of_int`.
     pub fn absval_of_int(&mut self, c: i64) -> AbstractValue {
-        if let Some(existing) = self
-            .path_condition
-            .phi()
-            .linear_eqs
-            .iter()
-            .find_map(|(v, lin)| {
-                lin.get_as_const()
-                    .filter(|q| *q == crate::formula::lin_arith::Q::from_integer(c))
-                    .map(|_| *v)
-            })
+        if c == 0 {
+            if let Some(existing) = self.path_condition.phi().find_const_value(c) {
+                return existing;
+            }
+        } else if let Some(existing) =
+            self.path_condition
+                .phi()
+                .linear_eqs
+                .iter()
+                .find_map(|(v, lin)| {
+                    lin.get_as_const()
+                        .filter(|q| *q == crate::formula::lin_arith::Q::from_integer(c))
+                        .map(|_| *v)
+                })
         {
             return existing;
         }
 
         let v = AbstractValue::mk_fresh();
-        let result = self.path_condition.and_equal_const(v, c);
+        let result = self
+            .path_condition
+            .and_equal_const_with_constant_collision(v, c);
         assert!(
             self.apply_formula_result(result).is_sat(),
             "fresh integer literal should never make the formula unsat"
         );
         v
+    }
+
+    /// Record a producer-time constant equality, preserving an existing zero
+    /// representative on collision (OCaml `term_eqs` constant collision).
+    pub fn and_equal_const_with_constant_collision(
+        &mut self,
+        v: AbstractValue,
+        c: i64,
+    ) -> SatUnsat<()> {
+        let result = self
+            .path_condition
+            .and_equal_const_with_constant_collision(v, c);
+        self.apply_formula_result(result)
     }
 
     /// Record that an abstract value is positive (> 0, i.e., non-null for pointers).
@@ -1733,6 +1752,53 @@ mod tests {
                 sil::qualified_cpp_name::QualifiedCppName::from_string("Callback"),
             )))
         );
+    }
+
+    #[test]
+    fn test_and_equal_const_collision_substitutes_heap_attrs_and_const_cache() {
+        let pdesc = make_simple_pdesc();
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let src = AbstractValue::of_raw(100);
+        let existing_zero = state.absval_of_int(0);
+        let existing_one = state.absval_of_int(1);
+        let another_one = AbstractValue::of_raw(150);
+        let malloc_null = AbstractValue::of_raw(200);
+
+        assert!(state.and_equal_const(another_one, 1).is_sat());
+        assert_ne!(
+            state.get_var_repr(another_one),
+            existing_one,
+            "only zero constants are globally coalesced; non-zero literals stay distinct unless const_cache is used"
+        );
+
+        state
+            .post
+            .heap
+            .add_edge(src, Access::Dereference, malloc_null);
+        state.invalidate(
+            malloc_null,
+            Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
+            ValueHistory::invalidated(
+                Invalidation::ConstantDereference(sil::int_lit::IntLit::zero()),
+                Location::dummy(),
+            ),
+        );
+
+        assert!(state
+            .and_equal_const_with_constant_collision(malloc_null, 0)
+            .is_sat());
+        assert_eq!(state.get_var_repr(malloc_null), existing_zero);
+        assert_eq!(
+            state.post.heap.find_edge(src, &Access::Dereference),
+            Some(existing_zero)
+        );
+        assert!(state
+            .post
+            .attrs
+            .get(&existing_zero)
+            .and_then(|attrs| attrs.get_invalid())
+            .is_some());
+        assert_eq!(state.canonicalize_for_access(malloc_null), existing_zero);
     }
 
     #[test]
