@@ -789,6 +789,24 @@ impl Phi {
 
     /// Simplify: remove constraints mentioning unreachable variables.
     pub fn simplify(&mut self, reachable: &HashSet<AbstractValue>) {
+        self.simplify_internal(reachable, None)
+    }
+
+    pub fn simplify_with_new_eqs_for_targets(
+        &mut self,
+        reachable: &HashSet<AbstractValue>,
+        eq_zero_targets: &HashSet<AbstractValue>,
+    ) -> Vec<NewEq> {
+        let mut new_eqs = Vec::new();
+        self.simplify_internal(reachable, Some((eq_zero_targets, &mut new_eqs)));
+        new_eqs
+    }
+
+    fn simplify_internal(
+        &mut self,
+        reachable: &HashSet<AbstractValue>,
+        new_eqs: Option<(&HashSet<AbstractValue>, &mut Vec<NewEq>)>,
+    ) {
         let var_eqs = &self.var_eqs;
         let is_reachable = |v: AbstractValue| reachable.contains(&var_eqs.find_immut(v));
         let operand_is_reachable = |operand: &super::Operand| match operand {
@@ -825,6 +843,39 @@ impl Phi {
                 && term_key_operand_is_reachable(&key.lhs)
                 && term_key_operand_is_reachable(&key.rhs)
         });
+
+        if let Some((eq_zero_targets, new_eqs)) = new_eqs {
+            self.collect_new_eqs_for_reachable(reachable, eq_zero_targets, new_eqs);
+        }
+    }
+
+    fn collect_new_eqs_for_reachable(
+        &self,
+        reachable: &HashSet<AbstractValue>,
+        eq_zero_targets: &HashSet<AbstractValue>,
+        new_eqs: &mut Vec<NewEq>,
+    ) {
+        let mut reachable_values: Vec<_> = eq_zero_targets
+            .iter()
+            .copied()
+            .filter(|value| reachable.contains(&self.get_repr(*value)))
+            .collect();
+        reachable_values.sort();
+        for value in reachable_values {
+            if self.is_known_zero(value) {
+                new_eqs.push(NewEq::EqZero(value));
+            }
+        }
+
+        let mut equalities: Vec<_> = self
+            .var_eqs
+            .iter_equalities()
+            .filter(|(old, kept)| old != kept && reachable.contains(kept))
+            .collect();
+        equalities.sort();
+        for (old, kept) in equalities {
+            new_eqs.push(NewEq::Equal(old, kept));
+        }
     }
 
     /// Cheap intermediate-state GC: remove high-volume facts for unreachable

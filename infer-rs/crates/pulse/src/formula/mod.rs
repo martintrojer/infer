@@ -757,7 +757,7 @@ impl Formula {
         precondition_vocabulary: &HashSet<AbstractValue>,
         keep: &HashSet<AbstractValue>,
     ) {
-        self.simplify_for_summary_with_witness_targets(precondition_vocabulary, keep, keep);
+        let _ = self.simplify_for_summary_with_witness_targets(precondition_vocabulary, keep, keep);
     }
 
     /// Summary-specific simplification with an explicit set of direct summary
@@ -773,7 +773,22 @@ impl Formula {
         precondition_vocabulary: &HashSet<AbstractValue>,
         keep: &HashSet<AbstractValue>,
         witness_targets: &HashSet<AbstractValue>,
-    ) {
+    ) -> Vec<NewEq> {
+        self.simplify_for_summary_with_witness_and_eq_zero_targets(
+            precondition_vocabulary,
+            keep,
+            witness_targets,
+            keep,
+        )
+    }
+
+    pub fn simplify_for_summary_with_witness_and_eq_zero_targets(
+        &mut self,
+        precondition_vocabulary: &HashSet<AbstractValue>,
+        keep: &HashSet<AbstractValue>,
+        witness_targets: &HashSet<AbstractValue>,
+        eq_zero_targets: &HashSet<AbstractValue>,
+    ) -> Vec<NewEq> {
         let rewritten_conditions: Vec<_> = std::mem::take(&mut self.conditions)
             .into_iter()
             .filter_map(|(atom, depth)| {
@@ -801,7 +816,9 @@ impl Formula {
         let mut keep_with_witnesses = keep.clone();
         keep_with_witnesses.extend(witness_vars.iter().copied());
 
-        self.phi_mut().simplify(&keep_with_witnesses);
+        let new_eqs = self
+            .phi_mut()
+            .simplify_with_new_eqs_for_targets(&keep_with_witnesses, eq_zero_targets);
         self.phi_mut()
             .drop_atoms_involving_or_restricted(&witness_vars);
 
@@ -840,6 +857,7 @@ impl Formula {
         }
 
         self.conditions = conditions;
+        new_eqs
     }
 
     pub(crate) fn replace_conditions(&mut self, conditions: BTreeMap<Atom, usize>) {

@@ -725,6 +725,18 @@ impl AbductiveDomain {
         })
     }
 
+    pub(crate) fn incorporate_new_eqs_for_summary_export(
+        &mut self,
+        new_eqs: Vec<NewEq>,
+    ) -> SatUnsat<ImportedFormulaEffect> {
+        self.incorporate_new_eqs_with_allocated_sets(
+            new_eqs,
+            None,
+            None::<&mut std::collections::HashSet<AbstractValue>>,
+            None::<&mut std::collections::HashSet<AbstractValue>>,
+        )
+    }
+
     fn incorporate_new_eqs(&mut self, new_eqs: Vec<NewEq>) -> SatUnsat<()> {
         for new_eq in new_eqs {
             match new_eq {
@@ -755,6 +767,21 @@ impl AbductiveDomain {
         stack_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
         heap_allocated_before_call: &mut std::collections::HashSet<AbstractValue>,
     ) -> SatUnsat<ImportedFormulaEffect> {
+        self.incorporate_new_eqs_with_allocated_sets(
+            new_eqs,
+            Some(imported_must_be_valid),
+            Some(stack_allocated_before_call),
+            Some(heap_allocated_before_call),
+        )
+    }
+
+    fn incorporate_new_eqs_with_allocated_sets(
+        &mut self,
+        new_eqs: Vec<NewEq>,
+        mut must_be_valid: Option<&mut std::collections::HashSet<AbstractValue>>,
+        mut stack_allocated: Option<&mut std::collections::HashSet<AbstractValue>>,
+        mut heap_allocated: Option<&mut std::collections::HashSet<AbstractValue>>,
+    ) -> SatUnsat<ImportedFormulaEffect> {
         for new_eq in new_eqs {
             match new_eq {
                 NewEq::Equal(old, new) if old == new => {}
@@ -762,20 +789,38 @@ impl AbductiveDomain {
                     if self.subst_var_or_unsat(old, new).is_unsat() {
                         return SatUnsat::Unsat;
                     }
-                    let updated = std::mem::take(imported_must_be_valid);
-                    *imported_must_be_valid = self.subst_value_set(updated, old, new);
-                    let updated = std::mem::take(stack_allocated_before_call);
-                    *stack_allocated_before_call = self.subst_value_set(updated, old, new);
-                    let updated = std::mem::take(heap_allocated_before_call);
-                    *heap_allocated_before_call = self.subst_value_set(updated, old, new);
+                    if let Some(values) = must_be_valid.as_deref_mut() {
+                        let updated = std::mem::take(values);
+                        *values = self.subst_value_set(updated, old, new);
+                    }
+                    if let Some(values) = stack_allocated.as_deref_mut() {
+                        let updated = std::mem::take(values);
+                        *values = self.subst_value_set(updated, old, new);
+                    }
+                    if let Some(values) = heap_allocated.as_deref_mut() {
+                        let updated = std::mem::take(values);
+                        *values = self.subst_value_set(updated, old, new);
+                    }
                 }
                 NewEq::EqZero(v) => {
                     let repr = self.path_condition.get_var_repr(v);
-                    if stack_allocated_before_call.contains(&repr) {
+                    let is_stack_allocated = stack_allocated.as_deref().map_or_else(
+                        || self.is_stack_allocated(repr),
+                        |values| values.contains(&repr),
+                    );
+                    if is_stack_allocated {
                         return SatUnsat::Unsat;
                     }
-                    if heap_allocated_before_call.contains(&repr) {
-                        if imported_must_be_valid.contains(&repr) {
+                    let is_heap_allocated = heap_allocated.as_deref().map_or_else(
+                        || self.is_heap_allocated(repr),
+                        |values| values.contains(&repr),
+                    );
+                    if is_heap_allocated {
+                        let is_must_be_valid = must_be_valid.as_deref().map_or_else(
+                            || self.must_be_valid.contains(&repr),
+                            |values| values.contains(&repr),
+                        );
+                        if is_must_be_valid {
                             return SatUnsat::Sat(ImportedFormulaEffect::PotentialInvalidAccess(
                                 repr,
                             ));

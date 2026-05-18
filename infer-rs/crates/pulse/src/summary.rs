@@ -29,6 +29,7 @@ use crate::formula::atom::Atom;
 use crate::formula::expand_formula_reachable;
 use crate::formula::term::Term;
 use crate::formula::Operand;
+use crate::sat_unsat::SatUnsat;
 use crate::value_history::HistoryEvent;
 
 /// The summary of a Pulse analysis on a single procedure.
@@ -134,7 +135,7 @@ pub(crate) struct StoppedStateSummary {
 
 struct NormalizedSummaryInfo {
     leaks: Vec<Diagnostic>,
-    summary_eq_zero_must_be_valid: std::collections::HashSet<AbstractValue>,
+    summary_potential_invalid_access: Option<AbstractValue>,
     aliasing_contradiction: bool,
 }
 
@@ -688,7 +689,7 @@ impl PrePost {
         if self.canonicalize_for_summary_or_unsat().is_unsat() {
             return NormalizedSummaryInfo {
                 leaks: Vec::new(),
-                summary_eq_zero_must_be_valid: HashSet::new(),
+                summary_potential_invalid_access: None,
                 aliasing_contradiction: true,
             };
         }
@@ -779,39 +780,45 @@ impl PrePost {
             .need_dynamic_type_specialization
             .retain(|addr| reachability.post_canonical_reachable.contains(addr));
 
-        let summary_eq_zero_must_be_valid = self
-            .post
-            .must_be_valid
-            .iter()
-            .copied()
-            .filter(|addr| {
-                self.post.path_condition.is_known_zero_for_summary(
-                    *addr,
-                    &reachability.precondition_vocabulary,
-                    &reachability.formula_reachable,
-                )
-            })
-            .collect();
-
         // Cross-ref: OCaml `PulseAbductiveDomain.filter_for_summary` calls
-        // `PulseFormula.simplify ~precondition_vocabulary ~keep`. The key
-        // effect here is that exported conditions keep caller-visible vars in
-        // their original shape while dead callee-local alias vars are
-        // rewritten through phi and dropped if they become tautological.
-        self.post
+        // `PulseFormula.simplify ~precondition_vocabulary ~keep` and returns
+        // the exact `new_eqs` from simplification. `Summary.of_post_` then
+        // immediately feeds those into the inner `incorporate_new_eqs`, where
+        // EqZero on a caller-controlled MustBeValid heap address becomes the
+        // `PotentialInvalidAccessSummary` sideband instead of a persisted
+        // `Invalid(ConstantDereference(0))` attribute.
+        let summary_new_eqs = self
+            .post
             .path_condition
-            .simplify_for_summary_with_witness_targets(
+            .simplify_for_summary_with_witness_and_eq_zero_targets(
                 &reachability.precondition_vocabulary,
                 &reachability.formula_reachable,
                 &reachability.witness_targets,
+                &self.post.must_be_valid,
             );
+        let summary_potential_invalid_access = match self
+            .post
+            .incorporate_new_eqs_for_summary_export(summary_new_eqs)
+        {
+            SatUnsat::Sat(crate::abductive::ImportedFormulaEffect::Sat) => None,
+            SatUnsat::Sat(crate::abductive::ImportedFormulaEffect::PotentialInvalidAccess(
+                addr,
+            )) => Some(self.post.path_condition.get_var_repr(addr)),
+            SatUnsat::Unsat => {
+                return NormalizedSummaryInfo {
+                    leaks: Vec::new(),
+                    summary_potential_invalid_access: None,
+                    aliasing_contradiction: true,
+                };
+            }
+        };
         self.restore_direct_cycle_edges_for_summary();
         self.materialize_visible_constant_invalidations(&reachability.post_canonical_reachable);
         self.align_function_pointer_closure_summary_surface();
 
         NormalizedSummaryInfo {
             leaks,
-            summary_eq_zero_must_be_valid,
+            summary_potential_invalid_access,
             aliasing_contradiction: false,
         }
     }
@@ -1138,7 +1145,7 @@ impl PulseSummary {
                 potential_invalid_access_from_normalized_continue_pre_post(
                     pdesc,
                     &pp,
-                    &info.summary_eq_zero_must_be_valid,
+                    info.summary_potential_invalid_access,
                 )
             } else {
                 None
@@ -1303,6 +1310,18 @@ impl PulseSummary {
             deduped_pre_posts.push(pre_post);
         }
         pre_posts = deduped_pre_posts;
+
+        if pre_posts
+            .iter()
+            .any(|pre_post| pre_post.kind == PrePostKind::LatentInvalidAccess)
+        {
+            pre_posts.sort_by_key(|pre_post| match pre_post.kind {
+                PrePostKind::ContinueProgram | PrePostKind::ExitProgram => 0,
+                PrePostKind::LatentInvalidAccess => 1,
+                PrePostKind::AbortProgram => 2,
+                PrePostKind::LatentAbortProgram => 3,
+            });
+        }
 
         let latent_invalid_access_specificity = |pre_post: &PrePost| {
             let location_rank = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
@@ -1596,8 +1615,7 @@ pub(crate) fn recovered_invalid_accesses_from_continue_state(
 
     let caller_controlled = pre_heap_values_reachable_from_formals(pdesc, &pp);
     let direct_formal_values = direct_formal_value_addrs(pdesc, &pp);
-    let candidate =
-        potential_invalid_access_from_normalized_continue_pre_post(pdesc, &pp, &HashSet::new());
+    let candidate = potential_invalid_access_from_normalized_continue_pre_post(pdesc, &pp, None);
     let Some(candidate) = candidate else {
         return Vec::new();
     };
@@ -1785,7 +1803,7 @@ fn recovered_invalid_access_pre_posts_from_abort_state(
 fn potential_invalid_access_from_normalized_continue_pre_post(
     pdesc: &Procdesc,
     pre_post: &PrePost,
-    summary_eq_zero_must_be_valid: &std::collections::HashSet<AbstractValue>,
+    summary_potential_invalid_access: Option<AbstractValue>,
 ) -> Option<PotentialInvalidAccessSummaryCandidate> {
     if pre_post.kind != PrePostKind::ContinueProgram {
         return None;
@@ -1831,7 +1849,8 @@ fn potential_invalid_access_from_normalized_continue_pre_post(
         if !seen.insert(repr) {
             continue;
         }
-        let recovered_from_summary_eq_zero = summary_eq_zero_must_be_valid.contains(&repr);
+        let recovered_from_summary_eq_zero = summary_potential_invalid_access
+            .is_some_and(|addr| pre_post.post.path_condition.get_var_repr(addr) == repr);
         let recovered_from_pending_sideband = pending.is_some();
         let known_zero = pre_post.post.path_condition.is_known_zero(repr);
         if !recovered_from_summary_eq_zero && !recovered_from_pending_sideband && !known_zero {
@@ -1842,7 +1861,11 @@ fn potential_invalid_access_from_normalized_continue_pre_post(
         // `formal_load_then_exit` should stay a pure ContinueProgram; the
         // summary-space zero recovery is for caller-visible aliases/fields
         // whose zero proof only emerges after simplification, not bare formals.
-        if recovered_from_summary_eq_zero && !known_zero && direct_formal_values.contains(&repr) {
+        if recovered_from_summary_eq_zero
+            && !known_zero
+            && direct_formal_values.contains(&repr)
+            && summary_potential_invalid_access.is_none_or(|addr| addr != repr)
+        {
             continue;
         }
         if formal_stack_addrs.contains(&repr) || !deref_value_targets.contains(&repr) {
@@ -1941,11 +1964,7 @@ fn potential_invalid_access_from_normalized_stopped_pre_post(
     pdesc: &Procdesc,
     pre_post: &PrePost,
 ) -> Option<PotentialInvalidAccessSummaryCandidate> {
-    potential_invalid_access_from_normalized_continue_pre_post(
-        pdesc,
-        pre_post,
-        &std::collections::HashSet::new(),
-    )
+    potential_invalid_access_from_normalized_continue_pre_post(pdesc, pre_post, None)
 }
 
 fn drop_selected_null_invalidation(pre_post: &mut PrePost, addr: AbstractValue) {
@@ -2949,7 +2968,6 @@ fn summary_formal_stack_addrs(pre_post: &PrePost) -> std::collections::HashSet<A
         .map(|(_formal, addr)| pre_post.post.path_condition.get_var_repr(*addr))
         .collect()
 }
-
 fn direct_formal_value_addrs(
     pdesc: &Procdesc,
     pre_post: &PrePost,
@@ -4105,6 +4123,51 @@ mod tests {
         };
 
         (pdesc, pre_post, formal_val)
+    }
+
+    #[test]
+    fn test_normalize_uses_simplify_new_eqs_for_summary_potential_invalid_access() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let formal_addr = astate
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar.clone())))
+            .unwrap();
+        let formal_val = astate.read_heap(formal_addr, Access::Dereference);
+        let _pointee = astate.read_heap(formal_val, Access::Dereference);
+        astate.mark_must_be_valid_at(formal_val, &Location::dummy());
+
+        // The zero proof is intentionally stored on an alias that will be
+        // rewritten away by summary simplification. OCaml returns the resulting
+        // `EqZero(formal_val)` as `PulseFormula.simplify` new_eqs and turns it
+        // into `PotentialInvalidAccessSummary` without synthesizing a null
+        // invalidation attr on the post state.
+        let alias = AbstractValue::mk_fresh();
+        assert!(astate
+            .path_condition
+            .and_equal_vars(alias, formal_val)
+            .is_sat());
+        assert!(astate.path_condition.and_equal_const(alias, 0).is_sat());
+
+        let mut pp = build_pre_post(&pdesc, astate, PrePostKind::ContinueProgram, None);
+        let info = pp.normalize_with_summary_info();
+
+        assert!(!info.aliasing_contradiction);
+        assert_eq!(
+            info.summary_potential_invalid_access,
+            Some(pp.post.path_condition.get_var_repr(formal_val))
+        );
+        assert!(
+            pp.post
+                .post
+                .attrs
+                .get(&formal_val)
+                .and_then(|attrs| attrs.get_invalid())
+                .is_none(),
+            "summary EqZero sideband must not materialize Invalid(ConstantDereference(0))"
+        );
     }
 
     fn make_named_pdesc_with_formals(name: &str, formals: &[&str]) -> Procdesc {
@@ -7678,9 +7741,7 @@ mod tests {
                     continue;
                 }
                 let candidate = potential_invalid_access_from_normalized_continue_pre_post(
-                    pdesc,
-                    pre_post,
-                    &std::collections::HashSet::new(),
+                    pdesc, pre_post, None,
                 );
                 eprintln!("    candidate_present={}", candidate.is_some());
                 let Some(candidate) = candidate else {
