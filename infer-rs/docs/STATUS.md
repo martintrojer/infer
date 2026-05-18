@@ -14,14 +14,14 @@ mu task list -w infer-rs --status OPEN
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `137` (latest worker-leak NPE per-file scout; `-3` vs the prior `140`; typed-stub repair `e5417f19ae` landed afterward, so exact post-fix total should be remeasured by the next non-doc sweep/scout) |
+| NPE count | expected `131`, found `133` (`+2` over expected) per worker-2's `79226f7ac6` close after Phase C EqZero unification; was `137` post-`9a1c7313ba` then `133` after the imported-EqZero sideband landed |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
-| specialization summary harness | `20 / 20` (held; C-suite `may_double_free_if_alias` residual now waits on `cluster_eqzero_interproc_sideband_unification`) |
+| specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `115 matching / 22 diffs` (+28/-28 today from the `87/50` session start; +65/-65 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `118 matching / 19 diffs` (+31/-31 today from the `87/50` session start; +68/-68 vs original `50/87`) |
 
 ### NPE issue-count deltas (current Linux)
 
@@ -133,24 +133,49 @@ refresh):
   docs/scouts include `3b1649b231`, `9a1c7313ba`, and `4b4edb48e1`; the
   typed-stub NPE repair landed as `25aa457dae` upstream / `e5417f19ae` here.
 
-### EqZero sideband chain progress
+### EqZero sideband chain progress — ALL THREE PHASES LANDED ✨
 
-The EqZero sideband chain is now the main mechanism boundary for the remaining
-latent/specialization residuals:
+The EqZero sideband chain is now fully ported and was the gating mechanism
+for the perfect-parity `specialization.c` close:
 
-- **Phase A — local sideband landed.** `cluster_eqzero_local_latent_sideband_field`
+- **Phase A — local sideband.** `cluster_eqzero_local_latent_sideband_field`
   landed as `56c98117b5`, after three reverted attr-stripping attempts showed
   that an explicit sideband field was the robust shape.
-- **Phase B — summary sideband landed.** `cluster_eqzero_summary_of_post_new_eqs_sideband`
-  landed as worker-1 `bd2416fe02` and is cherry-picked here as `c1f17f040f`;
-  it returns the summary `of_post` EqZero sideband and moved `funptr.c` by
-  `+1` matching / `-1` diff.
-- **Phase C — interproc unification in flight.** Worker-2 owns
-  `cluster_eqzero_interproc_sideband_unification`. Once it lands,
-  `cluster_specialization_may_double_free_summary_surface` should unblock, with
-  the scoped target of moving `specialization.c` from `20/1` to `21/0`.
+- **Phase B — summary sideband.** `cluster_eqzero_summary_of_post_new_eqs_sideband`
+  landed as worker-1 `bd2416fe02` (cherry-picked as `c1f17f040f`); returns the
+  summary `of_post` EqZero sideband and moved `funptr.c` `+1/-1`.
+- **Phase C — interproc unification.** `cluster_eqzero_interproc_sideband_unification`
+  landed as worker-2 `79226f7ac6` (cherry-picked as `3d1432f34b`); imported
+  EqZero now records the common `PendingInvalidAccess` sideband in
+  `apply_imported_formula_result`.
+- **Follow-up — specialization closer.** Once all three phases landed, worker-2
+  added direct-formal `PotentialInvalidAccessSummary` follow-up in
+  `cluster_specialization_may_double_free_summary_surface` (`d1e188b3a0` /
+  `2dcccc1a41`) and closed `specialization.c` to **`21/0` perfect parity**.
+- **Const-zero coalescing follow-up.** Worker-1 also implemented producer-time
+  zero-constant coalescing under `bug_array_access_const_null_coalescing_summary`
+  (`359fc9b7ce`), closing `allocate_all_in_array` and moving `memory_leak.c`
+  `38/8` -> `40/6`; regression fixtures pinned in `bug_summary_alpha_isograph_arrayaccess_constants`
+  (`504d768d0e` / `905ec61662`).
 
-### C-suite OCaml↔Rust Pulse summary parity (`115 matching / 22 diffs`)
+### Deep-port scoping in flight (next-wave 2026-05-18)
+
+Three fresh scoping scouts cover the remaining mechanism boundaries:
+
+- `scout_nondisjdomain_port_dayplan` (worker-2) — OCaml `PulseNonDisjDomain`
+  port day plan; gates all five `arithmetic.c` residuals plus likely
+  latent/memory_leak surfaces.
+- `scout_latent_cycle_cursor_deep_port_dayplan` (worker-1) — cycle-cursor
+  traversal port for `latent.c` `crash_after_{one,two,six}_nodes_bad` plus
+  the deferred `latent_use_after_free` after-Phase-C divergence.
+- `scout_memory_leak_funptr_residuals_combined_dayplan` (worker-leak) —
+  per-diff re-classification of the remaining `memory_leak.c` (`6` diffs)
+  and `funptr.c` (`3` diffs) after today's wave.
+
+Each scout files concrete phase sub-tasks with edges into one another, in
+the same shape as the closed `APPLY_POST_RECORD_POST_FOR_ADDRESS_DAYPLAN_2026_05.md`.
+
+### C-suite OCaml↔Rust Pulse summary parity (`118 matching / 19 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -280,13 +305,13 @@ ended at `115/22` (`+28 matching / -28 diffs`). Current scoped per-file totals:
 
 | file | session start | now | best landed commit / residual |
 |---|---:|---:|---|
-| `arithmetic.c` | `6/5` | `6/5` | held; residual: OCaml `NonDisjDomain` non-disj sideband mechanism; scout-only |
+| `arithmetic.c` | `6/5` | `6/5` | held; residual: OCaml `NonDisjDomain` non-disj sideband mechanism; scoping in flight via `scout_nondisjdomain_port_dayplan` |
 | `funptr.c` | `20/8` | `25/3` | `bd2416fe02` / `c1f17f040f` summary EqZero sideband closed one residual after `fa938dc6dd` callback `Closure` attr surface |
-| `interprocedural.c` | `11/6` | `16/1` | held; `3b7b90f1a9` branch-only attr cleanup + `e18143e41d` benign `Continue` duplicates; residual `trace_correctly_through_wrappers_bad` multiplicity |
-| `latent.c` | `5/9` | `10/4` | held; `56c98117b5` shifts composition from `[cycle ×3 + deref_then_free]` to `[cycle ×3 + latent_use_after_free]`, net unchanged |
-| `memory_leak.c` | `25/21` | `38/8` | held after moving from `37/9`; benign `Continue` duplicates plus later-wave surface cleanup |
-| `specialization.c` | `20/1` | `20/1` | held; `may_double_free_if_alias` waits on `cluster_eqzero_interproc_sideband_unification` |
-| **total** | **`87/50`** | **`115/22`** | **+28/-28 today; +65/-65 vs original `50/87` baseline** |
+| `interprocedural.c` | `11/6` | `16/1` | held; `490aa92ccd` repaired silent `15/2` drift introduced by `da98dd6b09`; residual `trace_correctly_through_wrappers_bad` multiplicity |
+| `latent.c` | `5/9` | `10/4` | held; `56c98117b5` shifts composition from `[cycle ×3 + deref_then_free]` to `[cycle ×3 + latent_use_after_free]`, net unchanged; cycle-cursor scoping in flight via `scout_latent_cycle_cursor_deep_port_dayplan` |
+| `memory_leak.c` | `25/21` | `40/6` | `359fc9b7ce` producer-time zero const coalescing closed `allocate_all_in_array`; `alloc_then_free_all_in_array` residual remains |
+| `specialization.c` | `20/1` | **`21/0`** ✨ | `2dcccc1a41` direct-formal `PotentialInvalidAccessSummary` after full EqZero sideband chain — PERFECT PARITY |
+| **total** | **`87/50`** | **`118/19`** | **+31/-31 today; +68/-68 vs original `50/87` baseline** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
@@ -510,13 +535,20 @@ Live themes (track headlines, not exhaustive task lists):
   invocation (`51b68ec816`) and auto-detects Linux GNU `/usr/bin/time -v` versus
   macOS BSD `/usr/bin/time -l` (`9a80eb9be7`). `TESTING.md` documents the
   in-process OOM hazard for `test_summary_comparison_c_triage` (`6b6af3ea19`).
-- **IN FLIGHT.** `cluster_eqzero_interproc_sideband_unification` is with
-  worker-2 as the deep EqZero Phase C fix. `bug_array_access_const_null_coalescing_summary`
-  is with worker-1 as a non-overlapping deep fix.
-- **PARKED until EqZero Phase C unblocks.**
-  `cluster_specialization_may_double_free_summary_surface` (targeting
-  `specialization.c` `20/1` -> `21/0`) plus the remaining
-  `bug_summary_alpha_isograph_arrayaccess_constants` follow-up.
+- **DONE since prior doc refresh (2026-05-18 later wave).** EqZero Phase C
+  unification (`79226f7ac6` / `3d1432f34b`), specialization closer to perfect
+  `21/0` (`d1e188b3a0` / `2dcccc1a41`), producer-time const-zero coalescing
+  for `memory_leak.c` `40/6` (`359fc9b7ce`), and regression fixtures for the
+  ArrayAccess constant coalescing (`504d768d0e` / `905ec61662`). NPE remeasure
+  saw `131 / 137` mid-wave (`9a1c7313ba`), repaired the `angelism.c` `+5`
+  typed-stub regression upstream `25aa457dae` / here `e5417f19ae`, and worker-2
+  drove it down further to `131 / 133` post-Phase-C.
+- **IN FLIGHT.** Three fresh deep-port scoping scouts:
+  `scout_nondisjdomain_port_dayplan` (worker-2),
+  `scout_latent_cycle_cursor_deep_port_dayplan` (worker-1),
+  `scout_memory_leak_funptr_residuals_combined_dayplan` (worker-leak). All
+  read-only; each files concrete phase sub-tasks with edges in the same shape
+  as the closed apply-post day plan.
 - **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
   `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
   as the baselines; any wall recovery should preserve the RAM and abort gains.
