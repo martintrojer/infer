@@ -1193,6 +1193,97 @@ fn assert_specialization_summary_report_at_post_overflow_baseline(
     );
 }
 
+fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
+    report: &test_harness::summary_compare::ComparisonReport,
+) {
+    assert_eq!(
+        (report.matching, report.differences.len(), report.rust_only.len()),
+        (40, 6, 5),
+        "memory_leak.c summary parity should stay at the ArrayAccess const-zero coalescing baseline\n{report}"
+    );
+    assert!(
+        report.ocaml_only.is_empty(),
+        "memory_leak.c should have no OCaml-only procedures\n{report}"
+    );
+    let residuals: std::collections::BTreeSet<_> = report
+        .differences
+        .iter()
+        .map(|diff| diff.proc_name.as_str())
+        .collect();
+    let expected = std::collections::BTreeSet::from([
+        "alias_ptr_free_ok",
+        "alloc_ref_counted_arith_ok",
+        "free_all_in_array",
+        "interproc_mutual_recusion_leak",
+        "mutual_recursion",
+        "mutual_recursion_2",
+    ]);
+    assert_eq!(
+        residuals, expected,
+        "allocate_all_in_array should remain matched after const-zero coalescing; residual diff set changed\n{report}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_summary_comparison_memory_leak_arrayaccess_const_zero_baseline() {
+    use test_harness::infer_runner::InferRunner;
+    use test_harness::summary_compare;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let c_path = test_harness::fixtures::ocaml_c_test_dir()
+        .join("pulse")
+        .join("memory_leak.c");
+    if !c_path.exists() {
+        eprintln!("skipping: memory_leak.c not found");
+        return;
+    }
+
+    let ocaml_summaries_path = runner
+        .analyze_pulse_c(&c_path)
+        .expect("OCaml analysis should succeed for memory_leak.c");
+    let ocaml_summaries = summary_compare::parse_ocaml_summaries(&ocaml_summaries_path);
+
+    let sil_path = runner
+        .dump_textual_for_c(&c_path)
+        .expect("dump-textual should succeed for memory_leak.c");
+    let tm = textual_utils::parse_file_and_convert(&sil_path);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+
+    let mut rust_summaries = std::collections::HashMap::new();
+    for (pname, summary) in store.to_vec() {
+        if sil::builtin_decl::is_declared(&pname) {
+            continue;
+        }
+        rust_summaries.insert(
+            pname.get_method_name().to_string(),
+            rust_summary_to_canonical(&summary),
+        );
+    }
+
+    let report = summary_compare::compare_summaries(&ocaml_summaries, &rust_summaries);
+    eprintln!("{report}");
+    assert!(
+        report.ocaml_only.is_empty() && report.rust_only.len() == 5,
+        "memory_leak.c summary harness should compare the expected procedure set\n{report}"
+    );
+    assert!(
+        ocaml_summaries.contains_key("allocate_all_in_array")
+            && rust_summaries.contains_key("allocate_all_in_array"),
+        "focused fixture procedure allocate_all_in_array should be present in both summary maps"
+    );
+    assert_eq!(
+        ocaml_summaries.get("allocate_all_in_array"),
+        rust_summaries.get("allocate_all_in_array"),
+        "allocate_all_in_array's ArrayAccess/null representative shape should match OCaml after const-zero coalescing\n{report}"
+    );
+    assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(&report);
+}
+
 #[test]
 #[ignore]
 fn test_summary_comparison_specialization_main() {

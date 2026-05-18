@@ -2162,6 +2162,61 @@ mod tests {
     }
 
     #[test]
+    fn test_alpha_equivalent_array_zero_collision_reuses_constant_index_repr() {
+        fn make_array_zero_state(burn_ids: usize) -> AbductiveDomain {
+            let pdesc = make_pdesc_with_formals(&["array"]);
+            let mut state = AbductiveDomain::mk_initial(&pdesc);
+            let pvar = Pvar::mk(Mangled::from_string("array"), pdesc.proc_name.clone());
+            let formal_var = Var::ProgramVar(Box::new(pvar));
+            let formal_addr = state.post.stack.find(&formal_var).unwrap();
+
+            for _ in 0..burn_ids {
+                let _ = AbstractValue::mk_fresh();
+            }
+
+            let array = state.read_heap(formal_addr, Access::Dereference);
+            let index_zero = AbstractValue::mk_fresh();
+            assert!(state.and_equal_const(index_zero, 0).is_sat());
+
+            // Producer-time null from malloc: the constant-collision path must
+            // merge this fresh known-zero value into the earlier index-zero
+            // representative before the ArrayAccess edge is summarized.
+            let malloc_null = AbstractValue::mk_fresh();
+            assert!(state
+                .and_equal_const_with_constant_collision(malloc_null, 0)
+                .is_sat());
+            assert_eq!(
+                state.get_var_repr(malloc_null),
+                state.get_var_repr(index_zero)
+            );
+
+            let slot = AbstractValue::mk_fresh();
+            state.write_heap(
+                array,
+                Access::ArrayAccess(Typ::mk_ptr(Typ::int(sil::typ::IKind::IInt)), index_zero),
+                slot,
+            );
+            state
+                .post
+                .heap
+                .add_edge(slot, Access::Dereference, malloc_null);
+            state
+        }
+
+        AbstractValue::reset_counters();
+        let lhs = make_array_zero_state(0);
+        AbstractValue::reset_counters();
+        let rhs = make_array_zero_state(5);
+
+        assert!(
+            alpha_equivalent(&lhs, &rhs),
+            "array-index/null zero collision must be stable under alpha-isograph renaming\nlhs:\n{}\nrhs:\n{}",
+            debug_canonical_dump(&lhs),
+            debug_canonical_dump(&rhs)
+        );
+    }
+
+    #[test]
     fn test_debug_signature_changes_for_reachable_heap_difference() {
         AbstractValue::reset_counters();
         let state1 = make_state(0, false);

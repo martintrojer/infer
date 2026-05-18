@@ -1621,6 +1621,63 @@ mod tests {
     }
 
     #[test]
+    fn test_const_zero_collision_is_alpha_isograph_stable_for_array_indices() {
+        fn make_phi(existing: AbstractValue, fresh_zero: AbstractValue) -> Phi {
+            let mut phi = Phi::ttrue();
+            assert!(phi.and_const_eq(existing, 0).is_sat());
+            let result = phi.and_const_eq_with_constant_collision(fresh_zero, 0);
+            assert!(matches!(
+                result,
+                SatUnsat::Sat(ref eqs)
+                    if eqs.iter().any(|eq| matches!(eq, NewEq::Equal(old, kept)
+                        if *old == fresh_zero && *kept == existing))
+            ));
+            phi
+        }
+
+        // This pins the exact mechanism used by ArrayAccess constant/null
+        // coalescing: adding a producer-time `fresh_zero = 0` when a loop
+        // index/literal zero already exists must preserve the older zero
+        // representative and emit `Equal(fresh_zero, existing)`.  The check is
+        // deliberately alpha-isograph-shaped: rebuilding the same collision
+        // with different raw AV numbers gives the same formula modulo the
+        // caller's alpha-renaming of array-index representatives.
+        let lhs_existing = AbstractValue::of_raw(1);
+        let lhs_fresh_zero = AbstractValue::of_raw(7);
+        let rhs_existing = AbstractValue::of_raw(101);
+        let rhs_fresh_zero = AbstractValue::of_raw(107);
+
+        let lhs = make_phi(lhs_existing, lhs_fresh_zero);
+        let rhs = make_phi(rhs_existing, rhs_fresh_zero);
+        assert_eq!(lhs.get_repr(lhs_fresh_zero), lhs_existing);
+        assert_eq!(rhs.get_repr(rhs_fresh_zero), rhs_existing);
+        assert_eq!(lhs.find_const_value(0), Some(lhs_existing));
+        assert_eq!(rhs.find_const_value(0), Some(rhs_existing));
+
+        let alpha = |value| match value {
+            v if v == rhs_existing => lhs_existing,
+            v if v == rhs_fresh_zero => lhs_fresh_zero,
+            v => v,
+        };
+        let rhs_equalities: Vec<_> = rhs
+            .var_eqs
+            .iter_equalities()
+            .map(|(old, kept)| (alpha(old), alpha(kept)))
+            .collect();
+        let lhs_equalities: Vec<_> = lhs.var_eqs.iter_equalities().collect();
+
+        assert_eq!(rhs_equalities, lhs_equalities);
+        assert_eq!(
+            lhs.get_known_const(lhs_fresh_zero),
+            Some(Q::from_integer(0))
+        );
+        assert_eq!(
+            rhs.get_known_const(rhs_fresh_zero),
+            Some(Q::from_integer(0))
+        );
+    }
+
+    #[test]
     fn test_contradiction_different_constants() {
         let mut phi = Phi::ttrue();
         let v = AbstractValue::of_raw(1);
