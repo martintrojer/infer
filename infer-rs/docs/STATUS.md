@@ -14,34 +14,40 @@ mu task list -w infer-rs --status OPEN
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `140` (`+9` over expected; per-file classification is correctness-aligned with OCaml direct or Rust-strictly-more-precise) |
+| NPE count | expected `131`, found `137` (latest worker-leak NPE per-file scout; `-3` vs the prior `140`; typed-stub repair `e5417f19ae` landed afterward, so exact post-fix total should be remeasured by the next non-doc sweep/scout) |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
-| specialization summary harness | `20 / 20` (held; C-suite `may_double_free_if_alias` residual now waits on the EqZero/cycle-cursor follow-up after the apply-post port) |
+| specialization summary harness | `20 / 20` (held; C-suite `may_double_free_if_alias` residual now waits on `cluster_eqzero_interproc_sideband_unification`) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `114 matching / 23 diffs` (+27/-27 today from the `87/50` session start; +64/-64 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `115 matching / 22 diffs` (+28/-28 today from the `87/50` session start; +65/-65 vs original `50/87`) |
 
 ### NPE issue-count deltas (current Linux)
 
-Current Linux store-textual NPE count is expected `131`, found `140` (`+9`
-over expected), measured by the existing store-textual sweep notes; do not
-re-run the sweep for doc refreshes. The sweep harness mirrors the upstream C
-Pulse test Makefile's `--no-pulse-force-continue` setting before comparing
-against `issues.exp`, and the regression guard now pins `52` OK / `0` FAIL /
-`0` TIMEOUT, exact LEAK/UAF parity, and `NPE >= expected` without pinning an
-exact NPE total.
+Latest recorded Linux store-textual NPE count is expected `131`, found `137`
+(`+6` over expected) in worker-leak's per-file NPE scout (`9a1c7313ba`), down
+from the prior `131/140` checkpoint. Do not re-run the sweep for doc refreshes:
+the sweep harness mirrors the upstream C Pulse test Makefile's
+`--no-pulse-force-continue` setting before comparing against `issues.exp`, and
+the regression guard pins `52` OK / `0` FAIL / `0` TIMEOUT, exact LEAK/UAF
+parity, and `NPE >= expected` without pinning an exact NPE total.
 
-The current sweep state is held at NPE expected `131`, found `140` (`+9`),
-LEAK `20/20` EXACT, and UAF `7/7` EXACT; do not re-run sweeps for doc
-refreshes. The dynamic-type specialized abort propagation fix (`a8b8fe7bde`)
-contributed a real `+1` NPE catch by surfacing a specialized function-pointer
-abort that was previously dropped, not a duplicate callee-local manifest
-report. The closed `scout_npe_per_file_full_remeasure` classification covers
-the remaining per-file surface: all live NPE deltas are either aligned with
-OCaml direct behavior under the test config or are Rust-strictly-more-precise
-catches.
+The current recorded sweep/scout state is held at `52` OK / `0` FAIL / `0`
+TIMEOUT, NPE expected `131` / found `137` in the worker-leak scout, LEAK
+`20/20` EXACT, and UAF `7/7` EXACT. That `131/137` figure was captured before
+the typed-stub repair (`25aa457dae`, cherry-picked here as `e5417f19ae`), which
+restored `angelism.c` from `12` NPEs back to `7` by treating typed `@?` textual
+extern declarations as declaration bodies / unknown calls and publishing the
+typed empty-body summary instead of reading them as real empty bodies. Exact
+post-fix NPE total should be remeasured by the next non-doc sweep/scout. The
+dynamic-type specialized abort propagation fix (`a8b8fe7bde`) contributed a
+real `+1` NPE catch by surfacing a specialized function-pointer abort that was
+previously dropped, not a duplicate callee-local manifest report. The closed
+`scout_npe_per_file_full_remeasure` classification plus the worker-leak
+per-file remeasure cover the remaining per-file surface: all intended live NPE
+deltas are either aligned with OCaml direct behavior under the test config or
+are Rust-strictly-more-precise catches.
 
 Leak per-file detail: LEAK now matches expected exactly per file after
 `bug_store_textual_leak_dead_root_parity` (commit `9078f04176`).
@@ -61,7 +67,7 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze.
 
-Today's 68-commit Linux session is summarized by track below (landed SHAs from
+Today's 74-commit Linux session is summarized by track below (landed SHAs from
 `git log --oneline fccf3f0b7d..HEAD`; no new sweeps were run for this doc
 refresh):
 
@@ -73,8 +79,9 @@ refresh):
   `a625c0dd55`, `fe0e95be3e`, `11fa5b8649`, `d9da630ae7`, and `48655710c4`
   close array-index, struct-formal, stdio-model, diagnostic-dedup, harness
   config, guard-test, and guard-doc gaps. The held checkpoint is now `52` OK /
-  `0` FAIL / `0` TIMEOUT, NPE expected `131` / found `140` (`+9`, classified),
-  LEAK `20/20` EXACT, and UAF `7/7` EXACT.
+  `0` FAIL / `0` TIMEOUT, LEAK `20/20` EXACT, and UAF `7/7` EXACT; the latest
+  worker-leak NPE per-file scout is NPE expected `131` / found `137` (`+6`)
+  before the typed-stub repair `e5417f19ae`.
 - **Per-procedure summary parity (Track 1B).** `e7dd96291a` routed latent
   witnesses; `bfb235e881` fixed canonical formula-var import; `a8b8fe7bde`
   propagated dynamic-type specialized function-pointer aborts; `3b7b90f1a9`
@@ -83,10 +90,11 @@ refresh):
   ignoring hidden history; `58c100411b` aligned latent null-exit written-to
   comparison; `a8ba9a20b5` pruned canonical heap alias contradictions;
   `da98dd6b09` coalesced zero direct formals on continue summaries;
-  `fa938dc6dd` aligned imported callback `Closure` attrs; and `490aa92ccd`
+  `fa938dc6dd` aligned imported callback `Closure` attrs; `490aa92ccd`
   restored interprocedural null invalidation when continue coalescing is a
-  no-op. The scoped C-suite parity total moves from the `87/50` session start
-  to `114/23`.
+  no-op; and `c1f17f040f` (cherry-pick of worker-1's `808ff65dd1`) returned a
+  summary EqZero sideband, closing one funptr residual. The scoped C-suite
+  parity total moves from the `87/50` session start to `115/22`.
 - **Perf / OpenSSL Linux wave (Track 2).** `b512df2924` aligns stopped latent
   leq with OCaml and closes the OBJ_bsearch convergence gate. `da9b92c384`
   avoids sorting unmapped canonical roots; `2f2c26a6a9` shares
@@ -107,7 +115,11 @@ refresh):
   umbrella `cluster_latent_record_post_for_address_porting` is closed.
   `e612cfeb52`, `10adfd6e52`, `6dce50de1e`, and `3b1649b231` archive the
   EqZero / const-zero / latent-use-after-free shape scouts that set up the
-  next sideband field fix.
+  sideband field fix. Phase A then landed in `56c98117b5` (local
+  `PrePost` sideband field after three reverted attr-stripping attempts), Phase
+  B landed in `bd2416fe02` / `c1f17f040f` (summary `of_post` EqZero sideband,
+  giving `funptr.c` +1), and Phase C is in flight in
+  `cluster_eqzero_interproc_sideband_unification`.
 - **Bench infrastructure and cleanup/tooling.** `51b68ec816` makes the OpenSSL
   partial bench pass explicit `--pulse-max-heap-mb 2048` /
   `--pulse-max-wall-secs 60` caps on every `infer-rs` invocation, and
@@ -117,9 +129,28 @@ refresh):
   `test_summary_comparison_c_triage`; `266a17dd9d`, `43a55e6f1d`,
   `1037a81a4e`, and `ca805cac19` remove/factor unused summary/formula helpers;
   and the OpenSSL planning/result docs landed in `02a79d2833`, `e4e4bc887e`,
-  `006b39cd2b`, `e9d292ad2c`, `a900e9f603`, and `ad5731ac39`.
+  `006b39cd2b`, `e9d292ad2c`, `a900e9f603`, and `ad5731ac39`. Today's later
+  docs/scouts include `3b1649b231`, `9a1c7313ba`, and `4b4edb48e1`; the
+  typed-stub NPE repair landed as `25aa457dae` upstream / `e5417f19ae` here.
 
-### C-suite OCaml↔Rust Pulse summary parity (`114 matching / 23 diffs`)
+### EqZero sideband chain progress
+
+The EqZero sideband chain is now the main mechanism boundary for the remaining
+latent/specialization residuals:
+
+- **Phase A — local sideband landed.** `cluster_eqzero_local_latent_sideband_field`
+  landed as `56c98117b5`, after three reverted attr-stripping attempts showed
+  that an explicit sideband field was the robust shape.
+- **Phase B — summary sideband landed.** `cluster_eqzero_summary_of_post_new_eqs_sideband`
+  landed as worker-1 `bd2416fe02` and is cherry-picked here as `c1f17f040f`;
+  it returns the summary `of_post` EqZero sideband and moved `funptr.c` by
+  `+1` matching / `-1` diff.
+- **Phase C — interproc unification in flight.** Worker-2 owns
+  `cluster_eqzero_interproc_sideband_unification`. Once it lands,
+  `cluster_specialization_may_double_free_summary_surface` should unblock, with
+  the scoped target of moving `specialization.c` from `20/1` to `21/0`.
+
+### C-suite OCaml↔Rust Pulse summary parity (`115 matching / 22 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -220,11 +251,21 @@ port also landed:
 - `a8ba9a20b5` / `da98dd6b09` — prune canonical heap alias contradictions and
   coalesce zero direct formals on continue summaries; `latent.c` reaches
   `10/4`.
-- `fa938dc6dd` — align imported callback `Closure` attrs; `funptr.c` reaches
-  and holds `24/4` (from the `22/6` doc-start state).
+- `fa938dc6dd` — align imported callback `Closure` attrs; `funptr.c` reached
+  and held `24/4` (from the `22/6` doc-start state) until the summary EqZero
+  sideband landed.
 - `490aa92ccd` — keep null invalidation when continue coalescing is a no-op;
   `interprocedural.c` is restored to and held at `16/1` after a mid-day
   `15/2` regression.
+- `56c98117b5` — carry local EqZero invalid accesses in an explicit sideband;
+  `latent.c` stays `10/4`, but its residual composition shifts from
+  `[cycle ×3 + deref_then_free]` to `[cycle ×3 + latent_use_after_free]`.
+- `c1f17f040f` — cherry-pick of worker-1's `bd2416fe02` summary `of_post`
+  EqZero sideband; closes one `funptr.c` residual and moves it `24/4` ->
+  `25/3`.
+- `e5417f19ae` — cherry-pick of the typed-stub repair `25aa457dae`; restores
+  `angelism.c` NPE from `12` to `7` by treating typed `@?` extern stubs as
+  declarations/unknown calls with typed empty-body summaries.
 - `dbf700355f` / `3f6ed8b43c` / `0884294feb` / `c8e19d914b` — complete the
   four apply-post phases: cell-id provenance restoration in `ValueHistory`,
   `delete_edges_in_callee_pre_from_caller`, recursive `record_post_for_address`
@@ -233,36 +274,44 @@ port also landed:
   `cluster_latent_record_post_for_address_porting` is closed.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `114 matching / 23 diffs`
-(`+64 matching / -64 diffs`). Today's Linux session started at `87/50` and
-ended at `114/23` (`+27 matching / -27 diffs`). Current scoped per-file totals:
+(`50 matching / 87 diffs`) is now `115 matching / 22 diffs`
+(`+65 matching / -65 diffs`). Today's Linux session started at `87/50` and
+ended at `115/22` (`+28 matching / -28 diffs`). Current scoped per-file totals:
 
 | file | session start | now | best landed commit / residual |
 |---|---:|---:|---|
-| `arithmetic.c` | `6/5` | `6/5` | residual: OCaml `NonDisjDomain` non-disj sideband mechanism; scout-only |
-| `funptr.c` | `20/8` | `24/4` | `fa938dc6dd` callback `Closure` attr surface |
-| `interprocedural.c` | `11/6` | `16/1` | `3b7b90f1a9` branch-only attr cleanup + `e18143e41d` benign `Continue` duplicates; residual `trace_correctly_through_wrappers_bad` multiplicity |
-| `latent.c` | `5/9` | `10/4` | `da98dd6b09` zero direct-formal coalesce after `bc0dc998c7`, `58c100411b`, `a8ba9a20b5` |
+| `arithmetic.c` | `6/5` | `6/5` | held; residual: OCaml `NonDisjDomain` non-disj sideband mechanism; scout-only |
+| `funptr.c` | `20/8` | `25/3` | `bd2416fe02` / `c1f17f040f` summary EqZero sideband closed one residual after `fa938dc6dd` callback `Closure` attr surface |
+| `interprocedural.c` | `11/6` | `16/1` | held; `3b7b90f1a9` branch-only attr cleanup + `e18143e41d` benign `Continue` duplicates; residual `trace_correctly_through_wrappers_bad` multiplicity |
+| `latent.c` | `5/9` | `10/4` | held; `56c98117b5` shifts composition from `[cycle ×3 + deref_then_free]` to `[cycle ×3 + latent_use_after_free]`, net unchanged |
 | `memory_leak.c` | `25/21` | `38/8` | held after moving from `37/9`; benign `Continue` duplicates plus later-wave surface cleanup |
-| `specialization.c` | `20/1` | `20/1` | held throughout; `may_double_free_if_alias` residual now waits on EqZero/cycle-cursor follow-up after apply-post port |
-| **total** | **`87/50`** | **`114/23`** | **+27/-27 today; +64/-64 vs original `50/87` baseline** |
+| `specialization.c` | `20/1` | `20/1` | held; `may_double_free_if_alias` waits on `cluster_eqzero_interproc_sideband_unification` |
+| **total** | **`87/50`** | **`115/22`** | **+28/-28 today; +65/-65 vs original `50/87` baseline** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 Later-wave note: arithmetic held at `6/5` after worker-1 classified all five
-diffs as OCaml `NonDisjDomain` sideband territory; funptr held at `24/4`;
+diffs as OCaml `NonDisjDomain` sideband territory; funptr moved from `24/4` to
+`25/3` via the summary EqZero sideband (`bd2416fe02` / `c1f17f040f`);
 interprocedural held/restored at `16/1` by `490aa92ccd`; latent held at `10/4`
-after the `7/7` -> `8/6` -> `10/4` sequence; memory_leak held at `38/8`; and
-specialization held at `20/1`.
+after the `7/7` -> `8/6` -> `10/4` sequence and then changed residual shape
+under `56c98117b5`; memory_leak held at `38/8`; and specialization held at
+`20/1`.
 
 Current residual work is saturated at mechanism boundaries: arithmetic is fully
 classified as OCaml `NonDisjDomain` sideband territory, interprocedural has one
-summary-multiplicity residual after the `490aa92ccd` repair, funptr has the
-remaining callback-attr/minor surface after `fa938dc6dd`, and latent plus
-specialization now depend on the EqZero sideband / cycle-cursor summary chain
-rather than on more apply-post plumbing. The sweep-level NPE `131/140` delta is
-correctness-aligned and classified. The next layer is multi-day mechanism
-porting, not another quick single-commit parity pass.
+summary-multiplicity residual after the `490aa92ccd` repair, funptr has three
+remaining summary-surface residuals after the EqZero summary sideband, and
+latent plus specialization now depend on the EqZero interproc sideband /
+cycle-cursor summary chain rather than on more apply-post plumbing. The scoped
+`cluster_latent_use_after_free_divergence_after_eqzero_sideband` follow-up is
+closed as a scout: the root cause is missing OCaml `Summary.of_post` provenance,
+which worker-2 is implementing in `cluster_eqzero_interproc_sideband_unification`.
+The latest recorded sweep/scout NPE figure is `131/137` before the typed-stub
+repair; `e5417f19ae` repaired the `angelism.c` `+5` regression, so the exact
+post-fix NPE total should be remeasured by the next non-doc sweep/scout. The
+next layer is multi-day mechanism porting, not another quick single-commit
+parity pass.
 
 ## OpenSSL benchmark dashboard
 
@@ -434,17 +483,23 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **DONE today — waves 5-7 apply-post / correctness.** The full four-phase
-  apply-post port is complete (`dbf700355f`, `3f6ed8b43c`, `0884294feb`,
-  `c8e19d914b`), all guards held, and the umbrella
-  `cluster_latent_record_post_for_address_porting` is closed. The later wave
-  also repaired the interprocedural regression (`490aa92ccd`), archived the
-  EqZero local-sideband shape spec (`3b1649b231`), and classified the
-  arithmetic.c residual fully as `NonDisjDomain`-gated.
+- **DONE today — waves 5-8 apply-post / EqZero / NPE correctness.** The full
+  four-phase apply-post port is complete (`dbf700355f`, `3f6ed8b43c`,
+  `0884294feb`, `c8e19d914b`), all guards held, and the umbrella
+  `cluster_latent_record_post_for_address_porting` is closed. The later waves
+  repaired the interprocedural regression (`490aa92ccd`), archived the EqZero
+  local-sideband shape spec (`3b1649b231`), classified the arithmetic.c
+  residual fully as `NonDisjDomain`-gated, landed local EqZero sideband Phase A
+  (`56c98117b5`), landed summary EqZero sideband Phase B (`bd2416fe02` /
+  `c1f17f040f`), archived latent-UAF sideband evidence (`4b4edb48e1`), and
+  repaired the typed-stub NPE regression (`25aa457dae` / `e5417f19ae`).
 - **DONE today — Linux baseline remains held.** Track 1A holds the
-  store-textual sweep at `52` OK / `0` FAIL / `0` TIMEOUT, NPE `131/140` (`+9`,
-  classified), LEAK `20/20` exact, and UAF `7/7` exact. Track 1B now totals
-  `114/23`: arithmetic `6/5`, funptr `24/4`, interproc `16/1`, latent `10/4`,
+  store-textual sweep at `52` OK / `0` FAIL / `0` TIMEOUT, LEAK `20/20` exact,
+  and UAF `7/7` exact. Worker-leak's NPE per-file scout (`9a1c7313ba`) moved
+  NPE from `131/140` to `131/137` before the typed-stub repair; `e5417f19ae`
+  restored `angelism.c` from `12` NPEs to `7`, so the exact post-fix NPE total
+  should be remeasured by the next non-doc sweep/scout. Track 1B now totals
+  `115/22`: arithmetic `6/5`, funptr `25/3`, interproc `16/1`, latent `10/4`,
   memory_leak `38/8`, and specialization `20/1`. The earlier OpenSSL Linux
   perf wave established the canonical pre-port `RUNS=3 JOBS=4` baseline
   (`4:47.79`, `5.70 GiB`, `445/445`, `6` aborts); the post-port row is
@@ -455,14 +510,13 @@ Live themes (track headlines, not exhaustive task lists):
   invocation (`51b68ec816`) and auto-detects Linux GNU `/usr/bin/time -v` versus
   macOS BSD `/usr/bin/time -l` (`9a80eb9be7`). `TESTING.md` documents the
   in-process OOM hazard for `test_summary_comparison_c_triage` (`6b6af3ea19`).
-- **IN FLIGHT.** `cluster_eqzero_local_latent_sideband_field` is with worker-2;
-  the fresh approach is a `PrePost` sideband field, not attr stripping.
-- **PARKED until the EqZero summary chain unblocks.**
-  `cluster_eqzero_summary_of_post_new_eqs_sideband`,
-  `cluster_eqzero_interproc_sideband_unification`,
-  `cluster_specialization_may_double_free_summary_surface`,
-  `bug_array_access_const_null_coalescing_summary`, and
-  `bug_summary_alpha_isograph_arrayaccess_constants`.
+- **IN FLIGHT.** `cluster_eqzero_interproc_sideband_unification` is with
+  worker-2 as the deep EqZero Phase C fix. `bug_array_access_const_null_coalescing_summary`
+  is with worker-1 as a non-overlapping deep fix.
+- **PARKED until EqZero Phase C unblocks.**
+  `cluster_specialization_may_double_free_summary_surface` (targeting
+  `specialization.c` `20/1` -> `21/0`) plus the remaining
+  `bug_summary_alpha_isograph_arrayaccess_constants` follow-up.
 - **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
   `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
   as the baselines; any wall recovery should preserve the RAM and abort gains.
