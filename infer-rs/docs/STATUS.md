@@ -317,12 +317,22 @@ unchanged-edge rebuild skipping (`5e09cd82a1`), and bounded
 | after canonical-root sort skip (`da9b92c384`) | `JOBS=4 RUNS=1` | ~neutral | `25.4 GiB` | `445/445` | `23` | `4` |
 | after `Arc<ValueHistory>` (`2f2c26a6a9`) | `JOBS=4 RUNS=1` | `~4:58` | `18.96 GiB` | `445/445` | `19` | `4` |
 | canonical Linux post-wave (`1319de4f19`) | `JOBS=4 RUNS=3` median | `4:47.79` (`287.79s`) | `5.70 GiB` (`5,979,620 KiB`) | `445/445` | `6` | `4` |
+| post-apply-post-port remeasure (`c8e19d914b`) | `JOBS=4 RUNS=3` median | `4:58.85` (`298.85s`) | `6.38 GiB` (`6,684,712 KiB`) | `445/445` | `6` | `4` |
 
 Current canonical Linux Rust baseline: corpus
 `~/infer-rs-bench/openssl-20260514-121752/` (`74` `.sil` / `454` Textual procs),
 `JOBS=4 RUNS=3` via `scripts/bench_openssl_partial.sh`, all three runs exit
 `0`, median wall `4:47.79` (`287.79s`), median max RSS `5,979,620 KiB`
 (`5.70 GiB`), procs `445/445`, median aborts `6`, and max visit count `4`.
+The post-apply-post-port remeasure at `c8e19d914b` used the same Linux corpus
+and config and all three runs exited `0`: wall `297.23s` / `299.70s` /
+`298.85s`, max RSS `6,684,712` / `6,786,528` / `6,492,828 KiB`, aborts
+`7` / `6` / `6`, procs `445/445`, and max visit count `4`. Medians are
+`4:58.85` (`298.85s`), `6,684,712 KiB` (`6.38 GiB`), `6` aborts, `445/445`
+procs, and max visit count `4`, for deltas versus canonical of `+3.84%` wall,
+`+11.79%` max RSS, `+0` aborts, and `+0` procs. Wall remains under the `>10%`
+profiling threshold; raw output was archived to
+`/tmp/bench_openssl_post_apply_post_port.txt` in the worker checkout.
 The Linux script uses GNU `/usr/bin/time -v`, so `peak_footprint_bytes` is not
 reported; do not compare the per-proc progress-log `peak_rss` heartbeat as the
 macOS malloc peak-footprint metric.
