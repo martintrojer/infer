@@ -18,10 +18,10 @@ mu task list -w infer-rs --status OPEN
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
-| specialization summary harness | `20 / 20` (held; C-suite `may_double_free_if_alias` residual deferred to the apply-post deep port) |
+| specialization summary harness | `20 / 20` (held; C-suite `may_double_free_if_alias` residual now waits on the EqZero/cycle-cursor follow-up after the apply-post port) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `113 matching / 24 diffs` (+26/-26 today from the `87/50` session start; +63/-63 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `114 matching / 23 diffs` (+27/-27 today from the `87/50` session start; +64/-64 vs original `50/87`) |
 
 ### NPE issue-count deltas (current Linux)
 
@@ -61,7 +61,7 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze.
 
-Today's 52-commit Linux session is summarized by track below (landed SHAs from
+Today's 68-commit Linux session is summarized by track below (landed SHAs from
 `git log --oneline fccf3f0b7d..HEAD`; no new sweeps were run for this doc
 refresh):
 
@@ -82,9 +82,11 @@ refresh):
   benign `Continue` summary duplicates; `bc0dc998c7` deduped latent summaries
   ignoring hidden history; `58c100411b` aligned latent null-exit written-to
   comparison; `a8ba9a20b5` pruned canonical heap alias contradictions;
-  `da98dd6b09` coalesced zero direct formals on continue summaries; and
-  `fa938dc6dd` aligned imported callback `Closure` attrs. The scoped C-suite
-  parity total moves from the `87/50` session start to `113/24`.
+  `da98dd6b09` coalesced zero direct formals on continue summaries;
+  `fa938dc6dd` aligned imported callback `Closure` attrs; and `490aa92ccd`
+  restored interprocedural null invalidation when continue coalescing is a
+  no-op. The scoped C-suite parity total moves from the `87/50` session start
+  to `114/23`.
 - **Perf / OpenSSL Linux wave (Track 2).** `b512df2924` aligns stopped latent
   leq with OCaml and closes the OBJ_bsearch convergence gate. `da9b92c384`
   avoids sorting unmapped canonical roots; `2f2c26a6a9` shares
@@ -93,7 +95,19 @@ refresh):
   rebuilds; and `1319de4f19` bounds `ValueHistory::merge` growth. The canonical
   OpenSSL Linux post-wave remeasure (`RUNS=3 JOBS=4`, all exits `0`) lands at
   median `4:47.79`, `5.70 GiB` max RSS, `445/445` procs, `6` aborts, and max
-  visit count `4`.
+  visit count `4`. Worker-leak's post-apply-post remeasure (`a9d2b1dc71` /
+  `ad5731ac39`) lands at median `4:58.85`, `6.38 GiB`, `445/445`, and `6`
+  aborts.
+- **Apply-post / EqZero scout waves (Tracks 5-7).** `5298e86d7b` archived the
+  apply-post day plan; `dbf700355f` restored cell-id provenance in
+  `ValueHistory`; `3f6ed8b43c` deleted callee pre edges during post replay;
+  `0884294feb` made `record_post_for_address` recursive with
+  `union_left_biased`; and `c8e19d914b` collected `AliasingWithAllAliases`
+  materialize-pre groups. All guards held through every phase, and the
+  umbrella `cluster_latent_record_post_for_address_porting` is closed.
+  `e612cfeb52`, `10adfd6e52`, `6dce50de1e`, and `3b1649b231` archive the
+  EqZero / const-zero / latent-use-after-free shape scouts that set up the
+  next sideband field fix.
 - **Bench infrastructure and cleanup/tooling.** `51b68ec816` makes the OpenSSL
   partial bench pass explicit `--pulse-max-heap-mb 2048` /
   `--pulse-max-wall-secs 60` caps on every `infer-rs` invocation, and
@@ -103,9 +117,9 @@ refresh):
   `test_summary_comparison_c_triage`; `266a17dd9d`, `43a55e6f1d`,
   `1037a81a4e`, and `ca805cac19` remove/factor unused summary/formula helpers;
   and the OpenSSL planning/result docs landed in `02a79d2833`, `e4e4bc887e`,
-  `006b39cd2b`, `e9d292ad2c`, and `a900e9f603`.
+  `006b39cd2b`, `e9d292ad2c`, `a900e9f603`, and `ad5731ac39`.
 
-### C-suite OCaml↔Rust Pulse summary parity (`113 matching / 24 diffs`)
+### C-suite OCaml↔Rust Pulse summary parity (`114 matching / 23 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -188,9 +202,10 @@ Store-textual LEAK fifth pass also landed:
   mirroring OCaml `check_memory_leaks` over `astate_before_filter`, plus
   allocator-return import to caller.
 
-Function-pointer abort propagation, interprocedural cleanup, Continue summary dedup,
-latent summary dedup, alias-contradiction pruning, zero-direct-formal coalescing,
-and callback-attr import also landed:
+Function-pointer abort propagation, interprocedural cleanup/regression repair,
+Continue summary dedup, latent summary dedup, alias-contradiction pruning,
+zero-direct-formal coalescing, callback-attr import, and the apply-post deep
+port also landed:
 
 - `a8b8fe7bde` — propagate dynamic-type specialized `AbortProgram` pre/posts
   through callers while preserving duplicate callee-local manifest-abort
@@ -206,12 +221,21 @@ and callback-attr import also landed:
   coalesce zero direct formals on continue summaries; `latent.c` reaches
   `10/4`.
 - `fa938dc6dd` — align imported callback `Closure` attrs; `funptr.c` reaches
-  `24/4`.
+  and holds `24/4` (from the `22/6` doc-start state).
+- `490aa92ccd` — keep null invalidation when continue coalescing is a no-op;
+  `interprocedural.c` is restored to and held at `16/1` after a mid-day
+  `15/2` regression.
+- `dbf700355f` / `3f6ed8b43c` / `0884294feb` / `c8e19d914b` — complete the
+  four apply-post phases: cell-id provenance restoration in `ValueHistory`,
+  `delete_edges_in_callee_pre_from_caller`, recursive `record_post_for_address`
+  with `union_left_biased`, and `AliasingWithAllAliases` group collection. All
+  guards held through the port, and the umbrella
+  `cluster_latent_record_post_for_address_porting` is closed.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `113 matching / 24 diffs`
-(`+63 matching / -63 diffs`). Today's Linux session started at `87/50` and
-ended at `113/24` (`+26 matching / -26 diffs`). Current scoped per-file totals:
+(`50 matching / 87 diffs`) is now `114 matching / 23 diffs`
+(`+64 matching / -64 diffs`). Today's Linux session started at `87/50` and
+ended at `114/23` (`+27 matching / -27 diffs`). Current scoped per-file totals:
 
 | file | session start | now | best landed commit / residual |
 |---|---:|---:|---|
@@ -219,22 +243,26 @@ ended at `113/24` (`+26 matching / -26 diffs`). Current scoped per-file totals:
 | `funptr.c` | `20/8` | `24/4` | `fa938dc6dd` callback `Closure` attr surface |
 | `interprocedural.c` | `11/6` | `16/1` | `3b7b90f1a9` branch-only attr cleanup + `e18143e41d` benign `Continue` duplicates; residual `trace_correctly_through_wrappers_bad` multiplicity |
 | `latent.c` | `5/9` | `10/4` | `da98dd6b09` zero direct-formal coalesce after `bc0dc998c7`, `58c100411b`, `a8ba9a20b5` |
-| `memory_leak.c` | `25/21` | `37/9` | `e18143e41d` benign `Continue` duplicate preservation |
-| `specialization.c` | `20/1` | `20/1` | held throughout; `may_double_free_if_alias` residual deferred to the apply-post/record-post deep port |
-| **total** | **`87/50`** | **`113/24`** | **+26/-26 today; +63/-63 vs original `50/87` baseline** |
+| `memory_leak.c` | `25/21` | `38/8` | held after moving from `37/9`; benign `Continue` duplicates plus later-wave surface cleanup |
+| `specialization.c` | `20/1` | `20/1` | held throughout; `may_double_free_if_alias` residual now waits on EqZero/cycle-cursor follow-up after apply-post port |
+| **total** | **`87/50`** | **`114/23`** | **+27/-27 today; +64/-64 vs original `50/87` baseline** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
+Later-wave note: arithmetic held at `6/5` after worker-1 classified all five
+diffs as OCaml `NonDisjDomain` sideband territory; funptr held at `24/4`;
+interprocedural held/restored at `16/1` by `490aa92ccd`; latent held at `10/4`
+after the `7/7` -> `8/6` -> `10/4` sequence; memory_leak held at `38/8`; and
+specialization held at `20/1`.
 
-Current residual work is saturated at mechanism boundaries: arithmetic still
-needs the OCaml `NonDisjDomain` sideband mechanism, interprocedural has one
-summary-multiplicity residual, funptr has the remaining callback-attr/minor
-surface after `fa938dc6dd`, latent's remaining `10/4` surface and
-specialization's `may_double_free_if_alias` both point at the parked
-`cluster_latent_record_post_for_address_porting` apply-post/record-post deep
-port, and the sweep-level NPE `131/140` delta is correctness-aligned and
-classified. The next layer is multi-day mechanism porting, not another quick
-single-commit parity pass.
+Current residual work is saturated at mechanism boundaries: arithmetic is fully
+classified as OCaml `NonDisjDomain` sideband territory, interprocedural has one
+summary-multiplicity residual after the `490aa92ccd` repair, funptr has the
+remaining callback-attr/minor surface after `fa938dc6dd`, and latent plus
+specialization now depend on the EqZero sideband / cycle-cursor summary chain
+rather than on more apply-post plumbing. The sweep-level NPE `131/140` delta is
+correctness-aligned and classified. The next layer is multi-day mechanism
+porting, not another quick single-commit parity pass.
 
 ## OpenSSL benchmark dashboard
 
@@ -324,15 +352,24 @@ Current canonical Linux Rust baseline: corpus
 `JOBS=4 RUNS=3` via `scripts/bench_openssl_partial.sh`, all three runs exit
 `0`, median wall `4:47.79` (`287.79s`), median max RSS `5,979,620 KiB`
 (`5.70 GiB`), procs `445/445`, median aborts `6`, and max visit count `4`.
-The post-apply-post-port remeasure at `c8e19d914b` used the same Linux corpus
-and config and all three runs exited `0`: wall `297.23s` / `299.70s` /
-`298.85s`, max RSS `6,684,712` / `6,786,528` / `6,492,828 KiB`, aborts
-`7` / `6` / `6`, procs `445/445`, and max visit count `4`. Medians are
-`4:58.85` (`298.85s`), `6,684,712 KiB` (`6.38 GiB`), `6` aborts, `445/445`
-procs, and max visit count `4`, for deltas versus canonical of `+3.84%` wall,
-`+11.79%` max RSS, `+0` aborts, and `+0` procs. Wall remains under the `>10%`
-profiling threshold; raw output was archived to
-`/tmp/bench_openssl_post_apply_post_port.txt` in the worker checkout.
+Worker-leak's post-apply-post-port remeasure (`a9d2b1dc71` / `ad5731ac39`) at
+`c8e19d914b` used the same Linux corpus and config and all three runs exited
+`0`: wall `297.23s` / `299.70s` / `298.85s`, max RSS `6,684,712` /
+`6,786,528` / `6,492,828 KiB`, aborts `7` / `6` / `6`, procs `445/445`, and
+max visit count `4`. Medians are `4:58.85` (`298.85s`), `6,684,712 KiB`
+(`6.38 GiB`), `6` aborts, `445/445` procs, and max visit count `4`, for
+deltas versus canonical of `+3.84%` wall, `+11.79%` max RSS, `+0` aborts, and
+`+0` procs. Wall remains under the `>10%` profiling threshold; raw output was
+archived to `/tmp/bench_openssl_post_apply_post_port.txt` in the worker
+checkout.
+
+| metric | canonical pre-port (5745f79996) | post-apply-post-port |
+|---|---:|---:|
+| wall median | `287.79s` | `298.85s` (`+3.84%`) |
+| max_rss median | `5.70 GiB` | `6.38 GiB` (`+11.79%`) |
+| aborts median | `6` | `6` |
+| procs | `445/445` | `445/445` |
+
 The Linux script uses GNU `/usr/bin/time -v`, so `peak_footprint_bytes` is not
 reported; do not compare the per-proc progress-log `peak_rss` heartbeat as the
 macOS malloc peak-footprint metric.
@@ -365,14 +402,20 @@ Interpretation:
   `21` aborts), canonical Linux wall is `+17.6%`, while max RSS is `-66%` lower
   and aborts drop `21` -> `6` (`-71%`). The current Rust/old-OCaml wall ratio is
   `287.79 / 42.9 = 6.71×`, back near the historical `5.7-6.7×` dashboard range.
+- The post-apply-post-port row is acceptable: the four apply-post phases traded
+  about `+4%` wall and `+12%` RAM for substantial correctness improvements.
+  Recursive `record_post_for_address` now mirrors OCaml more closely, and the
+  phases were prerequisites for the cycle-cursor / specialization residuals
+  once the EqZero sideband lands.
 - The key dashboard message is RAM and stability: Linux Rust is now below the
   historical macOS-derived Rust max-RSS reference, with far fewer cap aborts,
   at the cost of a modest wall regression from the Linux reach-end checkpoint.
 
 Recommended next perf wave: profile the remaining wall cost only after treating
-this RUNS=3 row as the canonical post-wave baseline. Likely targets remain
-latent/state comparison fast paths and residual `state_cmp` canonicalization
-work, but new changes should preserve the `5.70 GiB` / `6`-abort gains.
+the `5745f79996` pre-port row and the post-apply-post row as paired baselines.
+Likely targets remain latent/state comparison fast paths and residual
+`state_cmp` canonicalization work, but new changes should preserve the low-abort
+profile and avoid erasing the RAM gains.
 
 Benchmark artifacts from the latest runs are under ignored `bench-out/` or `/tmp`
 paths in the worker checkout. Historical OpenSSL archaeology is in
@@ -391,37 +434,41 @@ mu task list -w infer-rs --status DEFERRED
 
 Live themes (track headlines, not exhaustive task lists):
 
-- **DONE today — full Linux perf wave.** OBJ_bsearch convergence and OpenSSL
-  reach-end (`b512df2924`), canonical-root sorting avoidance (`da9b92c384`),
-  shared `ValueHistory` clones (`2f2c26a6a9`), keyed sort-helper reuse
-  (`70ca0c562d`), unchanged-edge rebuild skipping (`5e09cd82a1`), and bounded
-  `ValueHistory::merge` growth (`1319de4f19`) establish the canonical
-  `RUNS=3 JOBS=4` Linux medians: `4:47.79`, `5.70 GiB`, `445/445`, `6` aborts,
-  max visit count `4`. The perf track is at a natural saturation point: the RAM
-  and abort wins should be preserved before any multi-day wall-recovery pass.
-- **DONE today — Linux correctness parity wave.** Track 1A holds the
+- **DONE today — waves 5-7 apply-post / correctness.** The full four-phase
+  apply-post port is complete (`dbf700355f`, `3f6ed8b43c`, `0884294feb`,
+  `c8e19d914b`), all guards held, and the umbrella
+  `cluster_latent_record_post_for_address_porting` is closed. The later wave
+  also repaired the interprocedural regression (`490aa92ccd`), archived the
+  EqZero local-sideband shape spec (`3b1649b231`), and classified the
+  arithmetic.c residual fully as `NonDisjDomain`-gated.
+- **DONE today — Linux baseline remains held.** Track 1A holds the
   store-textual sweep at `52` OK / `0` FAIL / `0` TIMEOUT, NPE `131/140` (`+9`,
-  classified), LEAK `20/20` exact, and UAF `7/7` exact. Track 1B moves the
-  scoped C-suite total from `87/50` to `113/24`: arithmetic `6/5`, funptr
-  `24/4`, interproc `16/1`, latent `10/4`, memory_leak `37/9`, specialization
-  `20/1`. This correctness track is also saturated at the quick-fix layer; the
-  next diffs require multi-day mechanism ports.
+  classified), LEAK `20/20` exact, and UAF `7/7` exact. Track 1B now totals
+  `114/23`: arithmetic `6/5`, funptr `24/4`, interproc `16/1`, latent `10/4`,
+  memory_leak `38/8`, and specialization `20/1`. The earlier OpenSSL Linux
+  perf wave established the canonical pre-port `RUNS=3 JOBS=4` baseline
+  (`4:47.79`, `5.70 GiB`, `445/445`, `6` aborts); the post-port row is
+  `4:58.85`, `6.38 GiB`, `445/445`, `6` aborts.
 - **DONE today — benchmark infrastructure hardening.**
   `scripts/bench_openssl_partial.sh` now explicitly passes
   `--pulse-max-heap-mb 2048` and `--pulse-max-wall-secs 60` on every `infer-rs`
   invocation (`51b68ec816`) and auto-detects Linux GNU `/usr/bin/time -v` versus
   macOS BSD `/usr/bin/time -l` (`9a80eb9be7`). `TESTING.md` documents the
   in-process OOM hazard for `test_summary_comparison_c_triage` (`6b6af3ea19`).
-- **PARKED correctness backlog.** `cluster_latent_record_post_for_address_porting`
-  is deferred as a three-day deep porting track despite high ROI (`11.7`).
-  Reopen when someone can reserve multi-day focus to port the OCaml
-  apply-post/record-post address mechanism and remeasure the remaining
-  latent.c `10/4` surface plus specialization `may_double_free_if_alias`.
-- **Next perf wave.** Treat the `RUNS=3` canonical Linux row (`4:47.79`,
-  `5.70 GiB`, `6` aborts) as the baseline; any wall recovery should preserve
-  the RAM and abort gains. Likely targets remain latent/state comparison fast
-  paths and residual `state_cmp` canonicalization work, but not as a quick
-  follow-up to today's wave.
+- **IN FLIGHT.** `cluster_eqzero_local_latent_sideband_field` is with worker-2;
+  the fresh approach is a `PrePost` sideband field, not attr stripping.
+- **PARKED until the EqZero summary chain unblocks.**
+  `cluster_eqzero_summary_of_post_new_eqs_sideband`,
+  `cluster_eqzero_interproc_sideband_unification`,
+  `cluster_specialization_may_double_free_summary_surface`,
+  `bug_array_access_const_null_coalescing_summary`, and
+  `bug_summary_alpha_isograph_arrayaccess_constants`.
+- **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
+  `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
+  as the baselines; any wall recovery should preserve the RAM and abort gains.
+  Likely targets remain latent/state comparison fast paths and residual
+  `state_cmp` canonicalization work, but not as a quick follow-up to today's
+  wave.
 - **Deferred backlog.** Micro-cleanups (`code_*`), speculative representation
   work (`perf_component_clone_reduction`), Textual enhancements, and accepted
   parity limits (`parity_sizeof_type_eval`) are parked with explicit
