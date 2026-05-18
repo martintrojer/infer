@@ -419,8 +419,14 @@ fn preserve_canonical_access_targets(state: &mut DisjunctiveDomain<ExecutionDoma
 }
 
 fn analyze_bodyless_source_definition(pdesc: &Procdesc) -> Option<PulseSummary> {
-    if !pdesc.is_empty_body() || !pdesc.has_source_body || pdesc.is_declaration_stub() {
+    if !pdesc.is_empty_body() || pdesc.is_declaration_stub() {
         return None;
+    }
+    if pdesc.is_declaration_body {
+        return Some(PulseSummary::empty_body(pdesc));
+    }
+    if !pdesc.has_source_body {
+        return Some(PulseSummary::skipped(pdesc));
     }
 
     // Clang dump-textual emits real source empty bodies such as
@@ -4672,6 +4678,31 @@ mod tests {
                 .is_some(),
             "bodyless source definitions should keep read-only formal materialization"
         );
+    }
+
+    #[test]
+    fn test_analyze_declaration_body_publishes_typed_empty_body_summary() {
+        let pname = Procname::c_from_string("extern_like");
+        let mut pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
+        pdesc.has_source_body = false;
+        pdesc.is_declaration_body = true;
+        let body = pdesc.add_node(
+            sil::procdesc::NodeKind::StmtNode(sil::procdesc::StmtNodeKind::MethodBody),
+            Vec::new(),
+            Location::dummy(),
+        );
+        pdesc.set_succs(0, vec![body]);
+        pdesc.set_succs(body, vec![1]);
+
+        let summary = analyze(&pdesc);
+        assert!(summary.pre_posts.is_empty());
+        assert!(summary.is_empty_body);
+        assert_eq!(summary.formal_types, vec![Typ::mk_ptr(Typ::void())]);
     }
 
     #[test]

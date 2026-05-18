@@ -655,16 +655,20 @@ fn procdesc_to_sil(
     }
 
     // Store-textual export can emit declaration-like empty `define`s with the
-    // canonical `#node_0: @?; jmp  @?` body shape. Treat those as undefined so
-    // merged analysis does not mistake them for real bodies. Do not classify
-    // real source-level empty bodies the same way: clang dump-textual emits
-    // bodies such as `void do_nothing(int**) { return; }` as a chain of empty
-    // jump nodes with concrete source locations. OCaml still publishes their
-    // read-only formal materialization summaries, which callers need to avoid
-    // treating those no-op calls as unknown havoc.
-    let is_declaration_stub = is_declaration_like_empty_define(pdesc);
+    // canonical `#node_0: @?; jmp  @?` body shape. No-formal stubs remain
+    // undefined so merged analysis does not mistake them for real bodies.
+    // Stubs with formals carry useful type information for typed unknown-call
+    // havoc, so keep them defined but mark `is_declaration_body` for Pulse.
+    // Do not classify real source-level empty bodies the same way: clang
+    // dump-textual emits bodies such as `void do_nothing(int**) { return; }`
+    // as a chain of empty jump nodes with concrete source locations. OCaml
+    // still publishes their read-only formal materialization summaries, which
+    // callers need to avoid treating those no-op calls as unknown havoc.
+    let is_declaration_body = is_declaration_like_empty_define(pdesc);
+    let is_declaration_stub = is_declaration_body && pdesc.params.is_empty();
     sil_pdesc.is_defined = !is_declaration_stub;
-    sil_pdesc.has_source_body = !is_declaration_stub;
+    sil_pdesc.has_source_body = !is_declaration_body;
+    sil_pdesc.is_declaration_body = is_declaration_body;
 
     if errors.is_empty() {
         Ok(sil_pdesc)
@@ -675,11 +679,11 @@ fn procdesc_to_sil(
 
 fn is_declaration_like_empty_define(pdesc: &ast::ProcDesc) -> bool {
     pdesc.nodes.len() == 1
-        && pdesc.params.is_empty()
         && pdesc.locals.is_empty()
-        && pdesc.nodes.iter().all(|node| {
+        && matches!(pdesc.nodes.as_slice(), [node] if {
             node.instrs.is_empty()
                 && matches!(node.last, ast::Terminator::Jump(ref calls) if calls.is_empty())
+                && node.label_loc == node.label.loc
         })
 }
 
@@ -1492,6 +1496,30 @@ define f() : void {
         let pdesc = cfg.iter_proc_descs().next().unwrap();
         assert!(pdesc.is_empty_body());
         assert!(!pdesc.is_defined);
+    }
+
+    #[test]
+    fn test_empty_define_with_formals_marks_declaration_body() {
+        let src = r#".source_language = "c"
+
+define external_like(p: *int) : void {
+  #node_0: @?
+      jmp  @?
+
+} @[12:1]
+"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let (cfg, _) = module_to_sil(&module, &decls).unwrap();
+
+        let pdesc = cfg.iter_proc_descs().next().unwrap();
+        assert!(pdesc.is_empty_body());
+        assert!(
+            pdesc.is_defined,
+            "typed stubs stay defined so Pulse can use formal types"
+        );
+        assert!(!pdesc.has_source_body);
+        assert!(pdesc.is_declaration_body);
     }
 
     #[test]

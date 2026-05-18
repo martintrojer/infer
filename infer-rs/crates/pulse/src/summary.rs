@@ -1046,6 +1046,24 @@ impl PulseSummary {
         }
     }
 
+    /// Summary surface for declaration-like empty procedure bodies.
+    pub fn empty_body(pdesc: &Procdesc) -> Self {
+        Self {
+            pre_posts: Vec::new(),
+            has_dropped_disjuncts: false,
+            specialized: Vec::new(),
+            diagnostics: Vec::new(),
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: true,
+            formal_types: pdesc
+                .formals
+                .iter()
+                .map(|(_name, typ, _annot)| typ.clone())
+                .collect(),
+        }
+    }
+
     /// Summary surface for procedures Pulse intentionally skipped.
     ///
     /// Cross-ref: OCaml Pulse returns no summary when `should_analyze` rejects

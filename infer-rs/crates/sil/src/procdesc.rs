@@ -185,6 +185,13 @@ pub struct Procdesc {
     /// jump nodes; Pulse must still publish/apply their read-only summaries.
     #[serde(default)]
     pub has_source_body: bool,
+    /// Whether the textual body is a declaration-like empty `define` emitted
+    /// for an extern/skipped procedure with known formal types. Unlike
+    /// [`Self::is_declaration_stub`], this can be true for procedures with
+    /// formals; callers should treat such summaries as typed empty-body
+    /// unknown calls.
+    #[serde(default)]
+    pub is_declaration_body: bool,
 }
 
 impl Procdesc {
@@ -217,6 +224,7 @@ impl Procdesc {
             is_defined: true,
             is_no_return: false,
             has_source_body: true,
+            is_declaration_body: false,
         }
     }
 
@@ -272,7 +280,7 @@ impl Procdesc {
 
     /// Whether this procdesc is only a declaration-like textual stub.
     pub fn is_declaration_stub(&self) -> bool {
-        self.is_empty_body() && !self.has_source_body
+        self.is_empty_body() && !self.has_source_body && self.formals.is_empty()
     }
 
     /// Iterate over all instructions in the procedure.

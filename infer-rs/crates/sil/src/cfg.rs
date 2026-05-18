@@ -65,8 +65,8 @@ fn should_replace_procdesc(current: &Procdesc, incoming: &Procdesc) -> bool {
     // plus one or more empty `@?` stubs. Never let an empty stub overwrite a
     // real body during merged direct-Textual analysis.
     match (
-        current.is_defined && !current.is_declaration_stub(),
-        incoming.is_defined && !incoming.is_declaration_stub(),
+        current.is_defined && !current.is_declaration_stub() && !current.is_declaration_body,
+        incoming.is_defined && !incoming.is_declaration_stub() && !incoming.is_declaration_body,
     ) {
         (false, true) => true,
         (true, false) => false,
@@ -105,6 +105,18 @@ mod tests {
         let mut pdesc = mk_proc(name);
         pdesc.is_defined = false;
         pdesc.has_source_body = false;
+        pdesc
+    }
+
+    fn mk_typed_declaration_body(name: &str) -> Procdesc {
+        let mut pdesc = mk_proc(name);
+        pdesc.has_source_body = false;
+        pdesc.is_declaration_body = true;
+        pdesc.formals = vec![(
+            crate::mangled::Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::void()),
+            Default::default(),
+        )];
         pdesc
     }
 
@@ -163,5 +175,25 @@ mod tests {
         assert!(merged.is_defined);
         assert!(merged.is_no_return);
         assert!(!merged.is_empty_body());
+    }
+
+    #[test]
+    fn test_merge_prefers_real_body_over_typed_declaration_body() {
+        let pname = Procname::c_from_string("dup");
+        let mut lhs = Cfg::new();
+        lhs.add_proc_desc(mk_typed_declaration_body("dup"));
+
+        let mut rhs = Cfg::new();
+        let mut right = mk_real_proc("dup");
+        right.is_no_return = true;
+        rhs.add_proc_desc(right);
+
+        lhs.merge(rhs);
+
+        let merged = lhs.get_proc_desc(&pname).expect("merged proc should exist");
+        assert!(merged.is_defined);
+        assert!(merged.is_no_return);
+        assert!(!merged.is_empty_body());
+        assert!(!merged.is_declaration_body);
     }
 }
