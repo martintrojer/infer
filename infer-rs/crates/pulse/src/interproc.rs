@@ -24,7 +24,7 @@ use sil::specialization::HeapPath;
 use sil::typ::Typ;
 use sil::var::Var;
 
-use crate::abductive::{AbductiveDomain, ImportedFormulaEffect};
+use crate::abductive::{AbductiveDomain, ImportedFormulaEffect, PendingInvalidAccess};
 use crate::abstract_value::AbstractValue;
 use crate::access::Access;
 use crate::attribute::Attribute;
@@ -554,12 +554,29 @@ pub(crate) fn apply_summary_with_aliasing(
             }
         }
         crate::summary::PrePostKind::LatentInvalidAccess => {
-            if let Some(diag) = pre_post.diagnostic.clone().or_else(|| {
-                crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
-            }) {
+            let diag = pre_post
+                .latent_invalid_access
+                .as_ref()
+                .and_then(|sideband| {
+                    crate::summary::latent_invalid_access_diagnostic_from_summary_state(pre_post)
+                        .map(|diag| (diag, Some(sideband)))
+                })
+                .or_else(|| {
+                    pre_post
+                        .diagnostic
+                        .clone()
+                        .or_else(|| {
+                            crate::summary::latent_invalid_access_diagnostic_from_exported_pre_post(
+                                pre_post,
+                            )
+                        })
+                        .map(|diag| (diag, None))
+                });
+            if let Some((diag, sideband)) = diag {
                 let mut caller_state = caller_state;
-                let diag = rebase_diagnostic_to_state(
-                    translate_diagnostic(
+                let diag = match sideband {
+                    Some(sideband) => translate_latent_invalid_access_sideband(
+                        sideband,
                         &diag,
                         &mut subst,
                         &caller_state,
@@ -568,8 +585,17 @@ pub(crate) fn apply_summary_with_aliasing(
                         callee_procname.as_ref(),
                         callee_proc_start_location.as_ref(),
                     ),
-                    &caller_state,
-                );
+                    None => translate_diagnostic(
+                        &diag,
+                        &mut subst,
+                        &caller_state,
+                        &formal_histories,
+                        loc,
+                        callee_procname.as_ref(),
+                        callee_proc_start_location.as_ref(),
+                    ),
+                };
+                let diag = rebase_diagnostic_to_state(diag, &caller_state);
                 mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
                 if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                     let manifest_diag = reify_invalid_access_diagnostic(diag, &caller_state);
@@ -717,6 +743,62 @@ fn translate_diagnostic(
             }
         }
         _ => diagnostic.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_latent_invalid_access_sideband(
+    sideband: &PendingInvalidAccess,
+    diagnostic: &Diagnostic,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &AbductiveDomain,
+    formal_histories: &std::collections::BTreeMap<Pvar, ValueHistory>,
+    loc: &Location,
+    callee_procname: Option<&Procname>,
+    callee_proc_start_location: Option<&Location>,
+) -> Diagnostic {
+    let Diagnostic::AccessToInvalidAddress { invalidation, .. } = diagnostic else {
+        return diagnostic.clone();
+    };
+    let caller_addr = caller_state
+        .path_condition
+        .get_var_repr(resolve_mut(subst, sideband.addr));
+    let access_history = sideband
+        .access_history
+        .map_formals_with_callsite(formal_histories, Some(loc.clone()));
+    let invalidation_base = sideband
+        .must_be_valid_trace
+        .map_formals_with_callsite(formal_histories, Some(loc.clone()));
+    let invalidation_history = invalidation_base.append_event(HistoryEvent::Invalidated {
+        invalidation: invalidation.clone(),
+        location: loc.clone(),
+    });
+    let invalidation_history = match (callee_procname, callee_proc_start_location) {
+        (Some(proc_name), Some(start_loc)) => {
+            let invalidation_history = if let Some(seed_pvar) = invalidation_history
+                .first_actual_argument()
+                .or_else(|| invalidation_history.first_formal_argument())
+            {
+                let outer_pvar = Pvar::mk(seed_pvar.name.clone(), proc_name.clone());
+                invalidation_history.prepend_event(HistoryEvent::FormalArgument(
+                    outer_pvar,
+                    Some(start_loc.clone()),
+                ))
+            } else {
+                invalidation_history
+            };
+            invalidation_history.wrap_call(proc_name, loc)
+        }
+        (Some(proc_name), None) => invalidation_history.wrap_call(proc_name, loc),
+        (None, _) => invalidation_history,
+    };
+    Diagnostic::AccessToInvalidAddress {
+        addr: caller_addr,
+        invalidation: invalidation.clone(),
+        access_location: loc.clone(),
+        trace_access_location: Some(sideband.location.clone()),
+        access_history,
+        invalidation_history,
     }
 }
 
@@ -2434,6 +2516,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2494,6 +2577,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2550,6 +2634,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2607,6 +2692,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2670,6 +2756,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2728,6 +2815,7 @@ mod tests {
             result: Some(ret_val),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2786,6 +2874,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2869,6 +2958,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -2934,6 +3024,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3019,6 +3110,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3115,6 +3207,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3209,6 +3302,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3307,6 +3401,7 @@ mod tests {
             result: Some(result_addr),
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3396,6 +3491,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3490,6 +3586,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3672,6 +3769,7 @@ mod tests {
                 shared_zero,
                 crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()),
             )),
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3787,6 +3885,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3855,6 +3954,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3966,6 +4066,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4015,6 +4116,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4119,6 +4221,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4185,6 +4288,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::AbortProgram,
             diagnostic: Some(diagnostic.clone()),
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4246,6 +4350,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::LatentAbortProgram,
             diagnostic: Some(diagnostic.clone()),
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4289,6 +4394,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::LatentInvalidAccess,
             diagnostic: Some(diagnostic.clone()),
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4323,6 +4429,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::LatentInvalidAccess,
             diagnostic: Some(diagnostic.clone()),
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4554,6 +4661,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4681,6 +4789,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4766,6 +4875,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -4935,6 +5045,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -5008,6 +5119,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -5218,6 +5330,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         }
     }
@@ -5272,6 +5385,7 @@ mod tests {
             result: None,
             kind: crate::summary::PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         }
     }

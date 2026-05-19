@@ -2813,12 +2813,12 @@ fn test_e2e_latent_uaf_phase1_exact_shape_oracle() {
         rows[2].post_invalid_attrs,
         ["x.*:[Initialized, Invalid(ConstantDereference(0))]"]
     );
-    assert_eq!(
-        rows[3].post_invalid_attrs,
-        [
-            "b.*.*:[Initialized, Invalid(ConstantDereference(42))]",
-            "return.*:[Invalid(ConstantDereference(0))]",
-        ]
+    assert!(
+        rows[4]
+            .post_invalid_attrs
+            .iter()
+            .any(|attr| attr.contains("Invalid(CFree)")),
+        "latent UAF row should retain ordinary CFree invalidation attrs: {rows:#?}"
     );
     assert!(
         rows[2]

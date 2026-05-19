@@ -3044,6 +3044,7 @@ mod tests {
             result: None,
             kind: PrePostKind::ContinueProgram,
             diagnostic: None,
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         };
 
@@ -3080,6 +3081,7 @@ mod tests {
                         result: None,
                         kind: PrePostKind::ContinueProgram,
                         diagnostic: None,
+                        latent_invalid_access: None,
                         pending_invalid_accesses: vec![],
                     }],
                     latent_abort_diagnostics: vec![None],
@@ -3165,6 +3167,7 @@ mod tests {
                     result: None,
                     kind: PrePostKind::AbortProgram,
                     diagnostic: Some(diagnostic.clone()),
+                    latent_invalid_access: None,
                     pending_invalid_accesses: vec![],
                 }],
                 has_dropped_disjuncts,
@@ -3767,6 +3770,7 @@ mod tests {
             result: None,
             kind: PrePostKind::LatentAbortProgram,
             diagnostic: Some(diagnostic),
+            latent_invalid_access: None,
             pending_invalid_accesses: vec![],
         });
 
