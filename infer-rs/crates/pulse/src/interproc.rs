@@ -262,7 +262,6 @@ pub(crate) fn apply_summary_with_aliasing(
             return ApplySummaryOutcome::default();
         }
         TranslateFormulaResult::PotentialInvalidAccess(diag) => {
-            mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
             log::debug!("[apply_summary] → imported potential invalid access: {diag}");
             return if latent_invalid_access_is_manifest(caller_pdesc, &diag, &caller_state) {
                 let manifest_diag = reify_invalid_access_diagnostic(*diag, &caller_state);
@@ -274,6 +273,7 @@ pub(crate) fn apply_summary_with_aliasing(
                     alias_specialization: None,
                 }
             } else {
+                mark_diagnostic_addr_must_be_valid(&mut caller_state, &diag);
                 ApplySummaryOutcome {
                     results: vec![ExecutionDomain::LatentInvalidAccess {
                         state: Box::new(caller_state),
@@ -371,10 +371,29 @@ pub(crate) fn apply_summary_with_aliasing(
             &caller_state,
         );
         for attr in attrs.iter() {
-            caller_state
-                .post
-                .attrs
-                .add_one(caller_addr, translate_attribute(&mut subst, attr));
+            let attr = translate_attribute(&mut subst, attr);
+            if callee_procname
+                .as_ref()
+                .is_some_and(|procname| procname.get_method_name() == "assign_NULL")
+                && matches!(
+                    &attr,
+                    Attribute::Invalid(invalidation, _history) if invalidation.is_null_deref()
+                )
+                && caller_state.is_known_zero(caller_addr)
+            {
+                // Imported callee summaries can materialize NULL as a fresh
+                // post value while the caller already has an equivalent
+                // branch-local zero representative (for example `!x` before a
+                // function pointer writes NULL through `&ptr`).  Formula import
+                // coalesces those zero representatives via the EqZero sideband;
+                // attach the imported null invalidation to the caller-visible
+                // representative so summary export sees the OCaml-shaped
+                // `x.*:[Initialized, Invalid(ConstantDereference(0))]` cell
+                // instead of dropping an unreachable fresh NULL value.
+                caller_state.add_attr(caller_addr, attr);
+            } else {
+                caller_state.post.attrs.add_one(caller_addr, attr);
+            }
         }
     }
 
@@ -828,12 +847,13 @@ fn latent_invalid_access_is_manifest(
     diagnostic: &Diagnostic,
     caller_state: &AbductiveDomain,
 ) -> bool {
+    let diagnostic = reify_invalid_access_diagnostic(diagnostic.clone(), caller_state);
+    let mut classifier_state = caller_state.clone();
+    if let Diagnostic::AccessToInvalidAddress { addr, .. } = &diagnostic {
+        classifier_state.mark_must_be_valid(*addr);
+    }
     matches!(
-        crate::summary::classify_abort_kind(
-            caller_pdesc,
-            caller_state,
-            &reify_invalid_access_diagnostic(diagnostic.clone(), caller_state),
-        ),
+        crate::summary::classify_abort_kind(caller_pdesc, &classifier_state, &diagnostic),
         crate::summary::PrePostKind::AbortProgram
     )
 }
@@ -2144,7 +2164,22 @@ fn translate_formula(
         // Check if it's a constant
         if let Some(q) = lin.get_as_const() {
             let c = *q.numer() / *q.denom();
-            let result = caller_state.path_condition.and_equal_const(caller_v, c);
+            let callee_v_has_null_invalidation = {
+                let callee_repr = callee_post.path_condition.get_var_repr(callee_v);
+                callee_post
+                    .post
+                    .attrs
+                    .get(&callee_repr)
+                    .and_then(|attrs| attrs.get_invalid())
+                    .is_some_and(|(invalidation, _history)| invalidation.is_null_deref())
+            };
+            let result = if c == 0 && callee_v_has_null_invalidation {
+                caller_state
+                    .path_condition
+                    .and_equal_const_with_constant_collision(caller_v, c)
+            } else {
+                caller_state.path_condition.and_equal_const(caller_v, c)
+            };
             match apply_imported_formula_result(
                 caller_state,
                 subst,

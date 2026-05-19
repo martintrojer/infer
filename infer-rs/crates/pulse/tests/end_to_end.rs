@@ -3274,6 +3274,76 @@ fn test_e2e_funptr_multilevel() {
 /// specialized function-pointer call chain, a later dereference of that formal
 /// must stay manifest.
 #[test]
+fn test_e2e_funptr_conditional_call_imports_null_invalidation_to_branch_zero_actual() {
+    let tm = textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        declare __call_c_function_ptr((fun _ -> _), **int) : void
+        define assign_NULL(ptr: **int) : void {
+          #entry:
+            n0:**int = load &ptr
+            store n0 <- 0:*int
+            ret null
+        }
+        define do_nothing(ptr: **int) : void {
+          #entry:
+            ret null
+        }
+        define funptr_conditional_call_bad(x: int) : int {
+          local ptr: *int, funptr: *(fun _ -> _)
+          #entry:
+            store &ptr <- &x
+            n0:int = load &x
+            jmp zero_branch, nonzero_branch
+          #zero_branch:
+            prune __sil_eq(n0, 0)
+            store &funptr <- __sil_cfun("assign_NULL"):*(fun _ -> _)
+            jmp call
+          #nonzero_branch:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            store &funptr <- __sil_cfun("do_nothing"):*(fun _ -> _)
+            jmp call
+          #call:
+            n1:*(fun _ -> _) = load &funptr
+            _ = __call_c_function_ptr(n1, &ptr)
+            n2:*int = load &ptr
+            n3:int = load n2
+            ret n3
+        }
+    "#,
+    );
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(p, _)| format!("{p}") == "funptr_conditional_call_bad")
+        .map(|(_, s)| s)
+        .expect("funptr_conditional_call_bad summary should exist");
+    let has_imported_null_invalidation = summary.pre_posts.iter().any(|pp| {
+        pp.post.post.attrs.iter().any(|(_addr, attrs)| {
+            attrs.iter().any(|attr| {
+                matches!(
+                    attr,
+                    pulse::attribute::Attribute::Invalid(
+                        pulse::invalidation::Invalidation::ConstantDereference(value),
+                        _
+                    ) if value.is_zero()
+                )
+            })
+        }) && pp
+            .post
+            .path_condition
+            .conditions()
+            .iter()
+            .any(|(atom, _depth)| format!("{atom}").contains("= 0"))
+    });
+    assert!(
+        has_imported_null_invalidation,
+        "the assign_NULL branch should import Invalid(ConstantDereference(0)) onto the caller-visible zero actual"
+    );
+}
+
+#[test]
 fn test_e2e_funptr_multilevel_formal_write_stays_manifest() {
     let tm = textual_utils::parse_and_convert(
         r#"

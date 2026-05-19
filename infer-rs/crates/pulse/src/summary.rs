@@ -1392,6 +1392,10 @@ impl PulseSummary {
                 pp.diagnostic = None;
             }
 
+            if pp.kind == PrePostKind::AbortProgram {
+                drop_pre_must_be_valid_on_imported_null_diagnostic_addr(&mut pp);
+            }
+
             let latent_abort_twin = export_local_latent_abort_twin.then(|| {
                 let mut twin = pp.clone();
                 twin.kind = PrePostKind::LatentAbortProgram;
@@ -3873,6 +3877,46 @@ fn abort_should_keep_local_manifest_twin(pdesc: &Procdesc, pre_post: &PrePost) -
     }
 
     false
+}
+
+fn drop_pre_must_be_valid_on_imported_null_diagnostic_addr(pre_post: &mut PrePost) {
+    let Some(addr) = pre_post.diagnostic.as_ref().and_then(|diag| match diag {
+        Diagnostic::AccessToInvalidAddress {
+            addr,
+            invalidation,
+            access_history,
+            ..
+        } if invalidation.is_null_deref()
+            && access_history.first_call_before_invalidation().is_some() =>
+        {
+            Some(pre_post.post.path_condition.get_var_repr(*addr))
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let remove = pre_post
+        .pre
+        .attrs
+        .get(&addr)
+        .map(|attrs| {
+            attrs
+                .iter()
+                .filter(|attr| matches!(attr, Attribute::MustBeValid(_, _, _)))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if remove.is_empty() {
+        return;
+    }
+    if let Some(attrs) = pre_post.pre.attrs.get_mut(&addr) {
+        for attr in remove {
+            attrs.remove(&attr);
+        }
+    }
+    pre_post.pre.attrs.remove_empty_entries();
 }
 
 fn abort_invalid_access_is_imported_from_call(pdesc: &Procdesc, pre_post: &PrePost) -> bool {
