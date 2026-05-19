@@ -1193,12 +1193,19 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
 ) {
     assert_eq!(
         (report.matching, report.differences.len(), report.rust_only.len()),
-        (40, 6, 5),
-        "memory_leak.c summary parity should stay at the ArrayAccess const-zero coalescing baseline\n{report}"
+        (42, 4, 5),
+        "memory_leak.c summary parity should include affine-temp normalization for alloc_ref_counted_arith_ok\n{report}"
     );
     assert!(
         report.ocaml_only.is_empty(),
         "memory_leak.c should have no OCaml-only procedures\n{report}"
+    );
+    assert!(
+        report
+            .differences
+            .iter()
+            .all(|diff| diff.proc_name != "alloc_ref_counted_arith_ok"),
+        "alloc_ref_counted_arith_ok should match after affine-temp normalization\n{report}"
     );
     let residuals: std::collections::BTreeSet<_> = report
         .differences
@@ -1206,8 +1213,6 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
         .map(|diff| diff.proc_name.as_str())
         .collect();
     let expected = std::collections::BTreeSet::from([
-        "alias_ptr_free_ok",
-        "alloc_ref_counted_arith_ok",
         "free_all_in_array",
         "interproc_mutual_recusion_leak",
         "mutual_recursion",
@@ -1215,7 +1220,7 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
     ]);
     assert_eq!(
         residuals, expected,
-        "allocate_all_in_array should remain matched after const-zero coalescing; residual diff set changed\n{report}"
+        "allocate_all_in_array and alloc_ref_counted_arith_ok should remain matched; residual diff set changed\n{report}"
     );
 }
 

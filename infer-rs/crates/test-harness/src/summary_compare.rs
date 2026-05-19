@@ -204,6 +204,7 @@ impl RawPrePost {
             .collect();
         let mut conditions = canonicalize_condition_items(&replaced_conditions, &replaced_phi);
         let mut phi = canonicalize_phi_items(&replaced_phi, &anchored_ids);
+        normalize_affine_formula_only_temps(&mut phi, &anchored_ids);
         let mut diagnostic = pruned
             .diagnostic
             .as_ref()
@@ -223,6 +224,7 @@ impl RawPrePost {
             &mut diagnostic,
         );
         route_zero_conditions_to_phi(&mut conditions, &mut phi);
+        normalize_affine_formula_only_temps(&mut phi, &anchored_ids);
         drop_phi_atoms_redundant_with_conditions(&conditions, &mut phi);
         let mut post_attrs = post_attrs;
         restore_ocaml_null_exit_formal_written_to_for_compare(
@@ -461,14 +463,7 @@ fn keep_summary_attr_for_compare(canonical_addr: &str, attr: &str) -> bool {
 }
 
 fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec<String> {
-    let eqs: HashMap<_, _> = phi
-        .iter()
-        .filter_map(|item| {
-            let rest = item.strip_prefix("eq:")?;
-            let (lhs, rhs) = rest.split_once('=')?;
-            Some((lhs.to_string(), rhs.to_string()))
-        })
-        .collect();
+    let eqs: HashMap<_, _> = phi_eqs(phi).collect();
     let witness_equivs = build_witness_equivalences(&eqs);
     let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
     let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
@@ -523,19 +518,29 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
                 &affine_env,
                 anchored_ids,
             );
+            let affine_atom = canonicalize_affine_atom(&lhs, atom.operator, &rhs, &affine_env);
+            let (lhs, rhs) = affine_atom
+                .as_ref()
+                .map(|atom| (atom.lhs.as_str(), atom.rhs.as_str()))
+                .unwrap_or((lhs.as_str(), rhs.as_str()));
+            let operator = affine_atom
+                .as_ref()
+                .map_or(atom.operator, |atom| atom.operator);
+            let lhs = lhs.to_string();
+            let rhs = rhs.to_string();
             let lhs_is_zero = lhs == "0" || constant_eqs.get(&lhs).is_some_and(|c| c == "0");
-            if lhs_is_zero && atom.operator == "<" && anchored_ids.contains(&rhs) {
+            if lhs_is_zero && operator == "<" && anchored_ids.contains(&rhs) {
                 normalized.insert(format!("atom:0 < {rhs}"));
                 continue;
             }
             let rhs_is_zero = rhs == "0" || constant_eqs.get(&rhs).is_some_and(|c| c == "0");
-            if rhs_is_zero && atom.operator == "<" && anchored_ids.contains(&lhs) {
+            if rhs_is_zero && operator == "<" && anchored_ids.contains(&lhs) {
                 normalized.insert(format!("atom:{lhs} < 0"));
                 continue;
             }
             if let Some(witness_atom) = collapse_witness_atom(
                 &lhs,
-                atom.operator,
+                operator,
                 &rhs,
                 &positive_witness_atoms,
                 &nonpositive_witness_atoms,
@@ -544,7 +549,7 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
             } else {
                 normalized.insert(format!(
                     "atom:{}",
-                    format_canonical_atom(&lhs, atom.operator, &rhs)
+                    format_canonical_atom(&lhs, operator, &rhs)
                 ));
             }
         } else {
@@ -556,14 +561,7 @@ fn canonicalize_phi_items(phi: &[String], anchored_ids: &HashSet<String>) -> Vec
 }
 
 fn canonicalize_condition_items(conditions: &[String], phi: &[String]) -> Vec<String> {
-    let eqs: HashMap<_, _> = phi
-        .iter()
-        .filter_map(|item| {
-            let rest = item.strip_prefix("eq:")?;
-            let (lhs, rhs) = rest.split_once('=')?;
-            Some((lhs.to_string(), rhs.to_string()))
-        })
-        .collect();
+    let eqs: HashMap<_, _> = phi_eqs(phi).collect();
     let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
     let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
     let reverse_eqs = build_exact_rhs_equivalences(&eqs);
@@ -617,6 +615,195 @@ fn canonicalize_condition_items(conditions: &[String], phi: &[String]) -> Vec<St
     }
 
     normalized.into_iter().collect()
+}
+
+fn normalize_affine_formula_only_temps(phi: &mut Vec<String>, anchored_ids: &HashSet<String>) {
+    let eqs: HashMap<_, _> = phi_eqs(phi).collect();
+    if eqs.is_empty() {
+        return;
+    }
+
+    let affine_env = build_unit_affine_equivalences(&eqs);
+    if affine_env.is_empty() {
+        return;
+    }
+
+    let atom_witness_ids = collect_formula_only_atom_witness_ids(phi, anchored_ids);
+    let mut replacement = HashMap::new();
+    for id in collect_formula_only_affine_ids(phi, anchored_ids) {
+        if atom_witness_ids.contains(&id) {
+            continue;
+        }
+        let Some(best) = best_affine_expr(&id, &affine_env) else {
+            continue;
+        };
+        if best.coeff == 1 && best.constant == 0 && best.base == id {
+            continue;
+        }
+        replacement.insert(id, format_affine_expr(&best));
+    }
+
+    if replacement.is_empty() {
+        return;
+    }
+
+    let before = phi.clone();
+    let mut rewritten = Vec::new();
+    for item in phi.iter() {
+        if let Some((lhs, rhs)) = parse_eq_item(item) {
+            if !anchored_ids.contains(lhs) && replacement.contains_key(lhs) {
+                continue;
+            }
+            rewritten.push(format!(
+                "eq:{lhs}={}",
+                replace_abstract_ids(rhs, &replacement)
+            ));
+        } else {
+            rewritten.push(replace_abstract_ids(item, &replacement));
+        }
+    }
+    let eq_lhss: HashSet<_> = rewritten
+        .iter()
+        .filter_map(|item| parse_eq_item(item).map(|(lhs, _)| lhs.to_string()))
+        .collect();
+    let positive_atom_terms: HashSet<_> = rewritten
+        .iter()
+        .filter_map(|item| parse_positive_atom_term(item))
+        .collect();
+    rewritten.retain(|item| {
+        if let Some((lhs, rhs)) = parse_eq_item(item) {
+            return !(!anchored_ids.contains(lhs)
+                && positive_atom_terms.contains(lhs)
+                && parse_affine_expr(rhs).is_some_and(|expr| anchored_ids.contains(&expr.base)));
+        }
+
+        let Some(atom) = parse_atom_item(item) else {
+            return true;
+        };
+        for term in [&atom.lhs, &atom.rhs] {
+            if eq_lhss.contains(term) {
+                return true;
+            }
+        }
+        !extract_abstract_ids(item)
+            .into_iter()
+            .any(|id| !anchored_ids.contains(&id) && replacement.contains_key(&id))
+    });
+
+    rewritten.sort();
+    rewritten.dedup();
+    if rewritten != before {
+        *phi = canonicalize_phi_items(&rewritten, anchored_ids);
+    }
+}
+
+fn collect_formula_only_affine_ids(
+    phi: &[String],
+    anchored_ids: &HashSet<String>,
+) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for item in phi {
+        for id in extract_abstract_ids(item) {
+            if !anchored_ids.contains(&id) {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+fn parse_positive_atom_term(item: &str) -> Option<String> {
+    let atom = parse_atom_item(item)?;
+    (atom.operator == "<" && atom.lhs == "0" && looks_like_term_identifier(&atom.rhs))
+        .then_some(atom.rhs)
+}
+
+fn collect_formula_only_atom_witness_ids(
+    phi: &[String],
+    anchored_ids: &HashSet<String>,
+) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for item in phi {
+        let Some(atom) = parse_atom_item(item) else {
+            continue;
+        };
+        for term in [&atom.lhs, &atom.rhs] {
+            if is_integer_constant(term) {
+                continue;
+            }
+            for id in extract_abstract_ids(term) {
+                if !anchored_ids.contains(&id) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn canonicalize_affine_atom(
+    lhs: &str,
+    operator: &'static str,
+    rhs: &str,
+    env: &HashMap<String, Vec<AffineExpr>>,
+) -> Option<ParsedAtom> {
+    if operator != "<" || lhs != "0" {
+        return None;
+    }
+
+    let rhs_expr = parse_affine_expr(rhs)?;
+    if rhs_expr.constant == 0 {
+        return None;
+    }
+
+    let exprs = collect_equivalent_affine_exprs(&rhs_expr, env);
+    let mut candidates: Vec<_> = exprs
+        .into_iter()
+        .filter(|expr| expr.coeff == 1 && expr.constant == 0)
+        .map(|expr| ParsedAtom {
+            lhs: "0".to_string(),
+            operator: "<",
+            rhs: expr.base,
+        })
+        .collect();
+    candidates.sort_by_key(|atom| condition_term_sort_key(&atom.rhs));
+    candidates.into_iter().next()
+}
+
+fn collect_equivalent_affine_exprs(
+    start: &AffineExpr,
+    env: &HashMap<String, Vec<AffineExpr>>,
+) -> BTreeSet<AffineExpr> {
+    let mut result = BTreeSet::new();
+    let mut worklist = vec![start.clone()];
+
+    while let Some(expr) = worklist.pop() {
+        if !result.insert(expr.clone()) {
+            continue;
+        }
+        let Some(next_exprs) = env.get(&expr.base) else {
+            continue;
+        };
+        for next in next_exprs {
+            let coeff = expr.coeff * next.coeff;
+            if !matches!(coeff, -1 | 1) {
+                continue;
+            }
+            worklist.push(AffineExpr {
+                coeff,
+                base: next.base.clone(),
+                constant: expr.coeff * next.constant + expr.constant,
+            });
+        }
+    }
+
+    result
+}
+
+fn phi_eqs(phi: &[String]) -> impl Iterator<Item = (String, String)> + '_ {
+    phi.iter()
+        .filter_map(|item| parse_eq_item(item))
+        .map(|(lhs, rhs)| (lhs.to_string(), rhs.to_string()))
 }
 
 fn normalize_atom_term_for_phi(
@@ -1063,14 +1250,7 @@ fn collapse_witness_atom(
 }
 
 fn drop_phi_atoms_redundant_with_conditions(conditions: &[String], phi: &mut Vec<String>) {
-    let eqs: HashMap<_, _> = phi
-        .iter()
-        .filter_map(|item| {
-            let rest = item.strip_prefix("eq:")?;
-            let (lhs, rhs) = rest.split_once('=')?;
-            Some((lhs.to_string(), rhs.to_string()))
-        })
-        .collect();
+    let eqs: HashMap<_, _> = phi_eqs(phi).collect();
     let positive_witness_atoms = build_positive_witness_atom_equivalences(&eqs);
     let nonpositive_witness_atoms = build_nonpositive_witness_atom_equivalences(&eqs);
     let reverse_eqs = build_exact_rhs_equivalences(&eqs);
