@@ -42,12 +42,14 @@ pub struct PulseSummary {
     /// The main (non-specialized) post-states at procedure exit.
     /// Matches OCaml's `PulseSummary.main.pre_post_list`.
     pub pre_posts: Vec<PrePost>,
-    /// Hidden non-disjunctive over-approximate pre/post exported separately
-    /// from the visible summary rows.
+    /// Hidden non-disjunctive over-approximate continuation summary, exported
+    /// separately from the visible summary rows.
     ///
     /// Cross-ref: OCaml `PulseSummary.main.non_disj` /
-    /// `PulseNonDisjunctiveDomain.Summary.astate`. Callers consume this as a
-    /// sideband rather than as an ordinary `pre_post_list` row.
+    /// `PulseNonDisjunctiveDomain.Summary.astate`. This row is not part of
+    /// the visible `pre_posts` surface and must not publish diagnostics;
+    /// callers apply it only to decide whether the hidden NonDisjDomain state
+    /// continued across a call, which in turn gates `pulse_force_continue`.
     pub non_disj_pre_post: Option<PrePost>,
     /// True when analysis had to drop some disjuncts while computing this
     /// summary (for example because of the disjunct bound or widening limit).
@@ -77,8 +79,8 @@ pub struct PulseSummary {
 #[derive(Clone, Debug)]
 pub struct SpecializedSummary {
     pub pre_posts: Vec<PrePost>,
-    /// Specialized hidden non-disjunctive pre/post, kept separate from the
-    /// visible rows just like the owning unspecialized summary.
+    /// Hidden non-disjunctive continuation for this specialized summary,
+    /// kept separate from the visible rows just like the owning unspecialized summary.
     pub non_disj_pre_post: Option<PrePost>,
     /// Specialized latent aborts stay latent in the cached summary, like
     /// OCaml's `LatentAbortProgram {latent_issue; ...}`. Keep the issue
@@ -295,6 +297,19 @@ fn build_pre_post(
         latent_invalid_access: None,
         pending_invalid_accesses,
     }
+}
+
+fn build_hidden_non_disj_pre_post(pdesc: &Procdesc, astate: AbductiveDomain) -> Option<PrePost> {
+    let mut pp = build_pre_post(pdesc, astate, PrePostKind::ContinueProgram, None);
+    let info = pp.normalize_with_summary_info();
+    if info.aliasing_contradiction || info.summary_potential_invalid_access.is_some() {
+        return None;
+    }
+    pp.pending_invalid_accesses.clear();
+    pp.latent_invalid_access = None;
+    pp.diagnostic = None;
+    pp.post.shrink_for_storage();
+    Some(pp)
 }
 
 pub(crate) fn abort_is_manifest(pdesc: &Procdesc, astate: &AbductiveDomain) -> bool {
@@ -1180,7 +1195,7 @@ impl PulseSummary {
         diagnostics: Vec<Diagnostic>,
         is_noreturn: bool,
     ) -> Self {
-        Self::of_proc_with_metadata(pdesc, exec_states, diagnostics, is_noreturn, false)
+        Self::of_proc_with_metadata(pdesc, exec_states, diagnostics, is_noreturn, false, None)
     }
 
     pub fn of_proc_with_metadata(
@@ -1189,25 +1204,10 @@ impl PulseSummary {
         diagnostics: Vec<Diagnostic>,
         is_noreturn: bool,
         has_dropped_disjuncts: bool,
+        non_disj_astate: Option<AbductiveDomain>,
     ) -> Self {
-        Self::of_proc_with_hidden_non_disj(
-            pdesc,
-            exec_states,
-            diagnostics,
-            is_noreturn,
-            has_dropped_disjuncts,
-            None,
-        )
-    }
-
-    pub fn of_proc_with_hidden_non_disj(
-        pdesc: &Procdesc,
-        exec_states: &[ExecutionDomain],
-        diagnostics: Vec<Diagnostic>,
-        is_noreturn: bool,
-        has_dropped_disjuncts: bool,
-        hidden_non_disj_astate: Option<AbductiveDomain>,
-    ) -> Self {
+        let mut non_disj_pre_post =
+            non_disj_astate.and_then(|astate| build_hidden_non_disj_pre_post(pdesc, astate));
         // Build a PrePost for each execution path (ContinueProgram, ExitProgram,
         // AbortProgram). Matches OCaml's `pre_post_list` which keeps ALL paths
         // including error paths. AbortProgram disjuncts stay in the summary so
@@ -1553,27 +1553,6 @@ impl PulseSummary {
         // to addresses in need_dynamic_type_specialization.
         // Cross-ref: OCaml PulseAbductiveDomain.Summary.heap_paths_that_need_dynamic_type_specialization.
         let needs_specialization = compute_specialization_heap_paths(&pre_posts);
-
-        // Cross-ref: OCaml `PulseNonDisjunctiveDomain.make_summary` runs the
-        // hidden over-approximate astate through
-        // `PulseAbductiveDomain.Summary.of_post` and stores it under
-        // `summary.non_disj` rather than appending it to `pre_post_list`.
-        // Keep the first Rust port conservative: export only a normalized
-        // Continue pre/post, and drop the hidden row if normalization exposes
-        // leaks, latent invalid-access obligations, or contradiction. Hidden
-        // diagnostics must not be published by summary creation.
-        let mut non_disj_pre_post = hidden_non_disj_astate.and_then(|astate| {
-            let mut pp = build_pre_post(pdesc, astate, PrePostKind::ContinueProgram, None);
-            let info = pp.normalize_with_summary_info();
-            if info.aliasing_contradiction
-                || !info.leaks.is_empty()
-                || info.summary_potential_invalid_access.is_some()
-            {
-                return None;
-            }
-            coalesce_zero_direct_formals_for_continue_export(pdesc, &mut pp);
-            Some(pp)
-        });
 
         // Drop analysis-only working state from each PrePost's stored
         // post-state. Run AFTER `compute_specialization_heap_paths` (which
@@ -4977,7 +4956,7 @@ mod tests {
     fn test_specialized_summary_keeps_hidden_non_disj_pre_post() {
         let pdesc = make_pdesc_with_formals(&[]);
         let hidden_state = AbductiveDomain::mk_initial(&pdesc);
-        let specialized = PulseSummary::of_proc_with_hidden_non_disj(
+        let specialized = PulseSummary::of_proc_with_metadata(
             &pdesc,
             &[],
             vec![],
@@ -5009,7 +4988,7 @@ mod tests {
         let x_addr = hidden_state.post.stack.find(&x_var).unwrap();
         let x_value = hidden_state.read_heap(x_addr, Access::Dereference);
 
-        let summary = PulseSummary::of_proc_with_hidden_non_disj(
+        let summary = PulseSummary::of_proc_with_metadata(
             &pdesc,
             &[ExecutionDomain::ContinueProgram(visible_state)],
             vec![],

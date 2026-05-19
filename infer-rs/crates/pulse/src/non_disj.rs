@@ -204,12 +204,12 @@ fn join_over_approx(
     match (lhs, rhs) {
         (None, None) => None,
         (Some(astate), None) | (None, Some(astate)) => Some(astate.clone()),
-        (Some(lhs), Some(_rhs)) => {
+        (Some(_lhs), Some(rhs)) => {
             // TODO(nondisj_phase4+): replace this with a real over-approximate
-            // Pulse join or a tiny bounded sideband. Keeping the left slot is
+            // Pulse join or a tiny bounded sideband. Keeping the newest slot is
             // deterministic and avoids pretending this scaffold has full OCaml
             // `PulseJoin.join` semantics.
-            Some(lhs.clone())
+            Some(rhs.clone())
         }
     }
 }
