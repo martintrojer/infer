@@ -1430,6 +1430,78 @@ fn test_summary_comparison_c_triage() {
     }
 }
 
+/// Phase-1 latent cycle-cursor port guard: pin the current full-C summary
+/// composition while the exact Rust-side shape probes below track the rows that
+/// phase 2/3/4 are expected to move toward OCaml. Heavy: spawns infer.
+#[test]
+#[ignore]
+fn test_summary_comparison_latent_cycle_phase1_baseline_10_4() {
+    use test_harness::infer_runner::InferRunner;
+    use test_harness::summary_compare;
+
+    let Some(runner) = InferRunner::new() else {
+        eprintln!("skipping: infer binary not found");
+        return;
+    };
+
+    let c_path = test_harness::fixtures::ocaml_c_test_dir()
+        .join("pulse")
+        .join("latent.c");
+    if !c_path.exists() {
+        eprintln!("skipping: latent.c not found");
+        return;
+    }
+
+    let ocaml_summaries_path = runner
+        .analyze_pulse_c(&c_path)
+        .expect("OCaml analysis should succeed for latent.c");
+    let ocaml_summaries = summary_compare::parse_ocaml_summaries(&ocaml_summaries_path);
+
+    let sil_path = runner
+        .dump_textual_for_c(&c_path)
+        .expect("dump-textual should succeed for latent.c");
+    let tm = textual_utils::parse_file_and_convert(&sil_path);
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+
+    let mut rust_summaries = std::collections::HashMap::new();
+    for (pname, summary) in store.to_vec() {
+        if sil::builtin_decl::is_declared(&pname) {
+            continue;
+        }
+        rust_summaries.insert(
+            pname.get_method_name().to_string(),
+            rust_summary_to_canonical(&summary),
+        );
+    }
+
+    let report = summary_compare::compare_summaries(&ocaml_summaries, &rust_summaries);
+    eprintln!("{report}");
+    assert_eq!(
+        (report.matching, report.differences.len()),
+        (10, 4),
+        "latent.c should stay at the phase-1 10/4 baseline until semantic phases deliberately move it\n{report}"
+    );
+    assert!(
+        report.ocaml_only.is_empty() && report.rust_only.is_empty(),
+        "latent.c procedure set should match at phase-1 baseline\n{report}"
+    );
+    let residuals: std::collections::BTreeSet<_> = report
+        .differences
+        .iter()
+        .map(|diff| diff.proc_name.as_str())
+        .collect();
+    assert_eq!(
+        residuals,
+        std::collections::BTreeSet::from([
+            "FN_crash_after_six_nodes_bad",
+            "crash_after_one_node_bad",
+            "crash_after_two_nodes_bad",
+            "latent_use_after_free",
+        ]),
+        "latent.c residual composition should be exactly cycle x3 + latent_use_after_free\n{report}"
+    );
+}
+
 fn rust_summary_to_canonical(
     summary: &pulse::summary::PulseSummary,
 ) -> test_harness::summary_compare::CanonicalProcedureSummary {
@@ -1449,6 +1521,193 @@ fn rust_summary_to_canonical(
             .collect(),
     };
     raw.canonicalize()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LatentShapeRow {
+    kind: String,
+    diagnostic: Option<String>,
+    report_tuple: Option<String>,
+    latent_heap_key: Option<String>,
+    selected_invalid_path: Option<String>,
+    pre_heap: Vec<String>,
+    post_heap: Vec<String>,
+    pre_invalid_attrs: Vec<String>,
+    post_invalid_attrs: Vec<String>,
+    pre_must_be_valid_attrs: Vec<String>,
+    post_must_be_valid_attrs: Vec<String>,
+    pre_must_be_valid_provenance: Vec<String>,
+}
+
+fn latent_shape_rows(
+    proc_name: &str,
+    summary: &pulse::summary::PulseSummary,
+) -> Vec<LatentShapeRow> {
+    summary
+        .pre_posts
+        .iter()
+        .map(|pre_post| latent_shape_row(proc_name, pre_post))
+        .collect()
+}
+
+fn latent_shape_row(proc_name: &str, pre_post: &pulse::summary::PrePost) -> LatentShapeRow {
+    let canonical = rust_pre_post_to_raw(pre_post).canonicalize();
+    let diagnostic = exported_shape_diagnostic(pre_post);
+    let selected_invalid_path = diagnostic.as_ref().and_then(|diagnostic| {
+        diagnostic_invalid_address(diagnostic).map(|addr| {
+            let target = pre_post.post.path_condition.get_var_repr(addr);
+            heap_path_to_target_label(pre_post, target).unwrap_or_else(|| format!("{target}"))
+        })
+    });
+    let latent_heap_key = if pre_post.kind == pulse::summary::PrePostKind::LatentInvalidAccess {
+        diagnostic.as_ref().map(|diagnostic| {
+            let issue_type = diagnostic.get_issue_type_id().id();
+            let path = selected_invalid_path
+                .clone()
+                .unwrap_or_else(|| diagnostic_invalid_address(diagnostic).unwrap().to_string());
+            format!("{issue_type}|{path}")
+        })
+    } else {
+        None
+    };
+    let report_tuple = diagnostic.as_ref().map(|diagnostic| {
+        let loc = diagnostic.get_location();
+        format!(
+            "{proc_name}:{}:{}",
+            loc.line,
+            diagnostic.get_issue_type_id().id()
+        )
+    });
+
+    LatentShapeRow {
+        kind: format!("{:?}", pre_post.kind),
+        diagnostic: diagnostic.as_ref().map(format_rust_diagnostic),
+        report_tuple,
+        latent_heap_key,
+        selected_invalid_path,
+        pre_heap: canonical.pre_heap,
+        post_heap: canonical.post_heap,
+        pre_invalid_attrs: canonical
+            .pre_attrs
+            .iter()
+            .filter(|attr| attr.contains("Invalid("))
+            .cloned()
+            .collect(),
+        post_invalid_attrs: canonical
+            .post_attrs
+            .iter()
+            .filter(|attr| attr.contains("Invalid("))
+            .cloned()
+            .collect(),
+        pre_must_be_valid_attrs: canonical
+            .pre_attrs
+            .iter()
+            .filter(|attr| attr.contains("MustBeValid"))
+            .cloned()
+            .collect(),
+        post_must_be_valid_attrs: canonical
+            .post_attrs
+            .iter()
+            .filter(|attr| attr.contains("MustBeValid"))
+            .cloned()
+            .collect(),
+        pre_must_be_valid_provenance: must_be_valid_provenance(pre_post),
+    }
+}
+
+fn must_be_valid_provenance(pre_post: &pulse::summary::PrePost) -> Vec<String> {
+    let mut entries = Vec::new();
+    for (addr, attrs) in pre_post.pre.attrs.iter() {
+        let Some((timestamp, location, reason)) = attrs.get_must_be_valid() else {
+            continue;
+        };
+        let addr = pre_post.post.path_condition.get_var_repr(*addr);
+        let path = heap_path_to_target_label(pre_post, addr).unwrap_or_else(|| format!("{addr}"));
+        let reason = reason
+            .as_ref()
+            .map(format_rust_reason)
+            .unwrap_or_else(|| "None".to_string());
+        entries.push(format!(
+            "{path}:ts={timestamp}:loc={}:{}:reason={reason}",
+            location.line, location.col
+        ));
+    }
+    entries.sort();
+    entries
+}
+
+fn exported_shape_diagnostic(
+    pre_post: &pulse::summary::PrePost,
+) -> Option<pulse::diagnostic::Diagnostic> {
+    match pre_post.kind {
+        pulse::summary::PrePostKind::LatentInvalidAccess => {
+            pulse::summary::latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
+        }
+        _ => pre_post.diagnostic.clone(),
+    }
+}
+
+fn diagnostic_invalid_address(
+    diagnostic: &pulse::diagnostic::Diagnostic,
+) -> Option<pulse::abstract_value::AbstractValue> {
+    match diagnostic {
+        pulse::diagnostic::Diagnostic::AccessToInvalidAddress { addr, .. } => Some(*addr),
+        _ => None,
+    }
+}
+
+fn heap_path_to_target_label(
+    pre_post: &pulse::summary::PrePost,
+    target: pulse::abstract_value::AbstractValue,
+) -> Option<String> {
+    let repr_of = |addr| pre_post.post.path_condition.get_var_repr(addr);
+    let mut best = None;
+    for (formal, stack_addr) in &pre_post.formals {
+        find_heap_path_to_target_label(
+            pre_post,
+            *stack_addr,
+            formal.name.plain.clone(),
+            target,
+            &repr_of,
+            &mut std::collections::HashSet::new(),
+            &mut best,
+        );
+    }
+    best
+}
+
+fn find_heap_path_to_target_label(
+    pre_post: &pulse::summary::PrePost,
+    addr: pulse::abstract_value::AbstractValue,
+    path: String,
+    target: pulse::abstract_value::AbstractValue,
+    repr_of: &impl Fn(pulse::abstract_value::AbstractValue) -> pulse::abstract_value::AbstractValue,
+    visited: &mut std::collections::HashSet<pulse::abstract_value::AbstractValue>,
+    best: &mut Option<String>,
+) {
+    let repr = repr_of(addr);
+    if !visited.insert(repr) {
+        return;
+    }
+    if repr == target {
+        if best.as_ref().is_none_or(|current| &path < current) {
+            *best = Some(path);
+        }
+        return;
+    }
+    let Some(edges) = pre_post.pre.heap.get_edges(addr) else {
+        return;
+    };
+    for (access, next_addr) in edges.iter() {
+        let next_path = match access {
+            pulse::access::Access::Dereference => format!("{path}.*"),
+            pulse::access::Access::FieldAccess(field) => format!("{path}.{}", field.field_name),
+            pulse::access::Access::ArrayAccess(_, index) => format!("{path}[{index}]"),
+        };
+        find_heap_path_to_target_label(
+            pre_post, *next_addr, next_path, target, repr_of, visited, best,
+        );
+    }
 }
 
 fn rust_pre_post_to_raw(
@@ -2083,6 +2342,122 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
         }
     "#,
     );
+    assert_latent_cycle_shape_oracles(&tm);
+}
+
+fn parse_latent_cycle_textual() -> textual_utils::TestModule {
+    textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+        type node = {data: int; next: *node}
+
+        define traverse_and_crash_if_equal_to_root(p: *node) : void {
+          local crash: *int, old_p: *node
+          #node_0:
+              jmp node_1
+          #node_11:
+              jmp
+          #node_2:
+              jmp node_13
+          #node_13:
+              n0:*node = load &p
+              jmp node_12, node_10
+          #node_12:
+              prune __sil_ne(n0, 0)
+              jmp node_3
+          #node_10:
+              prune __sil_lnot(__sil_ne(n0, 0))
+              jmp node_11
+          #node_7:
+              jmp node_2
+          #node_4:
+              n1:*node = load &old_p
+              n2:*node = load &p
+              jmp node_9, node_8
+          #node_9:
+              prune __sil_eq(n1, n2)
+              jmp node_5
+          #node_8:
+              prune __sil_lnot(__sil_eq(n1, n2))
+              jmp node_7
+          #node_6:
+              n3:*int = load &crash
+              store n3 <- 42:int
+              jmp node_7
+          #node_5:
+              _ = __sil_metadata_variable_lifetime_begins(&crash, <*int>)
+              store &crash <- 0:*int
+              jmp node_6
+          #node_3:
+              n6:*node = load &p
+              n7:*node = load n6.node.next
+              store &p <- n7:*node
+              jmp node_4
+          #node_1:
+              _ = __sil_metadata_variable_lifetime_begins(&old_p, <*node>)
+              n9:*node = load &p
+              store &old_p <- n9:*node
+              jmp node_2
+        }
+
+        define crash_after_one_node_bad(q: *node) : void {
+          #node_0:
+              jmp node_1
+          #node_3:
+              jmp
+          #node_2:
+              n0:*node = load &q
+              n1 = traverse_and_crash_if_equal_to_root(n0)
+              jmp node_3
+          #node_1:
+              n3:*node = load &q
+              n2:*node = load &q
+              store n2.node.next <- n3:*node
+              jmp node_2
+        }
+
+        define crash_after_two_nodes_bad(q: *node) : void {
+          #node_0:
+              jmp node_1
+          #node_3:
+              jmp
+          #node_2:
+              n0:*node = load &q
+              n1 = traverse_and_crash_if_equal_to_root(n0)
+              jmp node_3
+          #node_1:
+              n4:*node = load &q
+              n2:*node = load &q
+              n3:*node = load n2.node.next
+              store n3.node.next <- n4:*node
+              jmp node_2
+        }
+
+        define FN_crash_after_six_nodes_bad(q: *node) : void {
+          #node_0:
+              jmp node_1
+          #node_3:
+              jmp
+          #node_2:
+              n0:*node = load &q
+              n1 = traverse_and_crash_if_equal_to_root(n0)
+              jmp node_3
+          #node_1:
+              n8:*node = load &q
+              n2:*node = load &q
+              n3:*node = load n2.node.next
+              n4:*node = load n3.node.next
+              n5:*node = load n4.node.next
+              n6:*node = load n5.node.next
+              n7:*node = load n6.node.next
+              store n7.node.next <- n8:*node
+              jmp node_2
+        }
+    "#,
+    )
+}
+
+fn assert_latent_cycle_shape_oracles(tm: &textual_utils::TestModule) {
     let store = run_pulse_inter(&tm.cfg, &tm.tenv);
 
     let expected = [
@@ -2184,6 +2559,312 @@ fn test_e2e_latent_cycle_summary_shapes_match_ocaml_subset() {
             );
         }
     }
+}
+
+#[test]
+fn test_e2e_latent_cycle_phase1_exact_shape_oracles() {
+    let tm = parse_latent_cycle_textual();
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+    let summaries = store.to_vec();
+
+    let one_node = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "crash_after_one_node_bad")
+        .map(|(_, summary)| latent_shape_rows("crash_after_one_node_bad", summary))
+        .expect("crash_after_one_node_bad summary should exist");
+    assert_eq!(
+        one_node
+            .iter()
+            .map(|row| row.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["ContinueProgram", "LatentInvalidAccess", "AbortProgram"]
+    );
+    assert_eq!(
+        one_node[1].report_tuple.as_deref(),
+        Some("crash_after_one_node_bad:61:NULLPTR_DEREFERENCE")
+    );
+    assert_eq!(
+        one_node[1].latent_heap_key.as_deref(),
+        Some("NULLPTR_DEREFERENCE|q.*")
+    );
+    assert_eq!(one_node[1].selected_invalid_path.as_deref(), Some("q.*"));
+    assert_eq!(
+        one_node[1].post_heap,
+        ["q -*-> q.*", "q.* -.next-> q.*.next", "q.*.next -*-> q.*",]
+    );
+    assert!(
+        one_node[1]
+            .pre_must_be_valid_attrs
+            .contains(&"q.*:[MustBeInitialized, MustBeValid]".to_string()),
+        "one-node latent row should pin the current MustBeValid shape: {one_node:#?}"
+    );
+    assert!(
+        one_node[1]
+            .pre_must_be_valid_provenance
+            .iter()
+            .any(|entry| entry.starts_with("q.*:ts=") && entry.contains(":loc=")),
+        "one-node latent row should expose MustBeValid timestamp/location provenance: {one_node:#?}"
+    );
+    assert_eq!(one_node[2].selected_invalid_path.as_deref(), Some("v5"));
+    assert!(
+        one_node[2].post_heap.contains(&"q.* -*-> q.*".to_string()),
+        "one-node abort row should pin the current self-cycle residual: {one_node:#?}"
+    );
+
+    let two_nodes = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "crash_after_two_nodes_bad")
+        .map(|(_, summary)| latent_shape_rows("crash_after_two_nodes_bad", summary))
+        .expect("crash_after_two_nodes_bad summary should exist");
+    assert_eq!(
+        two_nodes
+            .iter()
+            .map(|row| row.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "ContinueProgram",
+            "LatentInvalidAccess",
+            "AbortProgram",
+            "AbortProgram",
+        ]
+    );
+    assert_eq!(
+        two_nodes[1].report_tuple.as_deref(),
+        Some("crash_after_two_nodes_bad:77:NULLPTR_DEREFERENCE")
+    );
+    assert_eq!(
+        two_nodes[1].latent_heap_key.as_deref(),
+        Some("NULLPTR_DEREFERENCE|q.*")
+    );
+    assert_eq!(
+        two_nodes[1].post_heap,
+        [
+            "q -*-> q.*",
+            "q.* -.next-> q.*.next",
+            "q.*.next -*-> q.*.next.*",
+            "q.*.next.* -.next-> q.*.next.*.next",
+            "q.*.next.*.next -*-> q.*",
+        ]
+    );
+    assert_eq!(two_nodes[2].selected_invalid_path.as_deref(), Some("v7"));
+    assert_eq!(two_nodes[3].selected_invalid_path.as_deref(), Some("v9"));
+    assert_eq!(
+        two_nodes[2].pre_must_be_valid_attrs,
+        [
+            "q.*.next.*.next:[MustBeValid]",
+            "q.*.next.*:[MustBeValid]",
+            "q.*.next:[MustBeInitialized, MustBeValid]",
+            "q.*:[MustBeInitialized, MustBeValid]",
+            "q:[MustBeInitialized, MustBeValid]",
+        ]
+    );
+    assert!(
+        two_nodes[1]
+            .pre_must_be_valid_provenance
+            .iter()
+            .any(|entry| entry.starts_with("q.*.next.*:ts=") && entry.contains(":loc=")),
+        "two-node latent row should expose MustBeValid timestamp/location provenance: {two_nodes:#?}"
+    );
+
+    let six_nodes = summaries
+        .iter()
+        .find(|(pname, _)| format!("{pname}") == "FN_crash_after_six_nodes_bad")
+        .map(|(_, summary)| latent_shape_rows("FN_crash_after_six_nodes_bad", summary))
+        .expect("FN_crash_after_six_nodes_bad summary should exist");
+    assert_eq!(
+        six_nodes
+            .iter()
+            .map(|row| row.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "ContinueProgram",
+            "LatentInvalidAccess",
+            "AbortProgram",
+            "AbortProgram",
+            "AbortProgram",
+        ]
+    );
+    assert_eq!(
+        six_nodes[1].report_tuple.as_deref(),
+        Some("FN_crash_after_six_nodes_bad:99:NULLPTR_DEREFERENCE")
+    );
+    assert_eq!(
+        six_nodes[1].latent_heap_key.as_deref(),
+        Some("NULLPTR_DEREFERENCE|q.*")
+    );
+    assert!(
+        six_nodes[1]
+            .pre_heap
+            .contains(&"q.*.next.*.next.*.next.*.next.*.next.* -.next-> q.*.next.*.next.*.next.*.next.*.next.*.next".to_string()),
+        "six-node latent row should retain the current deep pre cursor chain: {six_nodes:#?}"
+    );
+    assert!(
+        six_nodes[1]
+            .post_heap
+            .contains(&"q.*.next.*.next.*.next -*-> q.*".to_string()),
+        "six-node latent row should pin the current root-collapsed post edge: {six_nodes:#?}"
+    );
+    assert!(
+        six_nodes[1]
+            .pre_must_be_valid_provenance
+            .contains(&"q.*:ts=7:loc=99:14:reason=None".to_string()),
+        "six-node latent row should pin exact MustBeValid timestamp/location provenance: {six_nodes:#?}"
+    );
+    assert_eq!(
+        six_nodes[2..]
+            .iter()
+            .map(|row| row.selected_invalid_path.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("v15"), Some("v17"), Some("v19")]
+    );
+}
+
+fn parse_latent_uaf_textual() -> textual_utils::TestModule {
+    textual_utils::parse_and_convert(
+        r#"
+        .source_language = "C"
+
+        define conditional_free2(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            jmp do_free, skip_free
+          #do_free:
+            prune __sil_eq(n0, 1)
+            _ = free(n1)
+            ret null
+          #skip_free:
+            prune __sil_lnot(__sil_eq(n0, 1))
+            ret null
+        }
+
+        define latent_use_after_free(b: int, x: *int) : void {
+          #entry:
+            n0:int = load &b
+            n1:*int = load &x
+            _ = conditional_free2(n0, n1)
+            store n1 <- 42:int
+            jmp clean_up, done
+          #clean_up:
+            prune __sil_eq(n0, 0)
+            _ = free(n1)
+            ret null
+          #done:
+            prune __sil_lnot(__sil_eq(n0, 0))
+            ret null
+        }
+    "#,
+    )
+}
+
+#[test]
+fn test_e2e_latent_uaf_phase1_exact_shape_oracle() {
+    let tm = parse_latent_uaf_textual();
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "latent_use_after_free")
+        .map(|(_, summary)| summary)
+        .expect("latent_use_after_free summary should exist");
+    let rows = latent_shape_rows("latent_use_after_free", &summary);
+
+    assert_eq!(
+        rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+        [
+            "ContinueProgram",
+            "ContinueProgram",
+            "LatentInvalidAccess",
+            "LatentInvalidAccess",
+            "LatentAbortProgram",
+        ]
+    );
+    assert_eq!(
+        rows[2].report_tuple.as_deref(),
+        Some("latent_use_after_free:23:NULLPTR_DEREFERENCE")
+    );
+    assert_eq!(
+        rows[2].latent_heap_key.as_deref(),
+        Some("NULLPTR_DEREFERENCE|x.*")
+    );
+    assert_eq!(
+        rows[3].latent_heap_key.as_deref(),
+        Some("NULLPTR_DEREFERENCE|b.*")
+    );
+    assert_eq!(
+        rows[4].report_tuple.as_deref(),
+        Some("latent_use_after_free:23:USE_AFTER_FREE")
+    );
+    assert_eq!(rows[4].selected_invalid_path.as_deref(), Some("x.*"));
+    assert!(
+        rows[0]
+            .post_invalid_attrs
+            .contains(&"x.*:[Initialized, Invalid(CFree), WrittenTo]".to_string()),
+        "cleanup row should pin the current persisted CFree attr: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row
+            .post_invalid_attrs
+            .iter()
+            .any(|attr| attr.contains("Invalid(ConstantDereference(42))"))),
+        "ordinary stored Invalid(ConstantDereference(42)) attrs should persist: {rows:#?}"
+    );
+    assert_eq!(
+        rows[2].post_invalid_attrs,
+        ["x.*:[Initialized, Invalid(ConstantDereference(0))]"]
+    );
+    assert_eq!(
+        rows[3].post_invalid_attrs,
+        [
+            "b.*.*:[Initialized, Invalid(ConstantDereference(42))]",
+            "return.*:[Invalid(ConstantDereference(0))]",
+        ]
+    );
+    assert!(
+        rows[2]
+            .pre_must_be_valid_attrs
+            .contains(&"x.*:[MustBeValid]".to_string()),
+        "direct x.* MustBeValid obligation should remain visible: {rows:#?}"
+    );
+    assert!(
+        rows[2]
+            .pre_must_be_valid_provenance
+            .iter()
+            .any(|entry| entry.starts_with("x.*:ts=") && entry.contains(":loc=")),
+        "direct x.* MustBeValid obligation should expose timestamp/location provenance: {rows:#?}"
+    );
+    assert!(
+        rows[3]
+            .pre_must_be_valid_attrs
+            .contains(&"b.*:[MustBeValid]".to_string()),
+        "current alias-shifted b.* MustBeValid residual should be pinned: {rows:#?}"
+    );
+}
+
+#[test]
+#[ignore = "phase 2/3 should turn this green: OCaml exports exactly one latent_use_after_free LatentInvalidAccess row, keyed to x.*, and keeps EqZero provenance out of Invalid(0) attrs"]
+fn test_e2e_latent_uaf_phase1_expected_ocaml_shape_probe() {
+    let tm = parse_latent_uaf_textual();
+    let store = run_pulse_inter(&tm.cfg, &tm.tenv);
+    let summary = store
+        .to_vec()
+        .into_iter()
+        .find(|(pname, _)| format!("{pname}") == "latent_use_after_free")
+        .map(|(_, summary)| summary)
+        .expect("latent_use_after_free summary should exist");
+    let rows = latent_shape_rows("latent_use_after_free", &summary);
+    let latent_keys: Vec<_> = rows
+        .iter()
+        .filter(|row| row.kind == "LatentInvalidAccess")
+        .map(|row| row.latent_heap_key.as_deref())
+        .collect();
+
+    assert_eq!(latent_keys, [Some("USE_AFTER_FREE|x.*")]);
+    assert!(
+        rows.iter().all(|row| !row.post_invalid_attrs.iter().any(|attr| attr
+            .contains("Invalid(ConstantDereference(0))"))),
+        "OCaml PotentialInvalidAccessSummary sideband should not be represented as Invalid(0): {rows:#?}"
+    );
 }
 
 #[test]
