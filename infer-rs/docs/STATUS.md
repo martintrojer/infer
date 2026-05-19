@@ -67,7 +67,7 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze.
 
-Today's 74-commit Linux session is summarized by track below (landed SHAs from
+Today's 93-commit Linux session is summarized by track below (landed SHAs from
 `git log --oneline fccf3f0b7d..HEAD`; no new sweeps were run for this doc
 refresh):
 
@@ -165,46 +165,58 @@ keeping the public correctness checkpoint held: Store-textual remains `52/0/0`,
 NPE is `131/133`, LEAK is `20/20`, UAF is `7/7`, specialization remains
 `21/0` perfect, and the six-file C-suite triage now totals `120/17`.
 
+Cross-track edges from the latest landings are now reflected in the dashboard:
+worker-2's apply-post phases 1-4 unblocked the EqZero local sideband; EqZero
+summary sideband Phase B unblocked specialization from `20/1` to `21/0` perfect;
+EqZero interproc unification Phase C further refined the NPE count to `131/133`;
+and NonDisjDomain Phases 1-4 set up the hidden over-approximation state
+machinery. Phase 5 now wires that state through call-site application.
+
 **NonDisjDomain port (worker-2; design doc
 `NONDISJDOMAIN_PORT_DAYPLAN_2026_05.md`)**
 
-- **Phase 1 — domain scaffold** (`805c8da766` / `f5894269e7`): added the
-  `NonDisjDomain` crate plus lattice operations (`bottom`, `top`, `join`,
-  `widen`) and `remember_dropped_disjuncts`; no semantic effect yet.
-- **Phase 2 — fixpoint dropped-state capture** (`d34303f8f7` / `2490d5bd9e`):
-  wired `DisjunctiveDomain<ExecutionDomain>` plus `NonDisjDomain` into
+- **Phase 1 — domain scaffold** (`805c8da766` / `f5894269e7`) — DONE:
+  added the `NonDisjDomain` crate plus lattice operations (`bottom`, `top`,
+  `join`, `widen`) and `remember_dropped_disjuncts`; no semantic effect yet.
+- **Phase 2 — fixpoint dropped-state capture** (`d34303f8f7` / `2490d5bd9e`) —
+  DONE: wired `DisjunctiveDomain<ExecutionDomain>` plus `NonDisjDomain` into
   `checker.rs`; dropped `Continue` payloads now populate the hidden
   over-approximation slot.
 - **Phase 3 — exec overapprox per-instruction** (`3f4b79f946` /
-  `dffd9a4397`): `NonDisjDomain::exec_over_approx` mirrors OCaml
+  `dffd9a4397`) — DONE: `NonDisjDomain::exec_over_approx` mirrors OCaml
   `PulseNonDisjunctiveDomain.exec`.
-- **Phases 4-6** are in flight or next (`nondisj_phase4` currently owned by
-  worker-2).
+- **Phase 4 — summary export hidden pre/post** (`edd17796ed`, merging
+  `90a7867699` plus worker-1's `a70b696222` through the orchestrator merge) —
+  DONE: summaries now carry hidden non-disjunctive pre/post state.
+- **Phase 5 — call apply + force-continue** — IN FLIGHT (worker-2): wires the
+  hidden over-approximation state through call-site application.
+- **Phase 6 — arithmetic validation** — NEXT, blocked by Phase 5.
 
 **Latent cycle-cursor port (worker-1; design doc
 `LATENT_CYCLE_CURSOR_PORT_DAYPLAN_2026_05.md`)**
 
-- **Phase 1 — shape oracles** (`bc9e169b01` / `b655a91ec4`): test-only; pins
-  current `latent.c` `10/4` composition and adds OCaml-shape probes for the
-  upcoming phases.
-- **Phase 2 — cursor reprs** (no commit): disciplined no-fix scout found that
-  Phase 2 was not the right closing mechanism; the residual sits earlier in
-  pre-materialization / summary flow.
-- **Phase 3 — latent address sideband** (`436a61c182` / `0f36716ec6` /
-  `52a15ef507`): added `PrePost.latent_invalid_access:
-  Option<PendingInvalidAccess>` as an OCaml-shaped
-  `LatentInvalidAccess(address,must_be_valid)` sideband. Mechanism landed;
-  counts unchanged (`latent.c` still `10/4`).
-- **Phase 4** is in flight as `cluster_latent_cycle_phase4`.
+- **Phase 1 — shape oracles** (`bc9e169b01` / `b655a91ec4`) — DONE:
+  test-only; pins current `latent.c` `10/4` composition and adds OCaml-shape
+  probes for the upcoming phases.
+- **Phase 2 — cursor reprs** (no commit) — RESOLVED-AS-SCOUT: disciplined
+  no-fix scout found that the root cause is in pre-materialization / summary
+  ordering, not direct cell replay.
+- **Phase 3 — latent address sideband** (`436a61c182` / `52a15ef507`) — DONE:
+  added `PrePost.latent_invalid_access: Option<PendingInvalidAccess>` as an
+  OCaml-shaped `LatentInvalidAccess(address,must_be_valid)` sideband. Mechanism
+  landed; counts unchanged (`latent.c` still `10/4`) because deeper
+  canonicalization still gates the closures.
+- **Phase 4 — NonDisjDomain + force-continue** (`edd17796ed` merged into
+  worker-2's Phase 4) — DONE.
 
 **Tight `memory_leak.c` fixes (worker-leak)**
 
-- `alias_ptr_free_ok` (`6a884580c3` / `ff99cf2089` / `af380e7952`) moved
-  `memory_leak.c` `40/6` -> `41/5`.
-- `alloc_ref_counted_arith_ok` (`5d4ba9d467` / `4bb89aef31`) moved
-  `memory_leak.c` `41/5` -> `42/4` via comparator-side affine normalization.
-- Null/free invalidation is deferred after one reverted attempt; the mechanism
+- `alias_ptr_free_ok` closed via `af380e7952` / `ff99cf2089` / `6a884580c3`,
+  moving `memory_leak.c` `40/6` -> `41/5`.
+- Null/free invalidation is deferred after a reverted attempt; the mechanism
   proved deeper than the scoped fix.
+- `alloc_ref_counted_arith_ok` closed via `4bb89aef31` / `5d4ba9d467`, moving
+  `memory_leak.c` `41/5` -> `42/4` via comparator-side affine normalization.
 
 ### C-suite OCaml↔Rust Pulse summary parity (`120 matching / 17 diffs`)
 
@@ -337,7 +349,7 @@ normalization. Current scoped per-file totals:
 
 | file | session start | now | best landed commit / residual |
 |---|---:|---:|---|
-| `arithmetic.c` | `6/5` | `6/5` | held; residual: OCaml `NonDisjDomain` non-disj sideband mechanism; port Phases 1-3 landed, Phase 4 in flight |
+| `arithmetic.c` | `6/5` | `6/5` | held; residual: OCaml `NonDisjDomain` call-site application / force-continue; port Phases 1-4 landed, Phase 5 in flight |
 | `funptr.c` | `25/3` | `25/3` | held after `bd2416fe02` / `c1f17f040f` summary EqZero sideband closed one residual after `fa938dc6dd` callback `Closure` attr surface |
 | `interprocedural.c` | `16/1` | `16/1` | held; `490aa92ccd` repaired silent `15/2` drift introduced by `da98dd6b09`; residual `trace_correctly_through_wrappers_bad` multiplicity |
 | `latent.c` | `10/4` | `10/4` | held; composition is `cycle ×3 + latent_use_after_free`; Phase 3 latent-address sideband mechanism landed, counts unchanged |
@@ -348,22 +360,23 @@ normalization. Current scoped per-file totals:
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 Wave 9 note: arithmetic held at `6/5` while the `NonDisjDomain` port landed
-Phases 1-3 and worker-2 continued Phase 4; funptr held at `25/3`; interprocedural
-held/restored at `16/1` by `490aa92ccd`; latent held at `10/4` with composition
+Phases 1-4 and worker-2 moved into Phase 5 call apply + force-continue;
+funptr held at `25/3`; interprocedural held/restored at `16/1` by
+`490aa92ccd`; latent held at `10/4` with composition
 `cycle ×3 + latent_use_after_free` while the latent-address sideband mechanism
-landed; memory_leak moved `40/6` -> `41/5` via `alias_ptr_free_ok` and `41/5`
--> `42/4` via `alloc_ref_counted_arith_ok`; and specialization held at `21/0`
-perfect.
+and Phase 4 NonDisjDomain/force-continue edge landed; memory_leak moved
+`40/6` -> `41/5` via `alias_ptr_free_ok` and `41/5` -> `42/4` via
+`alloc_ref_counted_arith_ok`; and specialization held at `21/0` perfect.
 
 Current residual work is saturated at mechanism boundaries: arithmetic remains
-OCaml `NonDisjDomain` sideband territory, interprocedural has one
-summary-multiplicity residual after the `490aa92ccd` repair, funptr has three
-remaining summary-surface residuals after the EqZero summary sideband, and
-latent depends on the cycle-cursor / pre-materialization summary chain rather
-than more apply-post plumbing. The latest recorded sweep/scout NPE figure is
-`131/133` after the typed-stub repair plus imported-EqZero unification. The next
-layer is multi-day mechanism porting, not another quick single-commit parity
-pass.
+OCaml `NonDisjDomain` call-site application / force-continue territory,
+interprocedural has one summary-multiplicity residual after the `490aa92ccd`
+repair, funptr has three remaining summary-surface residuals after the EqZero
+summary sideband, and latent depends on the cycle-cursor / pre-materialization
+summary chain rather than more apply-post plumbing. The latest recorded
+sweep/scout NPE figure is `131/133` after the typed-stub repair plus
+imported-EqZero unification. The next layer is multi-day mechanism porting, not
+another quick single-commit parity pass.
 
 ## OpenSSL benchmark dashboard
 
@@ -506,8 +519,8 @@ Interpretation:
 - The post-apply-post-port row is acceptable: the four apply-post phases traded
   about `+4%` wall and `+12%` RAM for substantial correctness improvements.
   Recursive `record_post_for_address` now mirrors OCaml more closely, and the
-  phases were prerequisites for the cycle-cursor / specialization residuals
-  once the EqZero sideband lands.
+  phases were prerequisites for the cycle-cursor / specialization residuals;
+  the EqZero sideband chain has now landed and specialization is perfect.
 - The key dashboard message is RAM and stability: Linux Rust is now below the
   historical macOS-derived Rust max-RSS reference, with far fewer cap aborts,
   at the cost of a modest wall regression from the Linux reach-end checkpoint.
@@ -568,16 +581,20 @@ Live themes (track headlines, not exhaustive task lists):
   typed-stub regression upstream `25aa457dae` / here `e5417f19ae`, and worker-2
   drove it down further to `131 / 133` post-Phase-C.
 - **DONE since prior doc refresh — Wave 9 deep-port landings.** Worker-2 landed
-  `NonDisjDomain` Phases 1-3 (`805c8da766` / `f5894269e7`, `d34303f8f7` /
-  `2490d5bd9e`, `3f4b79f946` / `dffd9a4397`); worker-1 landed latent
-  cycle-cursor Phase 1 (`bc9e169b01` / `b655a91ec4`) and Phase 3
-  latent-address sideband (`436a61c182` / `0f36716ec6` / `52a15ef507`);
-  worker-leak landed `alias_ptr_free_ok` (`6a884580c3` / `ff99cf2089` /
-  `af380e7952`) and `alloc_ref_counted_arith_ok` (`5d4ba9d467` /
-  `4bb89aef31`) for `memory_leak.c` `42/4`.
-- **IN FLIGHT.** Worker-2 owns `nondisj_phase4`; worker-1 owns
-  `cluster_latent_cycle_phase4`. Null/free invalidation is deferred after one
-  reverted attempt showed the issue is deeper than the scoped worker-leak fix.
+  `NonDisjDomain` Phases 1-4 (`805c8da766` / `f5894269e7`, `d34303f8f7` /
+  `2490d5bd9e`, `3f4b79f946` / `dffd9a4397`, and `edd17796ed` merging
+  `90a7867699` plus worker-1's `a70b696222`); worker-1 landed latent
+  cycle-cursor Phase 1 (`bc9e169b01` / `b655a91ec4`), resolved Phase 2 as a
+  no-fix scout, landed Phase 3 latent-address sideband (`436a61c182` /
+  `52a15ef507`), and closed Phase 4 via the NonDisjDomain/force-continue
+  landing. Worker-leak landed `alias_ptr_free_ok` (`af380e7952` /
+  `ff99cf2089` / `6a884580c3`) and `alloc_ref_counted_arith_ok`
+  (`4bb89aef31` / `5d4ba9d467`) for `memory_leak.c` `42/4`.
+- **IN FLIGHT.** Worker-2 owns `nondisj_phase5` (call apply + force-continue,
+  deep fix); Phase 6 arithmetic validation is next and blocked by Phase 5.
+  Worker-leak is on read-only re-baselining scout work. Null/free invalidation
+  is deferred after one reverted attempt showed the issue is deeper than the
+  scoped worker-leak fix.
 - **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
   `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
   as the baselines; any wall recovery should preserve the RAM and abort gains.
