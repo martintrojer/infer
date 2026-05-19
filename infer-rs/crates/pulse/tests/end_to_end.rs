@@ -1824,7 +1824,10 @@ fn rust_phi_items(formula: &pulse::formula::Formula) -> Vec<String> {
     }
 
     for (var, term_eq) in &phi.term_eqs {
-        items.push(format!("eq:{var}={}", format_rust_term_eq(term_eq)));
+        items.push(format!(
+            "eq:{var}={}",
+            format_rust_term_eq_with_phi(term_eq, phi)
+        ));
     }
 
     for (fn_app, ret) in phi.iter_fn_app_eqs() {
@@ -2019,13 +2022,36 @@ fn format_rust_linear(lin: &pulse::formula::lin_arith::LinArith) -> String {
     format_linear_for_compare(terms, lin.constant.to_string())
 }
 
-fn format_rust_term_eq(term_eq: &pulse::formula::phi::TermEq) -> String {
-    format!(
-        "binop::{:?}({}, {})",
-        term_eq.op,
-        format_rust_operand(&term_eq.lhs),
-        format_rust_operand(&term_eq.rhs)
-    )
+fn format_rust_term_eq_with_phi(
+    term_eq: &pulse::formula::phi::TermEq,
+    phi: &pulse::formula::phi::Phi,
+) -> String {
+    match term_eq.op {
+        sil::binop::Binop::DivF => format!(
+            "[DivF,[{}],[{}]]",
+            format_rust_ocaml_style_operand(&term_eq.lhs, phi),
+            format_rust_ocaml_style_operand(&term_eq.rhs, phi)
+        ),
+        _ => format!(
+            "binop::{:?}({}, {})",
+            term_eq.op,
+            format_rust_operand(&term_eq.lhs),
+            format_rust_operand(&term_eq.rhs)
+        ),
+    }
+}
+
+fn format_rust_ocaml_style_operand(
+    operand: &pulse::formula::Operand,
+    phi: &pulse::formula::phi::Phi,
+) -> String {
+    match operand {
+        pulse::formula::Operand::AbstractValue(value) => match phi.get_known_const(*value) {
+            Some(q) if q.is_integer() => format!("Const,{{den:1,num:{}}}", *q.numer() / *q.denom()),
+            _ => format!("Var,{}", phi.get_repr(*value)),
+        },
+        pulse::formula::Operand::ConstOperand(value) => format!("Const,{{den:1,num:{value}}}"),
+    }
 }
 
 fn format_rust_operand(operand: &pulse::formula::Operand) -> String {

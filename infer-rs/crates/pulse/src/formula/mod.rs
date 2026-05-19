@@ -143,6 +143,40 @@ pub fn expand_formula_reachable(
         }
 
         // Cross-ref: OCaml PulseFormula.DeadVariables.build_var_graph keeps
+        // term-equality results connected to their operand values. This is
+        // needed for formula terms represented in Rust as `term_eqs` rather
+        // than as first-class `Term` nodes, for example float `DivF` in
+        // arithmetic.c. If the result is summary-visible, keep operand values
+        // reachable so the term equality survives summary simplification.
+        if let Some(term_eq) = phi.term_eqs.get(&repr) {
+            if term_eq.op == sil::binop::Binop::DivF {
+                for operand in [&term_eq.lhs, &term_eq.rhs] {
+                    let Operand::AbstractValue(value) = operand else {
+                        continue;
+                    };
+                    let value_repr = phi.get_repr(*value);
+                    if reachable.insert(value_repr) {
+                        worklist.push(value_repr);
+                    }
+                }
+            }
+        }
+        for (&lhs, term_eq) in &phi.term_eqs {
+            if term_eq.op != sil::binop::Binop::DivF {
+                continue;
+            }
+            let lhs_repr = phi.get_repr(lhs);
+            if lhs_repr != repr
+                && [&term_eq.lhs, &term_eq.rhs].iter().any(|operand| {
+                    matches!(operand, Operand::AbstractValue(value) if phi.get_repr(*value) == repr)
+                })
+                && reachable.insert(lhs_repr)
+            {
+                worklist.push(lhs_repr);
+            }
+        }
+
+        // Cross-ref: OCaml PulseFormula.DeadVariables.build_var_graph keeps
         // function-application results connected to their actual arguments.
         // Without this, imported conditions on pure-call results can be
         // dropped during summary normalization even when the actuals are
@@ -666,7 +700,11 @@ impl Formula {
                 }
             }
             // DivF: rational division (not integer truncation).
-            // Must be handled separately to preserve fractional results.
+            // Must be handled separately to preserve fractional results. If
+            // the operands are not both constants, keep the symbolic term
+            // equality too; OCaml exports `return = DivF(random(), 28)` in
+            // arithmetic summaries, while dropping this relation makes the
+            // float residual purely presentationally different.
             sil::binop::Binop::DivF => {
                 if let (Some(qx), Some(qy)) = (operand_q(x, &self.phi), operand_q(y, &self.phi)) {
                     if qy != Q::from_integer(0) {
@@ -675,7 +713,23 @@ impl Formula {
                         return self.phi_mut().and_linear_eq(v, lin);
                     }
                 }
-                let _ = self.phi_mut().var_eqs.find(v);
+                let canonical_term_operand = |operand: &Operand| match operand {
+                    Operand::ConstOperand(c) => Operand::ConstOperand(*c),
+                    Operand::AbstractValue(value) => {
+                        let repr = self.phi.get_repr(*value);
+                        if let Some(q) = self.phi.get_known_const(repr) {
+                            if q.is_integer() {
+                                return Operand::ConstOperand(*q.numer() / *q.denom());
+                            }
+                        }
+                        Operand::AbstractValue(repr)
+                    }
+                };
+                let lhs = canonical_term_operand(x);
+                let rhs = canonical_term_operand(y);
+                let phi = self.phi_mut();
+                phi.term_eqs.insert(v, phi::TermEq { op, lhs, rhs });
+                let _ = phi.var_eqs.find(v);
                 SatUnsat::Sat(Vec::new())
             }
             // Mul, DivI, Mod, Shift: fold if both operands are known constants

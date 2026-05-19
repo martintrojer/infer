@@ -2531,9 +2531,30 @@ fn apply_pre_posts_with_specialization_loop(
                             | ExecutionDomain::LatentInvalidAccess { .. }
                     )
                 });
+            let applied_results_all_non_continue = !results.is_empty()
+                && results
+                    .iter()
+                    .all(|result| !matches!(result, ExecutionDomain::ContinueProgram(_)));
             let alias_specialization_needs_force_continue = alias_specialized_latent_only_summary
                 && applied_results_all_stopped
                 && !has_continue_program(&results);
+            // OCaml's force-continue fallback also preserves an unknown-call
+            // continuation when a selected summary contains only stopped rows
+            // but at least one row is latent/caller-dependent. This closes the
+            // arithmetic `if_negative_then_crash_latent` callers: the visible
+            // callee summary has LatentAbort+Exit and no Continue, so callers
+            // should keep the unknown-call FunctionApplication row alongside
+            // the stopped outcomes. Keep precise manifest abort-only summaries
+            // excluded (covered by the guard test below).
+            let latent_stopped_summary_needs_force_continue = applied_results_all_non_continue
+                && current_pre_posts.iter().any(|pp| {
+                    matches!(
+                        pp.kind,
+                        crate::summary::PrePostKind::LatentAbortProgram
+                            | crate::summary::PrePostKind::LatentInvalidAccess
+                    )
+                })
+                && args.iter().any(|(arg_exp, _)| !arg_exp.is_const());
             // Cross-ref: OCaml `PulseCallOperations.iter_call` applies
             // `DynamicTypeNeeded` specialized summaries through `apply_callee`;
             // when the specialized side only stops, `PulseCallOperations.call`
@@ -2552,6 +2573,7 @@ fn apply_pre_posts_with_specialization_loop(
                 non_disj,
                 used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts
                     || alias_specialization_needs_force_continue
+                    || latent_stopped_summary_needs_force_continue
                     || dynamic_type_abort_specialization_needs_force_continue,
                 used_summary_was_empty: false,
             };

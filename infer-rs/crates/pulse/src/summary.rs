@@ -596,6 +596,32 @@ impl PrePost {
 
         let mut formula_seeds = post_canonical_reachable.clone();
         formula_seeds.extend(self.collect_reachable_array_indices(&post_heap_reachable));
+        // Keep operands of caller-visible term equalities rooted at summary
+        // values live through summary export. OCaml `PulseFormula` stores
+        // symbolic terms such as `DivF(random(), 28)` in the formula graph;
+        // Rust's first term-eq reachability only followed linear/fn-app
+        // edges, so `return = DivF(v, 28)` lost `v` and then dropped the
+        // whole DivF fact. Arithmetic float summaries need this presentation
+        // to match OCaml and to keep downstream non-negativity proofs stable.
+        let term_eq_operand_values: Vec<_> = self
+            .post
+            .path_condition
+            .phi()
+            .term_eqs
+            .iter()
+            .filter(|(lhs, term_eq)| {
+                term_eq.op == sil::binop::Binop::DivF
+                    && formula_seeds.contains(&self.post.path_condition.get_var_repr(**lhs))
+            })
+            .flat_map(|(_, term_eq)| [&term_eq.lhs, &term_eq.rhs])
+            .filter_map(|operand| match operand {
+                crate::formula::Operand::AbstractValue(value) => {
+                    Some(self.post.path_condition.get_var_repr(*value))
+                }
+                crate::formula::Operand::ConstOperand(_) => None,
+            })
+            .collect();
+        formula_seeds.extend(term_eq_operand_values);
         let witness_targets = formula_seeds.clone();
         let formula_reachable = expand_formula_reachable(&self.post.path_condition, &formula_seeds);
         let mut precondition_vocabulary = pre_reachable.clone();
