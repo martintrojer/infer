@@ -14,19 +14,19 @@ mu task list -w infer-rs --status OPEN
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `133` (`+2` over expected; held at `-4` vs the pre-fix `137` after the angelism repair plus EqZero imported-sideband unification, including worker-2's Phase C close) |
+| NPE count | expected `131`, found `132` (`+1` over expected; `-1` vs the prior `133` after worker-leak's struct-pointee fallback fix tightened the surface) |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `120 matching / 17 diffs` (Wave 9: `119/18` -> `120/17`; +70/-70 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `130 matching / 7 diffs` (Wave 9 complete: `119/18` -> `130/7`; +80/-80 vs original `50/87`) |
 
 ### NPE issue-count deltas (current Linux)
 
 Latest recorded Linux store-textual checkpoint is `52` OK / `0` FAIL / `0`
-TIMEOUT, NPE expected `131` / found `133`, LEAK `20/20` EXACT, and UAF `7/7`
+TIMEOUT, NPE expected `131` / found `132`, LEAK `20/20` EXACT, and UAF `7/7`
 EXACT. Do not re-run the sweep for doc refreshes: the sweep harness mirrors the
 upstream C Pulse test Makefile's `--no-pulse-force-continue` setting before
 comparing against `issues.exp`, and the regression guard pins `52` OK / `0`
@@ -36,14 +36,16 @@ pinning an exact NPE total.
 The NPE count moved from the pre-fix `131/137` surface to `131/133` after the
 angelism typed-stub repair (`25aa457dae`, cherry-picked here as `e5417f19ae`)
 and the imported-EqZero sideband unification chain through worker-2's Phase C
-(`79226f7ac6` / `3d1432f34b`). The typed-stub repair restored `angelism.c` from
-`12` NPEs back to `7` by treating typed `@?` textual extern declarations as
-declaration bodies / unknown calls and publishing the typed empty-body summary
-instead of reading them as real empty bodies. EqZero unification then held the
-repaired NPE surface at `131/133` while specialization closed. The dynamic-type
-specialized abort propagation fix (`a8b8fe7bde`) contributed a real `+1` NPE
-catch by surfacing a specialized function-pointer abort that was previously
-dropped, not a duplicate callee-local manifest report. The closed
+(`79226f7ac6` / `3d1432f34b`), then tightened to `131/132` after worker-leak's
+struct-pointee fallback repair (`c4c7d6a6b5`). The typed-stub repair restored
+`angelism.c` from `12` NPEs back to `7` by treating typed `@?` textual extern
+declarations as declaration bodies / unknown calls and publishing the typed
+empty-body summary instead of reading them as real empty bodies. EqZero
+unification held the repaired NPE surface at `131/133` while specialization
+closed; the struct-pointee fix removed one remaining over-report. The
+dynamic-type specialized abort propagation fix (`a8b8fe7bde`) contributed a
+real `+1` NPE catch by surfacing a specialized function-pointer abort that was
+previously dropped, not a duplicate callee-local manifest report. The closed
 `scout_npe_per_file_full_remeasure` classification plus the worker-leak
 per-file remeasure cover the remaining per-file surface: all intended live NPE
 deltas are either aligned with OCaml direct behavior under the test config or
@@ -67,9 +69,9 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze.
 
-Today's 93-commit Linux session is summarized by track below (landed SHAs from
-`git log --oneline fccf3f0b7d..HEAD`; no new sweeps were run for this doc
-refresh):
+Today's 104+-commit resumed Linux session is summarized by track below
+(landed SHAs from `git log --oneline fccf3f0b7d..HEAD`; this doc refresh
+records the Wave 9 complete checkpoint):
 
 - **Sweep parity / store-textual (Track 1A).** `502236c5b2` pre-warms the
   sweep harness to avoid first-run TIMEOUT races. `9078f04176` moves LEAK to
@@ -79,9 +81,9 @@ refresh):
   `a625c0dd55`, `fe0e95be3e`, `11fa5b8649`, `d9da630ae7`, and `48655710c4`
   close array-index, struct-formal, stdio-model, diagnostic-dedup, harness
   config, guard-test, and guard-doc gaps. The held checkpoint is now `52` OK /
-  `0` FAIL / `0` TIMEOUT, NPE `131/133`, LEAK `20/20` EXACT, and UAF `7/7`
-  EXACT after the typed-stub repair `e5417f19ae` plus imported-EqZero
-  unification.
+  `0` FAIL / `0` TIMEOUT, NPE `131/132`, LEAK `20/20` EXACT, and UAF `7/7`
+  EXACT after the typed-stub repair `e5417f19ae`, imported-EqZero unification,
+  and worker-leak's struct-pointee fallback repair `c4c7d6a6b5`.
 - **Per-procedure summary parity (Track 1B).** `e7dd96291a` routed latent
   witnesses; `bfb235e881` fixed canonical formula-var import; `a8b8fe7bde`
   propagated dynamic-type specialized function-pointer aborts; `3b7b90f1a9`
@@ -93,8 +95,9 @@ refresh):
   `fa938dc6dd` aligned imported callback `Closure` attrs; `490aa92ccd`
   restored interprocedural null invalidation when continue coalescing is a
   no-op; and `c1f17f040f` (cherry-pick of worker-1's `808ff65dd1`) returned a
-  summary EqZero sideband, closing one funptr residual. Later Wave 9 landings
-  carry the scoped C-suite parity total to `120/17`.
+  summary EqZero sideband, closing one funptr residual. The complete Wave 9
+  deep-port stack plus downstream tight fixes now carry the scoped C-suite
+  parity total to `130/7`.
 - **Perf / OpenSSL Linux wave (Track 2).** `b512df2924` aligns stopped latent
   leq with OCaml and closes the OBJ_bsearch convergence gate. `da9b92c384`
   avoids sorting unmapped canonical roots; `2f2c26a6a9` shares
@@ -158,67 +161,102 @@ for the perfect-parity `specialization.c` close:
   `38/8` -> `40/6`; regression fixtures pinned in `bug_summary_alpha_isograph_arrayaccess_constants`
   (`504d768d0e` / `905ec61662`).
 
-### Wave 9 deep-port work (2026-05-18/19)
+### Wave 9 deep-port work COMPLETE (2026-05-18/19)
 
-Wave 9 moved from scout-only classification into deep-port mechanism work while
-keeping the public correctness checkpoint held: Store-textual remains `52/0/0`,
-NPE is `131/133`, LEAK is `20/20`, UAF is `7/7`, specialization remains
-`21/0` perfect, and the six-file C-suite triage now totals `120/17`.
+Wave 9 is complete. It moved from scout-only classification into the full
+deep-port stack while keeping the public correctness checkpoint held:
+Store-textual remains `52/0/0`, NPE is `131/132`, LEAK is `20/20`, UAF is
+`7/7`, the specialization summary harness is `21/21` perfect, and the six-file
+C-suite triage now totals `130/7`. The resumed session's C-suite total moved
+from `119/18` at Wave 9 start to `130/7` now (`+11` matching, `-11` diffs in
+Wave 9), and from the original `50/87` baseline to `130/7` (`+80/-80`).
 
-Cross-track edges from the latest landings are now reflected in the dashboard:
+Cross-track edges from the final landings are now reflected in the dashboard:
 worker-2's apply-post phases 1-4 unblocked the EqZero local sideband; EqZero
-summary sideband Phase B unblocked specialization from `20/1` to `21/0` perfect;
-EqZero interproc unification Phase C further refined the NPE count to `131/133`;
-and NonDisjDomain Phases 1-4 set up the hidden over-approximation state
-machinery. Phase 5 now wires that state through call-site application.
+summary sideband Phase B unblocked specialization from `20/1` to `21/0`
+perfect; EqZero interproc unification Phase C refined the NPE count to
+`131/133`; worker-leak's struct-pointee fallback repair tightened it further to
+`131/132`; and the complete NonDisjDomain stack unblocked force-continue,
+DivF/arithmetic validation, dynamic-specialization, latent UAF, recursive
+memory, and the final interprocedural equality-prune cleanup. Both
+`specialization.c` and `interprocedural.c` are now at perfect parity.
 
-**NonDisjDomain port (worker-2; design doc
+**PulseNonDisjDomain port (6/6 phases; design doc
 `NONDISJDOMAIN_PORT_DAYPLAN_2026_05.md`)**
 
-- **Phase 1 — domain scaffold** (`805c8da766` / `f5894269e7`) — DONE:
-  added the `NonDisjDomain` crate plus lattice operations (`bottom`, `top`,
-  `join`, `widen`) and `remember_dropped_disjuncts`; no semantic effect yet.
+- **Phase 1 — domain scaffold** (`805c8da766` / `f5894269e7`) — DONE: added
+  the `NonDisjDomain` crate plus lattice operations (`bottom`, `top`, `join`,
+  `widen`) and `remember_dropped_disjuncts`; no semantic effect yet.
 - **Phase 2 — fixpoint dropped-state capture** (`d34303f8f7` / `2490d5bd9e`) —
   DONE: wired `DisjunctiveDomain<ExecutionDomain>` plus `NonDisjDomain` into
-  `checker.rs`; dropped `Continue` payloads now populate the hidden
+  `checker.rs`; dropped `Continue` payloads populate the hidden
   over-approximation slot.
 - **Phase 3 — exec overapprox per-instruction** (`3f4b79f946` /
   `dffd9a4397`) — DONE: `NonDisjDomain::exec_over_approx` mirrors OCaml
   `PulseNonDisjunctiveDomain.exec`.
 - **Phase 4 — summary export hidden pre/post** (`edd17796ed`, merging
   `90a7867699` plus worker-1's `a70b696222` through the orchestrator merge) —
-  DONE: summaries now carry hidden non-disjunctive pre/post state.
-- **Phase 5 — call apply + force-continue** — IN FLIGHT (worker-2): wires the
-  hidden over-approximation state through call-site application.
-- **Phase 6 — arithmetic validation** — NEXT, blocked by Phase 5.
+  DONE: summaries carry hidden non-disjunctive pre/post state.
+- **Phase 5 — call apply + force-continue** (`979ca8eaee` / `90dbd9f91e`
+  re-implemented after merge) — DONE: call-site application consumes hidden
+  over-approximation state and uses it for OCaml-shaped force-continue.
+- **Phase 6 — arithmetic validation + cleanup** (`beb77cd0ed` / `39e1f8ce3a`)
+  — DONE: arithmetic validation closed the force-continue and DivF cases and
+  moved `arithmetic.c` from `6/5` to `7/4` at that step.
 
-**Latent cycle-cursor port (worker-1; design doc
+**Latent cycle-cursor port (4/4 phases; design doc
 `LATENT_CYCLE_CURSOR_PORT_DAYPLAN_2026_05.md`)**
 
 - **Phase 1 — shape oracles** (`bc9e169b01` / `b655a91ec4`) — DONE:
-  test-only; pins current `latent.c` `10/4` composition and adds OCaml-shape
+  test-only; pinned the `latent.c` `10/4` composition and added OCaml-shape
   probes for the upcoming phases.
 - **Phase 2 — cursor reprs** (no commit) — RESOLVED-AS-SCOUT: disciplined
-  no-fix scout found that the root cause is in pre-materialization / summary
-  ordering, not direct cell replay.
+  no-fix scout found the root cause in pre-materialization / summary ordering,
+  not direct cell replay.
 - **Phase 3 — latent address sideband** (`436a61c182` / `52a15ef507`) — DONE:
   added `PrePost.latent_invalid_access: Option<PendingInvalidAccess>` as an
-  OCaml-shaped `LatentInvalidAccess(address,must_be_valid)` sideband. Mechanism
-  landed; counts unchanged (`latent.c` still `10/4`) because deeper
-  canonicalization still gates the closures.
-- **Phase 4 — NonDisjDomain + force-continue** (`edd17796ed` merged into
-  worker-2's Phase 4) — DONE.
+  OCaml-shaped `LatentInvalidAccess(address,must_be_valid)` sideband.
+- **Phase 4 — NonDisjDomain + force-continue** (`edd17796ed` /
+  `a70b696222`, merged into NonDisjDomain Phase 4) — DONE. The later Wave 9
+  tight fix for `latent_use_after_free` moved `latent.c` `10/4` -> `11/3`; the
+  three remaining latent diffs are the cycle-cursor procedures.
 
-**Tight `memory_leak.c` fixes (worker-leak)**
+**EqZero sideband chain (3/3 phases + follow-ups)**
+
+- **Phase A — local sideband** (`56c98117b5`) — DONE: explicit local sideband
+  for EqZero invalid accesses after three reverted attr-stripping attempts.
+- **Phase B — summary sideband** (`bd2416fe02` / `c1f17f040f`) — DONE:
+  summary `of_post` returns the EqZero sideband and moved `funptr.c` `+1/-1`.
+- **Phase C — interproc unification** (`79226f7ac6` / `3d1432f34b`) — DONE:
+  imported EqZero records the common `PendingInvalidAccess` sideband in
+  `apply_imported_formula_result`.
+- **Specialization closer** (`d1e188b3a0` / `2dcccc1a41`) — DONE:
+  direct-formal `PotentialInvalidAccessSummary` closed `specialization.c`
+  `20/1` -> `21/0` perfect.
+- **Const-zero coalescing** (`359fc9b7ce`) — DONE: producer-time zero-constant
+  coalescing closed `allocate_all_in_array` and moved `memory_leak.c` `38/8` ->
+  `40/6`.
+
+**Downstream tight fixes unblocked by the stack**
 
 - `alias_ptr_free_ok` closed via `af380e7952` / `ff99cf2089` / `6a884580c3`,
   moving `memory_leak.c` `40/6` -> `41/5`.
-- Null/free invalidation is deferred after a reverted attempt; the mechanism
-  proved deeper than the scoped fix.
 - `alloc_ref_counted_arith_ok` closed via `4bb89aef31` / `5d4ba9d467`, moving
   `memory_leak.c` `41/5` -> `42/4` via comparator-side affine normalization.
+- `free_all_in_array` alpha delta was accepted by `ac2c9bffc0`, and the
+  struct-pointee fallback repair `c4c7d6a6b5` closed the remaining
+  struct-pointee memory-leak residual and tightened NPE to `131/132`; together
+  these carry `memory_leak.c` to `45/1`.
+- `funptr_conditional_call_bad` and the dynamic-specialization row closed after
+  EqZero/NonDisj call-application work (`a1ca20c413` and the Phase 5/6 stack),
+  moving `funptr.c` to `27/1`.
+- `latent_use_after_free` closed after latent sideband + NonDisj force-continue,
+  moving `latent.c` to `11/3`.
+- `test_modified_value_then_error_bad` closed by random-equality const
+  invalidation pruning (`b186aa3cd6`), moving `interprocedural.c` from `16/1`
+  to `17/0` perfect.
 
-### C-suite OCaml↔Rust Pulse summary parity (`120 matching / 17 diffs`)
+### C-suite OCaml↔Rust Pulse summary parity (`130 matching / 7 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -340,43 +378,61 @@ port also landed:
   with `union_left_biased`, and `AliasingWithAllAliases` group collection. All
   guards held through the port, and the umbrella
   `cluster_latent_record_post_for_address_porting` is closed.
+- `979ca8eaee` — apply hidden non-disj summaries at calls, completing the
+  Phase 5 call-application / force-continue leg.
+- `beb77cd0ed` — finish NonDisj arithmetic validation and cleanup, including
+  the DivF / force-continue arithmetic wins.
+- `a1ca20c413` — import null funptr invalidation through EqZero, closing the
+  remaining actionable funptr zero-invalidation row.
+- `4e362600e4` / `b186aa3cd6` — stop summary import before invalid-precondition
+  post replay and snapshot equality prunes before const invalidation export;
+  `interprocedural.c` reaches `17/0` perfect.
+- `ac2c9bffc0` / `c4c7d6a6b5` — accept `free_all_in_array` alpha delta and avoid
+  struct-pointee fallback materialization, carrying `memory_leak.c` to `45/1`
+  and tightening NPE to `131/132`.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `120 matching / 17 diffs`
-(`+70 matching / -70 diffs`). Wave 9 started from `119/18` and is now
-`120/17` after the `alloc_ref_counted_arith_ok` comparator-side affine
-normalization. Current scoped per-file totals:
+(`50 matching / 87 diffs`) is now `130 matching / 7 diffs`
+(`+80 matching / -80 diffs`). Wave 9 started from `119/18` and completed at
+`130/7` after the full deep-port stack and all unblocked downstream tight fixes.
+Current scoped per-file totals:
 
-| file | session start | now | best landed commit / residual |
+| file | session start | now | delta / note |
 |---|---:|---:|---|
-| `arithmetic.c` | `6/5` | `6/5` | held; residual: OCaml `NonDisjDomain` call-site application / force-continue; port Phases 1-4 landed, Phase 5 in flight |
-| `funptr.c` | `25/3` | `25/3` | held after `bd2416fe02` / `c1f17f040f` summary EqZero sideband closed one residual after `fa938dc6dd` callback `Closure` attr surface |
-| `interprocedural.c` | `16/1` | `16/1` | held; `490aa92ccd` repaired silent `15/2` drift introduced by `da98dd6b09`; residual `trace_correctly_through_wrappers_bad` multiplicity |
-| `latent.c` | `10/4` | `10/4` | held; composition is `cycle ×3 + latent_use_after_free`; Phase 3 latent-address sideband mechanism landed, counts unchanged |
-| `memory_leak.c` | `41/5` | **`42/4`** | +1 via `5d4ba9d467` / `4bb89aef31` `alloc_ref_counted_arith_ok`; previous `alias_ptr_free_ok` moved `40/6` -> `41/5` |
-| `specialization.c` | `21/0` ✨ | `21/0` ✨ | held; `2dcccc1a41` direct-formal `PotentialInvalidAccessSummary` after full EqZero sideband chain — PERFECT PARITY |
-| **total** | **`119/18`** | **`120/17`** | **+1/-1 in Wave 9; +70/-70 vs original `50/87` baseline** |
+| `arithmetic.c` | `6/5` | **`9/2`** | +3; force-continue + DivF closed, only unary-neg presentation remains |
+| `specialization.c` | `21/0` ✨ | `21/0` ✨ | PERFECT held after `2dcccc1a41` |
+| `latent.c` | `10/4` | **`11/3`** | +1; `latent_use_after_free` closed, cycle-cursor ×3 remain |
+| `memory_leak.c` | `41/5` | **`45/1`** | +4; `alias_ptr_free_ok`, `alloc_ref_counted_arith_ok`, `free_all_in_array` alpha, and struct-pointee fallback closed |
+| `funptr.c` | `24/4` | **`27/1`** | +3; summary EqZero, `funptr_conditional_call_bad`, and dynamic-specialization rows closed |
+| `interprocedural.c` | `15/2` | **`17/0`** ✨ | +2; PERFECT NEW after random-equality const invalidation pruning |
+| **total** | **`119/18`** | **`130/7`** | **+11 matching / -11 diffs in Wave 9; +80/-80 vs original `50/87` baseline** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
-Wave 9 note: arithmetic held at `6/5` while the `NonDisjDomain` port landed
-Phases 1-4 and worker-2 moved into Phase 5 call apply + force-continue;
-funptr held at `25/3`; interprocedural held/restored at `16/1` by
-`490aa92ccd`; latent held at `10/4` with composition
-`cycle ×3 + latent_use_after_free` while the latent-address sideband mechanism
-and Phase 4 NonDisjDomain/force-continue edge landed; memory_leak moved
-`40/6` -> `41/5` via `alias_ptr_free_ok` and `41/5` -> `42/4` via
-`alloc_ref_counted_arith_ok`; and specialization held at `21/0` perfect.
+Wave 9 note: NonDisjDomain Phases 1-6 moved arithmetic from `6/5` to `9/2` and
+left only unary-neg formula presentation; EqZero Phases A-C plus follow-ups held
+specialization at `21/0` perfect and helped funptr reach `27/1`; latent sideband
+plus force-continue closed `latent_use_after_free`; memory_leak moved to `45/1`
+through alias/ref-count/free-all/struct-pointee work; and interprocedural
+reached new perfect parity (`17/0`) after the random-equality const invalidation
+fix.
 
-Current residual work is saturated at mechanism boundaries: arithmetic remains
-OCaml `NonDisjDomain` call-site application / force-continue territory,
-interprocedural has one summary-multiplicity residual after the `490aa92ccd`
-repair, funptr has three remaining summary-surface residuals after the EqZero
-summary sideband, and latent depends on the cycle-cursor / pre-materialization
-summary chain rather than more apply-post plumbing. The latest recorded
-sweep/scout NPE figure is `131/133` after the typed-stub repair plus
-imported-EqZero unification. The next layer is multi-day mechanism porting, not
-another quick single-commit parity pass.
+Final residual work is down to seven shared-procedure diffs:
+
+- `arithmetic.c` (2): `FN_call_if_negative_then_crash_with_negative_bad` and
+  `if_negative_then_crash_latent` — unary-neg formula presentation; non-trivial
+  formula refactor.
+- `latent.c` (3): `crash_after_one_node_bad`, `crash_after_two_nodes_bad`, and
+  `FN_crash_after_six_nodes_bad` — cycle-cursor / deep rev_subst alias-ordering
+  work.
+- `memory_leak.c` (1): `interproc_mutual_recusion_leak` — recursive interproc
+  case.
+- `funptr.c` (1): `conditionnaly_apply_funptr_with_intptrptr` — extra benign
+  `assign_NULL` specialization.
+
+Worker-1 is scouting whether any of the final seven remain tractable. The
+latest recorded sweep/scout NPE figure is `131/132` after the typed-stub repair,
+imported-EqZero unification, and worker-leak's struct-pointee fallback repair.
 
 ## OpenSSL benchmark dashboard
 
@@ -559,13 +615,13 @@ Live themes (track headlines, not exhaustive task lists):
   `c1f17f040f`), archived latent-UAF sideband evidence (`4b4edb48e1`), and
   repaired the typed-stub NPE regression (`25aa457dae` / `e5417f19ae`).
 - **DONE today — Linux baseline remains held.** Track 1A holds the
-  store-textual sweep at `52` OK / `0` FAIL / `0` TIMEOUT, NPE `131/133`, LEAK
-  `20/20` exact, and UAF `7/7` exact. Track 1B now totals `120/17`:
-  arithmetic `6/5`, specialization `21/0` perfect, latent `10/4`, memory_leak
-  `42/4`, funptr `25/3`, and interproc `16/1`. The earlier OpenSSL Linux perf
-  wave established the canonical pre-port `RUNS=3 JOBS=4` baseline (`4:47.79`,
-  `5.70 GiB`, `445/445`, `6` aborts); the post-port row is `4:58.85`,
-  `6.38 GiB`, `445/445`, `6` aborts.
+  store-textual sweep at `52` OK / `0` FAIL / `0` TIMEOUT, NPE `131/132`, LEAK
+  `20/20` exact, and UAF `7/7` exact. Track 1B now totals `130/7`:
+  arithmetic `9/2`, specialization `21/0` perfect, latent `11/3`, memory_leak
+  `45/1`, funptr `27/1`, and interproc `17/0` perfect. The earlier OpenSSL
+  Linux perf wave established the canonical pre-port `RUNS=3 JOBS=4` baseline
+  (`4:47.79`, `5.70 GiB`, `445/445`, `6` aborts); the post-port row is
+  `4:58.85`, `6.38 GiB`, `445/445`, `6` aborts.
 - **DONE today — benchmark infrastructure hardening.**
   `scripts/bench_openssl_partial.sh` now explicitly passes
   `--pulse-max-heap-mb 2048` and `--pulse-max-wall-secs 60` on every `infer-rs`
@@ -578,23 +634,25 @@ Live themes (track headlines, not exhaustive task lists):
   `memory_leak.c` `40/6` (`359fc9b7ce`), and regression fixtures for the
   ArrayAccess constant coalescing (`504d768d0e` / `905ec61662`). NPE remeasure
   saw `131 / 137` mid-wave (`9a1c7313ba`), repaired the `angelism.c` `+5`
-  typed-stub regression upstream `25aa457dae` / here `e5417f19ae`, and worker-2
-  drove it down further to `131 / 133` post-Phase-C.
-- **DONE since prior doc refresh — Wave 9 deep-port landings.** Worker-2 landed
-  `NonDisjDomain` Phases 1-4 (`805c8da766` / `f5894269e7`, `d34303f8f7` /
-  `2490d5bd9e`, `3f4b79f946` / `dffd9a4397`, and `edd17796ed` merging
-  `90a7867699` plus worker-1's `a70b696222`); worker-1 landed latent
-  cycle-cursor Phase 1 (`bc9e169b01` / `b655a91ec4`), resolved Phase 2 as a
-  no-fix scout, landed Phase 3 latent-address sideband (`436a61c182` /
-  `52a15ef507`), and closed Phase 4 via the NonDisjDomain/force-continue
-  landing. Worker-leak landed `alias_ptr_free_ok` (`af380e7952` /
-  `ff99cf2089` / `6a884580c3`) and `alloc_ref_counted_arith_ok`
-  (`4bb89aef31` / `5d4ba9d467`) for `memory_leak.c` `42/4`.
-- **IN FLIGHT.** Worker-2 owns `nondisj_phase5` (call apply + force-continue,
-  deep fix); Phase 6 arithmetic validation is next and blocked by Phase 5.
-  Worker-leak is on read-only re-baselining scout work. Null/free invalidation
-  is deferred after one reverted attempt showed the issue is deeper than the
-  scoped worker-leak fix.
+  typed-stub regression upstream `25aa457dae` / here `e5417f19ae`, worker-2
+  drove it down to `131 / 133` post-Phase-C, and worker-leak's struct-pointee
+  fallback repair tightened it to `131 / 132`.
+- **DONE since prior doc refresh — Wave 9 deep-port landings COMPLETE.** Worker-2
+  landed `NonDisjDomain` Phases 1-6 (`805c8da766` / `f5894269e7`,
+  `d34303f8f7` / `2490d5bd9e`, `3f4b79f946` / `dffd9a4397`, `edd17796ed`
+  merging `90a7867699` plus worker-1's `a70b696222`, `979ca8eaee` /
+  `90dbd9f91e`, and `beb77cd0ed` / `39e1f8ce3a`); worker-1 landed latent
+  cycle-cursor Phases 1, 3, and 4 (`bc9e169b01` / `b655a91ec4`,
+  `436a61c182` / `52a15ef507`, and the NonDisjDomain Phase 4 merge) and
+  resolved Phase 2 as a no-fix scout; and the EqZero A-C chain plus follow-ups
+  is complete (`56c98117b5`, `bd2416fe02` / `c1f17f040f`, `79226f7ac6` /
+  `3d1432f34b`, `2dcccc1a41`, `359fc9b7ce`). Worker-leak's downstream fixes
+  include `alias_ptr_free_ok`, `alloc_ref_counted_arith_ok`, free-all alpha, and
+  struct-pointee fallback, leaving only seven C-suite diffs.
+- **IN FLIGHT.** Worker-1 is scouting final-seven residual tractability
+  read-only. Worker-2 is idle. The seven remaining diffs are two unary-neg
+  arithmetic presentation rows, three latent cycle-cursor rows, one recursive
+  memory-leak row, and one benign extra funptr `assign_NULL` specialization.
 - **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
   `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
   as the baselines; any wall recovery should preserve the RAM and abort gains.
