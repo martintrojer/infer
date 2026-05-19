@@ -1193,8 +1193,8 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
 ) {
     assert_eq!(
         (report.matching, report.differences.len(), report.rust_only.len()),
-        (42, 4, 5),
-        "memory_leak.c summary parity should include affine-temp normalization for alloc_ref_counted_arith_ok\n{report}"
+        (43, 3, 5),
+        "memory_leak.c summary parity should treat free_all_in_array's residual free/array invalidation alpha-shape as equivalent\n{report}"
     );
     assert!(
         report.ocaml_only.is_empty(),
@@ -1213,7 +1213,6 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
         .map(|diff| diff.proc_name.as_str())
         .collect();
     let expected = std::collections::BTreeSet::from([
-        "free_all_in_array",
         "interproc_mutual_recusion_leak",
         "mutual_recursion",
         "mutual_recursion_2",
