@@ -734,6 +734,9 @@ impl PrePost {
         self.add_pre_stack_for_global_function_pointer_values();
 
         let reachability = self.collect_summary_reachability();
+        let freed_condition_witnesses =
+            self.collect_freed_condition_witnesses(&reachability.precondition_vocabulary);
+        self.promote_positive_atoms_for_condition_witnesses(&freed_condition_witnesses);
 
         let mut leak_candidates: HashSet<_> = locally_reachable
             .iter()
@@ -787,12 +790,26 @@ impl PrePost {
         // EqZero on a caller-controlled MustBeValid heap address becomes the
         // `PotentialInvalidAccessSummary` sideband instead of a persisted
         // `Invalid(ConstantDereference(0))` attribute.
+        // OCaml `DeadVariables.eliminate` preserves a local freed value as a
+        // condition witness when it participates in a relational guard against
+        // caller-visible precondition values (for example `malloc_result !=
+        // out.*` after `free(malloc_result)`).  Without that witness, Rust
+        // drops the relational `conditions` entry but keeps the equivalent
+        // non-relational `phi` atoms, causing alpha pairing to match the row
+        // against the wrong branch.  Keep only freed, post-local witnesses
+        // that actually bridge to the precondition vocabulary; this preserves
+        // the heap/value-history provenance of the summary row while avoiding
+        // broader retention of callee-local branch temps.
+        let mut condition_vocabulary = reachability.precondition_vocabulary.clone();
+        condition_vocabulary.extend(freed_condition_witnesses.iter().copied());
+        let mut formula_keep = reachability.formula_reachable.clone();
+        formula_keep.extend(freed_condition_witnesses.iter().copied());
         let summary_new_eqs = self
             .post
             .path_condition
             .simplify_for_summary_with_witness_and_eq_zero_targets(
-                &reachability.precondition_vocabulary,
-                &reachability.formula_reachable,
+                &condition_vocabulary,
+                &formula_keep,
                 &reachability.witness_targets,
                 &self.post.must_be_valid,
             );
@@ -880,6 +897,51 @@ impl PrePost {
                         .find_edge(*stack_addr, &Access::Dereference)
                         .is_some_and(|target| self.post.path_condition.get_var_repr(target) == addr)
             })
+    }
+
+    fn collect_freed_condition_witnesses(
+        &self,
+        precondition_vocabulary: &std::collections::HashSet<AbstractValue>,
+    ) -> std::collections::HashSet<AbstractValue> {
+        let phi = self.post.path_condition.phi();
+        self.post
+            .post
+            .attrs
+            .iter()
+            .filter_map(|(addr, attrs)| {
+                attrs
+                    .get_invalid()
+                    .filter(|(inv, _history)| **inv == crate::invalidation::Invalidation::CFree)
+                    .map(|_| self.post.path_condition.get_var_repr(*addr))
+            })
+            .filter(|freed| !precondition_vocabulary.contains(freed))
+            .filter(|freed| {
+                self.post.path_condition.conditions().keys().any(|atom| {
+                    atom.all_vars()
+                        .into_iter()
+                        .any(|v| phi.get_repr(v) == *freed)
+                        && atom.all_vars().into_iter().any(|v| {
+                            let repr = phi.get_repr(v);
+                            repr != *freed && precondition_vocabulary.contains(&repr)
+                        })
+                })
+            })
+            .collect()
+    }
+
+    fn promote_positive_atoms_for_condition_witnesses(
+        &mut self,
+        witnesses: &std::collections::HashSet<AbstractValue>,
+    ) {
+        for witness in witnesses {
+            if self.post.path_condition.is_known_const(*witness).is_some() {
+                continue;
+            }
+            let _ = self
+                .post
+                .path_condition
+                .and_atom_direct(Atom::LessThan(Term::Const(0), Term::Var(*witness)));
+        }
     }
 
     fn align_function_pointer_closure_summary_surface(&mut self) {
