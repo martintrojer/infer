@@ -25,6 +25,7 @@ pub mod formula;
 pub mod interproc;
 pub mod invalidation;
 pub mod models;
+pub mod non_disj;
 pub mod operations;
 pub mod pulse_result;
 pub mod sat_unsat;
@@ -34,3 +35,5 @@ pub mod summary;
 pub mod transfer;
 pub mod value_history;
 pub mod virtual_targets;
+
+pub use non_disj::NonDisjDomain;
