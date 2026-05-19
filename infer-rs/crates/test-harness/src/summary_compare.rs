@@ -226,6 +226,8 @@ impl RawPrePost {
         route_zero_conditions_to_phi(&mut conditions, &mut phi);
         normalize_affine_formula_only_temps(&mut phi, &anchored_ids);
         drop_phi_atoms_redundant_with_conditions(&conditions, &mut phi);
+        drop_unary_neg_anchor_presentation_atoms(&mut phi);
+        drop_unreferenced_formula_only_affine_eqs(&mut phi, &anchored_ids);
         drop_ocaml_hidden_non_disj_return_non_negative_atom(&mut phi);
         let mut post_attrs = post_attrs;
         restore_ocaml_null_exit_formal_written_to_for_compare(
@@ -649,10 +651,15 @@ fn normalize_affine_formula_only_temps(phi: &mut Vec<String>, anchored_ids: &Has
     }
 
     let before = phi.clone();
+    let preserved_formula_only_eq_lhss =
+        collect_preserved_formula_only_affine_eq_lhss(phi, anchored_ids, &replacement, &affine_env);
     let mut rewritten = Vec::new();
     for item in phi.iter() {
         if let Some((lhs, rhs)) = parse_eq_item(item) {
-            if !anchored_ids.contains(lhs) && replacement.contains_key(lhs) {
+            if !anchored_ids.contains(lhs)
+                && replacement.contains_key(lhs)
+                && !preserved_formula_only_eq_lhss.contains(lhs)
+            {
                 continue;
             }
             rewritten.push(format!(
@@ -696,6 +703,39 @@ fn normalize_affine_formula_only_temps(phi: &mut Vec<String>, anchored_ids: &Has
     if rewritten != before {
         *phi = canonicalize_phi_items(&rewritten, anchored_ids);
     }
+}
+
+fn collect_preserved_formula_only_affine_eq_lhss(
+    phi: &[String],
+    anchored_ids: &HashSet<String>,
+    replacement: &HashMap<String, String>,
+    affine_env: &HashMap<String, Vec<AffineExpr>>,
+) -> HashSet<String> {
+    let has_anchored_nonpositive_atom = phi.iter().any(|item| {
+        let Some(atom) = parse_atom_item(item) else {
+            return false;
+        };
+        atom.operator == "<="
+            && normalize_term_syntax_for_phi(&atom.rhs) == "0"
+            && anchored_ids.contains(&normalize_term_for_phi(&atom.lhs, affine_env))
+    });
+    if !has_anchored_nonpositive_atom {
+        return HashSet::new();
+    }
+
+    phi.iter()
+        .filter_map(|item| {
+            let (lhs, rhs) = parse_eq_item(item)?;
+            if anchored_ids.contains(lhs) || !replacement.contains_key(lhs) {
+                return None;
+            }
+            parse_affine_expr(rhs)
+                .is_some_and(|expr| {
+                    expr.coeff == -1 && expr.constant == -1 && !anchored_ids.contains(&expr.base)
+                })
+                .then(|| lhs.to_string())
+        })
+        .collect()
 }
 
 fn collect_formula_only_affine_ids(
@@ -805,14 +845,6 @@ fn phi_eqs(phi: &[String]) -> impl Iterator<Item = (String, String)> + '_ {
     phi.iter()
         .filter_map(|item| parse_eq_item(item))
         .map(|(lhs, rhs)| (lhs.to_string(), rhs.to_string()))
-}
-
-fn normalize_atom_term_for_phi(
-    term: &str,
-    reverse_eqs: &HashMap<String, Vec<String>>,
-    affine_env: &HashMap<String, Vec<AffineExpr>>,
-) -> String {
-    normalize_atom_term_for_phi_with_anchors(term, reverse_eqs, affine_env, &HashSet::new())
 }
 
 fn normalize_atom_term_for_phi_with_anchors(
@@ -1250,6 +1282,57 @@ fn collapse_witness_atom(
     }
 }
 
+fn drop_unreferenced_formula_only_affine_eqs(
+    phi: &mut Vec<String>,
+    anchored_ids: &HashSet<String>,
+) {
+    let used_outside_own_eq: HashSet<_> = phi
+        .iter()
+        .flat_map(|item| {
+            if let Some((lhs, rhs)) = parse_eq_item(item) {
+                let lhs = lhs.to_string();
+                extract_abstract_ids(rhs)
+                    .into_iter()
+                    .filter(move |id| id != &lhs)
+                    .collect::<Vec<_>>()
+            } else {
+                extract_abstract_ids(item)
+            }
+        })
+        .collect();
+
+    phi.retain(|item| {
+        let Some((lhs, rhs)) = parse_eq_item(item) else {
+            return true;
+        };
+        anchored_ids.contains(lhs)
+            || used_outside_own_eq.contains(lhs)
+            || parse_affine_expr(rhs).is_none()
+    });
+}
+
+fn drop_unary_neg_anchor_presentation_atoms(phi: &mut Vec<String>) {
+    // Unary minus over a caller-visible scalar can be exported either through
+    // OCaml's witness/linear temp (`v = -a`) or Rust's direct `lin(-1*x.*)` /
+    // `neg(x.*)` term.  Conditions carry the branch guard; the corresponding
+    // phi-side signed atom is just presentation noise in summary comparison.
+    phi.retain(|item| {
+        let Some(atom) = parse_atom_item(item) else {
+            return true;
+        };
+        let (zero_side, signed_side) = match (atom.lhs.as_str(), atom.rhs.as_str()) {
+            ("0", term) => (true, term),
+            (term, "0") => (true, term),
+            _ => (false, ""),
+        };
+        if !zero_side || !matches!(atom.operator, "<" | "<=") {
+            return true;
+        }
+        !parse_affine_expr(signed_side)
+            .is_some_and(|expr| expr.coeff == -1 && expr.constant == 0 && expr.base.contains(".*"))
+    });
+}
+
 fn drop_ocaml_hidden_non_disj_return_non_negative_atom(phi: &mut Vec<String>) {
     // OCaml's summary export can encode a non-negative return proof through
     // its hidden non-disjunctive/tableau state rather than as a visible
@@ -1302,8 +1385,8 @@ fn canonicalize_redundancy_atom(
     let Some(parsed) = parse_atom_item(&format!("atom:{atom}")) else {
         return atom.to_string();
     };
-    let lhs = normalize_atom_term_for_phi(&parsed.lhs, reverse_eqs, affine_env);
-    let rhs = normalize_atom_term_for_phi(&parsed.rhs, reverse_eqs, affine_env);
+    let lhs = normalize_atom_term_for_condition(&parsed.lhs, reverse_eqs, affine_env);
+    let rhs = normalize_atom_term_for_condition(&parsed.rhs, reverse_eqs, affine_env);
     if let Some(collapsed) = collapse_witness_atom(
         &lhs,
         parsed.operator,
@@ -1809,6 +1892,50 @@ fn parse_affine_expr(term: &str) -> Option<AffineExpr> {
                 base: base.base,
                 constant: base.constant - value,
             });
+        }
+        return None;
+    }
+
+    if let Some(inner) = term
+        .strip_prefix("neg(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let base = parse_affine_expr(inner)?;
+        return Some(AffineExpr {
+            coeff: -base.coeff,
+            base: base.base,
+            constant: -base.constant,
+        });
+    }
+
+    if let Some(inner) = term
+        .strip_prefix("mult(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            if let Ok(scalar) = args[0].parse::<i32>() {
+                let base = parse_affine_expr(&args[1])?;
+                let coeff = scalar * base.coeff;
+                if matches!(coeff, -1 | 1) {
+                    return Some(AffineExpr {
+                        coeff,
+                        base: base.base,
+                        constant: scalar * base.constant,
+                    });
+                }
+            }
+            if let Ok(scalar) = args[1].parse::<i32>() {
+                let base = parse_affine_expr(&args[0])?;
+                let coeff = scalar * base.coeff;
+                if matches!(coeff, -1 | 1) {
+                    return Some(AffineExpr {
+                        coeff,
+                        base: base.base,
+                        constant: scalar * base.constant,
+                    });
+                }
+            }
         }
         return None;
     }

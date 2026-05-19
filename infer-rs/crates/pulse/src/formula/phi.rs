@@ -520,6 +520,13 @@ impl Phi {
             }
             _ => {}
         }
+        if self
+            .atoms
+            .iter()
+            .any(|existing| self.linear_inequalities_contradict(&resolved, existing))
+        {
+            return SatUnsat::Unsat;
+        }
         self.atoms.insert(resolved);
         SatUnsat::Sat(Vec::new())
     }
@@ -835,6 +842,28 @@ impl Phi {
         }
 
         Some((target, solution))
+    }
+
+    fn linear_inequality_diff(&self, atom: &Atom) -> Option<(LinArith, bool)> {
+        let (lhs, rhs, strict) = match atom {
+            Atom::LessEqual(lhs, rhs) => (lhs, rhs, false),
+            Atom::LessThan(lhs, rhs) => (lhs, rhs, true),
+            Atom::Equal(_, _) | Atom::NotEqual(_, _) => return None,
+        };
+        Some((
+            self.normalize_linear(&self.term_to_lin(lhs)?.sub(&self.term_to_lin(rhs)?)),
+            strict,
+        ))
+    }
+
+    fn linear_inequalities_contradict(&self, lhs: &Atom, rhs: &Atom) -> bool {
+        let Some((lhs_diff, lhs_strict)) = self.linear_inequality_diff(lhs) else {
+            return false;
+        };
+        let Some((rhs_diff, rhs_strict)) = self.linear_inequality_diff(rhs) else {
+            return false;
+        };
+        (lhs_strict || rhs_strict) && lhs_diff == rhs_diff.neg()
     }
 
     fn term_to_lin(&self, term: &Term) -> Option<LinArith> {
@@ -1192,6 +1221,13 @@ impl Phi {
                 return SatUnsat::Unsat;
             }
             if subst.is_trivially_true() != Some(true) {
+                if self
+                    .atoms
+                    .iter()
+                    .any(|existing| self.linear_inequalities_contradict(&subst, existing))
+                {
+                    return SatUnsat::Unsat;
+                }
                 self.atoms.insert(subst);
             }
         }
@@ -1777,6 +1813,23 @@ mod tests {
             .and_atom(Atom::LessThan(t1.clone(), t2.clone()))
             .is_sat());
         assert!(phi.and_atom(Atom::Equal(t1.clone(), t2.clone())).is_unsat());
+    }
+
+    #[test]
+    fn test_linear_inequality_contradiction_through_unary_negation() {
+        let mut phi = Phi::ttrue();
+        let x = AbstractValue::of_raw(1);
+        let neg_x = AbstractValue::of_raw(2);
+
+        assert!(phi.and_linear_eq(neg_x, LinArith::of_var(x).neg()).is_sat());
+        assert!(phi
+            .and_atom(Atom::LessThan(Term::Var(x), Term::Const(0)))
+            .is_sat());
+        assert!(
+            phi.and_atom(Atom::LessThan(Term::Var(neg_x), Term::Const(0)))
+                .is_unsat(),
+            "x < 0 and -x < 0 are contradictory over linearized unary negation"
+        );
     }
 
     #[test]
