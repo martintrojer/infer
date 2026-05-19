@@ -723,7 +723,9 @@ fn exec_call(ctx: CallContext<'_>, mut state: AbductiveDomain) -> Vec<ExecutionD
         for ((arg_exp, arg_typ), actual) in args.iter().zip(actuals_with_history.iter()) {
             if should_havoc_unknown_call_arg(arg_typ) {
                 is_pure = false;
-                materialize_unknown_call_pointer_if_needed(actual, &mut state);
+                if should_materialize_unknown_call_pointer_actual(arg_typ) {
+                    materialize_unknown_call_pointer_if_needed(actual, &mut state);
+                }
                 apply_unknown_call_pointer_actual_effect(arg_exp, actual.addr, loc, &mut state);
             }
         }
@@ -745,6 +747,14 @@ fn exec_call(ctx: CallContext<'_>, mut state: AbductiveDomain) -> Vec<ExecutionD
 
 fn should_havoc_unknown_call_arg(arg_typ: &sil::typ::Typ) -> bool {
     arg_typ.is_pointer() || matches!(&*arg_typ.desc, sil::typ::TypeDesc::Tfun(_))
+}
+
+fn should_materialize_unknown_call_pointer_actual(arg_typ: &sil::typ::Typ) -> bool {
+    !matches!(
+        arg_typ.desc.as_ref(),
+        sil::typ::TypeDesc::Tptr(pointee, _)
+            if matches!(pointee.desc.as_ref(), sil::typ::TypeDesc::Tstruct(_))
+    )
 }
 
 fn apply_unknown_call_pointer_actual_effect(
@@ -1678,6 +1688,77 @@ mod tests {
                 .iter()
                 .any(|attr| matches!(attr, crate::attribute::Attribute::WrittenTo(_, _))),
             "known integer leaves should not be marked WrittenTo by unknown-call fallback"
+        );
+    }
+
+    #[test]
+    fn test_unknown_call_struct_pointer_value_does_not_materialize_missing_pointee_before_havoc() {
+        let pname = Procname::c_from_string("test");
+        let node_typ = Typ::mk_struct(sil::typ::TypeName::CStruct(
+            sil::qualified_cpp_name::QualifiedCppName::from_string("node_st"),
+        ));
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::mk_ptr(Typ::mk_ptr(node_typ.clone())),
+            Default::default(),
+        )];
+
+        let mut state = AbductiveDomain::mk_initial(&pdesc);
+        let p_pvar = Pvar::mk(Mangled::from_string("p"), pname);
+        let p_root = state
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(p_pvar.clone())))
+            .expect("p should be bound");
+        let p_val = state.read_heap(p_root, Access::Dereference);
+        assert!(
+            state.pre.heap.get_edges(p_val).is_some(),
+            "loading the formal struct pointer should register the pointee root in pre"
+        );
+        assert!(
+            state
+                .pre
+                .heap
+                .find_edge(p_val, &Access::Dereference)
+                .is_none(),
+            "the struct pointee cell should start unmaterialized"
+        );
+
+        let arg_id = Ident::create_normal(IdentName::from_string("arg"), 0);
+        state.post.stack.add(Var::LogicalVar(arg_id.clone()), p_val);
+
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+        let instr = Instr::Call {
+            ret: (ret_id, Typ::void()),
+            fun_exp: Exp::Const(Const::Cfun(Procname::c_from_string("unknown"))),
+            args: vec![(Exp::Var(arg_id), Typ::mk_ptr(node_typ))],
+            loc: Location::dummy(),
+            flags: CallFlags::default(),
+        };
+
+        let results = exec_instr_with_pdesc(Some(&pdesc), &instr, state);
+        let continue_state = results.into_iter().find_map(|result| match result {
+            ExecutionDomain::ContinueProgram(state) => Some(state),
+            _ => None,
+        });
+        let state = continue_state.expect("unknown call should continue");
+
+        assert!(
+            state
+                .pre
+                .heap
+                .find_edge(p_val, &Access::Dereference)
+                .is_none(),
+            "unknown-call fallback should not synthesize an extra pre pointee for struct pointer values"
+        );
+        assert!(
+            state
+                .post
+                .heap
+                .find_edge(p_val, &Access::Dereference)
+                .is_none(),
+            "without a pre-existing field read, struct pointer values should not gain an extra post pointee"
         );
     }
 
