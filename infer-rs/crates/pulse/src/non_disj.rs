@@ -5,11 +5,11 @@
 
 //! Non-disjunctive Pulse side domain.
 //!
-//! This is the Phase-1 scaffold for the Rust port of OCaml's
-//! `PulseNonDisjunctiveDomain` over-approximate `astate` sideband. It is kept
-//! isolated from transfer/summary wiring for now: subsequent phases will feed
-//! dropped `ContinueProgram` disjuncts into this domain, execute the hidden
-//! state after each instruction, and export/apply the hidden summary pre/post.
+//! This is the minimal Rust port of OCaml's
+//! `PulseNonDisjunctiveDomain` over-approximate `astate` sideband. Phase 2
+//! wires dropped disjunct capture from the disjunctive fixpoint into this
+//! domain; subsequent phases will execute the hidden state after each
+//! instruction and export/apply the hidden summary pre/post.
 //!
 //! Deliberately not ported here: OCaml's `intra` copy/const-ref/lifetime maps
 //! and `inter` transitive-info bookkeeping. The arithmetic-focused port only

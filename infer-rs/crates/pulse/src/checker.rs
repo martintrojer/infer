@@ -39,6 +39,7 @@ use sil::typ::TypeDesc;
 use crate::abductive::{AbductiveDomain, AstateSizeStats};
 use crate::diagnostic::Diagnostic;
 use crate::execution_domain::ExecutionDomain;
+use crate::non_disj::NonDisjDomain;
 use crate::operations;
 use crate::pulse_result::PulseResult;
 use crate::summary::PulseSummary;
@@ -142,6 +143,204 @@ impl SummaryLookup for HashMap<Procname, Arc<PulseSummary>> {
     }
 }
 
+/// Pulse analysis domain: visible disjuncts plus the non-disjunctive
+/// over-approximate sideband.
+///
+/// Cross-ref: OCaml `AbstractInterpreter.MakeDisjunctiveTransferFunctions` uses
+/// `Domain.t = DisjDomain.t list * NonDisjDomain.t`. Rust keeps the existing
+/// generic `DisjunctiveDomain<ExecutionDomain>` for the visible list and pairs
+/// it locally here so dropped disjunct payloads can be remembered before the
+/// list under-approximates them away.
+#[derive(Clone, Debug, PartialEq)]
+struct PulseDomain {
+    disjunctive: DisjunctiveDomain<ExecutionDomain>,
+    non_disj: NonDisjDomain,
+}
+
+impl PulseDomain {
+    fn singleton(disjunct: ExecutionDomain, max_disjuncts: usize, max_widen_iters: usize) -> Self {
+        Self {
+            disjunctive: DisjunctiveDomain::singleton(disjunct, max_disjuncts, max_widen_iters),
+            non_disj: NonDisjDomain::bottom(),
+        }
+    }
+
+    fn empty(max_disjuncts: usize, max_widen_iters: usize) -> Self {
+        Self {
+            disjunctive: DisjunctiveDomain::empty(max_disjuncts, max_widen_iters),
+            non_disj: NonDisjDomain::bottom(),
+        }
+    }
+
+    fn from_parts(
+        disjunctive: DisjunctiveDomain<ExecutionDomain>,
+        non_disj: NonDisjDomain,
+    ) -> Self {
+        let mut result = Self {
+            disjunctive,
+            non_disj,
+        };
+        result.sync_dropped_bit_from_non_disj();
+        result
+    }
+
+    fn sync_dropped_bit_from_non_disj(&mut self) {
+        self.disjunctive.had_dropped_disjuncts |= self.non_disj.has_dropped_disjuncts();
+    }
+
+    fn remember_dropped_disjuncts<I>(&mut self, dropped: I)
+    where
+        I: IntoIterator<Item = ExecutionDomain>,
+    {
+        self.non_disj = self.non_disj.remember_dropped_disjuncts(dropped);
+        self.sync_dropped_bit_from_non_disj();
+    }
+
+    fn dedup(&mut self) {
+        let dropped = dedup_disjuncts_with(&mut self.disjunctive, |lhs, rhs| lhs.equal_fast(rhs));
+        self.remember_dropped_disjuncts(dropped);
+    }
+
+    fn bound(&mut self) {
+        let dropped = bound_disjuncts(&mut self.disjunctive);
+        self.remember_dropped_disjuncts(dropped);
+    }
+
+    fn join_disjunctive_with_drops(
+        lhs: &DisjunctiveDomain<ExecutionDomain>,
+        rhs: &DisjunctiveDomain<ExecutionDomain>,
+        mut subsumes: impl FnMut(&ExecutionDomain, &ExecutionDomain) -> bool,
+    ) -> (DisjunctiveDomain<ExecutionDomain>, Vec<ExecutionDomain>) {
+        let mut result = lhs.clone();
+        result.had_dropped_disjuncts |= rhs.had_dropped_disjuncts;
+        let mut dropped = Vec::new();
+        for disjunct in &rhs.disjuncts {
+            if result
+                .disjuncts
+                .iter()
+                .any(|existing| subsumes(disjunct, existing))
+            {
+                result.had_dropped_disjuncts = true;
+                dropped.push(disjunct.clone());
+            } else {
+                result.disjuncts.push(disjunct.clone());
+            }
+        }
+        dropped.extend(bound_disjuncts(&mut result));
+        (result, dropped)
+    }
+
+    fn join_pulse(&self, other: &Self) -> Self {
+        let (disjunctive, dropped) =
+            Self::join_disjunctive_with_drops(&self.disjunctive, &other.disjunctive, |lhs, rhs| {
+                lhs.equal_fast(rhs)
+            });
+        let non_disj = self
+            .non_disj
+            .join(&other.non_disj)
+            .remember_dropped_disjuncts(dropped);
+        Self::from_parts(disjunctive, non_disj)
+    }
+
+    fn widen_pulse(&self, next: &Self, num_iters: usize) -> Self {
+        let non_disj = self.non_disj.widen(&next.non_disj, num_iters);
+        if num_iters > self.disjunctive.max_widen_iters {
+            // Preserve the convergence-critical disjunctive behavior from
+            // `DisjunctiveDomain::widen`: return the previous visible list
+            // exactly once the widening threshold is exceeded. We still widen
+            // the sideband so dropped state captured before this point is not
+            // lost.
+            return Self::from_parts(self.disjunctive.clone(), non_disj);
+        }
+
+        let (joined, dropped) =
+            Self::join_disjunctive_with_drops(&self.disjunctive, &next.disjunctive, |lhs, rhs| {
+                lhs.leq(rhs)
+            });
+        let non_disj = non_disj.remember_dropped_disjuncts(dropped);
+        let joined_domain = Self::from_parts(joined, non_disj);
+        // Match `DisjunctiveDomain::widen`: only return `prev` when the whole
+        // product made no progress. If the non-disj sideband learned a dropped
+        // state, keep the joined product even if the visible list is stable.
+        if joined_domain.leq(self) {
+            self.clone()
+        } else {
+            joined_domain
+        }
+    }
+}
+
+impl Comparable for PulseDomain {
+    fn leq(&self, rhs: &Self) -> bool {
+        self.disjunctive.leq(&rhs.disjunctive) && self.non_disj.leq(&rhs.non_disj)
+    }
+
+    fn equal_fast(&self, rhs: &Self) -> bool {
+        self.disjunctive.equal_fast(&rhs.disjunctive) && self.non_disj.equal_fast(&rhs.non_disj)
+    }
+}
+
+impl AbstractDomain for PulseDomain {
+    fn join(&self, other: &Self) -> Self {
+        self.join_pulse(other)
+    }
+
+    fn widen(&self, next: &Self, num_iters: usize) -> Self {
+        self.widen_pulse(next, num_iters)
+    }
+}
+
+impl absint::domain::WithBottom for PulseDomain {
+    fn bottom() -> Self {
+        Self::empty(20, 3)
+    }
+
+    fn is_bottom(&self) -> bool {
+        self.disjunctive.disjuncts.is_empty() && self.non_disj.is_bottom()
+    }
+}
+
+impl std::ops::Deref for PulseDomain {
+    type Target = DisjunctiveDomain<ExecutionDomain>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.disjunctive
+    }
+}
+
+impl std::ops::DerefMut for PulseDomain {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.disjunctive
+    }
+}
+
+fn dedup_disjuncts_with(
+    domain: &mut DisjunctiveDomain<ExecutionDomain>,
+    mut subsumes: impl FnMut(&ExecutionDomain, &ExecutionDomain) -> bool,
+) -> Vec<ExecutionDomain> {
+    let mut dropped = Vec::new();
+    let mut kept = Vec::with_capacity(domain.disjuncts.len());
+    for disjunct in domain.disjuncts.drain(..) {
+        if kept.iter().any(|existing| subsumes(&disjunct, existing)) {
+            domain.had_dropped_disjuncts = true;
+            dropped.push(disjunct);
+        } else {
+            kept.push(disjunct);
+        }
+    }
+    domain.disjuncts = kept;
+    dropped
+}
+
+fn bound_disjuncts(domain: &mut DisjunctiveDomain<ExecutionDomain>) -> Vec<ExecutionDomain> {
+    if domain.disjuncts.len() <= domain.max_disjuncts {
+        return Vec::new();
+    }
+    let excess = domain.disjuncts.len() - domain.max_disjuncts;
+    domain.had_dropped_disjuncts = true;
+    domain.disjuncts.drain(..excess).collect()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DisjunctiveStateStats {
     disjuncts: usize,
@@ -229,7 +428,7 @@ struct FixpointStats {
 }
 
 impl FixpointStats {
-    fn from_inv_map(inv_map: &interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>) -> Self {
+    fn from_inv_map(inv_map: &interp::InvariantMap<PulseDomain>) -> Self {
         let mut stats = Self {
             nodes: inv_map.len(),
             ..Self::default()
@@ -536,7 +735,7 @@ fn return_candidate_logical_stamp(pdesc: &Procdesc) -> Option<i32> {
 fn dump_selected_fixpoint_nodes(
     proc_name: &str,
     pdesc: &Procdesc,
-    inv_map: &interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>,
+    inv_map: &interp::InvariantMap<PulseDomain>,
 ) {
     if !fixpoint_node_dump_enabled() {
         return;
@@ -696,7 +895,7 @@ impl ProcProgress {
         &mut self,
         proc_name: &str,
         updated_node: NodeId,
-        inv_map: &interp::InvariantMap<DisjunctiveDomain<ExecutionDomain>>,
+        inv_map: &interp::InvariantMap<PulseDomain>,
     ) {
         if !pulse_progress_enabled()
             || self.last_fixpoint_log.elapsed() < PROC_PROGRESS_LOG_INTERVAL
@@ -907,7 +1106,7 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     }
 
     let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-    let initial_domain = DisjunctiveDomain::singleton(initial_exec, max_disjuncts, max_widen_iters);
+    let initial_domain = PulseDomain::singleton(initial_exec, max_disjuncts, max_widen_iters);
 
     let liveness = if cfg.pulse_drop_dead_logical_vars {
         Some(analyses::liveness::analyze(pdesc))
@@ -1148,9 +1347,9 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     // path for empty stubs / declarations.
     let is_noreturn = pdesc.is_no_return;
 
-    let has_dropped_disjuncts = inv_map
-        .values()
-        .any(|domain| domain.post.had_dropped_disjuncts);
+    let has_dropped_disjuncts = inv_map.values().any(|domain| {
+        domain.post.non_disj.has_dropped_disjuncts() || domain.post.had_dropped_disjuncts
+    });
     let summary_start = Instant::now();
     if pulse_progress_enabled() {
         log::info!(
@@ -1309,7 +1508,7 @@ struct PulseTransferFunctions<'a> {
 }
 
 impl TransferFunctions for PulseTransferFunctions<'_> {
-    type Domain = DisjunctiveDomain<ExecutionDomain>;
+    type Domain = PulseDomain;
     type AnalysisData = ();
 
     fn exec_instr(
@@ -1363,15 +1562,18 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             }
         }
 
-        let mut result = DisjunctiveDomain {
-            disjuncts: new_disjuncts,
-            max_disjuncts: state.max_disjuncts,
-            max_widen_iters: state.max_widen_iters,
-            // Cross-ref: OCaml carries dropped-disjunct metadata in the
-            // non-disjunctive state, so once a path has been under-approximated
-            // the bit remains set for the rest of the procedure.
-            had_dropped_disjuncts: state.had_dropped_disjuncts,
-        };
+        let mut result = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: new_disjuncts,
+                max_disjuncts: state.max_disjuncts,
+                max_widen_iters: state.max_widen_iters,
+                // Cross-ref: OCaml carries dropped-disjunct metadata in the
+                // non-disjunctive state, so once a path has been under-approximated
+                // the bit remains set for the rest of the procedure.
+                had_dropped_disjuncts: state.had_dropped_disjuncts,
+            },
+            state.non_disj.clone(),
+        );
         result.dedup();
         result.bound();
 
@@ -1406,7 +1608,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         // loop converges in one or two more iterations rather than
         // continuing to deep-clone heavy disjunctive domains forever.
         let abort_response =
-            || -> Self::Domain { DisjunctiveDomain::empty(pre.max_disjuncts, pre.max_widen_iters) };
+            || -> Self::Domain { PulseDomain::empty(pre.max_disjuncts, pre.max_widen_iters) };
         if self.aborted.get() {
             return abort_response();
         }
@@ -1459,8 +1661,10 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         // regenerating fresh-but-equivalent post disjuncts on hot loop heads.
         let mut current_post = old_state
             .map(|state| state.post.clone())
-            .unwrap_or_else(|| DisjunctiveDomain::empty(pre.max_disjuncts, pre.max_widen_iters));
+            .unwrap_or_else(|| PulseDomain::empty(pre.max_disjuncts, pre.max_widen_iters));
         current_post.had_dropped_disjuncts |= pre.had_dropped_disjuncts;
+        current_post.non_disj = current_post.non_disj.join(&pre.non_disj);
+        current_post.sync_dropped_bit_from_non_disj();
 
         let mut input = pre.clone();
         if let Some(old_state) = old_state {
@@ -2952,6 +3156,82 @@ mod tests {
     }
 
     #[test]
+    fn test_pulse_domain_bound_captures_dropped_continue_in_non_disj() {
+        let pdesc = Procdesc::new(
+            Procname::c_from_string("capture_dropped_continue"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let dropped_astate = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let kept_astate = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let mut domain = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: vec![
+                    ExecutionDomain::ContinueProgram(dropped_astate.clone()),
+                    ExecutionDomain::ContinueProgram(kept_astate),
+                ],
+                max_disjuncts: 1,
+                max_widen_iters: 3,
+                had_dropped_disjuncts: false,
+            },
+            NonDisjDomain::bottom(),
+        );
+
+        domain.bound();
+
+        assert_eq!(domain.disjuncts.len(), 1);
+        assert!(domain.non_disj.has_dropped_disjuncts());
+        assert_eq!(domain.non_disj.over_approx(), Some(&dropped_astate));
+    }
+
+    #[test]
+    fn test_pulse_domain_bound_stopped_only_drop_sets_bit_without_hidden_continue() {
+        let pdesc = Procdesc::new(
+            Procname::c_from_string("capture_dropped_stopped"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let stopped_astate = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let kept_astate = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let mut domain = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: vec![
+                    ExecutionDomain::ExitProgram(stopped_astate),
+                    ExecutionDomain::ContinueProgram(kept_astate),
+                ],
+                max_disjuncts: 1,
+                max_widen_iters: 3,
+                had_dropped_disjuncts: false,
+            },
+            NonDisjDomain::bottom(),
+        );
+
+        domain.bound();
+
+        assert_eq!(domain.disjuncts.len(), 1);
+        assert!(domain.non_disj.has_dropped_disjuncts());
+        assert!(domain.non_disj.is_over_approx_bottom());
+    }
+
+    #[test]
+    fn test_pulse_domain_join_captures_duplicate_continue_in_non_disj() {
+        let pdesc = Procdesc::new(
+            Procname::c_from_string("capture_duplicate_continue"),
+            Typ::void(),
+            Location::dummy(),
+        );
+        let astate = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let lhs = PulseDomain::singleton(ExecutionDomain::ContinueProgram(astate.clone()), 20, 3);
+        let rhs = PulseDomain::singleton(ExecutionDomain::ContinueProgram(astate.clone()), 20, 3);
+
+        let joined = lhs.join(&rhs);
+
+        assert_eq!(joined.disjuncts.len(), 1);
+        assert!(joined.non_disj.has_dropped_disjuncts());
+        assert_eq!(joined.non_disj.over_approx(), Some(&astate));
+    }
+
+    #[test]
     fn test_exec_instr_preserves_dropped_disjuncts_metadata() {
         let pname = Procname::c_from_string("preserve_drop_flag");
         let pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
@@ -2969,14 +3249,17 @@ mod tests {
             start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
-        let state = DisjunctiveDomain {
-            disjuncts: vec![ExecutionDomain::ContinueProgram(
-                crate::abductive::AbductiveDomain::mk_initial(&pdesc),
-            )],
-            max_disjuncts: 20,
-            max_widen_iters: 3,
-            had_dropped_disjuncts: true,
-        };
+        let state = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: vec![ExecutionDomain::ContinueProgram(
+                    crate::abductive::AbductiveDomain::mk_initial(&pdesc),
+                )],
+                max_disjuncts: 20,
+                max_widen_iters: 3,
+                had_dropped_disjuncts: true,
+            },
+            NonDisjDomain::top(),
+        );
         let instr = Instr::Load {
             id: Ident::create_normal(IdentName::from_string("n"), 0),
             e: Exp::Const(Const::Cint(IntLit::zero())),
@@ -3020,14 +3303,17 @@ mod tests {
             start_instant: Instant::now(),
             aborted: std::cell::Cell::new(false),
         };
-        let state = DisjunctiveDomain {
-            disjuncts: vec![ExecutionDomain::ContinueProgram(
-                crate::abductive::AbductiveDomain::mk_initial(&pdesc),
-            )],
-            max_disjuncts: 20,
-            max_widen_iters: 3,
-            had_dropped_disjuncts: false,
-        };
+        let state = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: vec![ExecutionDomain::ContinueProgram(
+                    crate::abductive::AbductiveDomain::mk_initial(&pdesc),
+                )],
+                max_disjuncts: 20,
+                max_widen_iters: 3,
+                had_dropped_disjuncts: false,
+            },
+            NonDisjDomain::bottom(),
+        );
         let old_state = interp::State {
             pre: state.clone(),
             post: state.clone(),
@@ -3050,11 +3336,16 @@ mod tests {
         let pdesc = Procdesc::new(pname, Typ::void(), Location::dummy());
         let exec =
             ExecutionDomain::ContinueProgram(crate::abductive::AbductiveDomain::mk_initial(&pdesc));
-        let mk_domain = |count| DisjunctiveDomain {
-            disjuncts: vec![exec.clone(); count],
-            max_disjuncts: 20,
-            max_widen_iters: 3,
-            had_dropped_disjuncts: false,
+        let mk_domain = |count| {
+            PulseDomain::from_parts(
+                DisjunctiveDomain {
+                    disjuncts: vec![exec.clone(); count],
+                    max_disjuncts: 20,
+                    max_widen_iters: 3,
+                    had_dropped_disjuncts: false,
+                },
+                NonDisjDomain::bottom(),
+            )
         };
 
         let mut inv_map = interp::InvariantMap::new();
@@ -4473,7 +4764,7 @@ mod tests {
         let cfg = config::get();
         let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
         let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-        let initial_domain = DisjunctiveDomain::singleton(
+        let initial_domain = PulseDomain::singleton(
             initial_exec,
             cfg.pulse_max_disjuncts,
             cfg.pulse_widen_threshold,
@@ -4576,7 +4867,7 @@ mod tests {
             let cfg = config::get();
             let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
             let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-            let initial_domain = DisjunctiveDomain::singleton(
+            let initial_domain = PulseDomain::singleton(
                 initial_exec,
                 cfg.pulse_max_disjuncts,
                 cfg.pulse_widen_threshold,
@@ -4741,7 +5032,7 @@ mod tests {
         let cfg = config::get();
         let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
         let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-        let initial_domain = DisjunctiveDomain::singleton(
+        let initial_domain = PulseDomain::singleton(
             initial_exec,
             cfg.pulse_max_disjuncts,
             cfg.pulse_widen_threshold,
@@ -5225,7 +5516,7 @@ mod tests {
         let cfg = config::get();
         let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
         let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-        let initial_domain = DisjunctiveDomain::singleton(
+        let initial_domain = PulseDomain::singleton(
             initial_exec,
             cfg.pulse_max_disjuncts,
             cfg.pulse_widen_threshold,
@@ -5357,7 +5648,7 @@ mod tests {
         let cfg = config::get();
         let initial_state = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
         let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-        let initial_domain = DisjunctiveDomain::singleton(
+        let initial_domain = PulseDomain::singleton(
             initial_exec,
             cfg.pulse_max_disjuncts,
             cfg.pulse_widen_threshold,
@@ -5453,7 +5744,7 @@ mod tests {
             let cfg = config::get();
             let initial_state = crate::abductive::AbductiveDomain::mk_initial(&caller);
             let initial_exec = ExecutionDomain::ContinueProgram(initial_state);
-            let initial_domain = DisjunctiveDomain::singleton(
+            let initial_domain = PulseDomain::singleton(
                 initial_exec,
                 cfg.pulse_max_disjuncts,
                 cfg.pulse_widen_threshold,
