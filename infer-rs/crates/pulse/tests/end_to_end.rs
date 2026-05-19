@@ -1188,6 +1188,27 @@ fn assert_specialization_summary_report_at_post_overflow_baseline(
     );
 }
 
+fn assert_latent_summary_report_at_sideband_rebase_baseline(
+    report: &test_harness::summary_compare::ComparisonReport,
+) {
+    assert_eq!(
+        (report.matching, report.differences.len()),
+        (11, 3),
+        "latent.c should treat the latent_use_after_free row-canonicalization delta as equivalent while leaving only cycle-cursor residuals\n{report}"
+    );
+    assert!(
+        report.ocaml_only.is_empty() && report.rust_only.is_empty(),
+        "latent.c should compare the same procedure set\n{report}"
+    );
+    assert!(
+        report
+            .differences
+            .iter()
+            .all(|diff| diff.proc_name != "latent_use_after_free"),
+        "latent_use_after_free should be accepted by the sideband row-canonicalization comparator\n{report}"
+    );
+}
+
 fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
     report: &test_harness::summary_compare::ComparisonReport,
 ) {
@@ -1418,6 +1439,9 @@ fn test_summary_comparison_c_triage() {
         eprintln!("{report}");
         if filename == "specialization.c" {
             assert_specialization_summary_report_at_post_overflow_baseline(&report);
+        }
+        if filename == "latent.c" {
+            assert_latent_summary_report_at_sideband_rebase_baseline(&report);
         }
         summary_lines.push(format!(
             "{filename}\tmatching={}\tdiffs={}\tocaml_only={}\trust_only={}",

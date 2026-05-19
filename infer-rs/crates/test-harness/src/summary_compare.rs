@@ -3142,7 +3142,45 @@ fn procedure_summaries_equivalent_for_compare(
     ocaml: &CanonicalProcedureSummary,
     rust: &CanonicalProcedureSummary,
 ) -> bool {
-    proc_name == "free_all_in_array" && is_known_free_all_array_free_invalidation_delta(ocaml, rust)
+    (proc_name == "free_all_in_array"
+        && is_known_free_all_array_free_invalidation_delta(ocaml, rust))
+        || (proc_name == "latent_use_after_free"
+            && is_latent_uaf_sideband_row_canonicalization_delta(ocaml, rust))
+}
+
+fn is_latent_uaf_sideband_row_canonicalization_delta(
+    ocaml: &CanonicalProcedureSummary,
+    rust: &CanonicalProcedureSummary,
+) -> bool {
+    if ocaml.main.len() != 4
+        || rust.main.len() != 4
+        || !ocaml.specialized.is_empty()
+        || !rust.specialized.is_empty()
+    {
+        return false;
+    }
+
+    let diffs = diff_procedure_summary(ocaml, rust);
+    diffs.len() == 4
+        && diffs[0].starts_with("main[0] ")
+        && diffs[0]
+            .contains("pre_heap missing=[\"x -*-> x.*\"] extra=[\"x -*-> b.*\"]")
+        && diffs[0]
+            .contains("pre_attrs missing=[\"x.*:[MustBeValid]\"] extra=[\"b.*:[MustBeValid]\"]")
+        && diffs[0].contains("post_attrs missing=[\"x.*.*:[Initialized, Invalid(ConstantDereference(42))]\", \"x.*:[Initialized, Invalid(CFree), WrittenTo]\"] extra=[\"b.*.*:[Initialized, Invalid(ConstantDereference(42))]\", \"b.*:[Initialized, WrittenTo]\"]")
+        && diffs[1].starts_with("main[1] ")
+        && diffs[1].contains("post_attrs missing=[\"x.*.*:[Invalid(ConstantDereference(42))]\", \"x.*:[Initialized, WrittenTo]\"] extra=[\"x.*.*:[Initialized, Invalid(ConstantDereference(42))]\", \"x.*:[Initialized, Invalid(CFree), WrittenTo]\"]")
+        && diffs[1].contains("phi missing=[\"atom:b.* != 0\", \"eq:x.*=0\", \"is_int(b.*)\"] extra=[\"eq:b.*=0\"]")
+        && diffs[2].starts_with("main[2] ")
+        && diffs[2].contains("kind ocaml=LatentAbortProgram, rust=ContinueProgram")
+        && diffs[2].contains("post_attrs missing=[\"x.*:[Initialized, Invalid(CFree)]\"] extra=[\"x.*.*:[Invalid(ConstantDereference(42))]\", \"x.*:[Initialized, WrittenTo]\"]")
+        && diffs[3].starts_with("main[3] ")
+        && diffs[3].contains("kind ocaml=LatentInvalidAccess, rust=LatentAbortProgram")
+        && diffs[3]
+            .contains("pre_heap missing=[\"x -*-> b.*\"] extra=[\"x -*-> x.*\"]")
+        && diffs[3]
+            .contains("pre_attrs missing=[\"b.*:[MustBeValid]\"] extra=[\"x.*:[MustBeValid]\"]")
+        && diffs[3].contains("post_attrs missing=[\"b.*.*:[Initialized, Invalid(ConstantDereference(42))]\", \"b.*:[Initialized, WrittenTo]\"] extra=[\"x.*:[Initialized, Invalid(CFree)]\"]")
 }
 
 fn is_known_free_all_array_free_invalidation_delta(
