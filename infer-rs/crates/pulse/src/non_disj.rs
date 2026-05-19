@@ -6,11 +6,10 @@
 //! Non-disjunctive Pulse side domain.
 //!
 //! This is the minimal Rust port of OCaml's
-//! `PulseNonDisjunctiveDomain` over-approximate `astate` sideband. Phase 2
-//! wires dropped disjunct capture from the disjunctive fixpoint into this
-//! domain. Phase 3 executes that hidden state after each instruction so it
-//! absorbs later transfer effects; later phases will export/apply the hidden
-//! summary pre/post.
+//! `PulseNonDisjunctiveDomain` over-approximate `astate` sideband. It wires
+//! dropped disjunct capture from the disjunctive fixpoint into this domain,
+//! executes that hidden state after each instruction, and feeds the hidden
+//! summary pre/post exported by `summary.rs` / consumed by call application.
 //!
 //! Deliberately not ported here: OCaml's `intra` copy/const-ref/lifetime maps
 //! and `inter` transitive-info bookkeeping. The arithmetic-focused port only
@@ -102,9 +101,10 @@ impl NonDisjDomain {
     ///
     /// The dropped-disjunct bit is BooleanOr. The hidden state currently uses
     /// deterministic single-slot retention: if both sides have states, keep
-    /// the left-hand state. The corresponding `leq` treats any non-bottom
-    /// hidden state as subsuming any other so this scaffold remains a stable
-    /// bounded lattice without claiming OCaml `PulseJoin.join` precision.
+    /// the right-hand state so newly evolved hidden states win over older
+    /// retained payloads. The corresponding `leq` treats any non-bottom hidden
+    /// state as subsuming any other so this remains a stable bounded lattice
+    /// without claiming OCaml `PulseJoin.join` precision.
     pub fn join(&self, other: &Self) -> Self {
         Self {
             has_dropped_disjuncts: self.has_dropped_disjuncts || other.has_dropped_disjuncts,
@@ -205,10 +205,10 @@ fn join_over_approx(
         (None, None) => None,
         (Some(astate), None) | (None, Some(astate)) => Some(astate.clone()),
         (Some(_lhs), Some(rhs)) => {
-            // TODO(nondisj_phase4+): replace this with a real over-approximate
-            // Pulse join or a tiny bounded sideband. Keeping the newest slot is
-            // deterministic and avoids pretending this scaffold has full OCaml
-            // `PulseJoin.join` semantics.
+            // Keep the newest slot deterministically. This deliberately does
+            // not claim full OCaml `PulseJoin.join` precision; it is the
+            // bounded single-state policy used by the current arithmetic
+            // NonDisjDomain port.
             Some(rhs.clone())
         }
     }
