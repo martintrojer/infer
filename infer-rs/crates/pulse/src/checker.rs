@@ -1532,6 +1532,8 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             .note_step(pn, node_id, instr_idx, state, spec_request_count);
 
         let mut new_disjuncts = Vec::new();
+        let pre_non_disj = state.non_disj.clone();
+        let disjunct_non_disj = pre_non_disj.for_disjunct_exec_instr();
 
         for (i, disjunct) in state.disjuncts.iter().enumerate() {
             match disjunct {
@@ -1572,10 +1574,32 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                 // the bit remains set for the rest of the procedure.
                 had_dropped_disjuncts: state.had_dropped_disjuncts,
             },
-            state.non_disj.clone(),
+            disjunct_non_disj,
         );
         result.dedup();
         result.bound();
+
+        let hidden_post = pre_non_disj.exec_over_approx(|exec, non_disj| {
+            let results = match exec {
+                ExecutionDomain::ContinueProgram(astate) => exec_instr_with_summaries(
+                    self.pdesc,
+                    self.tenv,
+                    instr,
+                    astate,
+                    self.callee_summaries,
+                    Some(&self.spec_requests),
+                ),
+                stopped => vec![stopped],
+            };
+            (results, non_disj)
+        });
+        // Prefer the freshly-executed hidden state when the current visible
+        // instruction also captures a dropped disjunct. A real Pulse join will
+        // eventually combine both; with the current single-slot scaffold,
+        // keeping the evolved hidden post-state avoids immediately masking the
+        // phase-3 effect with a same-instruction dropped payload.
+        result.non_disj = hidden_post.join(&result.non_disj);
+        result.sync_dropped_bit_from_non_disj();
 
         let rc = result.disjuncts.iter().filter(|d| d.is_continue()).count();
         log::debug!(
@@ -1663,7 +1687,14 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
             .map(|state| state.post.clone())
             .unwrap_or_else(|| PulseDomain::empty(pre.max_disjuncts, pre.max_widen_iters));
         current_post.had_dropped_disjuncts |= pre.had_dropped_disjuncts;
-        current_post.non_disj = current_post.non_disj.join(&pre.non_disj);
+        // Preserve the sticky dropped-disjunct bit from the incoming sideband
+        // without pre-joining its hidden astate into the retained post. Phase 3
+        // executes that hidden astate through this node's instructions below;
+        // pre-joining it here would make the single-slot join keep the
+        // unexecuted pre-state and mask the evolved hidden post-state.
+        if pre.non_disj.has_dropped_disjuncts() {
+            current_post.non_disj = current_post.non_disj.join(&NonDisjDomain::top());
+        }
         current_post.sync_dropped_bit_from_non_disj();
 
         let mut input = pre.clone();
@@ -1675,18 +1706,21 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                     .iter()
                     .any(|old| disjunct.equal_fast(old))
             });
-            if input.disjuncts.is_empty() {
+            if input.disjuncts.is_empty() && input.non_disj.leq(&old_state.pre.non_disj) {
                 return current_post;
             }
         }
 
-        // If no active ContinueProgram disjunct remains, instruction transfer
-        // is the identity: `exec_instr` just clones Abort/Latent/Exit/Exception
+        // If no active ContinueProgram disjunct remains and there is no hidden
+        // over-approximate state to execute, instruction transfer is the
+        // identity: `exec_instr` just clones Abort/Latent/Exit/Exception
         // disjuncts through every instruction. Short-circuit here to avoid
         // repeatedly deep-cloning large latent-invalid states on hot fixpoint
         // nodes such as OpenSSL `OBJ_bsearch_ex_` node 44, where pathological
         // runs can revisit all-latent nodes thousands of times.
-        if !input.disjuncts.iter().any(ExecutionDomain::is_continue) {
+        if !input.disjuncts.iter().any(ExecutionDomain::is_continue)
+            && input.non_disj.is_over_approx_bottom()
+        {
             return current_post.join(&input);
         }
 
@@ -1721,6 +1755,12 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         preserve_canonical_access_targets(&mut state);
 
         let mut joined = current_post.join(&state);
+        // `PulseDomain::join` is intentionally left-biased for the temporary
+        // single hidden-state slot. At node post joins, prefer the state just
+        // threaded through this node's instructions so the retained old post
+        // does not mask the freshly evolved over-approx state.
+        joined.non_disj = state.non_disj.join(&joined.non_disj);
+        joined.sync_dropped_bit_from_non_disj();
         if node_id != pdesc.exit_node {
             shrink_intermediate_post_to_stack_reachable(&mut joined);
         }
@@ -3273,6 +3313,146 @@ mod tests {
             result.had_dropped_disjuncts,
             "instruction execution should preserve earlier dropped-disjunct metadata"
         );
+    }
+
+    #[test]
+    fn test_exec_instr_executes_hidden_over_approx_state() {
+        let pname = Procname::c_from_string("hidden_store_exec");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::int(sil::typ::IKind::IInt),
+            Default::default(),
+        )];
+        let pvar = Pvar::mk(Mangled::from_string("p"), pname.clone());
+        let hidden_pre = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let callee_summaries: HashMap<Procname, PulseSummary> = HashMap::new();
+        let tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            tenv: None,
+            proc_name: format!("{pname}"),
+            spec_requests: RefCell::new(vec![]),
+            progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
+            aborted: std::cell::Cell::new(false),
+        };
+        let state = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: vec![],
+                max_disjuncts: 20,
+                max_widen_iters: 3,
+                had_dropped_disjuncts: true,
+            },
+            NonDisjDomain::bottom()
+                .remember_dropped_disjuncts([ExecutionDomain::ContinueProgram(hidden_pre)]),
+        );
+        let instr = Instr::Store {
+            e1: Box::new(Exp::Lvar(pvar.clone())),
+            typ: Typ::int(sil::typ::IKind::IInt),
+            e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(42)))),
+            loc: Location::dummy(),
+        };
+
+        let result = tf.exec_instr(&state, &(), pdesc.start_node, 0, &instr);
+
+        assert!(result.disjuncts.is_empty());
+        assert!(result.non_disj.has_dropped_disjuncts());
+        let hidden_post = result
+            .non_disj
+            .over_approx()
+            .expect("hidden over-approx state should survive instruction execution");
+        let slot = hidden_post
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar)))
+            .expect("formal stack slot should remain bound");
+        let stored = hidden_post
+            .post
+            .heap
+            .find_edge(slot, &Access::Dereference)
+            .expect("hidden store should update the formal slot");
+        assert_eq!(hidden_post.get_const(stored), Some(42));
+    }
+
+    #[test]
+    fn test_exec_node_executes_hidden_state_even_when_visible_pre_is_old() {
+        let pname = Procname::c_from_string("hidden_delta_exec_node");
+        let mut pdesc = Procdesc::new(pname.clone(), Typ::void(), Location::dummy());
+        pdesc.formals = vec![(
+            Mangled::from_string("p"),
+            Typ::int(sil::typ::IKind::IInt),
+            Default::default(),
+        )];
+        let pvar = Pvar::mk(Mangled::from_string("p"), pname.clone());
+        let node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Store {
+                e1: Box::new(Exp::Lvar(pvar.clone())),
+                typ: Typ::int(sil::typ::IKind::IInt),
+                e2: Box::new(Exp::Const(Const::Cint(IntLit::of_int(7)))),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        let callee_summaries: HashMap<Procname, PulseSummary> = HashMap::new();
+        let tf = PulseTransferFunctions {
+            callee_summaries: &callee_summaries,
+            pdesc: &pdesc,
+            tenv: None,
+            proc_name: format!("{pname}"),
+            spec_requests: RefCell::new(vec![]),
+            progress: RefCell::new(ProcProgress::new()),
+            liveness: None,
+            return_candidate_logical_stamp: None,
+            start_peak_rss_bytes: 0,
+            start_instant: Instant::now(),
+            aborted: std::cell::Cell::new(false),
+        };
+        let visible =
+            ExecutionDomain::ContinueProgram(crate::abductive::AbductiveDomain::mk_initial(&pdesc));
+        let old_pre = PulseDomain::singleton(visible.clone(), 20, 3);
+        let old_state = interp::State {
+            pre: old_pre.clone(),
+            post: old_pre.clone(),
+            visit_count: 1,
+        };
+        let hidden_pre = crate::abductive::AbductiveDomain::mk_initial(&pdesc);
+        let pre = PulseDomain::from_parts(
+            DisjunctiveDomain {
+                disjuncts: vec![visible],
+                max_disjuncts: 20,
+                max_widen_iters: 3,
+                had_dropped_disjuncts: false,
+            },
+            NonDisjDomain::bottom()
+                .remember_dropped_disjuncts([ExecutionDomain::ContinueProgram(hidden_pre)]),
+        );
+
+        let result = tf.exec_node(Some(&old_state), &pre, &(), node, &pdesc, false);
+
+        assert!(
+            tf.progress.borrow().exec_steps > 0,
+            "hidden non-disj delta should force instruction execution even without new visible disjuncts"
+        );
+        let hidden_post = result
+            .non_disj
+            .over_approx()
+            .expect("node execution should retain the evolved hidden state");
+        let slot = hidden_post
+            .post
+            .stack
+            .find(&Var::ProgramVar(Box::new(pvar)))
+            .expect("formal stack slot should remain bound");
+        let stored = hidden_post
+            .post
+            .heap
+            .find_edge(slot, &Access::Dereference)
+            .expect("hidden node store should update the formal slot");
+        assert_eq!(hidden_post.get_const(stored), Some(7));
     }
 
     #[test]

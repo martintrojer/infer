@@ -8,8 +8,9 @@
 //! This is the minimal Rust port of OCaml's
 //! `PulseNonDisjunctiveDomain` over-approximate `astate` sideband. Phase 2
 //! wires dropped disjunct capture from the disjunctive fixpoint into this
-//! domain; subsequent phases will execute the hidden state after each
-//! instruction and export/apply the hidden summary pre/post.
+//! domain. Phase 3 executes that hidden state after each instruction so it
+//! absorbs later transfer effects; later phases will export/apply the hidden
+//! summary pre/post.
 //!
 //! Deliberately not ported here: OCaml's `intra` copy/const-ref/lifetime maps
 //! and `inter` transitive-info bookkeeping. The arithmetic-focused port only
@@ -29,9 +30,9 @@ use crate::execution_domain::ExecutionDomain;
 /// Cross-ref: OCaml `PulseNonDisjunctiveDomain.OverApproxDomain` is a
 /// bottom-lifted `(AbductiveDomain.t * PathContext.t)` joined with
 /// `PulseJoin.join`. Rust does not yet have a Pulse join for two abductive
-/// states, so Phase 1 intentionally uses a deterministic single-state
+/// states, so the port intentionally uses a deterministic single-state
 /// retention policy with a coarse "any non-bottom hidden state subsumes any
-/// other" ordering behind the same API. Phase 2+ can replace only
+/// other" ordering behind the same API. Later phases can replace only
 /// `join_over_approx`/`leq` when a proper bounded join/list representation
 /// lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +149,42 @@ impl NonDisjDomain {
             over_approx: None,
         }
     }
+
+    /// Execute one instruction transfer over the hidden over-approximate
+    /// state.
+    ///
+    /// This mirrors OCaml `PulseNonDisjunctiveDomain.exec`: take the current
+    /// hidden `ContinueProgram` state, clear it before running the supplied
+    /// transfer (preventing recursive consumption), then join only resulting
+    /// `ContinueProgram` states back into the over-approx slot. Stopped
+    /// results are intentionally ignored for the minimal port; hidden
+    /// diagnostics must not be published in phase 3.
+    pub fn exec_over_approx<F>(&self, mut exec_instr: F) -> Self
+    where
+        F: FnMut(ExecutionDomain, Self) -> (Vec<ExecutionDomain>, Self),
+    {
+        let Some(astate) = self.over_approx.clone() else {
+            return Self::bottom();
+        };
+
+        let exec_non_disj = self.for_disjunct_exec_instr();
+        let (results, mut result_non_disj) =
+            exec_instr(ExecutionDomain::ContinueProgram(astate), exec_non_disj);
+        result_non_disj.over_approx = None;
+
+        let mut result = result_non_disj;
+        for exec in results {
+            if let ExecutionDomain::ContinueProgram(astate) = exec {
+                result = result.join_to_astate(astate);
+            }
+        }
+
+        if result.is_over_approx_bottom() {
+            Self::bottom()
+        } else {
+            result
+        }
+    }
 }
 
 fn join_over_approx(
@@ -158,7 +195,7 @@ fn join_over_approx(
         (None, None) => None,
         (Some(astate), None) | (None, Some(astate)) => Some(astate.clone()),
         (Some(lhs), Some(_rhs)) => {
-            // TODO(nondisj_phase2+): replace this with a real over-approximate
+            // TODO(nondisj_phase4+): replace this with a real over-approximate
             // Pulse join or a tiny bounded sideband. Keeping the left slot is
             // deterministic and avoids pretending this scaffold has full OCaml
             // `PulseJoin.join` semantics.
@@ -179,7 +216,7 @@ impl Comparable for NonDisjDomain {
         let over_approx_leq = match (&self.over_approx, &rhs.over_approx) {
             (None, _) => true,
             (Some(_), None) => false,
-            // Phase-1 single-slot abstraction: any non-bottom hidden state is
+            // Single-slot abstraction: any non-bottom hidden state is
             // an upper bound for any other non-bottom hidden state. This keeps
             // `join` lawful enough for future product-domain plumbing while
             // the actual retained payload remains deterministic.
@@ -285,5 +322,45 @@ mod tests {
 
         assert!(ordinary.has_dropped_disjuncts());
         assert!(ordinary.is_over_approx_bottom());
+    }
+
+    #[test]
+    fn exec_over_approx_threads_continue_results_and_clears_input_sideband() {
+        let captured = test_astate("captured");
+        let evolved = test_astate("evolved");
+        let domain = NonDisjDomain::bottom()
+            .remember_dropped_disjuncts([ExecutionDomain::ContinueProgram(captured.clone())]);
+
+        let result = domain.exec_over_approx(|exec, non_disj| {
+            assert_eq!(exec, ExecutionDomain::ContinueProgram(captured.clone()));
+            assert!(non_disj.has_dropped_disjuncts());
+            assert!(non_disj.is_over_approx_bottom());
+            (
+                vec![ExecutionDomain::ContinueProgram(evolved.clone())],
+                non_disj,
+            )
+        });
+
+        assert!(result.has_dropped_disjuncts());
+        assert_eq!(result.over_approx(), Some(&evolved));
+    }
+
+    #[test]
+    fn exec_over_approx_ignores_stopped_hidden_results() {
+        let captured = test_astate("captured_stopped");
+        let stopped = test_astate("hidden_exit");
+        let domain = NonDisjDomain::bottom()
+            .remember_dropped_disjuncts([ExecutionDomain::ContinueProgram(captured)]);
+
+        let result = domain.exec_over_approx(|_exec, non_disj| {
+            (
+                vec![ExecutionDomain::ExitProgram(stopped.clone())],
+                non_disj,
+            )
+        });
+
+        assert!(result.is_bottom());
+        assert!(!result.has_dropped_disjuncts());
+        assert!(result.is_over_approx_bottom());
     }
 }
