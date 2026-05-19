@@ -323,6 +323,12 @@ pub(crate) fn apply_summary_with_aliasing(
     let mut post_visited = HashSet::new();
     let mut subst_histories =
         initial_post_subst_histories(&subst, &callee_actual_value_addrs, &caller_state);
+    apply_unknown_effects_from_callee_summary(
+        pre_post,
+        &callee_actual_value_addrs,
+        &mut subst,
+        &mut caller_state,
+    );
     apply_post_from_callee_pre(
         pre_post,
         &value_actual_formal_stack_addrs,
@@ -1495,6 +1501,75 @@ fn callee_cell_is_read_only(
         .attrs
         .get(&callee_addr)
         .is_some_and(|attrs| attrs.iter().any(Attribute::is_modified))
+}
+
+fn callee_pre_post_edge_changed(
+    pre_post: &PrePost,
+    callee_addr: AbstractValue,
+    access: &Access,
+) -> bool {
+    let pre_value = pre_post
+        .pre
+        .heap
+        .find_edge(callee_addr, access)
+        .map(|value| pre_post.post.path_condition.get_var_repr(value));
+    let post_value = pre_post
+        .post
+        .post
+        .heap
+        .find_edge(callee_addr, access)
+        .map(|value| pre_post.post.path_condition.get_var_repr(value));
+    pre_value != post_value
+}
+
+fn apply_unknown_effects_from_callee_summary(
+    pre_post: &PrePost,
+    callee_actual_value_addrs: &std::collections::HashSet<AbstractValue>,
+    subst: &mut HashMap<AbstractValue, AbstractValue>,
+    caller_state: &mut AbductiveDomain,
+) {
+    let unknown_effect_callee_addrs: Vec<_> = pre_post
+        .post
+        .post
+        .attrs
+        .iter()
+        .filter_map(|(callee_addr, attrs)| {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::UnknownEffect))
+                .then_some(*callee_addr)
+        })
+        .collect();
+
+    for callee_addr in unknown_effect_callee_addrs {
+        let caller_addr =
+            resolve_for_post(subst, callee_addr, callee_actual_value_addrs, caller_state);
+        let mapped_caller_to_callee: Vec<_> = subst
+            .iter()
+            .map(|(&addr_callee, &addr_caller)| {
+                (caller_state.get_var_repr(addr_caller), addr_callee)
+            })
+            .collect();
+        let reachable_before_unknown_effect: Vec<_> = caller_state
+            .reachable_from_post(caller_addr)
+            .into_iter()
+            .collect();
+        caller_state.apply_unknown_effect_with_filter(
+            caller_addr,
+            |addr_caller, access, _target| {
+                let Some((_, addr_callee)) = mapped_caller_to_callee
+                    .iter()
+                    .find(|(mapped_addr, _)| *mapped_addr == addr_caller)
+                else {
+                    return true;
+                };
+                !callee_pre_post_edge_changed(pre_post, *addr_callee, access)
+            },
+        );
+        for reachable_addr in reachable_before_unknown_effect {
+            caller_state.initialize(reachable_addr);
+        }
+    }
 }
 
 fn initial_post_subst_histories(

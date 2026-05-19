@@ -1352,13 +1352,36 @@ impl AbductiveDomain {
     ///
     /// Cross-ref: OCaml `PulseAbductiveDomain.ml apply_unknown_effect`.
     pub fn apply_unknown_effect(&mut self, addr: AbstractValue) {
+        self.apply_unknown_effect_with_filter(addr, |_reachable_addr, _access, _target| true);
+    }
+
+    /// Apply an unknown effect while skipping already-replayed callee writes.
+    ///
+    /// OCaml `PulseInterproc.apply_unknown_effects` imports `UnknownEffect`
+    /// attributes from callee summaries before replaying the callee post, but
+    /// filters out fields whose pre/post target already differs in the callee
+    /// summary.  Those fields have already been havoced during the callee
+    /// analysis and replaying them a second time in the caller would overwrite
+    /// more precise branch/malloc facts.  The direct unknown-call path above
+    /// uses the unfiltered variant; summary application uses this filtered
+    /// helper.
+    pub fn apply_unknown_effect_with_filter(
+        &mut self,
+        addr: AbstractValue,
+        mut havoc_filter: impl FnMut(AbstractValue, &Access, AbstractValue) -> bool,
+    ) {
         let reachable = self.reachable_from(addr);
         for reachable_addr in &reachable {
             if let Some(edges) = self.post.heap.get_edges(*reachable_addr) {
-                let accesses: Vec<Access> = edges.iter().map(|(a, _)| a.clone()).collect();
-                for access in accesses {
-                    let fresh = AbstractValue::mk_fresh();
-                    self.post.heap.add_edge(*reachable_addr, access, fresh);
+                let edges: Vec<_> = edges
+                    .iter()
+                    .map(|(access, target)| (access.clone(), *target))
+                    .collect();
+                for (access, target) in edges {
+                    if havoc_filter(*reachable_addr, &access, target) {
+                        let fresh = AbstractValue::mk_fresh();
+                        self.post.heap.add_edge(*reachable_addr, access, fresh);
+                    }
                 }
             }
             // Remove Allocated attribute from havoced addresses to prevent
