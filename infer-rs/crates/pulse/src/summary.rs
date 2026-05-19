@@ -615,6 +615,30 @@ impl PrePost {
         }
     }
 
+    /// Snapshot branch/imported equalities before summary simplification can
+    /// collapse them to plain phi constants.  These facts by themselves are
+    /// not OCaml literal invalidations, so `materialize_visible_constant_invalidations`
+    /// uses the snapshot to avoid publishing `Invalid(ConstantDereference k)`
+    /// for a value that is merely pruned equal to `k`.
+    fn collect_visible_equal_const_conditions(
+        &self,
+        reachable: &std::collections::HashSet<AbstractValue>,
+    ) -> std::collections::HashSet<(AbstractValue, i64)> {
+        self.post
+            .path_condition
+            .conditions()
+            .keys()
+            .filter_map(|atom| match atom {
+                Atom::Equal(Term::Var(v), Term::Const(c))
+                | Atom::Equal(Term::Const(c), Term::Var(v)) => {
+                    let repr = self.post.path_condition.get_var_repr(*v);
+                    reachable.contains(&repr).then_some((repr, *c))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Cross-ref: OCaml normal evaluation records every integer literal as
     /// `Invalid(ConstantDereference k)`. When a caller-visible summary value is
     /// only known equal to a constant through phi (for example after
@@ -623,6 +647,7 @@ impl PrePost {
     fn materialize_visible_constant_invalidations(
         &mut self,
         reachable: &std::collections::HashSet<AbstractValue>,
+        equality_prune_constants: &std::collections::HashSet<(AbstractValue, i64)>,
     ) {
         let mut materialized = Vec::new();
 
@@ -662,15 +687,7 @@ impl PrePost {
                     )
                 })
             });
-            let has_equal_const_condition =
-                self.post.path_condition.conditions().keys().any(|atom| {
-                    matches!(
-                        atom,
-                        Atom::Equal(Term::Var(v), Term::Const(c))
-                            | Atom::Equal(Term::Const(c), Term::Var(v))
-                            if self.post.path_condition.get_var_repr(*v) == repr && *c == constant
-                    )
-                });
+            let has_equal_const_condition = equality_prune_constants.contains(&(repr, constant));
             // OCaml `eval_const` records `Invalid(ConstantDereference k)`, but prune-only
             // equality conditions such as `a == 4` or `random() == 5` do not. Only recreate
             // the attr when a real literal invalidation is still visible in the value provenance
@@ -833,6 +850,8 @@ impl PrePost {
         // that actually bridge to the precondition vocabulary; this preserves
         // the heap/value-history provenance of the summary row while avoiding
         // broader retention of callee-local branch temps.
+        let equality_prune_constants =
+            self.collect_visible_equal_const_conditions(&reachability.post_canonical_reachable);
         let mut condition_vocabulary = reachability.precondition_vocabulary.clone();
         condition_vocabulary.extend(freed_condition_witnesses.iter().copied());
         let mut formula_keep = reachability.formula_reachable.clone();
@@ -863,7 +882,10 @@ impl PrePost {
             }
         };
         self.restore_direct_cycle_edges_for_summary();
-        self.materialize_visible_constant_invalidations(&reachability.post_canonical_reachable);
+        self.materialize_visible_constant_invalidations(
+            &reachability.post_canonical_reachable,
+            &equality_prune_constants,
+        );
         self.align_function_pointer_closure_summary_surface();
 
         NormalizedSummaryInfo {
