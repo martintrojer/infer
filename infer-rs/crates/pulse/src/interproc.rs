@@ -285,6 +285,35 @@ pub(crate) fn apply_summary_with_aliasing(
         }
     }
 
+    // If there was a pre-condition violation, report it and abort this path
+    // before applying the callee post heap/attrs. Cross-ref: OCaml
+    // `PulseInterproc.apply_summary` runs `check_all_valid` after
+    // `materialize_pre`/callee formula import but before `apply_post`; a failed
+    // callee `MustBeValid` therefore must not replay trailing callee reads such
+    // as `**ptr` into the caller abort state.
+    if let Some(ref diag) = pre_error {
+        log::debug!("[apply_summary] pre_error present: {diag}");
+    }
+    if let Some(diag) = pre_error {
+        return if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
+            ApplySummaryOutcome {
+                results: vec![ExecutionDomain::AbortProgram {
+                    state: Box::new(caller_state),
+                    diagnostic: Box::new(diag),
+                }],
+                alias_specialization: None,
+            }
+        } else {
+            ApplySummaryOutcome {
+                results: vec![ExecutionDomain::LatentAbortProgram {
+                    state: Box::new(caller_state),
+                    diagnostic: Box::new(diag),
+                }],
+                alias_specialization: None,
+            }
+        };
+    }
+
     // Step 3: Apply the callee's post heap to the caller.
     //
     // This must handle strong updates, not just writes. If an access exists in
@@ -395,32 +424,6 @@ pub(crate) fn apply_summary_with_aliasing(
                 caller_state.post.attrs.add_one(caller_addr, attr);
             }
         }
-    }
-
-    // If there was a pre-condition violation, report it and abort this path.
-    // The callee dereferences a formal that's invalid in the caller.
-    // Matches OCaml's first_error → check_all_valid → error flow.
-    if let Some(ref diag) = pre_error {
-        log::debug!("[apply_summary] pre_error present: {diag}");
-    }
-    if let Some(diag) = pre_error {
-        return if crate::summary::abort_is_manifest(caller_pdesc, &caller_state) {
-            ApplySummaryOutcome {
-                results: vec![ExecutionDomain::AbortProgram {
-                    state: Box::new(caller_state),
-                    diagnostic: Box::new(diag),
-                }],
-                alias_specialization: None,
-            }
-        } else {
-            ApplySummaryOutcome {
-                results: vec![ExecutionDomain::LatentAbortProgram {
-                    state: Box::new(caller_state),
-                    diagnostic: Box::new(diag),
-                }],
-                alias_specialization: None,
-            }
-        };
     }
 
     let stopped_summary = (!matches!(pre_post.kind, crate::summary::PrePostKind::ContinueProgram))
