@@ -1538,20 +1538,23 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         let mut new_disjuncts = Vec::new();
         let pre_non_disj = state.non_disj.clone();
         let disjunct_non_disj = pre_non_disj.for_disjunct_exec_instr();
+        let mut post_non_disj = disjunct_non_disj.clone();
 
         for (i, disjunct) in state.disjuncts.iter().enumerate() {
             match disjunct {
                 ExecutionDomain::ContinueProgram(astate) => {
                     log::trace!("[{pn}]   disjunct #{i}: {astate:?}");
-                    let results = exec_instr_with_summaries(
+                    let exec_result = exec_instr_with_summaries_with_mode(
                         self.pdesc,
                         self.tenv,
                         instr,
                         astate.clone(),
                         self.callee_summaries,
                         Some(&self.spec_requests),
-                    )
-                    .results;
+                        NonDisjCallMode::Ordinary,
+                    );
+                    post_non_disj = exec_result.non_disj.join(&post_non_disj);
+                    let results = exec_result.results;
                     let nc = results.iter().filter(|d| d.is_continue()).count();
                     let na = results
                         .iter()
@@ -1579,31 +1582,28 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                 // the bit remains set for the rest of the procedure.
                 had_dropped_disjuncts: state.had_dropped_disjuncts,
             },
-            disjunct_non_disj,
+            post_non_disj,
         );
         result.dedup();
         result.bound();
 
         let hidden_post = pre_non_disj.exec_over_approx(|exec, non_disj| {
-            let results = match exec {
-                ExecutionDomain::ContinueProgram(astate) => {
-                    let output = exec_instr_with_summaries(
-                        self.pdesc,
-                        self.tenv,
-                        instr,
-                        astate,
-                        self.callee_summaries,
-                        Some(&self.spec_requests),
-                    );
-                    let mut results = output.results;
-                    if let Some(hidden_astate) = output.hidden_non_disj_astate {
-                        results.push(ExecutionDomain::ContinueProgram(hidden_astate));
-                    }
-                    results
-                }
-                stopped => vec![stopped],
+            let exec_result = match exec {
+                ExecutionDomain::ContinueProgram(astate) => exec_instr_with_summaries_with_mode(
+                    self.pdesc,
+                    self.tenv,
+                    instr,
+                    astate,
+                    self.callee_summaries,
+                    Some(&self.spec_requests),
+                    NonDisjCallMode::HiddenNonDisj,
+                ),
+                stopped => InstrExecResult {
+                    results: vec![stopped],
+                    non_disj: NonDisjDomain::bottom(),
+                },
             };
-            (results, non_disj)
+            (exec_result.results, non_disj.join(&exec_result.non_disj))
         });
         // Prefer the freshly-executed hidden state when the current visible
         // instruction also captures a dropped disjunct. A real Pulse join will
@@ -1789,18 +1789,40 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
 /// Execute an instruction, checking for interprocedural summary application.
 ///
 /// Priority: arg validity check > models > noreturn summaries > pre/post summaries > transfer.
+#[cfg(test)]
 fn exec_instr_with_summaries(
+    pdesc: &Procdesc,
+    tenv: Option<&Tenv>,
+    instr: &Instr,
+    state: AbductiveDomain,
+    callee_summaries: &dyn SummaryLookup,
+    spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
+) -> Vec<ExecutionDomain> {
+    exec_instr_with_summaries_with_mode(
+        pdesc,
+        tenv,
+        instr,
+        state,
+        callee_summaries,
+        spec_requests,
+        NonDisjCallMode::Ordinary,
+    )
+    .results
+}
+
+fn exec_instr_with_summaries_with_mode(
     pdesc: &Procdesc,
     tenv: Option<&Tenv>,
     instr: &Instr,
     mut state: AbductiveDomain,
     callee_summaries: &dyn SummaryLookup,
     spec_requests: Option<&RefCell<Vec<(Procname, PulseSpecialization)>>>,
-) -> KnownCallOutput {
+    non_disj_call_mode: NonDisjCallMode,
+) -> InstrExecResult {
     if let Some(results) =
         maybe_inline_global_initializer_load(pdesc, instr, state.clone(), callee_summaries)
     {
-        return KnownCallOutput::visible(results);
+        return InstrExecResult::visible(results);
     }
 
     if let Instr::Call {
@@ -1852,13 +1874,14 @@ fn exec_instr_with_summaries(
                         loc: loc.clone(),
                         flags: direct_flags,
                     };
-                    return exec_instr_with_summaries(
+                    return exec_instr_with_summaries_with_mode(
                         pdesc,
                         tenv,
                         &direct_call,
                         state,
                         callee_summaries,
                         spec_requests,
+                        non_disj_call_mode,
                     );
                 }
                 state.add_need_dynamic_type_specialization(receiver);
@@ -1878,20 +1901,22 @@ fn exec_instr_with_summaries(
             log::debug!("  [call] model: {callee_pname}");
             let results =
                 transfer::exec_instr_with_pdesc_and_tenv(Some(pdesc), tenv, instr, state.clone());
-            return KnownCallOutput::visible(merge_return_history_from_equal_actuals(
+            return InstrExecResult::visible(merge_return_history_from_equal_actuals(
                 results, ret_id, args, loc, &state,
             ));
         }
 
         if let Some(callee_summary) = callee_summaries.get(callee_pname) {
-            return exec_known_callee_summary(
+            return exec_known_callee_summary_with_mode(
                 KnownCalleeCall {
                     callee_pname,
                     callee_summary,
                     callsite,
                 },
                 state,
-            );
+                non_disj_call_mode,
+            )
+            .into_instr_result();
         }
 
         if *callee_pname == pdesc.proc_name {
@@ -1903,7 +1928,7 @@ fn exec_instr_with_summaries(
             );
             let fallback_state = state.clone();
             let results = exec_known_call_as_unknown(callsite, callee_pname, state);
-            return KnownCallOutput::visible(merge_return_history_from_equal_actuals(
+            return InstrExecResult::visible(merge_return_history_from_equal_actuals(
                 results,
                 ret_id,
                 args,
@@ -1913,7 +1938,7 @@ fn exec_instr_with_summaries(
         }
     }
 
-    KnownCallOutput::visible(transfer::exec_instr_with_pdesc_and_tenv(
+    InstrExecResult::visible(transfer::exec_instr_with_pdesc_and_tenv(
         Some(pdesc),
         tenv,
         instr,
@@ -2029,51 +2054,57 @@ struct SelectedSummary<'a> {
     has_dropped_disjuncts: bool,
 }
 
-struct KnownCalleeResults {
-    results: Vec<ExecutionDomain>,
-    hidden_non_disj_astate: Option<AbductiveDomain>,
-    used_summary_has_dropped_disjuncts: bool,
-    used_summary_was_empty: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonDisjCallMode {
+    /// Ordinary visible-disjunct execution: callee visible pre/posts produce
+    /// visible results, while the callee hidden non-disj pre/post is applied
+    /// into the caller's hidden sideband only.
+    Ordinary,
+    /// Hidden over-approximate execution: mirror OCaml's `PathContext.is_non_disj`
+    /// branch by treating the callee hidden pre/post as another executable
+    /// continuing row for this hidden path. The produced `ContinueProgram`
+    /// states are consumed only by `NonDisjDomain::exec_over_approx`, not
+    /// exposed as visible caller disjuncts.
+    HiddenNonDisj,
 }
 
-#[derive(Debug)]
-struct KnownCallOutput {
+#[derive(Debug, Default)]
+struct InstrExecResult {
     results: Vec<ExecutionDomain>,
-    hidden_non_disj_astate: Option<AbductiveDomain>,
+    non_disj: NonDisjDomain,
 }
 
 #[allow(dead_code)]
-impl KnownCallOutput {
+impl InstrExecResult {
     fn visible(results: Vec<ExecutionDomain>) -> Self {
         Self {
             results,
-            hidden_non_disj_astate: None,
+            non_disj: NonDisjDomain::bottom(),
         }
     }
 
     fn as_slice(&self) -> &[ExecutionDomain] {
         &self.results
     }
-
-    fn iter(&self) -> std::slice::Iter<'_, ExecutionDomain> {
-        self.results.iter()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.results.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.results.len()
-    }
 }
 
-impl IntoIterator for KnownCallOutput {
-    type Item = ExecutionDomain;
-    type IntoIter = std::vec::IntoIter<ExecutionDomain>;
+struct KnownCalleeResults {
+    results: Vec<ExecutionDomain>,
+    non_disj: NonDisjDomain,
+    used_summary_has_dropped_disjuncts: bool,
+    used_summary_was_empty: bool,
+}
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.results.into_iter()
+impl KnownCalleeResults {
+    fn hidden_non_disj_continued(&self) -> bool {
+        !self.non_disj.is_over_approx_bottom()
+    }
+
+    fn into_instr_result(self) -> InstrExecResult {
+        InstrExecResult {
+            results: self.results,
+            non_disj: self.non_disj,
+        }
     }
 }
 
@@ -2335,12 +2366,16 @@ fn select_pre_posts_and_specialization<'a>(
     }
 }
 
-fn hidden_non_disj_pre_post_astate(
+fn apply_hidden_non_disj_pre_post(
     known_callee: KnownCalleeCall<'_>,
     caller_state: &crate::abductive::AbductiveDomain,
     pre_post: Option<&crate::summary::PrePost>,
-) -> Option<AbductiveDomain> {
-    let pre_post = pre_post?;
+    current_dynamic_type_specialization: bool,
+    non_disj_call_mode: NonDisjCallMode,
+) -> (Option<crate::interproc::ApplySummaryOutcome>, NonDisjDomain) {
+    let Some(pre_post) = pre_post else {
+        return (None, NonDisjDomain::bottom());
+    };
     let CallSite {
         pdesc,
         ret_id,
@@ -2355,18 +2390,30 @@ fn hidden_non_disj_pre_post_astate(
         args,
         loc,
         caller_state.clone(),
-        false,
+        current_dynamic_type_specialization,
     );
-    outcome.results.into_iter().find_map(|result| match result {
-        ExecutionDomain::ContinueProgram(astate) => Some(astate),
-        _ => None,
-    })
+    log::debug!(
+        "    hidden non-disj pre/post: {} results",
+        outcome.results.len()
+    );
+
+    let mut non_disj = NonDisjDomain::bottom();
+    if matches!(non_disj_call_mode, NonDisjCallMode::Ordinary) {
+        for result in &outcome.results {
+            if let ExecutionDomain::ContinueProgram(astate) = result {
+                non_disj = non_disj.join_to_astate(astate.clone());
+            }
+        }
+    }
+
+    (Some(outcome), non_disj)
 }
 
 fn apply_pre_posts_with_specialization_loop(
     known_callee: KnownCalleeCall<'_>,
     caller_state: &crate::abductive::AbductiveDomain,
     initial_summary: SelectedSummary<'_>,
+    non_disj_call_mode: NonDisjCallMode,
 ) -> KnownCalleeResults {
     // Cross-ref: OCaml `PulseCallOperations.iter_call` first tries the
     // currently available summary, then turns alias contradictions from
@@ -2391,20 +2438,15 @@ fn apply_pre_posts_with_specialization_loop(
     let mut tried_specs: Vec<PulseSpecialization> = Vec::new();
 
     loop {
-        if current_pre_posts.is_empty() {
+        if current_pre_posts.is_empty() && current_non_disj_pre_post.is_none() {
             return KnownCalleeResults {
                 results: vec![],
-                hidden_non_disj_astate: hidden_non_disj_pre_post_astate(
-                    known_callee,
-                    caller_state,
-                    current_non_disj_pre_post,
-                ),
+                non_disj: NonDisjDomain::bottom(),
                 used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
                 used_summary_was_empty: true,
             };
         }
 
-        let _selected_non_disj_pre_post = current_non_disj_pre_post;
         log::debug!(
             "  [call] applying {} pre/posts for {callee_pname} with specialization {current_spec}",
             current_pre_posts.len()
@@ -2444,15 +2486,33 @@ fn apply_pre_posts_with_specialization_loop(
                 merge_alias_groups(&mut alias_groups, groups);
             }
         }
-        if !results.is_empty() || alias_groups.is_empty() {
+
+        let (hidden_outcome, non_disj) = apply_hidden_non_disj_pre_post(
+            known_callee,
+            caller_state,
+            current_non_disj_pre_post,
+            current_dynamic_type_specialization,
+            non_disj_call_mode,
+        );
+        if matches!(non_disj_call_mode, NonDisjCallMode::HiddenNonDisj) {
+            if let Some(outcome) = hidden_outcome.as_ref() {
+                results.extend(outcome.results.clone());
+            }
+        }
+
+        if !results.is_empty()
+            || hidden_outcome
+                .as_ref()
+                .is_some_and(|outcome| !outcome.results.is_empty())
+            || alias_groups.is_empty()
+        {
             // Cross-ref: OCaml `PulseCallOperations.call` computes
             // `has_continue_program` from both the disjunctive results and the
             // hidden non-disj astate, then `pulse_force_continue`s only when
             // the selected summary has dropped/empty disjuncts and still has
-            // no continue. Rust does not model that non-disj sideband for
-            // alias-specialized summaries, so approximate the same narrow
-            // signal only for alias-specialized summaries whose cached rows
-            // are all latent stopped states and whose applied rows all stop.
+            // no continue. We now apply the callee hidden pre/post into
+            // `non_disj`; keep the narrow alias/dynamic-type heuristics below
+            // for specialized summaries whose cached hidden row is absent.
             let alias_specialized_latent_only_summary = current_spec.aliases.is_some()
                 && !current_pre_posts.is_empty()
                 && current_pre_posts.iter().all(|pp| {
@@ -2489,11 +2549,7 @@ fn apply_pre_posts_with_specialization_loop(
                     && !has_continue_program(&results);
             return KnownCalleeResults {
                 results,
-                hidden_non_disj_astate: hidden_non_disj_pre_post_astate(
-                    known_callee,
-                    caller_state,
-                    current_non_disj_pre_post,
-                ),
+                non_disj,
                 used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts
                     || alias_specialization_needs_force_continue
                     || dynamic_type_abort_specialization_needs_force_continue,
@@ -2505,11 +2561,7 @@ fn apply_pre_posts_with_specialization_loop(
         if next_spec == current_spec || tried_specs.iter().any(|spec| spec == &next_spec) {
             return KnownCalleeResults {
                 results: vec![],
-                hidden_non_disj_astate: hidden_non_disj_pre_post_astate(
-                    known_callee,
-                    caller_state,
-                    current_non_disj_pre_post,
-                ),
+                non_disj: NonDisjDomain::bottom(),
                 used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
                 used_summary_was_empty: false,
             };
@@ -2531,21 +2583,18 @@ fn apply_pre_posts_with_specialization_loop(
         queue_specialization_request(spec_requests, callee_pname, callee_summary, next_spec);
         return KnownCalleeResults {
             results: vec![],
-            hidden_non_disj_astate: hidden_non_disj_pre_post_astate(
-                known_callee,
-                caller_state,
-                current_non_disj_pre_post,
-            ),
+            non_disj: NonDisjDomain::bottom(),
             used_summary_has_dropped_disjuncts: current_has_dropped_disjuncts,
             used_summary_was_empty: false,
         };
     }
 }
 
-fn exec_known_callee_summary(
+fn exec_known_callee_summary_with_mode(
     known_callee: KnownCalleeCall<'_>,
     mut state: crate::abductive::AbductiveDomain,
-) -> KnownCallOutput {
+    non_disj_call_mode: NonDisjCallMode,
+) -> KnownCalleeResults {
     let CallSite {
         pdesc: _,
         ret_id,
@@ -2565,7 +2614,12 @@ fn exec_known_callee_summary(
 
     if callee_summary.is_noreturn {
         log::debug!("  [call] noreturn: {callee_pname}");
-        return KnownCallOutput::visible(vec![ExecutionDomain::ExitProgram(state)]);
+        return KnownCalleeResults {
+            results: vec![ExecutionDomain::ExitProgram(state)],
+            non_disj: NonDisjDomain::bottom(),
+            used_summary_has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
+            used_summary_was_empty: false,
+        };
     }
 
     // Empty-body callees (extern stubs): treat as unknown with type-aware
@@ -2604,10 +2658,20 @@ fn exec_known_callee_summary(
                 .and_fn_app(ret_val, &callee_name, &actual_vals)
                 .is_unsat()
             {
-                return KnownCallOutput::visible(vec![]);
+                return KnownCalleeResults {
+                    results: vec![],
+                    non_disj: NonDisjDomain::bottom(),
+                    used_summary_has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
+                    used_summary_was_empty: false,
+                };
             }
         }
-        return KnownCallOutput::visible(vec![ExecutionDomain::ContinueProgram(state)]);
+        return KnownCalleeResults {
+            results: vec![ExecutionDomain::ContinueProgram(state)],
+            non_disj: NonDisjDomain::bottom(),
+            used_summary_has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
+            used_summary_was_empty: false,
+        };
     }
 
     if !callee_summary.needs_specialization.is_empty() {
@@ -2616,42 +2680,53 @@ fn exec_known_callee_summary(
 
     let selected_summary =
         select_pre_posts_and_specialization(callee_summary, caller_spec.as_ref());
-    if selected_summary.pre_posts.is_empty() {
+    if selected_summary.pre_posts.is_empty() && selected_summary.non_disj_pre_post.is_none() {
         log::debug!("  [call] no applicable pre/posts for {callee_pname}");
-        let hidden_astate = hidden_non_disj_pre_post_astate(
-            known_callee,
-            &state,
-            selected_summary.non_disj_pre_post,
-        );
-        let hidden_continued = hidden_astate.is_some();
         let results = maybe_force_continue_after_known_call(
             known_callee.callsite,
             state.clone(),
             callee_pname,
             vec![],
-            !hidden_continued,
+            true,
         );
-        let hidden_non_disj_astate = hidden_astate;
-        return KnownCallOutput {
+        return KnownCalleeResults {
             results: merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state),
-            hidden_non_disj_astate,
+            non_disj: NonDisjDomain::bottom(),
+            used_summary_has_dropped_disjuncts: selected_summary.has_dropped_disjuncts,
+            used_summary_was_empty: true,
         };
     }
 
-    let applied = apply_pre_posts_with_specialization_loop(known_callee, &state, selected_summary);
-    let hidden_continued = applied.hidden_non_disj_astate.is_some();
+    let applied = apply_pre_posts_with_specialization_loop(
+        known_callee,
+        &state,
+        selected_summary,
+        non_disj_call_mode,
+    );
+    let should_force_continue = (applied.used_summary_was_empty
+        || applied.used_summary_has_dropped_disjuncts)
+        && !applied.hidden_non_disj_continued();
     let results = maybe_force_continue_after_known_call(
         known_callee.callsite,
         state.clone(),
         callee_pname,
         applied.results,
-        (applied.used_summary_was_empty || applied.used_summary_has_dropped_disjuncts)
-            && !hidden_continued,
+        should_force_continue,
     );
-    KnownCallOutput {
+    KnownCalleeResults {
         results: merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state),
-        hidden_non_disj_astate: applied.hidden_non_disj_astate,
+        non_disj: applied.non_disj,
+        used_summary_has_dropped_disjuncts: applied.used_summary_has_dropped_disjuncts,
+        used_summary_was_empty: applied.used_summary_was_empty,
     }
+}
+
+#[cfg(test)]
+fn exec_known_callee_summary(
+    known_callee: KnownCalleeCall<'_>,
+    state: crate::abductive::AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    exec_known_callee_summary_with_mode(known_callee, state, NonDisjCallMode::Ordinary).results
 }
 
 fn has_continue_program(results: &[ExecutionDomain]) -> bool {
@@ -2716,7 +2791,7 @@ fn exec_call_c_function_ptr(
     callsite: CallSite<'_>,
     mut state: crate::abductive::AbductiveDomain,
     callee_summaries: &dyn SummaryLookup,
-) -> KnownCallOutput {
+) -> InstrExecResult {
     let CallSite {
         pdesc,
         ret_id,
@@ -2733,7 +2808,7 @@ fn exec_call_c_function_ptr(
             // No args — treat as unknown
             let ret_val = crate::abstract_value::AbstractValue::mk_fresh();
             crate::operations::write_id(ret_id, ret_val, &mut state);
-            return KnownCallOutput::visible(vec![ExecutionDomain::ContinueProgram(state)]);
+            return InstrExecResult::visible(vec![ExecutionDomain::ContinueProgram(state)]);
         }
     };
 
@@ -2771,7 +2846,7 @@ fn exec_call_c_function_ptr(
                 loc: loc.clone(),
                 flags: call_flags.clone(),
             };
-            return KnownCallOutput::visible(transfer::exec_instr_with_pdesc(
+            return InstrExecResult::visible(transfer::exec_instr_with_pdesc(
                 Some(pdesc),
                 &call_instr,
                 state,
@@ -2784,7 +2859,7 @@ fn exec_call_c_function_ptr(
             callee_summaries.contains_key(&target_pname)
         );
         if let Some(callee_summary) = callee_summaries.get(&target_pname) {
-            return exec_known_callee_summary(
+            return exec_known_callee_summary_with_mode(
                 KnownCalleeCall {
                     callee_pname: &target_pname,
                     callee_summary,
@@ -2799,7 +2874,9 @@ fn exec_call_c_function_ptr(
                     },
                 },
                 state,
-            );
+                NonDisjCallMode::Ordinary,
+            )
+            .into_instr_result();
         }
 
         if target_pname == pdesc.proc_name {
@@ -2824,7 +2901,7 @@ fn exec_call_c_function_ptr(
                 &target_pname,
                 state,
             );
-            return KnownCallOutput::visible(merge_return_history_from_equal_actuals(
+            return InstrExecResult::visible(merge_return_history_from_equal_actuals(
                 results,
                 ret_id,
                 actual_args,
@@ -2857,7 +2934,7 @@ fn exec_call_c_function_ptr(
             &target_pname,
             state,
         );
-        return KnownCallOutput::visible(merge_return_history_from_equal_actuals(
+        return InstrExecResult::visible(merge_return_history_from_equal_actuals(
             results,
             ret_id,
             actual_args,
@@ -2879,10 +2956,10 @@ fn exec_call_c_function_ptr(
                     diagnostic: Box::new(diag),
                 });
             }
-            return KnownCallOutput::visible(results);
+            return InstrExecResult::visible(results);
         }
         PulseResult::FatalError(diag, _) => {
-            return KnownCallOutput::visible(vec![ExecutionDomain::AbortProgram {
+            return InstrExecResult::visible(vec![ExecutionDomain::AbortProgram {
                 state: Box::new(state),
                 diagnostic: Box::new(diag),
             }]);
@@ -2901,7 +2978,7 @@ fn exec_call_c_function_ptr(
         state.apply_unknown_effect(arg_val);
         crate::operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
     }
-    KnownCallOutput::visible(vec![ExecutionDomain::ContinueProgram(state)])
+    InstrExecResult::visible(vec![ExecutionDomain::ContinueProgram(state)])
 }
 
 /// Convert Pulse diagnostics to an IssueLog for reporting.
@@ -5603,7 +5680,7 @@ mod tests {
             requests.into_inner().is_empty(),
             "cached specialization should avoid re-enqueueing the same alias request"
         );
-        results.results
+        results
     }
 
     #[test]
@@ -5755,6 +5832,186 @@ mod tests {
                 .iter()
                 .any(|result| matches!(result, ExecutionDomain::ContinueProgram(_))),
             "precise abort-only summaries should not be widened into unknown-call continues"
+        );
+    }
+
+    #[test]
+    fn test_apply_hidden_non_disj_pre_post_suppresses_force_continue_unknown_path() {
+        let callee_pname = Procname::c_from_string("hidden_non_disj_callee");
+        let callee_pdesc = Procdesc::new(
+            callee_pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let visible_state = crate::abductive::AbductiveDomain::mk_initial(&callee_pdesc);
+        let visible_pre_post = PrePost {
+            pre: visible_state.pre.clone(),
+            post: visible_state,
+            formals: vec![],
+            result: None,
+            kind: PrePostKind::ExitProgram,
+            diagnostic: None,
+            latent_invalid_access: None,
+            pending_invalid_accesses: vec![],
+        };
+
+        let mut hidden_state = crate::abductive::AbductiveDomain::mk_initial(&callee_pdesc);
+        let hidden_ret = AbstractValue::mk_fresh();
+        hidden_state.and_equal_const(hidden_ret, 7);
+        let hidden_pre_post = PrePost {
+            pre: hidden_state.pre.clone(),
+            post: hidden_state,
+            formals: vec![],
+            result: Some(hidden_ret),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+            latent_invalid_access: None,
+            pending_invalid_accesses: vec![],
+        };
+        let callee_summary = PulseSummary {
+            pre_posts: vec![visible_pre_post],
+            non_disj_pre_post: Some(hidden_pre_post),
+            has_dropped_disjuncts: true,
+            specialized: vec![],
+            diagnostics: vec![],
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: false,
+            formal_types: vec![],
+        };
+
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller"),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        let ret_typ = Typ::int(sil::typ::IKind::IInt);
+        let args: [(Exp, Typ); 0] = [];
+        let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
+        let state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let applied = exec_known_callee_summary_with_mode(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    call_flags: &call_flags,
+                    spec_requests: None,
+                },
+            },
+            state,
+            NonDisjCallMode::Ordinary,
+        );
+
+        assert!(
+            applied
+                .results
+                .iter()
+                .all(|result| !matches!(result, ExecutionDomain::ContinueProgram(_))),
+            "hidden non-disj application should not become a visible continue row, got {:?}",
+            applied.results
+        );
+        let hidden_post = applied
+            .non_disj
+            .over_approx()
+            .expect("callee hidden pre/post should continue in caller sideband");
+        let ret_val = hidden_post
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("hidden summary application should write the call return");
+        assert_eq!(hidden_post.get_const(ret_val), Some(7));
+        assert!(
+            applied.hidden_non_disj_continued(),
+            "hidden continuation must be visible to the force-continue gate"
+        );
+    }
+
+    #[test]
+    fn test_hidden_non_disj_execution_consumes_callee_hidden_pre_post_as_continue() {
+        let callee_pname = Procname::c_from_string("hidden_to_hidden_callee");
+        let callee_pdesc = Procdesc::new(
+            callee_pname.clone(),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let mut hidden_state = crate::abductive::AbductiveDomain::mk_initial(&callee_pdesc);
+        let hidden_ret = AbstractValue::mk_fresh();
+        hidden_state.and_equal_const(hidden_ret, 9);
+        let hidden_pre_post = PrePost {
+            pre: hidden_state.pre.clone(),
+            post: hidden_state,
+            formals: vec![],
+            result: Some(hidden_ret),
+            kind: PrePostKind::ContinueProgram,
+            diagnostic: None,
+            latent_invalid_access: None,
+            pending_invalid_accesses: vec![],
+        };
+        let callee_summary = PulseSummary {
+            pre_posts: vec![],
+            non_disj_pre_post: Some(hidden_pre_post),
+            has_dropped_disjuncts: true,
+            specialized: vec![],
+            diagnostics: vec![],
+            is_noreturn: false,
+            needs_specialization: HashMap::new(),
+            is_empty_body: false,
+            formal_types: vec![],
+        };
+
+        let caller_pdesc = Procdesc::new(
+            Procname::c_from_string("caller_hidden"),
+            Typ::int(sil::typ::IKind::IInt),
+            Location::dummy(),
+        );
+        let ret_id = Ident::create_normal(IdentName::from_string("ret"), 1);
+        let ret_typ = Typ::int(sil::typ::IKind::IInt);
+        let args: [(Exp, Typ); 0] = [];
+        let loc = Location::dummy();
+        let call_flags = sil::call_flags::CallFlags::default();
+        let state = crate::abductive::AbductiveDomain::mk_initial(&caller_pdesc);
+
+        let applied = exec_known_callee_summary_with_mode(
+            KnownCalleeCall {
+                callee_pname: &callee_pname,
+                callee_summary: &callee_summary,
+                callsite: CallSite {
+                    pdesc: &caller_pdesc,
+                    ret_id: &ret_id,
+                    ret_typ: &ret_typ,
+                    args: &args,
+                    loc: &loc,
+                    call_flags: &call_flags,
+                    spec_requests: None,
+                },
+            },
+            state,
+            NonDisjCallMode::HiddenNonDisj,
+        );
+
+        let [ExecutionDomain::ContinueProgram(hidden_post)] = applied.results.as_slice() else {
+            panic!(
+                "hidden execution should append the callee hidden continue row, got {:?}",
+                applied.results
+            );
+        };
+        let ret_val = hidden_post
+            .post
+            .stack
+            .find(&Var::LogicalVar(ret_id))
+            .expect("hidden summary application should write the call return");
+        assert_eq!(hidden_post.get_const(ret_val), Some(9));
+        assert!(
+            applied.non_disj.is_over_approx_bottom(),
+            "hidden execution should return the applied hidden row as a result, not re-sideband it"
         );
     }
 
