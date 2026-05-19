@@ -1350,6 +1350,9 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     let has_dropped_disjuncts = inv_map.values().any(|domain| {
         domain.post.non_disj.has_dropped_disjuncts() || domain.post.had_dropped_disjuncts
     });
+    let hidden_non_disj_astate = inv_map
+        .get(&pdesc.exit_node)
+        .and_then(|exit_state| exit_state.post.non_disj.to_summary_astate());
     let summary_start = Instant::now();
     if pulse_progress_enabled() {
         log::info!(
@@ -1361,12 +1364,13 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
             has_dropped_disjuncts,
         );
     }
-    let summary = PulseSummary::of_proc_with_metadata(
+    let summary = PulseSummary::of_proc_with_hidden_non_disj(
         pdesc,
         &exit_disjuncts,
         diagnostics,
         is_noreturn,
         has_dropped_disjuncts,
+        hidden_non_disj_astate,
     );
     if pulse_progress_enabled() {
         log::info!(
@@ -2004,6 +2008,7 @@ struct KnownCalleeCall<'a> {
 #[derive(Clone)]
 struct SelectedSummary<'a> {
     pre_posts: &'a [crate::summary::PrePost],
+    non_disj_pre_post: Option<&'a crate::summary::PrePost>,
     latent_stopped_diagnostics: Option<&'a [Option<Diagnostic>]>,
     specialization: PulseSpecialization,
     has_dropped_disjuncts: bool,
@@ -2256,6 +2261,7 @@ fn select_pre_posts_and_specialization<'a>(
         if let Some(specialized) = callee_summary.get_specialized_data(spec) {
             return SelectedSummary {
                 pre_posts: &specialized.pre_posts,
+                non_disj_pre_post: specialized.non_disj_pre_post.as_ref(),
                 latent_stopped_diagnostics: Some(&specialized.latent_abort_diagnostics),
                 specialization: spec.clone(),
                 has_dropped_disjuncts: specialized.has_dropped_disjuncts,
@@ -2265,6 +2271,7 @@ fn select_pre_posts_and_specialization<'a>(
 
     SelectedSummary {
         pre_posts: &callee_summary.pre_posts,
+        non_disj_pre_post: callee_summary.non_disj_pre_post.as_ref(),
         latent_stopped_diagnostics: None,
         specialization: PulseSpecialization::bottom(),
         has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
@@ -2291,6 +2298,7 @@ fn apply_pre_posts_with_specialization_loop(
     let callee_pname = known_callee.callee_pname;
     let callee_summary = known_callee.callee_summary;
     let mut current_pre_posts = initial_summary.pre_posts;
+    let mut current_non_disj_pre_post = initial_summary.non_disj_pre_post;
     let mut current_latent_stopped_diagnostics = initial_summary.latent_stopped_diagnostics;
     let mut current_spec = initial_summary.specialization;
     let mut current_dynamic_type_specialization = !current_spec.dynamic_types.is_empty();
@@ -2306,6 +2314,7 @@ fn apply_pre_posts_with_specialization_loop(
             };
         }
 
+        let _selected_non_disj_pre_post = current_non_disj_pre_post;
         log::debug!(
             "  [call] applying {} pre/posts for {callee_pname} with specialization {current_spec}",
             current_pre_posts.len()
@@ -2411,6 +2420,7 @@ fn apply_pre_posts_with_specialization_loop(
             log::debug!("  [call] retrying {callee_pname} with alias specialization {next_spec}");
             current_spec = next_spec;
             current_pre_posts = &specialized.pre_posts;
+            current_non_disj_pre_post = specialized.non_disj_pre_post.as_ref();
             current_latent_stopped_diagnostics = Some(&specialized.latent_abort_diagnostics);
             current_dynamic_type_specialization = !current_spec.dynamic_types.is_empty();
             current_has_dropped_disjuncts = specialized.has_dropped_disjuncts;
@@ -3084,6 +3094,7 @@ mod tests {
                         latent_invalid_access: None,
                         pending_invalid_accesses: vec![],
                     }],
+                    non_disj_pre_post: None,
                     latent_abort_diagnostics: vec![None],
                     has_dropped_disjuncts: false,
                 },
@@ -3096,6 +3107,7 @@ mod tests {
             callee_pname,
             PulseSummary {
                 pre_posts: vec![unspecialized_pre_post],
+                non_disj_pre_post: None,
                 has_dropped_disjuncts: false,
                 specialized,
                 diagnostics: vec![],
@@ -3170,6 +3182,7 @@ mod tests {
                     latent_invalid_access: None,
                     pending_invalid_accesses: vec![],
                 }],
+                non_disj_pre_post: None,
                 has_dropped_disjuncts,
                 specialized: vec![],
                 diagnostics: vec![diagnostic],
@@ -3187,6 +3200,7 @@ mod tests {
             callee_pname,
             PulseSummary {
                 pre_posts: vec![],
+                non_disj_pre_post: None,
                 has_dropped_disjuncts: false,
                 specialized: vec![],
                 diagnostics: vec![],

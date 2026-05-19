@@ -88,6 +88,16 @@ impl NonDisjDomain {
         self.over_approx.as_ref()
     }
 
+    /// Clone the retained hidden over-approximate state for summary export.
+    ///
+    /// Cross-ref: OCaml `PulseNonDisjunctiveDomain.make_summary` consumes the
+    /// hidden `astate` sideband by passing it to
+    /// `PulseAbductiveDomain.Summary.of_post`, but leaves ordinary visible
+    /// disjunct summary rows untouched.
+    pub fn to_summary_astate(&self) -> Option<AbductiveDomain> {
+        self.over_approx.clone()
+    }
+
     /// Join two non-disjunctive domains.
     ///
     /// The dropped-disjunct bit is BooleanOr. The hidden state currently uses

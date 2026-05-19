@@ -42,6 +42,13 @@ pub struct PulseSummary {
     /// The main (non-specialized) post-states at procedure exit.
     /// Matches OCaml's `PulseSummary.main.pre_post_list`.
     pub pre_posts: Vec<PrePost>,
+    /// Hidden non-disjunctive over-approximate pre/post exported separately
+    /// from the visible summary rows.
+    ///
+    /// Cross-ref: OCaml `PulseSummary.main.non_disj` /
+    /// `PulseNonDisjunctiveDomain.Summary.astate`. Callers consume this as a
+    /// sideband rather than as an ordinary `pre_post_list` row.
+    pub non_disj_pre_post: Option<PrePost>,
     /// True when analysis had to drop some disjuncts while computing this
     /// summary (for example because of the disjunct bound or widening limit).
     /// Cross-ref: OCaml `PulseNonDisjunctiveDomain.Summary.has_dropped_disjuncts`.
@@ -70,6 +77,9 @@ pub struct PulseSummary {
 #[derive(Clone, Debug)]
 pub struct SpecializedSummary {
     pub pre_posts: Vec<PrePost>,
+    /// Specialized hidden non-disjunctive pre/post, kept separate from the
+    /// visible rows just like the owning unspecialized summary.
+    pub non_disj_pre_post: Option<PrePost>,
     /// Specialized latent aborts stay latent in the cached summary, like
     /// OCaml's `LatentAbortProgram {latent_issue; ...}`. Keep the issue
     /// sideband here so callers can still reify it when applying the summary.
@@ -1106,6 +1116,7 @@ impl PulseSummary {
     pub fn intra_only(diagnostics: Vec<Diagnostic>) -> Self {
         Self {
             pre_posts: Vec::new(),
+            non_disj_pre_post: None,
             has_dropped_disjuncts: false,
             specialized: Vec::new(),
             diagnostics,
@@ -1120,6 +1131,7 @@ impl PulseSummary {
     pub fn empty_body(pdesc: &Procdesc) -> Self {
         Self {
             pre_posts: Vec::new(),
+            non_disj_pre_post: None,
             has_dropped_disjuncts: false,
             specialized: Vec::new(),
             diagnostics: Vec::new(),
@@ -1143,6 +1155,7 @@ impl PulseSummary {
     pub fn skipped(pdesc: &Procdesc) -> Self {
         Self {
             pre_posts: Vec::new(),
+            non_disj_pre_post: None,
             has_dropped_disjuncts: false,
             specialized: Vec::new(),
             diagnostics: Vec::new(),
@@ -1176,6 +1189,24 @@ impl PulseSummary {
         diagnostics: Vec<Diagnostic>,
         is_noreturn: bool,
         has_dropped_disjuncts: bool,
+    ) -> Self {
+        Self::of_proc_with_hidden_non_disj(
+            pdesc,
+            exec_states,
+            diagnostics,
+            is_noreturn,
+            has_dropped_disjuncts,
+            None,
+        )
+    }
+
+    pub fn of_proc_with_hidden_non_disj(
+        pdesc: &Procdesc,
+        exec_states: &[ExecutionDomain],
+        diagnostics: Vec<Diagnostic>,
+        is_noreturn: bool,
+        has_dropped_disjuncts: bool,
+        hidden_non_disj_astate: Option<AbductiveDomain>,
     ) -> Self {
         // Build a PrePost for each execution path (ContinueProgram, ExitProgram,
         // AbortProgram). Matches OCaml's `pre_post_list` which keeps ALL paths
@@ -1523,13 +1554,34 @@ impl PulseSummary {
         // Cross-ref: OCaml PulseAbductiveDomain.Summary.heap_paths_that_need_dynamic_type_specialization.
         let needs_specialization = compute_specialization_heap_paths(&pre_posts);
 
+        // Cross-ref: OCaml `PulseNonDisjunctiveDomain.make_summary` runs the
+        // hidden over-approximate astate through
+        // `PulseAbductiveDomain.Summary.of_post` and stores it under
+        // `summary.non_disj` rather than appending it to `pre_post_list`.
+        // Keep the first Rust port conservative: export only a normalized
+        // Continue pre/post, and drop the hidden row if normalization exposes
+        // leaks, latent invalid-access obligations, or contradiction. Hidden
+        // diagnostics must not be published by summary creation.
+        let mut non_disj_pre_post = hidden_non_disj_astate.and_then(|astate| {
+            let mut pp = build_pre_post(pdesc, astate, PrePostKind::ContinueProgram, None);
+            let info = pp.normalize_with_summary_info();
+            if info.aliasing_contradiction
+                || !info.leaks.is_empty()
+                || info.summary_potential_invalid_access.is_some()
+            {
+                return None;
+            }
+            coalesce_zero_direct_formals_for_continue_export(pdesc, &mut pp);
+            Some(pp)
+        });
+
         // Drop analysis-only working state from each PrePost's stored
         // post-state. Run AFTER `compute_specialization_heap_paths` (which
         // reads `need_dynamic_type_specialization`) and the rest of the
         // dedup / classification passes above. The cached PulseSummary
         // lives for the whole run in the SummaryStore, so this is the
         // single biggest lever on per-procedure summary retention cost.
-        for pp in pre_posts.iter_mut() {
+        for pp in pre_posts.iter_mut().chain(non_disj_pre_post.iter_mut()) {
             pp.post.shrink_for_storage();
         }
 
@@ -1542,6 +1594,7 @@ impl PulseSummary {
 
         Self {
             pre_posts,
+            non_disj_pre_post,
             has_dropped_disjuncts,
             specialized: Vec::new(),
             diagnostics,
@@ -1607,6 +1660,7 @@ impl PulseSummary {
             spec,
             SpecializedSummary {
                 pre_posts: summary.pre_posts,
+                non_disj_pre_post: summary.non_disj_pre_post,
                 latent_abort_diagnostics,
                 has_dropped_disjuncts: summary.has_dropped_disjuncts,
             },
@@ -2088,7 +2142,10 @@ fn potential_invalid_access_from_normalized_stopped_pre_post(
 }
 
 #[allow(dead_code)]
-fn promote_imported_latent_abort_invalid_access_to_sideband(pdesc: &Procdesc, pre_post: &mut PrePost) {
+fn promote_imported_latent_abort_invalid_access_to_sideband(
+    pdesc: &Procdesc,
+    pre_post: &mut PrePost,
+) {
     if pdesc.proc_name.get_method_name() != "latent_use_after_free"
         || pre_post.kind != PrePostKind::LatentAbortProgram
     {
@@ -3263,7 +3320,10 @@ fn latent_invalid_access_invalidation_pair(
     addr: AbstractValue,
     base_history: &crate::value_history::ValueHistory,
     location: &sil::location::Location,
-) -> (crate::invalidation::Invalidation, crate::value_history::ValueHistory) {
+) -> (
+    crate::invalidation::Invalidation,
+    crate::value_history::ValueHistory,
+) {
     let repr = pre_post.post.path_condition.get_var_repr(addr);
     let invalidation = pre_post
         .post
@@ -3272,9 +3332,7 @@ fn latent_invalid_access_invalidation_pair(
         .get(&repr)
         .and_then(|attrs| attrs.get_invalid())
         .map(|(invalidation, _history)| invalidation.clone())
-        .unwrap_or_else(|| {
-            crate::invalidation::Invalidation::ConstantDereference(IntLit::zero())
-        });
+        .unwrap_or_else(|| crate::invalidation::Invalidation::ConstantDereference(IntLit::zero()));
     let history = base_history.append_event(HistoryEvent::Invalidated {
         invalidation: invalidation.clone(),
         location: location.clone(),
@@ -4874,6 +4932,7 @@ mod tests {
                 latent_invalid_access: None,
                 pending_invalid_accesses: vec![],
             }],
+            non_disj_pre_post: None,
             has_dropped_disjuncts: false,
             specialized: vec![],
             diagnostics: vec![diagnostic.clone()],
@@ -4908,6 +4967,73 @@ mod tests {
 
         let summary = PulseSummary::of_proc(&pdesc, &states, vec![], false);
         assert_eq!(summary.pre_posts.len(), 2, "should keep both disjuncts");
+        assert!(
+            summary.non_disj_pre_post.is_none(),
+            "ordinary summary export must not synthesize hidden non-disj rows"
+        );
+    }
+
+    #[test]
+    fn test_specialized_summary_keeps_hidden_non_disj_pre_post() {
+        let pdesc = make_pdesc_with_formals(&[]);
+        let hidden_state = AbductiveDomain::mk_initial(&pdesc);
+        let specialized = PulseSummary::of_proc_with_hidden_non_disj(
+            &pdesc,
+            &[],
+            vec![],
+            false,
+            true,
+            Some(hidden_state),
+        );
+
+        let mut summary = PulseSummary::intra_only(vec![]);
+        let spec = PulseSpecialization::bottom();
+        summary.add_specialized_summary(spec.clone(), specialized);
+
+        assert!(
+            summary
+                .get_specialized_data(&spec)
+                .and_then(|data| data.non_disj_pre_post.as_ref())
+                .is_some(),
+            "specialized summary should preserve the hidden non-disj sideband"
+        );
+    }
+
+    #[test]
+    fn test_hidden_non_disj_pre_post_exports_without_visible_row() {
+        let pdesc = make_pdesc_with_formals(&["x"]);
+        let visible_state = AbductiveDomain::mk_initial(&pdesc);
+        let mut hidden_state = AbductiveDomain::mk_initial(&pdesc);
+        let x_pvar = Pvar::mk(Mangled::from_string("x"), pdesc.proc_name.clone());
+        let x_var = Var::ProgramVar(Box::new(x_pvar.clone()));
+        let x_addr = hidden_state.post.stack.find(&x_var).unwrap();
+        let x_value = hidden_state.read_heap(x_addr, Access::Dereference);
+
+        let summary = PulseSummary::of_proc_with_hidden_non_disj(
+            &pdesc,
+            &[ExecutionDomain::ContinueProgram(visible_state)],
+            vec![],
+            false,
+            true,
+            Some(hidden_state),
+        );
+
+        assert_eq!(
+            summary.pre_posts.len(),
+            1,
+            "hidden non-disj pre/post must not be appended to visible rows"
+        );
+        let hidden = summary
+            .non_disj_pre_post
+            .as_ref()
+            .expect("hidden over-approx astate should export as a pre/post");
+        assert_eq!(hidden.kind, PrePostKind::ContinueProgram);
+        assert_eq!(hidden.formals, vec![(x_pvar, x_addr)]);
+        assert_eq!(
+            hidden.pre.heap.find_edge(x_addr, &Access::Dereference),
+            Some(x_value),
+            "hidden export should go through the same summary normalization surface"
+        );
     }
 
     #[test]
@@ -7584,6 +7710,7 @@ mod tests {
                 latent_invalid_access: None,
                 pending_invalid_accesses: vec![],
             }],
+            non_disj_pre_post: None,
             has_dropped_disjuncts: false,
             specialized: vec![],
             diagnostics: vec![diagnostic],
@@ -7629,6 +7756,7 @@ mod tests {
                 latent_invalid_access: None,
                 pending_invalid_accesses: vec![],
             }],
+            non_disj_pre_post: None,
             has_dropped_disjuncts: false,
             specialized: vec![],
             diagnostics: vec![],
