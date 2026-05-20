@@ -1534,6 +1534,33 @@ struct PulseTransferFunctions<'a> {
     aborted: std::cell::Cell<bool>,
 }
 
+impl PulseTransferFunctions<'_> {
+    /// Check the per-procedure wall-time cap from within long instruction
+    /// transfers. `exec_node` checks the same cap between CFG node visits; this
+    /// intra-instruction check prevents a single instruction with many
+    /// expensive disjuncts from evading the cap for minutes or hours.
+    fn check_wall_cap(&self, max_secs: Option<u64>) -> bool {
+        if self.aborted.get() {
+            return true;
+        }
+        if let Some(max_secs) = max_secs.filter(|s| *s > 0) {
+            let elapsed = self.start_instant.elapsed();
+            if elapsed.as_secs() > max_secs {
+                log::warn!(
+                    target: "ondemand",
+                    "[pulse-progress] proc={} aborted at elapsed={} > {}s wall cap",
+                    self.proc_name,
+                    format_duration(elapsed),
+                    max_secs,
+                );
+                self.aborted.set(true);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 impl TransferFunctions for PulseTransferFunctions<'_> {
     type Domain = PulseDomain;
     type AnalysisData = ();
@@ -1546,6 +1573,13 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         instr_idx: usize,
         instr: &Instr,
     ) -> Self::Domain {
+        let abort_response =
+            || -> Self::Domain { PulseDomain::empty(state.max_disjuncts, state.max_widen_iters) };
+        if self.aborted.get() {
+            return abort_response();
+        }
+        let cfg = config::get();
+
         let continue_count = state.disjuncts.iter().filter(|d| d.is_continue()).count();
 
         let pn = &self.proc_name;
@@ -1564,6 +1598,9 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         let mut post_non_disj = disjunct_non_disj.clone();
 
         for (i, disjunct) in state.disjuncts.iter().enumerate() {
+            if self.aborted.get() {
+                break;
+            }
             match disjunct {
                 ExecutionDomain::ContinueProgram(astate) => {
                     log::trace!("[{pn}]   disjunct #{i}: {astate:?}");
@@ -1588,11 +1625,18 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                         results.len()
                     );
                     new_disjuncts.extend(results);
+                    // Check wall cap between disjuncts to avoid evasion on loaded machines.
+                    if self.check_wall_cap(cfg.pulse_max_wall_secs) {
+                        break;
+                    }
                 }
                 other => {
                     new_disjuncts.push(other.clone());
                 }
             }
+        }
+        if self.aborted.get() {
+            return abort_response();
         }
 
         let mut result = PulseDomain::from_parts(
@@ -1611,6 +1655,9 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         result.bound();
 
         let hidden_post = pre_non_disj.exec_over_approx(|exec, non_disj| {
+            if self.aborted.get() {
+                return (Vec::new(), NonDisjDomain::bottom());
+            }
             let exec_result = match exec {
                 ExecutionDomain::ContinueProgram(astate) => exec_instr_with_summaries_with_mode(
                     self.pdesc,
@@ -1626,8 +1673,16 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                     non_disj: NonDisjDomain::bottom(),
                 },
             };
+            // Check wall cap after the hidden non-disjunctive transfer too, so
+            // phase-3 over-approximation cannot defer the abort to the next CFG node.
+            if self.check_wall_cap(cfg.pulse_max_wall_secs) {
+                return (Vec::new(), NonDisjDomain::bottom());
+            }
             (exec_result.results, non_disj.join(&exec_result.non_disj))
         });
+        if self.aborted.get() {
+            return abort_response();
+        }
         // Prefer the freshly-executed hidden state when the current visible
         // instruction also captures a dropped disjunct. A real Pulse join will
         // eventually combine both; with the current single-slot scaffold,
@@ -1692,19 +1747,8 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                 }
             }
         }
-        if let Some(max_secs) = cfg.pulse_max_wall_secs.filter(|s| *s > 0) {
-            let elapsed = self.start_instant.elapsed();
-            if elapsed.as_secs() > max_secs {
-                log::warn!(
-                    target: "ondemand",
-                    "[pulse-progress] proc={} aborted at elapsed={} > {}s wall cap",
-                    self.proc_name,
-                    format_duration(elapsed),
-                    max_secs,
-                );
-                self.aborted.set(true);
-                return abort_response();
-            }
+        if self.check_wall_cap(cfg.pulse_max_wall_secs) {
+            return abort_response();
         }
 
         let node = match pdesc.get_node(node_id) {
