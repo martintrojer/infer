@@ -22,7 +22,7 @@ pub mod phi;
 pub mod term;
 pub mod var_uf;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::abstract_value::AbstractValue;
@@ -121,6 +121,32 @@ pub fn expand_formula_reachable(
     let mut reachable = seed_reachable.clone();
     let mut worklist: Vec<_> = seed_reachable.iter().copied().collect();
 
+    // Reverse dependency index for equations where the current worklist value
+    // appears on the RHS/operand side. The forward direction below still uses
+    // direct lookups from the current representative to its own equation; this
+    // index only replaces the previous O(worklist × total_eqs) reverse scans.
+    let mut reverse_deps: HashMap<AbstractValue, Vec<AbstractValue>> = HashMap::new();
+    for (&lhs, lin) in &phi.linear_eqs {
+        let lhs_repr = phi.get_repr(lhs);
+        for dep in lin.vars.keys() {
+            let dep_repr = phi.get_repr(*dep);
+            reverse_deps.entry(dep_repr).or_default().push(lhs_repr);
+        }
+    }
+    for (&lhs, term_eq) in &phi.term_eqs {
+        if term_eq.op != sil::binop::Binop::DivF {
+            continue;
+        }
+        let lhs_repr = phi.get_repr(lhs);
+        for operand in [&term_eq.lhs, &term_eq.rhs] {
+            let Operand::AbstractValue(value) = operand else {
+                continue;
+            };
+            let value_repr = phi.get_repr(*value);
+            reverse_deps.entry(value_repr).or_default().push(lhs_repr);
+        }
+    }
+
     while let Some(v) = worklist.pop() {
         let repr = phi.get_repr(v);
         if let Some(lin) = phi.linear_eqs.get(&repr) {
@@ -132,13 +158,13 @@ pub fn expand_formula_reachable(
             }
         }
 
-        for (&lhs, lin) in &phi.linear_eqs {
-            let lhs_repr = phi.get_repr(lhs);
-            if lhs_repr != repr
-                && lin.vars.keys().any(|dep| phi.get_repr(*dep) == repr)
-                && reachable.insert(lhs_repr)
-            {
-                worklist.push(lhs_repr);
+        // Equations that mention `repr` on the RHS/operand side imply reverse
+        // reachability to their LHS/result.
+        if let Some(lhs_reprs) = reverse_deps.get(&repr) {
+            for &lhs_repr in lhs_reprs {
+                if lhs_repr != repr && reachable.insert(lhs_repr) {
+                    worklist.push(lhs_repr);
+                }
             }
         }
 
@@ -161,21 +187,6 @@ pub fn expand_formula_reachable(
                 }
             }
         }
-        for (&lhs, term_eq) in &phi.term_eqs {
-            if term_eq.op != sil::binop::Binop::DivF {
-                continue;
-            }
-            let lhs_repr = phi.get_repr(lhs);
-            if lhs_repr != repr
-                && [&term_eq.lhs, &term_eq.rhs].iter().any(|operand| {
-                    matches!(operand, Operand::AbstractValue(value) if phi.get_repr(*value) == repr)
-                })
-                && reachable.insert(lhs_repr)
-            {
-                worklist.push(lhs_repr);
-            }
-        }
-
         // Cross-ref: OCaml PulseFormula.DeadVariables.build_var_graph keeps
         // function-application results connected to their actual arguments.
         // Without this, imported conditions on pure-call results can be
