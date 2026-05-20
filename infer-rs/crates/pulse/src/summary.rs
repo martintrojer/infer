@@ -1254,8 +1254,34 @@ impl PulseSummary {
         has_dropped_disjuncts: bool,
         non_disj_astate: Option<AbductiveDomain>,
     ) -> Self {
-        let mut non_disj_pre_post =
-            non_disj_astate.and_then(|astate| build_hidden_non_disj_pre_post(pdesc, astate));
+        Self::of_proc_with_metadata_and_abort(
+            pdesc,
+            exec_states,
+            diagnostics,
+            is_noreturn,
+            has_dropped_disjuncts,
+            non_disj_astate,
+            || false,
+        )
+    }
+
+    pub(crate) fn of_proc_with_metadata_and_abort<F>(
+        pdesc: &Procdesc,
+        exec_states: &[ExecutionDomain],
+        diagnostics: Vec<Diagnostic>,
+        is_noreturn: bool,
+        has_dropped_disjuncts: bool,
+        non_disj_astate: Option<AbductiveDomain>,
+        mut should_abort: F,
+    ) -> Self
+    where
+        F: FnMut() -> bool,
+    {
+        let mut non_disj_pre_post = if should_abort() {
+            None
+        } else {
+            non_disj_astate.and_then(|astate| build_hidden_non_disj_pre_post(pdesc, astate))
+        };
         // Build a PrePost for each execution path (ContinueProgram, ExitProgram,
         // AbortProgram). Matches OCaml's `pre_post_list` which keeps ALL paths
         // including error paths. AbortProgram disjuncts stay in the summary so
@@ -1283,6 +1309,9 @@ impl PulseSummary {
                     | ExecutionDomain::LatentInvalidAccess { .. }
             )
         }) {
+            if should_abort() {
+                break;
+            }
             let mut drop_exported_latent_invalid_access_diagnostic = false;
             let (initial_kind, abort_diag) = match state {
                 ExecutionDomain::ExitProgram(_) => (PrePostKind::ExitProgram, None),
@@ -1484,22 +1513,28 @@ impl PulseSummary {
         //    it here at the summary export site too via
         //    `pre_posts_equivalent_for_summary_export` so duplicate latent
         //    rows that differ only on hidden history collapse.
-        let mut deduped_pre_posts = Vec::with_capacity(pre_posts.len());
-        for pre_post in pre_posts.drain(..) {
-            if !preserve_exact_duplicate_pre_post(&pre_post)
-                && deduped_pre_posts
-                    .iter()
-                    .any(|existing| pre_posts_equivalent_for_summary_export(existing, &pre_post))
-            {
-                continue;
+        if !should_abort() {
+            let mut deduped_pre_posts = Vec::with_capacity(pre_posts.len());
+            for pre_post in pre_posts.drain(..) {
+                if should_abort() {
+                    break;
+                }
+                if !preserve_exact_duplicate_pre_post(&pre_post)
+                    && deduped_pre_posts.iter().any(|existing| {
+                        pre_posts_equivalent_for_summary_export(existing, &pre_post)
+                    })
+                {
+                    continue;
+                }
+                deduped_pre_posts.push(pre_post);
             }
-            deduped_pre_posts.push(pre_post);
+            pre_posts = deduped_pre_posts;
         }
-        pre_posts = deduped_pre_posts;
 
-        if pre_posts
-            .iter()
-            .any(|pre_post| pre_post.kind == PrePostKind::LatentInvalidAccess)
+        if !should_abort()
+            && pre_posts
+                .iter()
+                .any(|pre_post| pre_post.kind == PrePostKind::LatentInvalidAccess)
         {
             pre_posts.sort_by_key(|pre_post| match pre_post.kind {
                 PrePostKind::ContinueProgram | PrePostKind::ExitProgram => 0,
@@ -1509,93 +1544,103 @@ impl PulseSummary {
             });
         }
 
-        let latent_invalid_access_specificity = |pre_post: &PrePost| {
-            let location_rank = latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
-                .map(|diag| {
-                    let loc = diag.get_location();
-                    (u32::MAX - loc.line as u32, u32::MAX - loc.col as u32)
-                })
-                .unwrap_or((0, 0));
-            (
-                pre_post.post.path_condition.conditions().len(),
-                usize::from(!pre_post_is_manifest(pdesc, pre_post)),
-                usize::from(pre_post.diagnostic.is_some()),
-                location_rank,
-            )
-        };
-        let mut keyed_pre_posts = Vec::with_capacity(pre_posts.len());
-        for pre_post in pre_posts.drain(..) {
-            let Some(key) = latent_invalid_access_report_key(&pre_post) else {
-                keyed_pre_posts.push(pre_post);
-                continue;
+        if !should_abort() {
+            let latent_invalid_access_specificity = |pre_post: &PrePost| {
+                let location_rank =
+                    latent_invalid_access_diagnostic_from_exported_pre_post(pre_post)
+                        .map(|diag| {
+                            let loc = diag.get_location();
+                            (u32::MAX - loc.line as u32, u32::MAX - loc.col as u32)
+                        })
+                        .unwrap_or((0, 0));
+                (
+                    pre_post.post.path_condition.conditions().len(),
+                    usize::from(!pre_post_is_manifest(pdesc, pre_post)),
+                    usize::from(pre_post.diagnostic.is_some()),
+                    location_rank,
+                )
             };
+            let mut keyed_pre_posts = Vec::with_capacity(pre_posts.len());
+            for pre_post in pre_posts.drain(..) {
+                if should_abort() {
+                    break;
+                }
+                let Some(key) = latent_invalid_access_report_key(&pre_post) else {
+                    keyed_pre_posts.push(pre_post);
+                    continue;
+                };
 
-            let Some(existing_idx) = keyed_pre_posts.iter().position(|existing| {
-                latent_invalid_access_report_key(existing).as_deref() == Some(key.as_str())
-            }) else {
-                keyed_pre_posts.push(pre_post);
-                continue;
-            };
+                let Some(existing_idx) = keyed_pre_posts.iter().position(|existing| {
+                    latent_invalid_access_report_key(existing).as_deref() == Some(key.as_str())
+                }) else {
+                    keyed_pre_posts.push(pre_post);
+                    continue;
+                };
 
-            if latent_invalid_access_specificity(&pre_post)
-                > latent_invalid_access_specificity(&keyed_pre_posts[existing_idx])
-            {
-                keyed_pre_posts[existing_idx] = pre_post;
+                if latent_invalid_access_specificity(&pre_post)
+                    > latent_invalid_access_specificity(&keyed_pre_posts[existing_idx])
+                {
+                    keyed_pre_posts[existing_idx] = pre_post;
+                }
             }
+            pre_posts = keyed_pre_posts;
         }
-        pre_posts = keyed_pre_posts;
 
-        if pre_posts.iter().any(|pre_post| {
-            pre_post.kind == PrePostKind::LatentInvalidAccess
-                && pre_post.post.path_condition.conditions().is_empty()
-        }) {
+        if !should_abort()
+            && pre_posts.iter().any(|pre_post| {
+                pre_post.kind == PrePostKind::LatentInvalidAccess
+                    && pre_post.post.path_condition.conditions().is_empty()
+            })
+        {
             pre_posts.retain(|pre_post| {
                 pre_post.kind != PrePostKind::LatentInvalidAccess
                     || pre_post.post.path_condition.conditions().is_empty()
             });
         }
 
-        // Cross-ref: OCaml reports manifest diagnostics only after the final
-        // latent-vs-manifest classification in `PulseSummary.exec_summary_of_post_common`.
-        // If Rust still carries a manifest diagnostic for an issue whose final
-        // summary surface is latent-only, drop that stale manifest publication.
-        // Keep the manifest diagnostic when the final summary intentionally
-        // exports both variants via an `AbortProgram` twin.
-        let latent_keys: std::collections::HashSet<_> = pre_posts
-            .iter()
-            .filter(|pre_post| {
-                matches!(
-                    pre_post.kind,
-                    PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
-                )
-            })
-            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
-            .map(Diagnostic::dedup_key)
-            .collect();
-        let abort_keys: std::collections::HashSet<_> = pre_posts
-            .iter()
-            .filter(|pre_post| pre_post.kind == PrePostKind::AbortProgram)
-            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
-            .map(Diagnostic::dedup_key)
-            .collect();
-        let publishable_manifest_abort_keys: std::collections::HashSet<_> = pre_posts
-            .iter()
-            .filter(|pre_post| abort_pre_post_should_publish_manifest_diagnostic(pdesc, pre_post))
-            .filter_map(|pre_post| pre_post.diagnostic.as_ref())
-            .map(Diagnostic::dedup_key)
-            .collect();
-        diagnostics.retain(|diag| {
-            let key = diag.dedup_key();
-            let latent_ok =
-                !latent_keys.contains(&key) || publishable_manifest_abort_keys.contains(&key);
-            let abort_ok =
-                !abort_keys.contains(&key) || publishable_manifest_abort_keys.contains(&key);
-            latent_ok && abort_ok
-        });
+        if !should_abort() {
+            // Cross-ref: OCaml reports manifest diagnostics only after the final
+            // latent-vs-manifest classification in `PulseSummary.exec_summary_of_post_common`.
+            // If Rust still carries a manifest diagnostic for an issue whose final
+            // summary surface is latent-only, drop that stale manifest publication.
+            // Keep the manifest diagnostic when the final summary intentionally
+            // exports both variants via an `AbortProgram` twin.
+            let latent_keys: std::collections::HashSet<_> = pre_posts
+                .iter()
+                .filter(|pre_post| {
+                    matches!(
+                        pre_post.kind,
+                        PrePostKind::LatentAbortProgram | PrePostKind::LatentInvalidAccess
+                    )
+                })
+                .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+                .map(Diagnostic::dedup_key)
+                .collect();
+            let abort_keys: std::collections::HashSet<_> = pre_posts
+                .iter()
+                .filter(|pre_post| pre_post.kind == PrePostKind::AbortProgram)
+                .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+                .map(Diagnostic::dedup_key)
+                .collect();
+            let publishable_manifest_abort_keys: std::collections::HashSet<_> = pre_posts
+                .iter()
+                .filter(|pre_post| {
+                    abort_pre_post_should_publish_manifest_diagnostic(pdesc, pre_post)
+                })
+                .filter_map(|pre_post| pre_post.diagnostic.as_ref())
+                .map(Diagnostic::dedup_key)
+                .collect();
+            diagnostics.retain(|diag| {
+                let key = diag.dedup_key();
+                let latent_ok =
+                    !latent_keys.contains(&key) || publishable_manifest_abort_keys.contains(&key);
+                let abort_ok =
+                    !abort_keys.contains(&key) || publishable_manifest_abort_keys.contains(&key);
+                latent_ok && abort_ok
+            });
 
-        // Deduplicate leak diagnostics: multiple disjuncts (e.g., malloc
-        // null/non-null) can report the same leak from the same allocation.
-        {
+            // Deduplicate leak diagnostics: multiple disjuncts (e.g., malloc
+            // null/non-null) can report the same leak from the same allocation.
             let mut seen = std::collections::HashSet::new();
             diagnostics.retain(|d| seen.insert(d.dedup_key()));
         }
@@ -1604,7 +1649,11 @@ impl PulseSummary {
         // Walk the pre-state heap from stack vars to find paths leading
         // to addresses in need_dynamic_type_specialization.
         // Cross-ref: OCaml PulseAbductiveDomain.Summary.heap_paths_that_need_dynamic_type_specialization.
-        let needs_specialization = compute_specialization_heap_paths(&pre_posts);
+        let needs_specialization = if should_abort() {
+            HashMap::new()
+        } else {
+            compute_specialization_heap_paths(&pre_posts)
+        };
 
         // Drop analysis-only working state from each PrePost's stored
         // post-state. Run AFTER `compute_specialization_heap_paths` (which
@@ -1612,8 +1661,10 @@ impl PulseSummary {
         // dedup / classification passes above. The cached PulseSummary
         // lives for the whole run in the SummaryStore, so this is the
         // single biggest lever on per-procedure summary retention cost.
-        for pp in pre_posts.iter_mut().chain(non_disj_pre_post.iter_mut()) {
-            pp.post.shrink_for_storage();
+        if !should_abort() {
+            for pp in pre_posts.iter_mut().chain(non_disj_pre_post.iter_mut()) {
+                pp.post.shrink_for_storage();
+            }
         }
 
         let is_empty_body = pdesc.is_declaration_stub();

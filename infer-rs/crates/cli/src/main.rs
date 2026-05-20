@@ -1525,6 +1525,23 @@ fn analyze_with_spec_loop(
     depth: usize,
 ) -> pulse::summary::PulseSummary {
     const MAX_SPEC_DEPTH: usize = 5;
+    let analysis_start = std::time::Instant::now();
+    let wall_cap_fired = || {
+        let Some(max_secs) = config::get().pulse_max_wall_secs.filter(|s| *s > 0) else {
+            return false;
+        };
+        if analysis_start.elapsed().as_secs() <= max_secs {
+            return false;
+        }
+        log::warn!(
+            target: "ondemand",
+            "[pulse-progress] proc={} specialization loop aborted at elapsed={} > {}s wall cap",
+            pdesc.proc_name,
+            format_duration(analysis_start.elapsed()),
+            max_secs,
+        );
+        true
+    };
 
     let mut callee_summaries: std::collections::HashMap<
         sil::procname::Procname,
@@ -1567,8 +1584,14 @@ fn analyze_with_spec_loop(
     }
 
     loop {
+        if wall_cap_fired() {
+            return summary;
+        }
         let mut added_any = false;
         for (callee_pname, spec) in &spec_requests {
+            if wall_cap_fired() {
+                return summary;
+            }
             if callee_summaries
                 .get(callee_pname)
                 .is_some_and(|summary| summary.get_specialized(spec).is_some())
@@ -1578,6 +1601,9 @@ fn analyze_with_spec_loop(
             if let Some(callee_pdesc) = ctx.cfg.get_proc_desc(callee_pname) {
                 let spec_summary =
                     analyze_with_spec_loop(callee_pdesc, ctx, vt_index, Some(spec), depth + 1);
+                if wall_cap_fired() {
+                    return summary;
+                }
                 let spec_summary_for_store = spec_summary.clone();
                 if let Some(existing) = callee_summaries.get_mut(callee_pname) {
                     Arc::make_mut(existing).add_specialized_summary(spec.clone(), spec_summary);
@@ -1591,6 +1617,9 @@ fn analyze_with_spec_loop(
             }
         }
         if !added_any {
+            return summary;
+        }
+        if wall_cap_fired() {
             return summary;
         }
         (summary, spec_requests) =

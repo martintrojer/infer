@@ -1182,7 +1182,11 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
             exit_has_normal_path,
         );
     }
+    let mut non_exit_scan_aborted = false;
     for (node_id, state) in &inv_map {
+        if pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs) {
+            break;
+        }
         let node_scan_start = Instant::now();
         if *node_id == pdesc.exit_node {
             continue;
@@ -1211,6 +1215,10 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
             );
         }
         for d in &state.post.disjuncts {
+            if pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs) {
+                non_exit_scan_aborted = true;
+                break;
+            }
             match d {
                 ExecutionDomain::AbortProgram { state, diagnostic } => {
                     let classify_start = Instant::now();
@@ -1261,6 +1269,10 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
                             recovered_non_exit_disjuncts.push(recovered);
                         }
                     }
+                    if pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs) {
+                        non_exit_scan_aborted = true;
+                        break;
+                    }
                 }
                 ExecutionDomain::LatentAbortProgram { .. }
                 | ExecutionDomain::LatentInvalidAccess { .. } => {
@@ -1293,6 +1305,10 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
                         );
                     }
                     for recovered in recovered_candidates {
+                        if pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs) {
+                            non_exit_scan_aborted = true;
+                            break;
+                        }
                         let diagnostic = match &recovered {
                             ExecutionDomain::AbortProgram { diagnostic, .. }
                             | ExecutionDomain::LatentInvalidAccess { diagnostic, .. } => {
@@ -1308,9 +1324,15 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
                             recovered_non_exit_disjuncts.push(recovered);
                         }
                     }
+                    if non_exit_scan_aborted {
+                        break;
+                    }
                 }
                 _ => {}
             }
+        }
+        if non_exit_scan_aborted {
+            break;
         }
         if pulse_progress_enabled() && node_scan_start.elapsed() >= PROC_SLOW_LOG_THRESHOLD {
             log::info!(
@@ -1340,6 +1362,9 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     let mut exit_disjuncts = Vec::new();
     if let Some(exit_state) = inv_map.get(&pdesc.exit_node) {
         for d in &exit_state.post.disjuncts {
+            if pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs) {
+                break;
+            }
             match d {
                 ExecutionDomain::ContinueProgram(_)
                 | ExecutionDomain::ExitProgram(_)
@@ -1354,6 +1379,9 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
     }
     let recovered_non_exit_count = recovered_non_exit_disjuncts.len();
     for recovered in recovered_non_exit_disjuncts {
+        if pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs) {
+            break;
+        }
         let recovered_key = stopped_summary_key(&recovered);
         let already_present = exit_disjuncts.iter().any(|existing| {
             stopped_summary_key(existing).as_ref() == recovered_key.as_ref()
@@ -1387,13 +1415,14 @@ pub fn analyze_with_tenv_and_specialization_and_requests(
             has_dropped_disjuncts,
         );
     }
-    let summary = PulseSummary::of_proc_with_metadata(
+    let summary = PulseSummary::of_proc_with_metadata_and_abort(
         pdesc,
         &exit_disjuncts,
         diagnostics,
         is_noreturn,
         has_dropped_disjuncts,
         hidden_non_disj_astate,
+        || pulse_tf.check_wall_cap(cfg.pulse_max_wall_secs),
     );
     if pulse_progress_enabled() {
         log::info!(
