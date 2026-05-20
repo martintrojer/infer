@@ -1535,46 +1535,18 @@ struct PulseTransferFunctions<'a> {
 }
 
 impl PulseTransferFunctions<'_> {
-    /// Check the per-procedure wall-time cap from within long instruction
-    /// transfers. `exec_node` checks the same cap between CFG node visits; this
-    /// intra-instruction check prevents a single instruction with many
-    /// expensive disjuncts from evading the cap for minutes or hours.
-    fn check_wall_cap(&self, max_secs: Option<u64>) -> bool {
-        if self.aborted.get() {
-            return true;
-        }
-        if let Some(max_secs) = max_secs.filter(|s| *s > 0) {
-            let elapsed = self.start_instant.elapsed();
-            if elapsed.as_secs() > max_secs {
-                log::warn!(
-                    target: "ondemand",
-                    "[pulse-progress] proc={} aborted at elapsed={} > {}s wall cap",
-                    self.proc_name,
-                    format_duration(elapsed),
-                    max_secs,
-                );
-                self.aborted.set(true);
-                return true;
-            }
-        }
-        false
-    }
-}
-
-impl TransferFunctions for PulseTransferFunctions<'_> {
-    type Domain = PulseDomain;
-    type AnalysisData = ();
-
-    fn exec_instr(
+    fn exec_instr_owned(
         &self,
-        state: &Self::Domain,
+        state: PulseDomain,
         _data: &(),
         node_id: NodeId,
         instr_idx: usize,
         instr: &Instr,
-    ) -> Self::Domain {
+    ) -> PulseDomain {
+        let max_disjuncts = state.max_disjuncts;
+        let max_widen_iters = state.max_widen_iters;
         let abort_response =
-            || -> Self::Domain { PulseDomain::empty(state.max_disjuncts, state.max_widen_iters) };
+            || -> PulseDomain { PulseDomain::empty(max_disjuncts, max_widen_iters) };
         if self.aborted.get() {
             return abort_response();
         }
@@ -1590,14 +1562,20 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         let spec_request_count = self.spec_requests.borrow().len();
         self.progress
             .borrow_mut()
-            .note_step(pn, node_id, instr_idx, state, spec_request_count);
+            .note_step(pn, node_id, instr_idx, &state, spec_request_count);
 
-        let mut new_disjuncts = Vec::new();
-        let pre_non_disj = state.non_disj.clone();
+        let had_dropped_disjuncts = state.had_dropped_disjuncts;
+        let PulseDomain {
+            disjunctive,
+            non_disj: pre_non_disj,
+        } = state;
+        let DisjunctiveDomain { disjuncts, .. } = disjunctive;
+
+        let mut new_disjuncts = Vec::with_capacity(disjuncts.len());
         let disjunct_non_disj = pre_non_disj.for_disjunct_exec_instr();
         let mut post_non_disj = disjunct_non_disj.clone();
 
-        for (i, disjunct) in state.disjuncts.iter().enumerate() {
+        for (i, disjunct) in disjuncts.into_iter().enumerate() {
             if self.aborted.get() {
                 break;
             }
@@ -1608,7 +1586,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                         self.pdesc,
                         self.tenv,
                         instr,
-                        astate.clone(),
+                        astate,
                         self.callee_summaries,
                         Some(&self.spec_requests),
                         NonDisjCallMode::Ordinary,
@@ -1631,7 +1609,7 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
                     }
                 }
                 other => {
-                    new_disjuncts.push(other.clone());
+                    new_disjuncts.push(other);
                 }
             }
         }
@@ -1642,19 +1620,19 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         let mut result = PulseDomain::from_parts(
             DisjunctiveDomain {
                 disjuncts: new_disjuncts,
-                max_disjuncts: state.max_disjuncts,
-                max_widen_iters: state.max_widen_iters,
+                max_disjuncts,
+                max_widen_iters,
                 // Cross-ref: OCaml carries dropped-disjunct metadata in the
                 // non-disjunctive state, so once a path has been under-approximated
                 // the bit remains set for the rest of the procedure.
-                had_dropped_disjuncts: state.had_dropped_disjuncts,
+                had_dropped_disjuncts,
             },
             post_non_disj,
         );
         result.dedup();
         result.bound();
 
-        let hidden_post = pre_non_disj.exec_over_approx(|exec, non_disj| {
+        let hidden_post = pre_non_disj.exec_over_approx_owned(|exec, non_disj| {
             if self.aborted.get() {
                 return (Vec::new(), NonDisjDomain::bottom());
             }
@@ -1698,6 +1676,47 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         );
 
         result
+    }
+
+    /// Check the per-procedure wall-time cap from within long instruction
+    /// transfers. `exec_node` checks the same cap between CFG node visits; this
+    /// intra-instruction check prevents a single instruction with many
+    /// expensive disjuncts from evading the cap for minutes or hours.
+    fn check_wall_cap(&self, max_secs: Option<u64>) -> bool {
+        if self.aborted.get() {
+            return true;
+        }
+        if let Some(max_secs) = max_secs.filter(|s| *s > 0) {
+            let elapsed = self.start_instant.elapsed();
+            if elapsed.as_secs() > max_secs {
+                log::warn!(
+                    target: "ondemand",
+                    "[pulse-progress] proc={} aborted at elapsed={} > {}s wall cap",
+                    self.proc_name,
+                    format_duration(elapsed),
+                    max_secs,
+                );
+                self.aborted.set(true);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl TransferFunctions for PulseTransferFunctions<'_> {
+    type Domain = PulseDomain;
+    type AnalysisData = ();
+
+    fn exec_instr(
+        &self,
+        state: &Self::Domain,
+        data: &(),
+        node_id: NodeId,
+        instr_idx: usize,
+        instr: &Instr,
+    ) -> Self::Domain {
+        self.exec_instr_owned(state.clone(), data, node_id, instr_idx, instr)
     }
 
     fn exec_node(
@@ -1806,11 +1825,11 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         let mut state = input;
         if reverse_instrs {
             for (idx, instr) in node.instrs.iter().enumerate().rev() {
-                state = self.exec_instr(&state, data, node_id, idx, instr);
+                state = self.exec_instr_owned(state, data, node_id, idx, instr);
             }
         } else {
             for (idx, instr) in node.instrs.iter().enumerate() {
-                state = self.exec_instr(&state, data, node_id, idx, instr);
+                state = self.exec_instr_owned(state, data, node_id, idx, instr);
             }
         }
 

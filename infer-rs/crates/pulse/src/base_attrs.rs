@@ -195,6 +195,12 @@ impl BaseAddressAttributes {
     }
 
     pub fn retain_for_pre_summary(&mut self) {
+        let needs_update = self.map.values().any(|attrs| {
+            attrs.is_empty() || attrs.iter().any(|attr| !attr.is_suitable_for_pre_summary())
+        });
+        if !needs_update {
+            return;
+        }
         self.map_mut().retain(|_addr, attrs| {
             let mutable = Arc::make_mut(attrs);
             mutable.retain_for_pre_summary();
@@ -203,6 +209,15 @@ impl BaseAddressAttributes {
     }
 
     pub fn retain_for_post_summary(&mut self) {
+        let needs_update = self.map.values().any(|attrs| {
+            attrs.is_empty()
+                || attrs
+                    .iter()
+                    .any(|attr| !attr.is_suitable_for_post_summary())
+        });
+        if !needs_update {
+            return;
+        }
         self.map_mut().retain(|_addr, attrs| {
             let mutable = Arc::make_mut(attrs);
             mutable.retain_for_post_summary();

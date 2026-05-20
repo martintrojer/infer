@@ -169,15 +169,32 @@ impl NonDisjDomain {
     /// `ContinueProgram` states back into the over-approx slot. Stopped
     /// results are intentionally ignored for the minimal port; hidden
     /// diagnostics must not be published in phase 3.
-    pub fn exec_over_approx<F>(&self, mut exec_instr: F) -> Self
+    pub fn exec_over_approx<F>(&self, exec_instr: F) -> Self
     where
         F: FnMut(ExecutionDomain, Self) -> (Vec<ExecutionDomain>, Self),
     {
-        let Some(astate) = self.over_approx.clone() else {
+        self.clone().exec_over_approx_owned(exec_instr)
+    }
+
+    /// Owned variant of [`Self::exec_over_approx`] that moves the retained
+    /// hidden `astate` into the transfer instead of cloning it. This is used
+    /// when instruction execution already owns the surrounding `PulseDomain`.
+    pub fn exec_over_approx_owned<F>(self, mut exec_instr: F) -> Self
+    where
+        F: FnMut(ExecutionDomain, Self) -> (Vec<ExecutionDomain>, Self),
+    {
+        let Self {
+            has_dropped_disjuncts,
+            over_approx,
+        } = self;
+        let Some(astate) = over_approx else {
             return Self::bottom();
         };
 
-        let exec_non_disj = self.for_disjunct_exec_instr();
+        let exec_non_disj = Self {
+            has_dropped_disjuncts,
+            over_approx: None,
+        };
         let (results, mut result_non_disj) =
             exec_instr(ExecutionDomain::ContinueProgram(astate), exec_non_disj);
         result_non_disj.over_approx = None;
