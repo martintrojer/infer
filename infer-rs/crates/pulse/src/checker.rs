@@ -57,6 +57,13 @@ fn pulse_progress_enabled() -> bool {
     log::log_enabled!(target: "ondemand", log::Level::Info)
 }
 
+fn disjunctive_state_size_stats_enabled() -> bool {
+    cfg!(debug_assertions)
+        || log::log_enabled!(log::Level::Debug)
+        || log::log_enabled!(target: "ondemand", log::Level::Debug)
+        || log::log_enabled!(target: FIXPOINT_LOG_TARGET, log::Level::Debug)
+}
+
 /// Best-effort current peak RSS in bytes since process start, used only for
 /// per-procedure progress logs so we can see where memory accumulates across
 /// procedures. Reads `getrusage(RUSAGE_SELF).ru_maxrss`. macOS reports the
@@ -352,12 +359,15 @@ struct DisjunctiveStateStats {
     exception_count: usize,
     sum: AstateSizeStats,
     max: AstateSizeStats,
+    includes_size_stats: bool,
 }
 
 impl DisjunctiveStateStats {
     fn from_domain(domain: &DisjunctiveDomain<ExecutionDomain>) -> Self {
+        let includes_size_stats = disjunctive_state_size_stats_enabled();
         let mut stats = Self {
             disjuncts: domain.disjuncts.len(),
+            includes_size_stats,
             ..Self::default()
         };
 
@@ -371,9 +381,11 @@ impl DisjunctiveStateStats {
                 ExecutionDomain::ExceptionRaised(_) => stats.exception_count += 1,
             }
 
-            let astate_stats = disjunct.get_astate().size_stats();
-            stats.sum.add_assign(astate_stats);
-            stats.max.max_assign(astate_stats);
+            if includes_size_stats {
+                let astate_stats = disjunct.get_astate().size_stats();
+                stats.sum.add_assign(astate_stats);
+                stats.max.max_assign(astate_stats);
+            }
         }
 
         stats
@@ -387,8 +399,16 @@ impl DisjunctiveStateStats {
         self.latent_abort_count += other.latent_abort_count;
         self.latent_invalid_count += other.latent_invalid_count;
         self.exception_count += other.exception_count;
-        self.sum.add_assign(other.sum);
-        self.max.max_assign(other.max);
+        if other.includes_size_stats {
+            if self.includes_size_stats {
+                self.sum.add_assign(other.sum);
+                self.max.max_assign(other.max);
+            } else {
+                self.sum = other.sum;
+                self.max = other.max;
+                self.includes_size_stats = true;
+            }
+        }
     }
 }
 
@@ -396,7 +416,7 @@ impl std::fmt::Display for DisjunctiveStateStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "disj={} kinds[c={} x={} a={} la={} li={} exn={}] sum{{{}}} max{{{}}}",
+            "disj={} kinds[c={} x={} a={} la={} li={} exn={}]",
             self.disjuncts,
             self.continue_count,
             self.exit_count,
@@ -404,9 +424,12 @@ impl std::fmt::Display for DisjunctiveStateStats {
             self.latent_abort_count,
             self.latent_invalid_count,
             self.exception_count,
-            self.sum,
-            self.max,
-        )
+        )?;
+        if self.includes_size_stats {
+            write!(f, " sum{{{}}} max{{{}}}", self.sum, self.max)
+        } else {
+            write!(f, " size_stats=debug-disabled")
+        }
     }
 }
 
