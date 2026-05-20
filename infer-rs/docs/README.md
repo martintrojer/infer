@@ -35,7 +35,7 @@ Current status and active work are intentionally separated:
   — C-suite OCaml↔Rust Pulse summary mismatch triage. Per-cluster status
   and remeasure totals after the initial cluster pass.
 
-### Linux session 2026-05-14/15
+### Linux sessions 2026-05-14/15 and Wave 9 2026-05-18/19
 
 - OpenSSL Linux perf wave docs:
   [`plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md`](plans/OPENSSL_LINUX_PERF_ATTACK_SURFACE_2026_05.md),
@@ -45,6 +45,41 @@ Current status and active work are intentionally separated:
   The live dashboard row is in [`STATUS.md`](STATUS.md): canonical Linux
   post-wave `RUNS=3 JOBS=4` median `4:47.79`, `5.70 GiB`, `445/445`, `6`
   aborts.
+
+#### Deep-port day plans (Wave 9)
+
+- [`plans/APPLY_POST_RECORD_POST_FOR_ADDRESS_DAYPLAN_2026_05.md`](plans/APPLY_POST_RECORD_POST_FOR_ADDRESS_DAYPLAN_2026_05.md)
+  — four-phase apply-post / `record_post_for_address` port plan.
+- [`plans/NONDISJDOMAIN_PORT_DAYPLAN_2026_05.md`](plans/NONDISJDOMAIN_PORT_DAYPLAN_2026_05.md)
+  — PulseNonDisjDomain six-phase port plan.
+- [`plans/LATENT_CYCLE_CURSOR_PORT_DAYPLAN_2026_05.md`](plans/LATENT_CYCLE_CURSOR_PORT_DAYPLAN_2026_05.md)
+  — latent cycle-cursor shape and deep-port plan.
+
+#### EqZero, const-zero, and ArrayAccess evidence
+
+- [`plans/EQZERO_POTENTIAL_INVALID_ACCESS_SUMMARY_SIDEBAND_2026_05.md`](plans/EQZERO_POTENTIAL_INVALID_ACCESS_SUMMARY_SIDEBAND_2026_05.md)
+  — summary `of_post` EqZero sideband design/evidence.
+- [`plans/EQZERO_LOCAL_E2E_SHAPE_SPEC_2026_05.md`](plans/EQZERO_LOCAL_E2E_SHAPE_SPEC_2026_05.md)
+  — local EqZero sideband shape spec.
+- [`plans/ARRAY_ACCESS_CONST_NULL_COALESCING_2026_05.md`](plans/ARRAY_ACCESS_CONST_NULL_COALESCING_2026_05.md)
+  — ArrayAccess const/null coalescing scout.
+- [`plans/CONST_ZERO_REPR_DESIGN_EVIDENCE_2026_05.md`](plans/CONST_ZERO_REPR_DESIGN_EVIDENCE_2026_05.md)
+  — const-zero representative design evidence.
+
+#### Scout evidence and remeasurement
+
+- [`plans/NPE_PER_FILE_REMEASURE_2026_05_18.md`](plans/NPE_PER_FILE_REMEASURE_2026_05_18.md)
+  — NPE per-file remeasure and typed-stub regression context.
+- [`plans/LATENT_INVALID_ACCESS_IMPORT_EVIDENCE_2026_05.md`](plans/LATENT_INVALID_ACCESS_IMPORT_EVIDENCE_2026_05.md)
+  — latent invalid-access import evidence.
+- [`plans/LATENT_UAF_EQZERO_SIDEBAND_FOLLOWUP_2026_05.md`](plans/LATENT_UAF_EQZERO_SIDEBAND_FOLLOWUP_2026_05.md)
+  — latent UAF / EqZero sideband follow-up evidence.
+- [`plans/MEMORY_LEAK_FUNPTR_RESIDUAL_CLASSIFICATION_2026_05_18.md`](plans/MEMORY_LEAK_FUNPTR_RESIDUAL_CLASSIFICATION_2026_05_18.md)
+  — memory_leak.c and funptr.c residual classification before the final Wave 9 fixes.
+- [`plans/POST_PHASE4_RESIDUAL_REMEASURE_2026_05_19.md`](plans/POST_PHASE4_RESIDUAL_REMEASURE_2026_05_19.md)
+  — post-phase-4 C-suite residual remeasure.
+- [`plans/FINAL_SEVEN_RESIDUALS_CLASSIFICATION_2026_05_19.md`](plans/FINAL_SEVEN_RESIDUALS_CLASSIFICATION_2026_05_19.md)
+  — final-seven scout; superseded by the `133/4` dashboard but useful for residual provenance.
 
 ## Archived plans and findings
 

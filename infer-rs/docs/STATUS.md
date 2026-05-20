@@ -21,7 +21,7 @@ mu task list -w infer-rs --status OPEN
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `130 matching / 7 diffs` (Wave 9 complete: `119/18` -> `130/7`; +80/-80 vs original `50/87`) |
+| C-suite OCaml↔Rust Pulse summary triage | `133 matching / 4 diffs` (Wave 9 complete: `119/18` -> `133/4`; `+83/-83` vs original `50/87` baseline) |
 
 ### NPE issue-count deltas (current Linux)
 
@@ -69,7 +69,7 @@ dispatch stack (`902b2deb50`, `cda27f6239`, `70365d047b`) closed the last
 `devirtualize_with_final_good`, and `devirtualize_with_static_call_good` all
 now analyze.
 
-Today's 104+-commit resumed Linux session is summarized by track below
+108 commits today in the resumed Linux session are summarized by track below
 (landed SHAs from `git log --oneline fccf3f0b7d..HEAD`; this doc refresh
 records the Wave 9 complete checkpoint):
 
@@ -97,7 +97,7 @@ records the Wave 9 complete checkpoint):
   no-op; and `c1f17f040f` (cherry-pick of worker-1's `808ff65dd1`) returned a
   summary EqZero sideband, closing one funptr residual. The complete Wave 9
   deep-port stack plus downstream tight fixes now carry the scoped C-suite
-  parity total to `130/7`.
+  parity total to `133/4`.
 - **Perf / OpenSSL Linux wave (Track 2).** `b512df2924` aligns stopped latent
   leq with OCaml and closes the OBJ_bsearch convergence gate. `da9b92c384`
   avoids sorting unmapped canonical roots; `2f2c26a6a9` shares
@@ -167,9 +167,9 @@ Wave 9 is complete. It moved from scout-only classification into the full
 deep-port stack while keeping the public correctness checkpoint held:
 Store-textual remains `52/0/0`, NPE is `131/132`, LEAK is `20/20`, UAF is
 `7/7`, the specialization summary harness is `21/21` perfect, and the six-file
-C-suite triage now totals `130/7`. The resumed session's C-suite total moved
-from `119/18` at Wave 9 start to `130/7` now (`+11` matching, `-11` diffs in
-Wave 9), and from the original `50/87` baseline to `130/7` (`+80/-80`).
+C-suite triage now totals `133/4`. The resumed session's C-suite total moved
+from `119/18` at Wave 9 start to `133/4` now (`+14` matching, `-14` diffs in
+Wave 9), and from the original `50/87` baseline to `133/4` (`+83/-83`).
 
 Cross-track edges from the final landings are now reflected in the dashboard:
 worker-2's apply-post phases 1-4 unblocked the EqZero local sideband; EqZero
@@ -178,8 +178,10 @@ perfect; EqZero interproc unification Phase C refined the NPE count to
 `131/133`; worker-leak's struct-pointee fallback repair tightened it further to
 `131/132`; and the complete NonDisjDomain stack unblocked force-continue,
 DivF/arithmetic validation, dynamic-specialization, latent UAF, recursive
-memory, and the final interprocedural equality-prune cleanup. Both
-`specialization.c` and `interprocedural.c` are now at perfect parity.
+memory, interprocedural equality-prune cleanup, recursive unknown-effect
+ordering, and unary-neg summary normalization. `arithmetic.c`,
+`specialization.c`, `memory_leak.c`, and `interprocedural.c` are now at perfect
+parity.
 
 **PulseNonDisjDomain port (6/6 phases; design doc
 `NONDISJDOMAIN_PORT_DAYPLAN_2026_05.md`)**
@@ -244,9 +246,9 @@ memory, and the final interprocedural equality-prune cleanup. Both
 - `alloc_ref_counted_arith_ok` closed via `4bb89aef31` / `5d4ba9d467`, moving
   `memory_leak.c` `41/5` -> `42/4` via comparator-side affine normalization.
 - `free_all_in_array` alpha delta was accepted by `ac2c9bffc0`, and the
-  struct-pointee fallback repair `c4c7d6a6b5` closed the remaining
-  struct-pointee memory-leak residual and tightened NPE to `131/132`; together
-  these carry `memory_leak.c` to `45/1`.
+  struct-pointee fallback repair `c4c7d6a6b5` closed the broad
+  struct-pointee memory-leak residual and tightened NPE to `131/132`, carrying
+  `memory_leak.c` to `45/1`.
 - `funptr_conditional_call_bad` and the dynamic-specialization row closed after
   EqZero/NonDisj call-application work (`a1ca20c413` and the Phase 5/6 stack),
   moving `funptr.c` to `27/1`.
@@ -255,8 +257,26 @@ memory, and the final interprocedural equality-prune cleanup. Both
 - `test_modified_value_then_error_bad` closed by random-equality const
   invalidation pruning (`b186aa3cd6`), moving `interprocedural.c` from `16/1`
   to `17/0` perfect.
+- `interproc_mutual_recusion_leak` closed by recursive unknown-effect replay
+  ordering (`9cf2a51a54`), moving `memory_leak.c` from `45/1` to `46/0`
+  perfect.
+- The two unary-neg arithmetic presentation residuals closed via summary
+  arithmetic normalization (`b65c8395fd`), moving `arithmetic.c` from `9/2` to
+  `11/0` perfect.
 
-### C-suite OCaml↔Rust Pulse summary parity (`130 matching / 7 diffs`)
+### Wave 9 closed (2026-05-18/19): 4 PERFECT-parity files
+
+- `specialization.c` — `21/0` perfect after the direct-formal
+  `PotentialInvalidAccessSummary` closer (`d1e188b3a0` / `2dcccc1a41`), enabled
+  by the full EqZero sideband chain.
+- `interprocedural.c` — `17/0` perfect after random-equality const invalidation
+  pruning (`b186aa3cd6`).
+- `memory_leak.c` — `46/0` perfect after struct-pointee fallback repair
+  (`c4c7d6a6b5`) and recursive unknown-effect replay ordering (`9cf2a51a54`).
+- `arithmetic.c` — `11/0` perfect after NonDisjDomain force-continue / DivF
+  validation (`d0319ba4b4`) and unary-neg summary normalization (`b65c8395fd`).
+
+### C-suite OCaml↔Rust Pulse summary parity (`133 matching / 4 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -388,51 +408,54 @@ port also landed:
   post replay and snapshot equality prunes before const invalidation export;
   `interprocedural.c` reaches `17/0` perfect.
 - `ac2c9bffc0` / `c4c7d6a6b5` — accept `free_all_in_array` alpha delta and avoid
-  struct-pointee fallback materialization, carrying `memory_leak.c` to `45/1`
-  and tightening NPE to `131/132`.
+  broad struct-pointee fallback materialization, carrying `memory_leak.c` to
+  `45/1` and tightening NPE to `131/132`.
+- `9cf2a51a54` — replay recursive unknown summary effects in OCaml order,
+  closing `interproc_mutual_recusion_leak` and moving `memory_leak.c` to
+  `46/0` perfect.
+- `b65c8395fd` — normalize unary-neg summary arithmetic residuals, closing the
+  two arithmetic presentation rows and moving `arithmetic.c` to `11/0` perfect.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `130 matching / 7 diffs`
-(`+80 matching / -80 diffs`). Wave 9 started from `119/18` and completed at
-`130/7` after the full deep-port stack and all unblocked downstream tight fixes.
+(`50 matching / 87 diffs`) is now `133 matching / 4 diffs`
+(`+83 matching / -83 diffs`). Wave 9 started from `119/18` and completed at
+`133/4` after the full deep-port stack and all unblocked downstream tight fixes.
 Current scoped per-file totals:
 
 | file | session start | now | delta / note |
 |---|---:|---:|---|
-| `arithmetic.c` | `6/5` | **`9/2`** | +3; force-continue + DivF closed, only unary-neg presentation remains |
+| `arithmetic.c` | `6/5` | **`11/0`** ✨ | +5; force-continue + DivF plus unary-neg summary normalization closed |
 | `specialization.c` | `21/0` ✨ | `21/0` ✨ | PERFECT held after `2dcccc1a41` |
 | `latent.c` | `10/4` | **`11/3`** | +1; `latent_use_after_free` closed, cycle-cursor ×3 remain |
-| `memory_leak.c` | `41/5` | **`45/1`** | +4; `alias_ptr_free_ok`, `alloc_ref_counted_arith_ok`, `free_all_in_array` alpha, and struct-pointee fallback closed |
+| `memory_leak.c` | `41/5` | **`46/0`** ✨ | +5; alias/ref-count/free-all/struct-pointee and recursive unknown-effect ordering closed |
 | `funptr.c` | `24/4` | **`27/1`** | +3; summary EqZero, `funptr_conditional_call_bad`, and dynamic-specialization rows closed |
-| `interprocedural.c` | `15/2` | **`17/0`** ✨ | +2; PERFECT NEW after random-equality const invalidation pruning |
-| **total** | **`119/18`** | **`130/7`** | **+11 matching / -11 diffs in Wave 9; +80/-80 vs original `50/87` baseline** |
+| `interprocedural.c` | `15/2` | **`17/0`** ✨ | +2; PERFECT after random-equality const invalidation pruning |
+| **total** | **`119/18`** | **`133/4`** | **+14 matching / -14 diffs in Wave 9; +83/-83 vs original `50/87` baseline** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
-Wave 9 note: NonDisjDomain Phases 1-6 moved arithmetic from `6/5` to `9/2` and
-left only unary-neg formula presentation; EqZero Phases A-C plus follow-ups held
+Wave 9 note: NonDisjDomain Phases 1-6 plus the final unary-neg normalization
+moved arithmetic from `6/5` to `11/0`; EqZero Phases A-C plus follow-ups held
 specialization at `21/0` perfect and helped funptr reach `27/1`; latent sideband
-plus force-continue closed `latent_use_after_free`; memory_leak moved to `45/1`
-through alias/ref-count/free-all/struct-pointee work; and interprocedural
-reached new perfect parity (`17/0`) after the random-equality const invalidation
-fix.
+plus force-continue closed `latent_use_after_free`; memory_leak moved to `46/0`
+through alias/ref-count/free-all/struct-pointee and recursive unknown-effect
+ordering work; and interprocedural reached perfect parity (`17/0`) after the
+random-equality const invalidation fix.
 
-Final residual work is down to seven shared-procedure diffs:
+#### Final residuals (4 classified)
 
-- `arithmetic.c` (2): `FN_call_if_negative_then_crash_with_negative_bad` and
-  `if_negative_then_crash_latent` — unary-neg formula presentation; non-trivial
-  formula refactor.
+Final residual work is down to four shared-procedure diffs:
+
 - `latent.c` (3): `crash_after_one_node_bad`, `crash_after_two_nodes_bad`, and
   `FN_crash_after_six_nodes_bad` — cycle-cursor / deep rev_subst alias-ordering
-  work.
-- `memory_leak.c` (1): `interproc_mutual_recusion_leak` — recursive interproc
-  case.
-- `funptr.c` (1): `conditionnaly_apply_funptr_with_intptrptr` — extra benign
-  `assign_NULL` specialization.
+  work; deferred to `cluster_latent_cycle_cursor_deep_port_revisit`.
+- `funptr.c` (1): `conditionnaly_apply_funptr_with_intptrptr` — accepted-known
+  limit: exact extra benign Rust-only `assign_NULL` specialization
+  (`dynamic_types: {*funptr: assign_NULL}`) with no issue/report impact.
 
-Worker-1 is scouting whether any of the final seven remain tractable. The
-latest recorded sweep/scout NPE figure is `131/132` after the typed-stub repair,
-imported-EqZero unification, and worker-leak's struct-pointee fallback repair.
+The latest recorded sweep/scout NPE figure is `131/132` after the typed-stub
+repair, imported-EqZero unification, and worker-leak's struct-pointee fallback
+repair.
 
 ## OpenSSL benchmark dashboard
 
@@ -616,12 +639,12 @@ Live themes (track headlines, not exhaustive task lists):
   repaired the typed-stub NPE regression (`25aa457dae` / `e5417f19ae`).
 - **DONE today — Linux baseline remains held.** Track 1A holds the
   store-textual sweep at `52` OK / `0` FAIL / `0` TIMEOUT, NPE `131/132`, LEAK
-  `20/20` exact, and UAF `7/7` exact. Track 1B now totals `130/7`:
-  arithmetic `9/2`, specialization `21/0` perfect, latent `11/3`, memory_leak
-  `45/1`, funptr `27/1`, and interproc `17/0` perfect. The earlier OpenSSL
-  Linux perf wave established the canonical pre-port `RUNS=3 JOBS=4` baseline
-  (`4:47.79`, `5.70 GiB`, `445/445`, `6` aborts); the post-port row is
-  `4:58.85`, `6.38 GiB`, `445/445`, `6` aborts.
+  `20/20` exact, and UAF `7/7` exact. Track 1B now totals `133/4`:
+  arithmetic `11/0` perfect, specialization `21/0` perfect, latent `11/3`,
+  memory_leak `46/0` perfect, funptr `27/1`, and interproc `17/0` perfect. The
+  earlier OpenSSL Linux perf wave established the canonical pre-port
+  `RUNS=3 JOBS=4` baseline (`4:47.79`, `5.70 GiB`, `445/445`, `6` aborts); the
+  post-port row is `4:58.85`, `6.38 GiB`, `445/445`, `6` aborts.
 - **DONE today — benchmark infrastructure hardening.**
   `scripts/bench_openssl_partial.sh` now explicitly passes
   `--pulse-max-heap-mb 2048` and `--pulse-max-wall-secs 60` on every `infer-rs`
@@ -637,7 +660,7 @@ Live themes (track headlines, not exhaustive task lists):
   typed-stub regression upstream `25aa457dae` / here `e5417f19ae`, worker-2
   drove it down to `131 / 133` post-Phase-C, and worker-leak's struct-pointee
   fallback repair tightened it to `131 / 132`.
-- **DONE since prior doc refresh — Wave 9 deep-port landings COMPLETE.** Worker-2
+- **DONE today — full Wave 9 deep-port stack landed; 4 perfect-parity files.** Worker-2
   landed `NonDisjDomain` Phases 1-6 (`805c8da766` / `f5894269e7`,
   `d34303f8f7` / `2490d5bd9e`, `3f4b79f946` / `dffd9a4397`, `edd17796ed`
   merging `90a7867699` plus worker-1's `a70b696222`, `979ca8eaee` /
@@ -647,12 +670,15 @@ Live themes (track headlines, not exhaustive task lists):
   resolved Phase 2 as a no-fix scout; and the EqZero A-C chain plus follow-ups
   is complete (`56c98117b5`, `bd2416fe02` / `c1f17f040f`, `79226f7ac6` /
   `3d1432f34b`, `2dcccc1a41`, `359fc9b7ce`). Worker-leak's downstream fixes
-  include `alias_ptr_free_ok`, `alloc_ref_counted_arith_ok`, free-all alpha, and
-  struct-pointee fallback, leaving only seven C-suite diffs.
-- **IN FLIGHT.** Worker-1 is scouting final-seven residual tractability
-  read-only. Worker-2 is idle. The seven remaining diffs are two unary-neg
-  arithmetic presentation rows, three latent cycle-cursor rows, one recursive
-  memory-leak row, and one benign extra funptr `assign_NULL` specialization.
+  include `alias_ptr_free_ok`, `alloc_ref_counted_arith_ok`, free-all alpha,
+  struct-pointee fallback, recursive unknown-effect ordering (`9cf2a51a54`),
+  and unary-neg summary normalization (`b65c8395fd`), leaving only four
+  C-suite diffs and four perfect-parity files.
+- **PARKED / DEFERRED.** The remaining four diffs are classified: three latent
+  cycle-cursor rows are deferred to `cluster_latent_cycle_cursor_deep_port_revisit`,
+  and the one `funptr.c::conditionnaly_apply_funptr_with_intptrptr` Rust-only
+  `assign_NULL` specialization is an accepted-known-limit benign
+  over-specialization.
 - **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
   `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
   as the baselines; any wall recovery should preserve the RAM and abort gains.

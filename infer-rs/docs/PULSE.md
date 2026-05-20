@@ -101,12 +101,16 @@ void uaf() {
 | Formula | Inlined solver (was sledge) | Port: union-find, linear arith, atoms, CItv, FunctionApplication |
 | Result monad | Custom `PulseResult` with `let*` | `enum PulseResult<T>` with combinators |
 | Memory edges | `RecencyMap` (bounded) | `BTreeMap` (deterministic iteration) |
-| Biabduction | MustBeValid + MustBeInitialized attrs, write_access | must_be_valid set plus local OCaml-style access-mode side effects; full interproc MustBeInitialized parity is still in progress |
+| Biabduction | MustBeValid + MustBeInitialized attrs, write_access | must_be_valid set plus OCaml-style access-mode side effects, hidden NonDisjDomain pre/post summaries, and interproc force-continue support |
 | Parallelism | Per-procedure via ondemand | Same, via `ondemand` crate with rayon |
 | Models | ~10K lines across languages | C models: malloc/free/realloc, new/delete, exit/abort, fopen/getcwd, random, 18 stdio |
 | Model dispatch | `ProcnameDispatcher` DSL | `builtin_decl::match_builtin` identity matching |
 | Specialization | HeapPath-based dynamic types | Same: specialization loop in CLI + checker |
 | Null-path provenance | Branch-conditioned summary/report logic | `UsedAsBranchCond` attrs + depth-0 recorded model/prune conditions |
+
+The 2026-05-18/19 Wave 9 deep-port stack has landed: the four apply-post phases,
+EqZero local/summary/interproc sidebands, and PulseNonDisjDomain phases 1-6 are
+in place. Current parity numbers live in [`STATUS.md`](STATUS.md).
 
 ## Excluded
 

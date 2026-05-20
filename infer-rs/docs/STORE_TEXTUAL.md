@@ -114,6 +114,9 @@ What infer-rs does today:
 
 - empty exported `define` stubs are now treated as undefined, so a real body correctly wins over an
   empty `@?` stub during multi-file direct `.sil` merge
+- typed textual `@?` extern stubs are treated as declarations / unknown calls with typed empty-body
+  summaries, not as real empty bodies; this is the `e5417f19ae` repair that restored `angelism.c`
+  NPE parity during the 2026-05-18/19 wave
 - infer-rs does **not** invent synthetic names for real+real collisions after export
 
 Policy:
