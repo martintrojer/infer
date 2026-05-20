@@ -17,6 +17,7 @@ regex = { workspace = true }
 num-rational = "0.4"
 num-traits = { workspace = true }
 num-bigint = { workspace = true }
+rustc-hash = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

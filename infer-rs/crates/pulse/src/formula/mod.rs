@@ -22,8 +22,10 @@ pub mod phi;
 pub mod term;
 pub mod var_uf;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::abstract_value::AbstractValue;
 use crate::sat_unsat::SatUnsat;
@@ -118,14 +120,14 @@ pub fn expand_formula_reachable(
     seed_reachable: &std::collections::HashSet<AbstractValue>,
 ) -> std::collections::HashSet<AbstractValue> {
     let phi = formula.phi();
-    let mut reachable = seed_reachable.clone();
+    let mut reachable: FxHashSet<_> = seed_reachable.iter().copied().collect();
     let mut worklist: Vec<_> = seed_reachable.iter().copied().collect();
 
     // Reverse dependency index for equations where the current worklist value
     // appears on the RHS/operand side. The forward direction below still uses
     // direct lookups from the current representative to its own equation; this
     // index only replaces the previous O(worklist × total_eqs) reverse scans.
-    let mut reverse_deps: HashMap<AbstractValue, Vec<AbstractValue>> = HashMap::new();
+    let mut reverse_deps: FxHashMap<AbstractValue, Vec<AbstractValue>> = FxHashMap::default();
     for (&lhs, lin) in &phi.linear_eqs {
         let lhs_repr = phi.get_repr(lhs);
         for dep in lin.vars.keys() {
@@ -219,7 +221,7 @@ pub fn expand_formula_reachable(
         }
     }
 
-    reachable
+    reachable.into_iter().collect()
 }
 
 impl Formula {

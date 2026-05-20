@@ -14,6 +14,7 @@
 //! We simplify to post-state only for now (forward analysis without
 //! precondition inference).
 
+use rustc_hash::FxHashSet;
 use sil::location::Location;
 use sil::procdesc::Procdesc;
 use sil::pvar::Pvar;
@@ -380,7 +381,7 @@ impl AbductiveDomain {
     }
 
     fn post_reachability_stats(&self) -> ReachabilitySizeStats {
-        let mut roots = std::collections::HashSet::new();
+        let mut roots = FxHashSet::default();
         for (_var, value) in self.post.stack.iter_with_history() {
             roots.insert(value.addr);
         }
@@ -390,7 +391,7 @@ impl AbductiveDomain {
             }
         }
 
-        let mut reachable = std::collections::HashSet::new();
+        let mut reachable = FxHashSet::default();
         let mut worklist: Vec<_> = roots.iter().copied().collect();
         while let Some(addr) = worklist.pop() {
             if !reachable.insert(addr) {
@@ -855,7 +856,7 @@ impl AbductiveDomain {
             })
             .collect();
 
-        let mut heap_allocated = std::collections::HashSet::new();
+        let mut heap_allocated = FxHashSet::default();
         for heap in [&self.pre.heap, &self.post.heap] {
             for (src, edges) in heap.iter() {
                 if !edges.is_empty() {
@@ -864,7 +865,7 @@ impl AbductiveDomain {
             }
         }
 
-        (stack_allocated, heap_allocated)
+        (stack_allocated, heap_allocated.into_iter().collect())
     }
 
     fn subst_var_or_unsat(&mut self, old: AbstractValue, new: AbstractValue) -> SatUnsat<()> {
@@ -1402,7 +1403,7 @@ impl AbductiveDomain {
         &mut self,
         roots: impl IntoIterator<Item = AbstractValue>,
     ) {
-        let mut reachable = std::collections::HashSet::new();
+        let mut reachable = FxHashSet::default();
         for root in roots {
             reachable.extend(self.reachable_from(root));
         }
@@ -1427,8 +1428,8 @@ impl AbductiveDomain {
     }
 
     /// Collect all abstract addresses reachable from `root` via post-heap edges.
-    fn reachable_from(&self, root: AbstractValue) -> std::collections::HashSet<AbstractValue> {
-        let mut visited = std::collections::HashSet::new();
+    fn reachable_from(&self, root: AbstractValue) -> FxHashSet<AbstractValue> {
+        let mut visited = FxHashSet::default();
         let mut worklist = vec![root];
         while let Some(addr) = worklist.pop() {
             if !visited.insert(addr) {
@@ -1449,7 +1450,7 @@ impl AbductiveDomain {
         &self,
         root: AbstractValue,
     ) -> std::collections::HashSet<AbstractValue> {
-        self.reachable_from(root)
+        self.reachable_from(root).into_iter().collect()
     }
 
     /// Shrink the current post heap/attrs to values reachable from the post
@@ -1476,11 +1477,11 @@ impl AbductiveDomain {
 
     fn shrink_post_to_stack_reachable_inner(&mut self, formula_gc: bool) {
         let roots: Vec<_> = self.post.stack.iter().map(|(_, addr)| *addr).collect();
-        let mut reachable = std::collections::HashSet::new();
+        let mut reachable = FxHashSet::default();
         for root in roots {
             reachable.extend(self.reachable_from(root));
         }
-        let canonical_reachable: std::collections::HashSet<_> = reachable
+        let canonical_reachable: FxHashSet<_> = reachable
             .iter()
             .map(|addr| self.path_condition.get_var_repr(*addr))
             .collect();
@@ -1502,8 +1503,13 @@ impl AbductiveDomain {
             }
         }
 
-        self.post.heap.retain_reachable(&heap_reachable);
-        self.post.attrs.retain_reachable(&canonical_reachable);
+        let heap_reachable_std: std::collections::HashSet<_> =
+            heap_reachable.iter().copied().collect();
+        let canonical_reachable_std: std::collections::HashSet<_> =
+            canonical_reachable.iter().copied().collect();
+
+        self.post.heap.retain_reachable(&heap_reachable_std);
+        self.post.attrs.retain_reachable(&canonical_reachable_std);
         self.must_be_valid
             .retain(|addr| canonical_reachable.contains(addr));
         self.need_dynamic_type_specialization
@@ -1511,7 +1517,7 @@ impl AbductiveDomain {
         self.dynamic_types
             .retain(|addr, _| canonical_reachable.contains(addr));
         if formula_gc {
-            self.apply_intermediate_formula_gc(formula_reachable);
+            self.apply_intermediate_formula_gc(formula_reachable.into_iter().collect());
         }
     }
 
@@ -1984,7 +1990,7 @@ mod tests {
         // shrink_post_to_stack_reachable would compute, then run only the
         // formula-GC step (bypasses the global flag, which other tests share).
         let roots: Vec<_> = state.post.stack.iter().map(|(_, addr)| *addr).collect();
-        let mut reachable = std::collections::HashSet::new();
+        let mut reachable = FxHashSet::default();
         for root in roots {
             reachable.extend(state.reachable_from(root));
         }

@@ -52,6 +52,7 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
+use rustc_hash::FxHashSet;
 use sil::fieldname::Fieldname;
 use sil::location::Location;
 use sil::typ::Typ;
@@ -704,8 +705,8 @@ fn keyed_sorted_vec<T, K: Ord>(
 fn written_stack_roots(
     stack: &crate::base_stack::BaseStack,
     attrs: &crate::base_attrs::BaseAddressAttributes,
-) -> std::collections::HashSet<AbstractValue> {
-    let mut roots = std::collections::HashSet::new();
+) -> FxHashSet<AbstractValue> {
+    let mut roots = FxHashSet::default();
     for (_var, addr) in stack.iter() {
         if attrs
             .get(addr)
@@ -966,8 +967,8 @@ impl Canonicalizer {
     fn assign_remaining(
         &mut self,
         state: &AbductiveDomain,
-        pre_reachable: &std::collections::HashSet<AbstractValue>,
-        post_reachable: &std::collections::HashSet<AbstractValue>,
+        pre_reachable: &FxHashSet<AbstractValue>,
+        post_reachable: &FxHashSet<AbstractValue>,
     ) {
         self.assign_remaining_stack(&state.pre.stack);
         self.assign_remaining_stack(&state.post.stack);
@@ -996,7 +997,7 @@ impl Canonicalizer {
     fn assign_remaining_memory(
         &mut self,
         memory: &BaseMemory,
-        reachable: &std::collections::HashSet<AbstractValue>,
+        reachable: &FxHashSet<AbstractValue>,
     ) {
         for (_, (src, edges)) in
             keyed_sorted_vec(memory.iter(), |(src, _)| self.partial_value_key(**src))
@@ -1012,7 +1013,7 @@ impl Canonicalizer {
     fn assign_remaining_attrs(
         &mut self,
         attrs: &BaseAddressAttributes,
-        reachable: &std::collections::HashSet<AbstractValue>,
+        reachable: &FxHashSet<AbstractValue>,
     ) {
         for (_, (addr, attrs)) in
             keyed_sorted_vec(attrs.iter(), |(addr, _)| self.partial_value_key(**addr))
@@ -1284,7 +1285,7 @@ fn canonical_stack(stack: &BaseStack, canon: &Canonicalizer) -> Vec<CanonStackEn
 
 fn canonical_heap(
     memory: &BaseMemory,
-    reachable: &std::collections::HashSet<AbstractValue>,
+    reachable: &FxHashSet<AbstractValue>,
     canon: &Canonicalizer,
 ) -> Vec<CanonHeapEdge> {
     let mut edges: Vec<CanonHeapEdge> = Vec::new();
@@ -1307,7 +1308,7 @@ fn canonical_heap(
 
 fn canonical_attrs(
     attrs: &BaseAddressAttributes,
-    reachable: &std::collections::HashSet<AbstractValue>,
+    reachable: &FxHashSet<AbstractValue>,
     canon: &Canonicalizer,
 ) -> Vec<CanonAttrEntry> {
     let mut entries: Vec<CanonAttrEntry> = Vec::new();
@@ -1379,14 +1380,11 @@ fn canonical_formula(state: &AbductiveDomain, canon: &Canonicalizer) -> Vec<Cano
     parts
 }
 
-fn reachable_from_stack(
-    stack: &BaseStack,
-    heap: &BaseMemory,
-) -> std::collections::HashSet<AbstractValue> {
+fn reachable_from_stack(stack: &BaseStack, heap: &BaseMemory) -> FxHashSet<AbstractValue> {
     // Cross-ref: OCaml `PulseAbductiveDomain.GraphComparison.isograph_map_from_stack`.
     // The OCaml `leq` relation compares only stack-reachable heap/attr state
     // and ignores disconnected retained garbage at fixpoint nodes.
-    let mut reachable = std::collections::HashSet::new();
+    let mut reachable = FxHashSet::default();
     let mut worklist: Vec<_> = stack.iter().map(|(_var, addr)| *addr).collect();
     while let Some(addr) = worklist.pop() {
         if !reachable.insert(addr) {
@@ -2351,7 +2349,7 @@ mod tests {
     /// helper for `structural_canonical_matches_non_formula_string_form`.
     fn legacy_canonical_heap_strings(
         memory: &crate::base_memory::BaseMemory,
-        reachable: &std::collections::HashSet<AbstractValue>,
+        reachable: &FxHashSet<AbstractValue>,
         canon: &Canonicalizer,
     ) -> Vec<String> {
         fn legacy_access(access: &Access, canon: &Canonicalizer) -> String {
@@ -2387,7 +2385,7 @@ mod tests {
     /// `canonical_attr` formatter.
     fn legacy_canonical_attrs_strings(
         attrs: &crate::base_attrs::BaseAddressAttributes,
-        reachable: &std::collections::HashSet<AbstractValue>,
+        reachable: &FxHashSet<AbstractValue>,
         canon: &Canonicalizer,
     ) -> Vec<String> {
         fn legacy_attr(attr: &Attribute, canon: &Canonicalizer) -> String {
