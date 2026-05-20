@@ -539,6 +539,7 @@ unchanged-edge rebuild skipping (`5e09cd82a1`), and bounded
 | after `Arc<ValueHistory>` (`2f2c26a6a9`) | `JOBS=4 RUNS=1` | `~4:58` | `18.96 GiB` | `445/445` | `19` | `4` |
 | canonical Linux post-wave (`1319de4f19`) | `JOBS=4 RUNS=3` median | `4:47.79` (`287.79s`) | `5.70 GiB` (`5,979,620 KiB`) | `445/445` | `6` | `4` |
 | post-apply-post-port remeasure (`c8e19d914b`) | `JOBS=4 RUNS=3` median | `4:58.85` (`298.85s`) | `6.38 GiB` (`6,684,712 KiB`) | `445/445` | `6` | `4` |
+| Wave 10/11 final perf/cap fixes (`3f088ce479`) | `JOBS=4 RUNS=1` | `6:31.98` (`391.98s`) | `9.44 GiB` (`9,894,392 KiB`) | `445/445` | `11` | `4` |
 
 Current canonical Linux Rust baseline: corpus
 `~/infer-rs-bench/openssl-20260514-121752/` (`74` `.sil` / `454` Textual procs),
@@ -563,6 +564,19 @@ checkout.
 | aborts median | `6` | `6` |
 | procs | `445/445` | `445/445` |
 
+Wave 10/11 latest one-run checkpoint (`RUNS=1 JOBS=4`, all eight perf/cap fixes
+through `3f088ce479`) completed the same Linux corpus with process exit `0`,
+`445/445` procs, wall `391.98s`, max RSS `9,894,392 KiB` (`9.44 GiB`), `11`
+aborts, and max visit count `4`. This is the latest dashboard row but not a
+replacement for the quieter `RUNS=3` median above: the session was on a noisy
+shared host. The important correctness/perf guard from this row is that
+`passwd_main` no longer evades the wall cap: before the final non-exit-scan /
+summary-build check it could remain active for `27m+` in a 30-minute driver
+run, and earlier loaded-machine evidence reached `3h+` / `45 GiB`; after
+`3f088ce479` it aborts at `1m01s` under the standard `60s` cap. Focused
+sentinels also improved: `sha512_block_data_order` is now `26.0s` (from roughly
+`~29s`) and `md4_block_data_order` focused RSS is `0.43 GiB` (from `2.49 GiB`).
+
 The Linux script uses GNU `/usr/bin/time -v`, so `peak_footprint_bytes` is not
 reported; do not compare the per-proc progress-log `peak_rss` heartbeat as the
 macOS malloc peak-footprint metric.
@@ -570,15 +584,15 @@ macOS malloc peak-footprint metric.
 Cross-baseline dashboard, keeping corpus/OS/accounting differences explicit and
 preserving the historical macOS reference separately from the current Linux row:
 
-| metric | macOS-derived original Rust (`-j 4`) | Linux session start Rust (`b512df2924`) | canonical Linux post-wave Rust (`-j 4`) | delta / note |
-|---|---:|---:|---:|---|
-| wall time | `244.70s` median | `4:17.11` (`257s`) | `4:47.79` (`287.79s`) median | `+17.6%` vs macOS-derived original; `+11.9%` vs Linux session start |
-| max RSS | `16.79 GiB` median | `26.3 GiB` | `5.70 GiB` median | `-66%` vs macOS-derived original; `-78%` vs Linux session start |
-| procs analyzed | `446 / 446` | `445 / 445` | `445 / 445` | parity on current Linux corpus |
-| heap+wall aborts | `21 / 446` median | `27 / 445` | `6 / 445` median | `-71%` vs macOS-derived original; `-78%` vs Linux session start |
-| max visit count | `4` | `4` | `4` | bounded after OBJ convergence fix |
-| Rust/OCaml old wall ratio | `5.7×` | `5.99×` | `6.71×` | modest wall regression in exchange for the RAM/abort win |
-| process exit | `2` due reported leaks | `0` | `0` on all 3 runs | Linux post-wave completed cleanly |
+| metric | macOS-derived original Rust (`-j 4`) | Linux session start Rust (`b512df2924`) | canonical Linux post-wave Rust (`-j 4`) | latest Wave 10/11 Rust (`-j 4`, `RUNS=1`) | delta / note |
+|---|---:|---:|---:|---:|---|
+| wall time | `244.70s` median | `4:17.11` (`257s`) | `4:47.79` (`287.79s`) median | `6:31.98` (`391.98s`) | latest is a noisy one-run checkpoint; `+36.2%` vs canonical median, but completes after cap fixes |
+| max RSS | `16.79 GiB` median | `26.3 GiB` | `5.70 GiB` median | `9.44 GiB` | `+65.5%` vs canonical median, still `-64%` vs Linux session start and cap evasion is fixed |
+| procs analyzed | `446 / 446` | `445 / 445` | `445 / 445` | `445 / 445` | parity on current Linux corpus |
+| heap+wall aborts | `21 / 446` median | `27 / 445` | `6 / 445` median | `11 / 445` | latest row includes expected wall-cap aborts, including `passwd_main` at `1m01s` |
+| max visit count | `4` | `4` | `4` | `4` | bounded after OBJ convergence fix |
+| Rust/OCaml old wall ratio | `5.7×` | `5.99×` | `6.71×` | `9.14×` | ratio is informational only across OS/corpus/run-count differences |
+| process exit | `2` due reported leaks | `0` | `0` on all 3 runs | `0` | Linux Wave 10/11 checkpoint completed cleanly |
 
 Old OCaml macOS-era reference, retained only for ratio context: `42.9s` wall,
 `~1.17 GB` max RSS, `570/570` procs, clean exit. The Linux script now detects
@@ -600,15 +614,18 @@ Interpretation:
   Recursive `record_post_for_address` now mirrors OCaml more closely, and the
   phases were prerequisites for the cycle-cursor / specialization residuals;
   the EqZero sideband chain has now landed and specialization is perfect.
-- The key dashboard message is RAM and stability: Linux Rust is now below the
-  historical macOS-derived Rust max-RSS reference, with far fewer cap aborts,
-  at the cost of a modest wall regression from the Linux reach-end checkpoint.
+- The key dashboard message through Wave 9 was RAM and stability: Linux Rust was
+  below the historical macOS-derived Rust max-RSS reference, with far fewer cap
+  aborts, at the cost of a modest wall regression from the Linux reach-end
+  checkpoint. Wave 10/11 adds two targeted wins (`sha512` wall and `md4` RSS)
+  plus the `passwd_main` cap-evasion fix; its one-run full-corpus row is noisier
+  and should be stabilized with a quiescent `RUNS=3` remeasure before treating it
+  as the new median.
 
-Recommended next perf wave: profile the remaining wall cost only after treating
-the `5745f79996` pre-port row and the post-apply-post row as paired baselines.
-Likely targets remain latent/state comparison fast paths and residual
-`state_cmp` canonicalization work, but new changes should preserve the low-abort
-profile and avoid erasing the RAM gains.
+Recommended next perf step: rerun the Wave 10/11 full corpus on a quieter host
+with `RUNS=3 JOBS=4` before starting another optimization wave. New perf work
+should preserve the wall-cap checks from `45f776d858` / `3f088ce479`, the low
+`md4` history RSS profile, and the bounded max visit count.
 
 Benchmark artifacts from the latest runs are under ignored `bench-out/` or `/tmp`
 paths in the worker checkout. Historical OpenSSL archaeology is in
@@ -624,6 +641,41 @@ mu state -w infer-rs            # tracks + ready set + agents
 mu task list -w infer-rs --status OPEN --sort roi
 mu task list -w infer-rs --status DEFERRED
 ```
+
+### Wave 10/11 performance session (2026-05-20)
+
+Eight perf/cap commits landed:
+
+1. `2415d5c1f0` — perf: reverse-dep index in `expand_formula_reachable`
+2. `5411dfd3df` — perf: reduce `BaseMemory::map_values` edge rebuild pressure
+3. `f8fcdad70a` — perf: gate `DisjunctiveStateStats` `size_stats` behind debug level
+4. `45f776d858` — fix: check wall cap inside `exec_instr` to prevent cap evasion
+5. `8b814147b6` — perf: use `FxHash` for hot `AbstractValue` lookups
+6. `a5758966d2` — perf: reduce unnecessary state component cloning
+7. `ad246b1ec9` — perf: optimize `ValueHistory` merge fast paths
+8. `3f088ce479` — fix: check wall cap in non-exit scan and summary-build phases
+
+Plus textual enhancement:
+
+9. `a5d75d0212` — textual: add `DeclEnv` variadic and attribute enhancements
+
+Key results:
+
+- `sha512_block_data_order` sentinel improved from roughly `~29s` to `26.0s`
+  (`~10%` faster; latest focused run analyzed `2/2` procs with `0` issues).
+- `md4_block_data_order` focused RSS dropped from `2.49 GiB` to `0.43 GiB`
+  (`439,856 KiB`, `-83%`) after the `ValueHistory` merge fast paths.
+- `passwd_main` wall-cap evasion is fixed: the loaded-machine failure mode went
+  from `3h+` / `45 GiB` and an intermediate `27m+` non-exit-scan timeout to a
+  wall-cap abort at `1m01s`.
+- Latest full-corpus OpenSSL checkpoint completes: `445/445` procs, process
+  exit `0`, `391.98s` wall, `9.44 GiB` max RSS, `11` aborts, max visit count
+  `4` (`RUNS=1 JOBS=4`; noisy shared-machine run, not yet a stable median).
+- `parity_sizeof_type_eval` is classified as **no-fix**: the remaining sizeof
+  behavior is an exported-Textual / type-fidelity limit, not a missing Rust
+  Pulse evaluator hook.
+- Correctness guards pass: `cargo test -p pulse --lib` (`418` passed) and
+  `cargo test -p pulse --test end_to_end` (`54` passed, `15` ignored).
 
 Live themes (track headlines, not exhaustive task lists):
 
@@ -679,17 +731,19 @@ Live themes (track headlines, not exhaustive task lists):
   and the one `funptr.c::conditionnaly_apply_funptr_with_intptrptr` Rust-only
   `assign_NULL` specialization is an accepted-known-limit benign
   over-specialization.
-- **Next perf wave.** Treat the canonical pre-port row (`4:47.79`, `5.70 GiB`,
-  `6` aborts) plus the post-apply-post row (`4:58.85`, `6.38 GiB`, `6` aborts)
-  as the baselines; any wall recovery should preserve the RAM and abort gains.
-  Likely targets remain latent/state comparison fast paths and residual
-  `state_cmp` canonicalization work, but not as a quick follow-up to today's
-  wave.
-- **Deferred backlog.** Micro-cleanups (`code_*`), speculative representation
-  work (`perf_component_clone_reduction`), Textual enhancements, and accepted
-  parity limits (`parity_sizeof_type_eval`) are parked with explicit
-  reopen-when notes. Run `mu task list -w infer-rs --status DEFERRED` for the
-  live set.
+- **DONE today — Wave 10/11 perf/cap sweep.** Eight perf/cap commits landed
+  through `3f088ce479`, plus the `a5d75d0212` Textual `DeclEnv` enhancement.
+  Latest full-corpus OpenSSL checkpoint is a noisy `RUNS=1 JOBS=4` row but
+  completes (`391.98s`, `9.44 GiB`, `445/445`, exit `0`, `11` aborts, max visit
+  `4`). Focused sentinels moved in the intended direction: `sha512` `~29s` ->
+  `26.0s`, `md4` RSS `2.49 GiB` -> `0.43 GiB`, and `passwd_main` no longer
+  evades the wall cap (`3h+` -> `1m01s`). Next step is a quiet `RUNS=3`
+  remeasure, not another speculative optimization wave.
+- **Deferred backlog.** Micro-cleanups (`code_*`) and speculative representation
+  work remain parked with explicit reopen-when notes. `parity_sizeof_type_eval`
+  is now closed as a no-fix exported-Textual/type-fidelity limit, and the
+  `DeclEnv` variadic/attribute Textual enhancement landed in `a5d75d0212`.
+  Run `mu task list -w infer-rs --status DEFERRED` for the live set.
 
 ## Test commands
 

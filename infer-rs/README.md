@@ -17,7 +17,12 @@ The authoritative dashboard is [`docs/STATUS.md`](docs/STATUS.md). At a glance:
   [`docs/STATUS.md`](docs/STATUS.md) and
   [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](docs/triage/c_pulse_summary_mismatches_2026_05_11.md).
 - Latest OpenSSL partial-corpus performance dashboard lives in
-  [`docs/STATUS.md`](docs/STATUS.md).
+  [`docs/STATUS.md`](docs/STATUS.md). Wave 10/11 landed eight perf/cap fixes
+  plus a Textual `DeclEnv` enhancement; the latest full-corpus checkpoint exits
+  `0` with `445/445` procs (`391.98s`, `9.44 GiB`, `11` aborts, max visit `4`).
+  Focused wins: `sha512_block_data_order` `~29s -> 26.0s`,
+  `md4_block_data_order` RSS `2.49 GiB -> 0.43 GiB`, and `passwd_main` wall-cap
+  evasion fixed (`3h+ -> 1m01s`).
 - Active work/backlog lives in `mu` tasks, not this file:
 
   ```sh
