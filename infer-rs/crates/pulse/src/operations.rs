@@ -300,10 +300,14 @@ pub(crate) fn eval_with_history_mode(
             // byte loops with hundreds of constant array-index computations
             // per iteration, this dominates per-disjunct unique-value count.
             let canonical = state.canonicalize_for_access(result);
-            PulseResult::Ok(ValueWithHistory::new(
-                canonical,
-                lhs_val.history.merge_owned(&rhs_val.history),
-            ))
+            let history = if lhs_val.history.is_epoch() {
+                rhs_val.history
+            } else if rhs_val.history.is_epoch() {
+                lhs_val.history
+            } else {
+                lhs_val.history.merge_owned(&rhs_val.history)
+            };
+            PulseResult::Ok(ValueWithHistory::new(canonical, history))
         }
         Exp::Cast(_, inner) => eval_with_history(inner, loc, state),
         Exp::Exn(inner) => eval_with_history(inner, loc, state),

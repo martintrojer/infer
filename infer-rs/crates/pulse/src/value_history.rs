@@ -287,12 +287,12 @@ fn merge_path_score(path: &HistoryPath) -> u8 {
     score
 }
 
-fn cap_merged_paths(mut paths: BTreeSet<Arc<HistoryPath>>) -> BTreeSet<Arc<HistoryPath>> {
+fn cap_merged_paths(paths: BTreeSet<Arc<HistoryPath>>) -> BTreeSet<Arc<HistoryPath>> {
     if paths.len() <= MAX_MERGED_HISTORY_PATHS {
         return paths;
     }
 
-    let mut candidates: Vec<_> = std::mem::take(&mut paths).into_iter().collect();
+    let mut candidates: Vec<_> = paths.into_iter().collect();
     candidates.sort_by(|lhs, rhs| {
         merge_path_score(rhs)
             .cmp(&merge_path_score(lhs))
@@ -301,6 +301,25 @@ fn cap_merged_paths(mut paths: BTreeSet<Arc<HistoryPath>>) -> BTreeSet<Arc<Histo
     });
     candidates.truncate(MAX_MERGED_HISTORY_PATHS);
     candidates.into_iter().collect()
+}
+
+fn paths_are_ptr_subset(
+    subset: &BTreeSet<Arc<HistoryPath>>,
+    superset: &BTreeSet<Arc<HistoryPath>>,
+) -> bool {
+    subset.len() <= superset.len()
+        && subset.iter().all(|path| {
+            superset
+                .iter()
+                .any(|candidate| Arc::ptr_eq(path, candidate))
+        })
+}
+
+fn paths_are_subset(
+    subset: &BTreeSet<Arc<HistoryPath>>,
+    superset: &BTreeSet<Arc<HistoryPath>>,
+) -> bool {
+    paths_are_ptr_subset(subset, superset) || subset.is_subset(superset)
 }
 
 fn cap_cell_ids(mut cell_ids: BTreeSet<CellId>) -> BTreeSet<CellId> {
@@ -563,13 +582,13 @@ impl ValueHistory {
         let self_cell_superset = other.cell_ids.is_subset(&self.cell_ids);
         let other_cell_superset = self.cell_ids.is_subset(&other.cell_ids);
         if other_paths_len <= self_paths_len
-            && other.paths.is_subset(&self.paths)
+            && paths_are_subset(&other.paths, &self.paths)
             && self_cell_superset
         {
             return self.clone();
         }
         if self_paths_len <= other_paths_len
-            && self.paths.is_subset(&other.paths)
+            && paths_are_subset(&self.paths, &other.paths)
             && other_cell_superset
         {
             return other.clone();
@@ -582,8 +601,15 @@ impl ValueHistory {
         };
         let mut paths = base.as_ref().clone();
         paths.extend(extra.iter().cloned());
+        let cell_ids = Arc::new(self.merged_cell_ids(other));
+        if paths.len() <= MAX_MERGED_HISTORY_PATHS {
+            return Self {
+                cell_ids,
+                paths: Arc::new(paths),
+            };
+        }
         Self {
-            cell_ids: Arc::new(self.merged_cell_ids(other)),
+            cell_ids,
             paths: Arc::new(cap_merged_paths(paths)),
         }
     }
@@ -603,13 +629,13 @@ impl ValueHistory {
         let self_cell_superset = other.cell_ids.is_subset(&self.cell_ids);
         let other_cell_superset = self.cell_ids.is_subset(&other.cell_ids);
         if other_paths_len <= self_paths_len
-            && other.paths.is_subset(&self.paths)
+            && paths_are_subset(&other.paths, &self.paths)
             && self_cell_superset
         {
             return self;
         }
         if self_paths_len <= other_paths_len
-            && self.paths.is_subset(&other.paths)
+            && paths_are_subset(&self.paths, &other.paths)
             && other_cell_superset
         {
             return other.clone();
@@ -630,6 +656,12 @@ impl ValueHistory {
         if self_paths_len >= other_paths_len {
             let mut paths = self.paths.as_ref().clone();
             paths.extend(other.paths.iter().cloned());
+            if paths.len() <= MAX_MERGED_HISTORY_PATHS {
+                return Self {
+                    cell_ids: merged_cell_ids,
+                    paths: Arc::new(paths),
+                };
+            }
             Self {
                 cell_ids: merged_cell_ids,
                 paths: Arc::new(cap_merged_paths(paths)),
@@ -637,6 +669,12 @@ impl ValueHistory {
         } else {
             let mut paths = other.paths.as_ref().clone();
             paths.extend(self.paths.iter().cloned());
+            if paths.len() <= MAX_MERGED_HISTORY_PATHS {
+                return Self {
+                    cell_ids: merged_cell_ids,
+                    paths: Arc::new(paths),
+                };
+            }
             Self {
                 cell_ids: merged_cell_ids,
                 paths: Arc::new(cap_merged_paths(paths)),
