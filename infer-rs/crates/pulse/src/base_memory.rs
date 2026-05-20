@@ -30,6 +30,23 @@ pub struct Edges {
     values: BTreeMap<Access, ValueWithHistory>,
 }
 
+fn map_value_after_first_change(
+    value: AbstractValue,
+    first_change: &mut Option<(AbstractValue, AbstractValue)>,
+    f: &mut impl FnMut(AbstractValue) -> AbstractValue,
+) -> AbstractValue {
+    if let Some((old, new)) = *first_change {
+        if value == old {
+            *first_change = None;
+            new
+        } else {
+            value
+        }
+    } else {
+        f(value)
+    }
+}
+
 impl Edges {
     pub fn empty() -> Self {
         Self::default()
@@ -299,54 +316,67 @@ impl Edges {
     }
 
     fn mapped_values(&self, mut f: impl FnMut(AbstractValue) -> AbstractValue) -> Option<Self> {
-        let mut changed = false;
-        let mut access_changed = false;
-        let mut rewritten = Vec::with_capacity(self.values.len());
+        let bindings = self.recency_bindings();
+        let mut target_only_edges = None;
+        let mut rewritten: Option<Vec<(Access, ValueWithHistory)>> = None;
 
-        for (access, value) in self.recency_bindings() {
-            let access = match access {
+        for (ordinal, (access, value)) in bindings.iter().copied().enumerate() {
+            let mapped_access = match access {
                 Access::ArrayAccess(typ, index) => {
                     let index = *index;
                     let new_index = f(index);
                     if new_index != index {
-                        changed = true;
-                        access_changed = true;
+                        Some(Access::ArrayAccess(typ.clone(), new_index))
+                    } else {
+                        None
                     }
-                    Access::ArrayAccess(typ.clone(), new_index)
                 }
-                Access::FieldAccess(_) | Access::Dereference => access.clone(),
+                Access::FieldAccess(_) | Access::Dereference => None,
             };
-            let mut value = value.clone();
             let new_addr = f(value.addr);
-            if new_addr != value.addr {
-                changed = true;
+
+            if let Some(rewritten) = rewritten.as_mut() {
+                let mut value = value.clone();
                 value.addr = new_addr;
+                rewritten.push((mapped_access.unwrap_or_else(|| access.clone()), value));
+                continue;
             }
-            rewritten.push((access, value));
-        }
 
-        if !changed {
-            return None;
-        }
+            if let Some(mapped_access) = mapped_access {
+                let mut new_rewritten = Vec::with_capacity(bindings.len());
+                for (prefix_access, prefix_value) in bindings.iter().copied().take(ordinal) {
+                    let prefix_value = target_only_edges
+                        .as_ref()
+                        .and_then(|edges: &Self| edges.values.get(prefix_access))
+                        .unwrap_or(prefix_value)
+                        .clone();
+                    new_rewritten.push((prefix_access.clone(), prefix_value));
+                }
 
-        if !access_changed {
-            let mut edges = self.clone();
-            for (access, value) in rewritten {
-                if let Some(existing) = edges.values.get_mut(&access) {
-                    existing.addr = value.addr;
+                let mut value = value.clone();
+                value.addr = new_addr;
+                new_rewritten.push((mapped_access, value));
+                rewritten = Some(new_rewritten);
+            } else if new_addr != value.addr {
+                let edges = target_only_edges.get_or_insert_with(|| self.clone());
+                if let Some(existing) = edges.values.get_mut(access) {
+                    existing.addr = new_addr;
                 }
             }
-            return Some(edges);
         }
 
-        Some(match Self::configured_limit() {
-            Some(limit) => Self::from_recency_bindings_limited(rewritten, limit),
-            None => Self {
-                new_keys: Vec::new(),
-                old_keys: Vec::new(),
-                values: rewritten.into_iter().collect(),
-            },
-        })
+        if let Some(rewritten) = rewritten {
+            return Some(match Self::configured_limit() {
+                Some(limit) => Self::from_recency_bindings_limited(rewritten, limit),
+                None => Self {
+                    new_keys: Vec::new(),
+                    old_keys: Vec::new(),
+                    values: rewritten.into_iter().collect(),
+                },
+            });
+        }
+
+        target_only_edges
     }
 
     /// Rewrite edge targets/access indices through an arbitrary value mapper.
@@ -546,25 +576,46 @@ impl BaseMemory {
     }
 
     /// Rewrite every heap source/target/index through an arbitrary value mapper.
-    pub fn map_values(&mut self, mut f: impl FnMut(AbstractValue) -> AbstractValue) -> bool {
-        let mut changed = false;
+    pub fn map_values(&mut self, f: impl FnMut(AbstractValue) -> AbstractValue) -> bool {
+        self.map_values_after_first_change(None, f)
+    }
+
+    /// Rewrite every heap source/target/index through an arbitrary value mapper,
+    /// optionally reusing a previously observed changed mapping. This keeps
+    /// callers that already probed the heap from paying another redundant
+    /// mapping call on the first changed value.
+    pub fn map_values_after_first_change(
+        &mut self,
+        mut first_change: Option<(AbstractValue, AbstractValue)>,
+        mut f: impl FnMut(AbstractValue) -> AbstractValue,
+    ) -> bool {
         let mut src_changed = false;
-        let mut rewritten = Vec::with_capacity(self.graph.len());
+        let mut edge_changed = false;
+        let mut rewritten = Vec::new();
 
         for (src, edges) in self.graph.iter() {
-            let mapped_edges = edges.mapped_values(&mut f);
-            let new_src = f(*src);
+            let new_src = map_value_after_first_change(*src, &mut first_change, &mut f);
             if new_src != *src {
-                changed = true;
                 src_changed = true;
             }
-            if mapped_edges.is_some() {
-                changed = true;
-            }
+
+            let mapped_edges = if edges
+                .first_mapping_change(|value| {
+                    map_value_after_first_change(value, &mut first_change, &mut f)
+                })
+                .is_some()
+            {
+                edge_changed = true;
+                edges.mapped_values(|value| {
+                    map_value_after_first_change(value, &mut first_change, &mut f)
+                })
+            } else {
+                None
+            };
             rewritten.push((*src, new_src, mapped_edges, Arc::clone(edges)));
         }
 
-        if !changed {
+        if !src_changed && !edge_changed {
             return false;
         }
 
@@ -700,6 +751,72 @@ mod tests {
             TypeName::CStruct(QualifiedCppName::from_string("S")),
             name,
         ))
+    }
+
+    #[test]
+    fn test_edges_mapped_values_target_only_preserves_recency_and_history() {
+        let mut edges = Edges::empty();
+        let a = field_access("a");
+        let b = field_access("b");
+        let c = field_access("c");
+        let v1 = AbstractValue::of_raw(1);
+        let v2 = AbstractValue::of_raw(2);
+        let v3 = AbstractValue::of_raw(3);
+        let v4 = AbstractValue::of_raw(4);
+        edges.add_with_history_limited(
+            a.clone(),
+            ValueWithHistory::new(v1, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            b.clone(),
+            ValueWithHistory::new(v2, ValueHistory::epoch()),
+            2,
+        );
+        edges.add_with_history_limited(
+            c.clone(),
+            ValueWithHistory::new(v3, ValueHistory::epoch()),
+            2,
+        );
+
+        let mapped = edges
+            .mapped_values(|value| if value == v2 { v4 } else { value })
+            .expect("target rewrite should change edges");
+
+        assert_eq!(mapped.new_keys, edges.new_keys);
+        assert_eq!(mapped.old_keys, edges.old_keys);
+        assert_eq!(mapped.find(&a), Some(v1));
+        assert_eq!(mapped.find(&b), Some(v4));
+        assert_eq!(mapped.find(&c), Some(v3));
+        assert_eq!(
+            mapped.find_with_history(&b).unwrap().history,
+            edges.find_with_history(&b).unwrap().history
+        );
+    }
+
+    #[test]
+    fn test_edges_mapped_values_array_index_rebuilds() {
+        let mut edges = Edges::empty();
+        let old_idx = AbstractValue::of_raw(1);
+        let new_idx = AbstractValue::of_raw(2);
+        let target = AbstractValue::of_raw(3);
+        edges.add_with_history(
+            Access::ArrayAccess(sil::typ::Typ::void(), old_idx),
+            ValueWithHistory::new(target, ValueHistory::epoch()),
+        );
+
+        let mapped = edges
+            .mapped_values(|value| if value == old_idx { new_idx } else { value })
+            .expect("index rewrite should change edges");
+
+        assert_eq!(
+            mapped.find(&Access::ArrayAccess(sil::typ::Typ::void(), new_idx)),
+            Some(target)
+        );
+        assert_eq!(
+            mapped.find(&Access::ArrayAccess(sil::typ::Typ::void(), old_idx)),
+            None
+        );
     }
 
     #[test]

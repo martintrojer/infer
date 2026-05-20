@@ -1273,13 +1273,15 @@ impl AbductiveDomain {
         else {
             return;
         };
-        self.post.heap.map_values(|value| {
-            if value == first_old {
-                first_repr
-            } else {
-                path_condition.get_var_repr(value)
-            }
-        });
+        self.post
+            .heap
+            .map_values_after_first_change(Some((first_old, first_repr)), |value| {
+                if value == first_old {
+                    first_repr
+                } else {
+                    path_condition.get_var_repr(value)
+                }
+            });
     }
 
     /// Rewrite the current state to the formula's canonical representatives.
