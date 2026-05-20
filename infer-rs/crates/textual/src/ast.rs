@@ -211,6 +211,16 @@ impl Attr {
             loc,
         }
     }
+
+    /// Whether this is a valueless annotation with the given name.
+    pub fn is_marker(&self, name: &str) -> bool {
+        self.name == name && self.values.is_empty()
+    }
+
+    /// Textual variadic marker on an annotated formal: `.variadic`.
+    pub fn is_variadic(&self) -> bool {
+        self.is_marker("variadic")
+    }
 }
 
 // ---- Typ ----
@@ -553,6 +563,24 @@ pub struct ProcDecl {
     pub formals_types: Option<Vec<AnnotatedTyp>>,
     pub result_type: AnnotatedTyp,
     pub attributes: Vec<Attr>,
+}
+
+impl ProcDecl {
+    /// Returns the index of the formal annotated with `.variadic`, if any.
+    ///
+    /// Cross-ref: OCaml `Textual.ProcDecl.is_variadic` checks whether any
+    /// annotated formal has `Attr.is_variadic`.
+    pub fn variadic_formal_index(&self) -> Option<usize> {
+        self.formals_types.as_ref().and_then(|formals| {
+            formals
+                .iter()
+                .position(|at| at.attributes.iter().any(Attr::is_variadic))
+        })
+    }
+
+    pub fn is_variadic(&self) -> bool {
+        self.variadic_formal_index().is_some()
+    }
 }
 
 // ---- ProcDesc ----

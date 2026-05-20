@@ -42,6 +42,19 @@ pub enum VerifError {
         formals: usize,
         loc: Location,
     },
+    /// A variadic call did not pass enough arguments to activate the
+    /// `.variadic` parameter.
+    VariadicNotEnoughArgs {
+        proc: QualifiedProcName,
+        args: usize,
+        formals: usize,
+        loc: Location,
+    },
+    /// A `.variadic` formal appears in an invalid position.
+    VariadicWrongParam {
+        proc: QualifiedProcName,
+        loc: Location,
+    },
 }
 
 impl std::fmt::Display for VerifError {
@@ -70,6 +83,19 @@ impl std::fmt::Display for VerifError {
                 f,
                 "function {proc} called with {args} arguments but declared with {formals} parameters"
             ),
+            VerifError::VariadicNotEnoughArgs {
+                proc,
+                args,
+                formals,
+                ..
+            } => write!(
+                f,
+                "variadic function {proc} expects at least {} arguments but is called with {args}",
+                formals.saturating_sub(1)
+            ),
+            VerifError::VariadicWrongParam { proc, .. } => {
+                write!(f, "variadic parameter is in an invalid position in function {proc}")
+            }
         }
     }
 }
@@ -81,6 +107,8 @@ impl VerifError {
             VerifError::UnknownProc { loc, .. } => loc,
             VerifError::UnknownLabel { label, .. } => &label.loc,
             VerifError::WrongArgNumber { loc, .. } => loc,
+            VerifError::VariadicNotEnoughArgs { loc, .. } => loc,
+            VerifError::VariadicWrongParam { loc, .. } => loc,
         }
     }
 }
@@ -105,6 +133,8 @@ pub fn verify(module: &Module, decls: &DeclEnv) -> Vec<VerifError> {
 }
 
 fn verify_procdesc(pdesc: &ProcDesc, decls: &DeclEnv, errors: &mut Vec<VerifError>) {
+    verify_variadic_position(pdesc, decls, errors);
+
     // Collect declared labels.
     let declared_labels: HashSet<&str> =
         pdesc.nodes.iter().map(|n| n.label.value.as_str()).collect();
@@ -209,17 +239,32 @@ fn verify_call(
         }
     }
 
-    match decls.get_proc(proc) {
-        Some(entry) => {
-            let decl = entry.procdecl();
-            if let Some(formals) = &decl.formals_types {
-                if formals.len() != num_args {
-                    errors.push(VerifError::WrongArgNumber {
-                        proc: proc.clone(),
-                        args: num_args,
-                        formals: formals.len(),
-                        loc: proc.name.loc.clone(),
-                    });
+    match decls.get_procdecl_for_call(proc, num_args) {
+        Some(resolved) => {
+            if let Some(formals) = &resolved.decl.formals_types {
+                if resolved.variadic.is_some() {
+                    if num_args < formals.len().saturating_sub(1) {
+                        errors.push(VerifError::VariadicNotEnoughArgs {
+                            proc: proc.clone(),
+                            args: num_args,
+                            formals: formals.len(),
+                            loc: proc.name.loc.clone(),
+                        });
+                    }
+                } else {
+                    let adjusted_args = if decls.is_trait_method(proc) {
+                        num_args + 1
+                    } else {
+                        num_args
+                    };
+                    if formals.len() != adjusted_args {
+                        errors.push(VerifError::WrongArgNumber {
+                            proc: proc.clone(),
+                            args: adjusted_args,
+                            formals: formals.len(),
+                            loc: proc.name.loc.clone(),
+                        });
+                    }
                 }
             }
             // If formals_types is None (ellipsis), any arity is fine.
@@ -231,6 +276,37 @@ fn verify_call(
                 loc: proc.name.loc.clone(),
             });
         }
+    }
+}
+
+fn verify_variadic_position(pdesc: &ProcDesc, decls: &DeclEnv, errors: &mut Vec<VerifError>) {
+    let Some(formals) = &pdesc.procdecl.formals_types else {
+        return;
+    };
+    let Some(variadic_index) = pdesc.procdecl.variadic_formal_index() else {
+        return;
+    };
+
+    let in_trait = decls.is_defined_in_a_trait(&pdesc.procdecl.qualified_name);
+    let has_reified_generics_param = pdesc
+        .params
+        .iter()
+        .any(|param| param.value == "$0ReifiedGenerics");
+    let expected_index_from_end = match (in_trait, has_reified_generics_param) {
+        (true, true) => 2,
+        (true, false) | (false, true) => 1,
+        (false, false) => 0,
+    };
+
+    if formals
+        .len()
+        .checked_sub(1 + expected_index_from_end)
+        .is_none_or(|expected| variadic_index != expected)
+    {
+        errors.push(VerifError::VariadicWrongParam {
+            proc: pdesc.procdecl.qualified_name.clone(),
+            loc: pdesc.procdecl.qualified_name.name.loc.clone(),
+        });
     }
 }
 
@@ -413,5 +489,63 @@ define f() : void {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_verify_variadic_definition_allows_extra_args() {
+        let src = r#".source_language = "hack"
+
+define foo(x: int, xs: .variadic int) : void {
+  #entry:
+    ret null
+}
+
+define f() : void {
+  #entry:
+    n0 = foo(1, 2, 3, 4)
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let errors = verify(&module, &decls);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_verify_variadic_definition_rejects_too_few_args() {
+        let src = r#".source_language = "hack"
+
+define foo(x: int, xs: .variadic int) : void {
+  #entry:
+    ret null
+}
+
+define f() : void {
+  #entry:
+    n0 = foo()
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let errors = verify(&module, &decls);
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, VerifError::VariadicNotEnoughArgs { .. })));
+    }
+
+    #[test]
+    fn test_verify_variadic_wrong_position() {
+        let src = r#".source_language = "hack"
+
+define foo(xs: .variadic int, x: int) : void {
+  #entry:
+    ret null
+}"#;
+        let module = parse_module(src, "test.sil").unwrap();
+        let (decls, _) = DeclEnv::from_module(&module);
+        let errors = verify(&module, &decls);
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, VerifError::VariadicWrongParam { .. })));
     }
 }

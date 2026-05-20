@@ -111,7 +111,7 @@ fn fix_closure_app_exp(exp: &mut Exp, local_vars: &HashSet<String>, decls: &Decl
             }
             if let EnclosingClass::TopLevel = &proc.enclosing_class {
                 let name = &proc.name.value;
-                if local_vars.contains(name) && decls.get_proc(proc).is_none() {
+                if local_vars.contains(name) && !decls.has_proc_named(proc) {
                     let closure_var = VarName::new(name.clone(), proc.name.loc.clone());
                     let closure_exp = Exp::Load {
                         exp: Box::new(Exp::Lvar(closure_var)),

@@ -216,8 +216,8 @@ impl<'a> TypeState<'a> {
                     "__sil_instanceof" => Typ::Int,
                     _ => self
                         .decls
-                        .get_proc(proc)
-                        .map(|entry| entry.procdecl().result_type.typ.clone())
+                        .get_procdecl_for_call(proc, args.len())
+                        .map(|resolved| resolved.decl.result_type.typ.clone())
                         .unwrap_or(Typ::Void),
                 };
                 (

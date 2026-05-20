@@ -245,25 +245,67 @@ fn procname_to_sil(
     }
 }
 
-fn call_result_typ(lang: Lang, decls: &DeclEnv, proc: &ast::QualifiedProcName) -> typ::Typ {
+fn call_result_typ(
+    lang: Lang,
+    decls: &DeclEnv,
+    proc: &ast::QualifiedProcName,
+    arity: usize,
+) -> typ::Typ {
     decls
-        .get_proc(proc)
-        .map(|entry| typ_to_sil(lang, &entry.procdecl().result_type.typ))
+        .get_procdecl_for_call(proc, arity)
+        .map(|resolved| typ_to_sil(lang, &resolved.decl.result_type.typ))
         .unwrap_or_else(typ::Typ::void)
+}
+
+fn call_proc_arity(
+    lang: Lang,
+    decls: &DeclEnv,
+    proc: &ast::QualifiedProcName,
+    call_arg_count: usize,
+) -> Option<i32> {
+    if lang == Lang::Hack {
+        decls
+            .get_procdecl_for_call(proc, call_arg_count)
+            .and_then(|resolved| resolved.decl.formals_types.as_ref())
+            .map(|formals| formals.len() as i32)
+            .or(Some(call_arg_count as i32))
+    } else {
+        Some(call_arg_count as i32)
+    }
 }
 
 fn call_arg_typ(
     lang: Lang,
     decls: &DeclEnv,
     proc: &ast::QualifiedProcName,
+    arity: usize,
     index: usize,
 ) -> typ::Typ {
     decls
-        .get_proc(proc)
-        .and_then(|entry| entry.procdecl().formals_types.as_ref())
-        .and_then(|formals| formals.get(index))
-        .map(|annotated| typ_to_sil(lang, &annotated.typ))
-        .unwrap_or_else(typ::Typ::void)
+        .get_procdecl_for_call(proc, arity)
+        .and_then(|resolved| {
+            let formals = resolved.decl.formals_types.as_ref()?;
+            let formal_index = match resolved.variadic {
+                Some(info) if index >= info.index => info.index,
+                _ => index,
+            };
+            formals.get(formal_index).map(|annotated| &annotated.typ)
+        })
+        .map(|typ| typ_to_sil(lang, typ))
+        .unwrap_or_else(|| default_unknown_formal_typ(lang))
+}
+
+fn default_unknown_formal_typ(lang: Lang) -> typ::Typ {
+    match lang {
+        Lang::Hack => typ::Typ::mk_ptr(typ::Typ::mk_struct(typ::TypeName::HackClass(
+            typ::HackClassName("HackMixed".to_string()),
+        ))),
+        Lang::Python => typ::Typ::mk_ptr(typ::Typ::mk_struct(typ::TypeName::PythonClass(
+            typ::PythonClassName("PyObject".to_string()),
+        ))),
+        Lang::C | Lang::Rust | Lang::Swift => typ::Typ::mk_ptr(typ::Typ::void()),
+        Lang::Java | Lang::ObjectiveC => typ::Typ::void(),
+    }
 }
 
 /// Mirrors `FieldDeclBridge.to_sil`.
@@ -464,7 +506,7 @@ fn exp_to_sil(
             }
 
             // Regular calls: create a function constant reference.
-            let arity = Some(args.len() as i32);
+            let arity = call_proc_arity(lang, decls, proc, args.len());
             let callee = procname_to_sil(lang, proc, arity);
             Ok(exp::Exp::Const(const_val::Const::Cfun(callee)))
         }
@@ -790,9 +832,9 @@ fn instr_to_sil(
                     }
 
                     // Regular call
-                    let call_arity = Some(args.len() as i32);
+                    let call_arity = call_proc_arity(lang, decls, proc, args.len());
                     let callee = procname_to_sil(lang, proc, call_arity);
-                    let ret_typ = call_result_typ(lang, decls, proc);
+                    let ret_typ = call_result_typ(lang, decls, proc, args.len());
                     let fun_exp = exp::Exp::Const(const_val::Const::Cfun(callee));
                     let sil_args: Vec<(exp::Exp, typ::Typ)> = args
                         .iter()
@@ -800,7 +842,7 @@ fn instr_to_sil(
                         .map(|(i, a)| {
                             Ok((
                                 exp_to_sil(lang, source_file, decls, pname, a, l)?,
-                                call_arg_typ(lang, decls, proc, i),
+                                call_arg_typ(lang, decls, proc, args.len(), i),
                             ))
                         })
                         .collect::<Result<Vec<_>, ConvError>>()?;
