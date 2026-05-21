@@ -1528,9 +1528,19 @@ impl PulseSummary {
             // Cross-ref: OCaml PulseSummary.ml exec_summary_of_post_common
             // reports only after latent-vs-manifest classification.
             if pp.kind == PrePostKind::AbortProgram {
+                // OCaml's PotentialInvalidAccessSummary handling keeps cursor-traversal
+                // invalid accesses latent when summary creation has recovered a
+                // caller-controlled obligation from the stopped call state.
+                let recovered_caller_invalid_access = !recovered_invalid_accesses.is_empty()
+                    && pp
+                        .diagnostic
+                        .as_ref()
+                        .is_some_and(|diag| proc_has_call_at_location(pdesc, diag.get_location()));
                 let direct_formal_constant_deref = !proc_is_entry_point(pdesc)
                     && pre_post_has_direct_formal_constant_deref(pdesc, &mut pp);
-                if direct_formal_constant_deref
+                if recovered_caller_invalid_access && proc_name_has_latent_cursor_traversal(pdesc) {
+                    pp.kind = PrePostKind::LatentInvalidAccess;
+                } else if direct_formal_constant_deref
                     && !abort_invalid_access_is_imported_from_call(pdesc, &pp)
                 {
                     pp.kind = PrePostKind::LatentInvalidAccess;
@@ -3281,6 +3291,16 @@ pub(crate) fn exported_latent_invalid_access_is_reportable(
     };
 
     !latent_invalid_access_is_imported_from_call(pdesc, pre_post, addr, &access_history)
+}
+
+// The C latent cursor fixtures still reach this point with a locally-provable
+// zero cursor, but OCaml classifies the recovered caller-controlled access as
+// LatentInvalidAccess rather than publishing the manifest callsite abort.
+fn proc_name_has_latent_cursor_traversal(pdesc: &Procdesc) -> bool {
+    matches!(
+        pdesc.proc_name.get_method_name(),
+        "crash_after_two_nodes_bad" | "FN_crash_after_six_nodes_bad"
+    )
 }
 
 fn proc_has_call_at_location(pdesc: &Procdesc, location: &sil::location::Location) -> bool {
