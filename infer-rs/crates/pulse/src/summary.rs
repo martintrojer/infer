@@ -4791,6 +4791,40 @@ mod tests {
         assert_eq!(find_return_value(&astate, &pdesc), None);
     }
 
+    #[test]
+    fn test_find_return_value_fallback_handles_single_node_start_is_exit_pred() {
+        let mut pdesc = make_pdesc_with_formals(&[]);
+        pdesc.ret_type = Typ::int(sil::typ::IKind::IInt);
+        let return_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        let dead_id = Ident::create_normal(IdentName::from_string("dead"), 1);
+        pdesc.nodes[0].instrs = vec![
+            sil::instr::Instr::Load {
+                id: return_id.clone(),
+                e: sil::exp::Exp::zero(),
+                typ: Typ::int(sil::typ::IKind::IInt),
+                loc: Location::dummy(),
+            },
+            sil::instr::Instr::Load {
+                id: dead_id.clone(),
+                e: sil::exp::Exp::one(),
+                typ: Typ::int(sil::typ::IKind::IInt),
+                loc: Location::dummy(),
+            },
+        ];
+        pdesc.set_succs(0, vec![1]);
+
+        let mut astate = AbductiveDomain::mk_initial(&pdesc);
+        let return_value = AbstractValue::of_raw(10);
+        let dead_value = AbstractValue::of_raw(20);
+        astate
+            .post
+            .stack
+            .add(Var::LogicalVar(return_id), return_value);
+        astate.post.stack.add(Var::LogicalVar(dead_id), dead_value);
+
+        assert_eq!(find_return_value(&astate, &pdesc), Some(dead_value));
+    }
+
     fn make_abort_pre_post_with_formal(name: &str) -> (Procdesc, PrePost, AbstractValue) {
         let pdesc = make_pdesc_with_formals(&[name]);
         let mut astate = AbductiveDomain::mk_initial(&pdesc);

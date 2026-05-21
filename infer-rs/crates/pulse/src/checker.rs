@@ -734,25 +734,34 @@ fn drop_dead_logical_vars(
 }
 
 /// Compute the stamp of the logical-var that `summary::find_return_value`'s
-/// fallback heuristic would pick: the last-encountered `Load`/`Call` `id`
-/// across the procedure in iteration order. Returns `None` for void
-/// procedures (the heuristic is short-circuited there) or when the
-/// procedure has no `Load`/`Call` instructions.
+/// fallback heuristic would pick: the last `Load`/`Call` `id` in the direct
+/// exit predecessor node(s). Returns `None` for void procedures (the heuristic
+/// is short-circuited there), when no direct exit predecessor has a candidate,
+/// or when direct exit predecessors disagree.
 fn return_candidate_logical_stamp(pdesc: &Procdesc) -> Option<i32> {
     if pdesc.ret_type.is_void() {
         return None;
     }
-    let mut last = None;
-    for node in &pdesc.nodes {
-        for instr in &node.instrs {
-            match instr {
-                sil::instr::Instr::Load { id, .. } => last = Some(id.stamp),
-                sil::instr::Instr::Call { ret: (id, _), .. } => last = Some(id.stamp),
-                _ => {}
-            }
+    let mut candidate = None;
+    let mut saw_pred = false;
+
+    for pred_id in pdesc.get_preds(pdesc.exit_node) {
+        saw_pred = true;
+        let pred_stamp = pdesc.get_node(*pred_id).and_then(|node| {
+            node.instrs.iter().rev().find_map(|instr| match instr {
+                sil::instr::Instr::Load { id, .. } => Some(id.stamp),
+                sil::instr::Instr::Call { ret: (id, _), .. } => Some(id.stamp),
+                _ => None,
+            })
+        })?;
+        match candidate {
+            Some(existing) if existing != pred_stamp => return None,
+            Some(_) => {}
+            None => candidate = Some(pred_stamp),
         }
     }
-    last
+
+    saw_pred.then_some(candidate).flatten()
 }
 
 fn dump_selected_fixpoint_nodes(
@@ -3232,6 +3241,10 @@ mod tests {
         HeapPath::Dereference(Box::new(HeapPath::Pvar(formal_pvar.clone())))
     }
 
+    fn int_typ() -> Typ {
+        Typ::int(sil::typ::IKind::IInt)
+    }
+
     #[test]
     fn test_formal_preeval_abduces_read_preconditions_and_deref_edge() {
         let loc = Location::dummy();
@@ -5404,6 +5417,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_return_candidate_logical_stamp_uses_exit_predecessor_not_later_node() {
+        let mut pdesc = Procdesc::new(
+            Procname::c_from_string("return_candidate_exit_pred"),
+            int_typ(),
+            Location::dummy(),
+        );
+        let return_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        let dead_id = Ident::create_normal(IdentName::from_string("dead"), 1);
+        let return_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::ReturnStmt),
+            vec![Instr::Load {
+                id: return_id.clone(),
+                e: Exp::Const(Const::Cint(IntLit::of_int(7))),
+                typ: int_typ(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        let _dead_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Load {
+                id: dead_id,
+                e: Exp::Const(Const::Cint(IntLit::of_int(42))),
+                typ: int_typ(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        pdesc.set_succs(pdesc.start_node, vec![return_node]);
+        pdesc.set_succs(return_node, vec![pdesc.exit_node]);
+
+        assert_eq!(
+            return_candidate_logical_stamp(&pdesc),
+            Some(return_id.stamp)
+        );
+    }
+
+    #[test]
+    fn test_return_candidate_logical_stamp_handles_single_node_start_is_exit_pred() {
+        let mut pdesc = Procdesc::new(
+            Procname::c_from_string("return_candidate_single_node"),
+            int_typ(),
+            Location::dummy(),
+        );
+        let return_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        pdesc.nodes[pdesc.start_node as usize].instrs = vec![Instr::Load {
+            id: return_id.clone(),
+            e: Exp::Const(Const::Cint(IntLit::of_int(7))),
+            typ: int_typ(),
+            loc: Location::dummy(),
+        }];
+        pdesc.set_succs(pdesc.start_node, vec![pdesc.exit_node]);
+
+        assert_eq!(
+            return_candidate_logical_stamp(&pdesc),
+            Some(return_id.stamp)
+        );
+    }
+
+    #[test]
+    fn test_return_candidate_logical_stamp_rejects_ambiguous_exit_predecessors() {
+        let mut pdesc = Procdesc::new(
+            Procname::c_from_string("return_candidate_ambiguous"),
+            int_typ(),
+            Location::dummy(),
+        );
+        let left_id = Ident::create_normal(IdentName::from_string("left"), 0);
+        let right_id = Ident::create_normal(IdentName::from_string("right"), 1);
+        let left = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::ReturnStmt),
+            vec![Instr::Load {
+                id: left_id,
+                e: Exp::Const(Const::Cint(IntLit::of_int(1))),
+                typ: int_typ(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        let right = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::ReturnStmt),
+            vec![Instr::Load {
+                id: right_id,
+                e: Exp::Const(Const::Cint(IntLit::of_int(2))),
+                typ: int_typ(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        pdesc.set_succs(pdesc.start_node, vec![left, right]);
+        pdesc.set_succs(left, vec![pdesc.exit_node]);
+        pdesc.set_succs(right, vec![pdesc.exit_node]);
+
+        assert_eq!(return_candidate_logical_stamp(&pdesc), None);
+    }
+
+    #[test]
+    fn test_return_fallback_liveness_keeps_exit_predecessor_candidate_not_later_dead_node() {
+        let mut pdesc = Procdesc::new(
+            Procname::c_from_string("liveness_return_fallback_exit_pred"),
+            int_typ(),
+            Location::dummy(),
+        );
+        let return_id = Ident::create_normal(IdentName::from_string("ret"), 0);
+        let dead_id = Ident::create_normal(IdentName::from_string("dead"), 1);
+        let return_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::ReturnStmt),
+            vec![Instr::Load {
+                id: return_id,
+                e: Exp::Const(Const::Cint(IntLit::of_int(7))),
+                typ: int_typ(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        let _dead_node = pdesc.add_node(
+            NodeKind::StmtNode(StmtNodeKind::MethodBody),
+            vec![Instr::Load {
+                id: dead_id,
+                e: Exp::Const(Const::Cint(IntLit::of_int(42))),
+                typ: int_typ(),
+                loc: Location::dummy(),
+            }],
+            Location::dummy(),
+        );
+        pdesc.set_succs(pdesc.start_node, vec![return_node]);
+        pdesc.set_succs(return_node, vec![pdesc.exit_node]);
+
+        let summary = analyze(&pdesc);
+
+        assert_eq!(summary.pre_posts.len(), 1, "summary={summary:?}");
+        let result = summary.pre_posts[0]
+            .result
+            .expect("fallback should preserve the exit-predecessor return candidate through liveness cleanup");
+        assert_eq!(summary.pre_posts[0].post.get_const(result), Some(7));
     }
 
     #[test]
