@@ -172,6 +172,19 @@ impl BaseAddressAttributes {
         }
     }
 
+    pub fn remove_must_be_initialized(&mut self, addr: AbstractValue) {
+        if !self.map.get(&addr).is_some_and(|attrs| {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::MustBeInitialized(_, _)))
+        }) {
+            return;
+        }
+        if let Some(attrs) = self.map_mut().get_mut(&addr) {
+            Arc::make_mut(attrs).remove_must_be_initialized();
+        }
+    }
+
     /// Iterate over all addresses and their attributes.
     pub fn iter(&self) -> impl Iterator<Item = (&AbstractValue, &Attributes)> {
         self.map.iter().map(|(addr, attrs)| (addr, attrs.as_ref()))

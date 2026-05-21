@@ -1506,8 +1506,8 @@ fn test_summary_comparison_latent_cycle_phase1_baseline_10_4() {
     eprintln!("{report}");
     assert_eq!(
         (report.matching, report.differences.len()),
-        (10, 4),
-        "latent.c should stay at the phase-1 10/4 baseline until semantic phases deliberately move it\n{report}"
+        (11, 3),
+        "latent.c should stay at the current sideband/cycle baseline\n{report}"
     );
     assert!(
         report.ocaml_only.is_empty() && report.rust_only.is_empty(),
@@ -1524,9 +1524,8 @@ fn test_summary_comparison_latent_cycle_phase1_baseline_10_4() {
             "FN_crash_after_six_nodes_bad",
             "crash_after_one_node_bad",
             "crash_after_two_nodes_bad",
-            "latent_use_after_free",
         ]),
-        "latent.c residual composition should be exactly cycle x3 + latent_use_after_free\n{report}"
+        "latent.c residual composition should be exactly the cycle cursor trio\n{report}"
     );
 }
 
@@ -2661,8 +2660,10 @@ fn test_e2e_latent_cycle_phase1_exact_shape_oracles() {
     );
     assert_eq!(one_node[2].selected_invalid_path.as_deref(), Some("v5"));
     assert!(
-        one_node[2].post_heap.contains(&"q.* -*-> q.*".to_string()),
-        "one-node abort row should pin the current self-cycle residual: {one_node:#?}"
+        one_node[2]
+            .post_heap
+            .contains(&"q.*.next -*-> q.*".to_string()),
+        "one-node abort row should preserve the cursor-field cycle edge without adding a root self-cycle: {one_node:#?}"
     );
 
     let two_nodes = summaries
@@ -2755,8 +2756,8 @@ fn test_e2e_latent_cycle_phase1_exact_shape_oracles() {
     assert!(
         six_nodes[1]
             .post_heap
-            .contains(&"q.*.next.*.next.*.next -*-> q.*".to_string()),
-        "six-node latent row should pin the current root-collapsed post edge: {six_nodes:#?}"
+            .contains(&"q.*.next.*.next.*.next -*-> q.*.next.*.next.*.next.*".to_string()),
+        "six-node latent row should preserve the cursor target instead of collapsing it to the root: {six_nodes:#?}"
     );
     assert!(
         six_nodes[1]

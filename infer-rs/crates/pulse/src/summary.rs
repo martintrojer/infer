@@ -267,6 +267,70 @@ fn restore_pre_cycle_heap_edges(
     }
 }
 
+fn restore_alias_deref_targets_from_saved_heap(
+    domain: &mut crate::base_domain::BaseDomain,
+    saved: &crate::base_domain::BaseDomain,
+    path_condition: &crate::formula::Formula,
+    strip_must_be_initialized_on_retargeted_addrs: bool,
+) {
+    let mut replacements = Vec::new();
+    for (src, edges) in saved.heap.iter() {
+        for (access, saved_target) in edges.iter() {
+            if !matches!(access, Access::Dereference) {
+                continue;
+            }
+            let src = path_condition.get_var_repr(*src);
+            let Some(current_target) = domain.heap.find_edge(src, access) else {
+                continue;
+            };
+            if current_target != *saved_target
+                && path_condition.get_var_repr(current_target)
+                    == path_condition.get_var_repr(*saved_target)
+            {
+                replacements.push((src, *saved_target));
+            }
+        }
+    }
+
+    for (src, saved_target) in replacements {
+        domain.heap.add_edge(src, Access::Dereference, saved_target);
+        if strip_must_be_initialized_on_retargeted_addrs {
+            domain.attrs.remove_must_be_initialized(saved_target);
+        }
+    }
+}
+
+fn restore_cursor_deref_targets_for_summary(
+    domain: &mut crate::base_domain::BaseDomain,
+    path_condition: &crate::formula::Formula,
+) {
+    let replacements: Vec<_> = domain
+        .heap
+        .iter()
+        .filter_map(|(src, edges)| {
+            let Some(root_target) = edges.find(&Access::Dereference) else {
+                return None;
+            };
+            let src_repr = path_condition.get_var_repr(*src);
+            let target_repr = path_condition.get_var_repr(root_target);
+            if src_repr != target_repr {
+                return None;
+            }
+            let replacement = edges.iter().find_map(|(access, target)| {
+                (!matches!(access, Access::Dereference)
+                    && path_condition.get_var_repr(*target) == src_repr
+                    && *target != root_target)
+                    .then_some(*target)
+            })?;
+            Some((*src, replacement))
+        })
+        .collect();
+
+    for (src, replacement) in replacements {
+        domain.heap.add_edge(src, Access::Dereference, replacement);
+    }
+}
+
 fn build_pre_post(
     pdesc: &Procdesc,
     astate: AbductiveDomain,
@@ -368,6 +432,9 @@ impl PrePost {
         restore_pre_cycle_heap_edges(&mut self.pre, &pre_cycle_heap_edges);
         restore_pre_cycle_heap_edges(&mut self.post.pre, &pre_cycle_heap_edges);
         restore_pre_cycle_heap_edges(&mut self.post.post, &post_cycle_heap_edges);
+        restore_cursor_deref_targets_for_summary(&mut self.pre, &self.post.path_condition);
+        restore_cursor_deref_targets_for_summary(&mut self.post.pre, &self.post.path_condition);
+        restore_cursor_deref_targets_for_summary(&mut self.post.post, &self.post.path_condition);
     }
 
     /// Canonicalize the exported state to the current formula representatives
@@ -376,6 +443,8 @@ impl PrePost {
     /// Cross-ref: OCaml `PulseAbductiveDomain.filter_for_summary` first calls
     /// `canonicalize`, then restores formals and discards unreachable state.
     fn canonicalize_for_summary_or_unsat(&mut self) -> crate::sat_unsat::SatUnsat<()> {
+        let saved_pre = self.post.pre.clone();
+        let saved_post = self.post.post.clone();
         if self
             .post
             .canonicalize_with_current_path_condition_or_unsat()
@@ -390,6 +459,24 @@ impl PrePost {
         // formula-equal pre/post frame edges look modified to `apply_post` and
         // callers get spurious self-cycle rewrites.
         self.pre = self.post.pre.clone();
+        restore_alias_deref_targets_from_saved_heap(
+            &mut self.pre,
+            &saved_pre,
+            &self.post.path_condition,
+            true,
+        );
+        restore_alias_deref_targets_from_saved_heap(
+            &mut self.post.pre,
+            &saved_pre,
+            &self.post.path_condition,
+            true,
+        );
+        restore_alias_deref_targets_from_saved_heap(
+            &mut self.post.post,
+            &saved_post,
+            &self.post.path_condition,
+            false,
+        );
         self.restore_direct_cycle_edges_for_summary();
         for (_formal, addr) in &mut self.formals {
             *addr = self.post.path_condition.get_var_repr(*addr);

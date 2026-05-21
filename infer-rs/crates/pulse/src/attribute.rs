@@ -258,6 +258,11 @@ impl Attributes {
         self.0.remove(attr);
     }
 
+    pub fn remove_must_be_initialized(&mut self) {
+        self.0
+            .retain(|attr| !matches!(attr, Attribute::MustBeInitialized(_, _)));
+    }
+
     pub fn remove_closure_attrs(&mut self) {
         self.0.retain(|attr| !matches!(attr, Attribute::Closure(_)));
     }
