@@ -9,25 +9,102 @@ mu state -w infer-rs
 mu task list -w infer-rs --status OPEN
 ```
 
+## Final session results (2026-05-20/21)
+
+This section records the final worker session sweep. It supersedes the older
+Wave 9 six-file parity rows below when a one-line dashboard needs the latest
+all-tested-file C-suite and store-textual numbers.
+
+### Landed work
+
+**Performance commits (8):**
+
+1. reverse-dependency index in `expand_formula_reachable`;
+2. copy-on-write fast path / reduced `BaseMemory::map_values` rebuild pressure;
+3. `DisjunctiveStateStats` `size_stats` gated behind debug level;
+4. hot `AbstractValue` lookup tables moved to `FxHash`;
+5. reduced unnecessary state-component cloning;
+6. `ValueHistory` merge fast paths, cutting focused `md4` RSS from `2.49 GiB` to `0.43 GiB`;
+7. wall-cap checks inside `exec_instr`; and
+8. wall-cap checks during non-exit scan / summary-build phases.
+
+**Correctness commits (6):**
+
+1. cursor path preservation;
+2. latent classification;
+3. `angelism.c` parity improvement (`14/7` -> `18/3`);
+4. return fallback;
+5. `rev_subst` alias ordering; and
+6. harness OOM fix.
+
+**Features / docs (2):**
+
+1. `DeclEnv` variadic enhancements; and
+2. this final documentation sweep.
+
+### Store-textual sweep
+
+- C Pulse store-textual sweep: `52` OK / `0` FAIL / `0` TIMEOUT.
+- NPE: `134`.
+- LEAK: `20/20`.
+- UAF: `7/7`.
+
+### Expanded C-suite OCaml↔Rust Pulse parity
+
+All tested C-suite files in the final expanded parity sweep:
+
+| File | Match | Diffs | Status |
+|---|---:|---:|---|
+| `arithmetic.c` | 11 | 0 | ✨ perfect |
+| `specialization.c` | 21 | 0 | ✨ perfect |
+| `memory_leak.c` | 46 | 0 | ✨ perfect |
+| `interprocedural.c` | 17 | 0 | ✨ perfect |
+| `array_out_of_bounds.c` | 3 | 0 | ✨ perfect |
+| `assert.c` | 1 | 0 | ✨ perfect |
+| `compound_literal.c` | 3 | 0 | ✨ perfect |
+| `dangling_deref.c` | 6 | 0 | ✨ perfect |
+| `enum.c` | 3 | 0 | ✨ perfect |
+| `frontend.c` | 4 | 0 | ✨ perfect |
+| `getcwd.c` | 4 | 0 | ✨ perfect |
+| `issues_abort_execution.c` | 3 | 0 | ✨ perfect |
+| `angelism.c` | 18 | 3 | near-parity |
+| `funptr.c` | 27 | 1 | accepted limit |
+| `latent.c` | 11 | 3 | cycle-cursor residuals |
+| `abduce.c` | 7 | 1 | near-parity |
+| `aliasing.c` | 2 | 4 | gaps |
+| `cleanup_attribute.c` | 3 | 3 | gaps |
+| `exit_example.c` | 5 | 2 | near-parity |
+| `integers.c` | 3 | 6 | gaps |
+| `divide_by_zero.c` | 0 | 1 | gap |
+| `fopen.c` | 1 | 38 | major gap |
+| **Total** | **199** | **62** | **76% match** |
+
+### OpenSSL benchmark
+
+- `sha512_block_data_order` sentinel: `26.0s`, from roughly `~29s` before this session.
+- `md4_block_data_order` focused RSS: `0.43 GiB`, from `2.49 GiB`.
+- `passwd_main`: wall-cap abort at `1m01s`, from the previous `3h+` cap-evasion failure mode.
+- Full corpus: `445/445` procedures, process exit `0`.
+
 ## Correctness checkpoint
 
 | area | current status |
 |---|---|
 | Store-textual C Pulse sweep | `52` OK / `0` FAIL / `0` TIMEOUT |
-| NPE count | expected `131`, found `132` (`+1` over expected; `-1` vs the prior `133` after worker-leak's struct-pointee fallback fix tightened the surface) |
+| NPE count | found `134` in the final 2026-05-20/21 sweep |
 | Leak count | expected `20`, found `20` (EXACT) |
 | UAF count | expected `7`, found `7` (EXACT) |
 | `latent.c` issue-set compare | exact at `(procedure, line, issue-type)`: `17` Rust / `17` OCaml |
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | `133 matching / 4 diffs` (Wave 9 complete: `119/18` -> `133/4`; `+83/-83` vs original `50/87` baseline) |
+| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `199` matching / `62` diffs (`76%` match); 12 files are perfect |
 
 ### NPE issue-count deltas (current Linux)
 
 Latest recorded Linux store-textual checkpoint is `52` OK / `0` FAIL / `0`
-TIMEOUT, NPE expected `131` / found `132`, LEAK `20/20` EXACT, and UAF `7/7`
-EXACT. Do not re-run the sweep for doc refreshes: the sweep harness mirrors the
+TIMEOUT, NPE found `134`, LEAK `20/20` EXACT, and UAF `7/7` EXACT. Do not
+re-run the sweep for doc refreshes: the sweep harness mirrors the
 upstream C Pulse test Makefile's `--no-pulse-force-continue` setting before
 comparing against `issues.exp`, and the regression guard pins `52` OK / `0`
 FAIL / `0` TIMEOUT, exact LEAK/UAF parity, and `NPE >= expected` without
@@ -37,7 +114,8 @@ The NPE count moved from the pre-fix `131/137` surface to `131/133` after the
 angelism typed-stub repair (`25aa457dae`, cherry-picked here as `e5417f19ae`)
 and the imported-EqZero sideband unification chain through worker-2's Phase C
 (`79226f7ac6` / `3d1432f34b`), then tightened to `131/132` after worker-leak's
-struct-pointee fallback repair (`c4c7d6a6b5`). The typed-stub repair restored
+struct-pointee fallback repair (`c4c7d6a6b5`) in the Wave 9 checkpoint. The
+final 2026-05-20/21 store-textual sweep records NPE found `134`. The typed-stub repair restored
 `angelism.c` from `12` NPEs back to `7` by treating typed `@?` textual extern
 declarations as declaration bodies / unknown calls and publishing the typed
 empty-body summary instead of reading them as real empty bodies. EqZero
