@@ -48,6 +48,11 @@ enum TranslateFormulaResult {
 
 /// Apply a callee's summary to the caller's abstract state.
 ///
+/// `materialize_pre` keeps the reverse substitution keyed by canonical caller
+/// representatives. When equal caller addresses collide during pre-walk, prefer
+/// the callee value reached by the deeper formal heap path, matching OCaml's
+/// cursor-path alias ordering for later alias checks.
+///
 /// Creates a substitution from callee abstract values to caller abstract
 /// values, then applies the callee's heap effects, invalidations, and
 /// path conditions to the caller's state.
@@ -994,6 +999,49 @@ fn heap_path_sort_key(path: &HeapPath) -> String {
     format!("{path}")
 }
 
+fn heap_path_depth(path: &HeapPath) -> usize {
+    match path {
+        HeapPath::Pvar(_) => 0,
+        HeapPath::FieldAccess(_, parent) | HeapPath::Dereference(parent) => {
+            1 + heap_path_depth(parent)
+        }
+    }
+}
+
+fn rev_subst_entry_is_preferred(
+    candidate: &(AbstractValue, Option<HeapPath>),
+    existing: &(AbstractValue, Option<HeapPath>),
+) -> bool {
+    match (candidate.1.as_ref(), existing.1.as_ref()) {
+        (Some(candidate_path), Some(existing_path)) => {
+            let candidate_depth = heap_path_depth(candidate_path);
+            let existing_depth = heap_path_depth(existing_path);
+            candidate_depth > existing_depth
+                || (candidate_depth == existing_depth
+                    && heap_path_sort_key(candidate_path) > heap_path_sort_key(existing_path))
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate.0 > existing.0,
+    }
+}
+
+fn rev_subst_insert_preferred(
+    rev_subst: &mut HashMap<AbstractValue, (AbstractValue, Option<HeapPath>)>,
+    caller_addr: AbstractValue,
+    candidate: (AbstractValue, Option<HeapPath>),
+) {
+    match rev_subst.get_mut(&caller_addr) {
+        Some(existing) if rev_subst_entry_is_preferred(&candidate, existing) => {
+            *existing = candidate;
+        }
+        Some(_) => {}
+        None => {
+            rev_subst.insert(caller_addr, candidate);
+        }
+    }
+}
+
 fn canonicalize_alias_groups(mut groups: Vec<Vec<HeapPath>>) -> Vec<Vec<HeapPath>> {
     for group in &mut groups {
         group.sort_by_key(heap_path_sort_key);
@@ -1062,7 +1110,7 @@ fn rev_subst_insert_canonical(
         return;
     }
     if let Some(caller_addr) = subst_get_canonical(subst, caller_state, callee_addr) {
-        rev_subst.insert(caller_addr, (callee_addr, path));
+        rev_subst_insert_preferred(rev_subst, caller_addr, (callee_addr, path));
     }
 }
 
