@@ -745,7 +745,10 @@ impl Formula {
                 let _ = phi.var_eqs.find(v);
                 SatUnsat::Sat(Vec::new())
             }
-            // Mul, DivI, Mod, Shift: fold if both operands are known constants
+            // Mul, DivI, Mod, Shift: fold if both operands are known constants.
+            // Keep symbolic DivI terms when they cannot be folded: OCaml's
+            // exported formula surface retains `return = DivI(1, x)` and the
+            // corresponding integer facts for C integer division summaries.
             sil::binop::Binop::Mult(_)
             | sil::binop::Binop::DivI
             | sil::binop::Binop::Mod
@@ -766,6 +769,26 @@ impl Formula {
                         }
                     };
                     self.phi_mut().and_const_eq(v, result)
+                } else if matches!(op, sil::binop::Binop::DivI) {
+                    let canonical_term_operand = |operand: &Operand| match operand {
+                        Operand::ConstOperand(c) => Operand::ConstOperand(*c),
+                        Operand::AbstractValue(value) => {
+                            let repr = self.phi.get_repr(*value);
+                            if let Some(q) = self.phi.get_known_const(repr) {
+                                if q.is_integer() {
+                                    return Operand::ConstOperand(*q.numer() / *q.denom());
+                                }
+                            }
+                            Operand::AbstractValue(repr)
+                        }
+                    };
+                    let lhs = canonical_term_operand(x);
+                    let rhs = canonical_term_operand(y);
+                    let phi = self.phi_mut();
+                    phi.mark_is_int(v);
+                    phi.term_eqs.insert(v, phi::TermEq { op, lhs, rhs });
+                    let _ = phi.var_eqs.find(v);
+                    SatUnsat::Sat(Vec::new())
                 } else {
                     let _ = self.phi_mut().var_eqs.find(v);
                     SatUnsat::Sat(Vec::new())

@@ -767,7 +767,9 @@ fn apply_unknown_call_pointer_actual_effect(
     let written_before_havoc: Vec<_> = reachable_before_havoc
         .iter()
         .copied()
-        .filter(|addr| !state.path_condition.phi().is_marked_int(*addr))
+        .filter(|addr| {
+            !state.path_condition.phi().is_marked_int(*addr) && !state.is_known_zero(*addr)
+        })
         .collect();
     state.apply_unknown_effect(arg_val);
     state.add_attr(arg_val, crate::attribute::Attribute::UnknownEffect);

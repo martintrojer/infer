@@ -74,6 +74,18 @@ fn run_pulse_inter(
     store
 }
 
+fn should_compare_rust_summary(
+    pname: &sil::procname::Procname,
+    tm: &textual_utils::TestModule,
+) -> bool {
+    if sil::builtin_decl::is_declared(pname) {
+        return false;
+    }
+    !tm.cfg
+        .get_proc_desc(pname)
+        .is_some_and(|pdesc| pdesc.is_declaration_body)
+}
+
 /// Analyze a procedure with the specialization loop, recursively specializing
 /// sub-callees as needed. This mirrors OCaml's iter_call + request_specialization
 /// which can recurse through multi-level call chains.
@@ -1214,7 +1226,7 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
 ) {
     assert_eq!(
         (report.matching, report.differences.len(), report.rust_only.len()),
-        (43, 3, 5),
+        (46, 0, 0),
         "memory_leak.c summary parity should treat free_all_in_array's residual free/array invalidation alpha-shape as equivalent\n{report}"
     );
     assert!(
@@ -1228,19 +1240,9 @@ fn assert_memory_leak_summary_report_at_const_zero_coalescing_baseline(
             .all(|diff| diff.proc_name != "alloc_ref_counted_arith_ok"),
         "alloc_ref_counted_arith_ok should match after affine-temp normalization\n{report}"
     );
-    let residuals: std::collections::BTreeSet<_> = report
-        .differences
-        .iter()
-        .map(|diff| diff.proc_name.as_str())
-        .collect();
-    let expected = std::collections::BTreeSet::from([
-        "interproc_mutual_recusion_leak",
-        "mutual_recursion",
-        "mutual_recursion_2",
-    ]);
-    assert_eq!(
-        residuals, expected,
-        "allocate_all_in_array and alloc_ref_counted_arith_ok should remain matched; residual diff set changed\n{report}"
+    assert!(
+        report.differences.is_empty(),
+        "memory_leak.c residual diff set should stay closed\n{report}"
     );
 }
 
@@ -1276,7 +1278,7 @@ fn test_summary_comparison_memory_leak_arrayaccess_const_zero_baseline() {
 
     let mut rust_summaries = std::collections::HashMap::new();
     for (pname, summary) in store.to_vec() {
-        if sil::builtin_decl::is_declared(&pname) {
+        if !should_compare_rust_summary(&pname, &tm) {
             continue;
         }
         rust_summaries.insert(
@@ -1288,7 +1290,7 @@ fn test_summary_comparison_memory_leak_arrayaccess_const_zero_baseline() {
     let report = summary_compare::compare_summaries(&ocaml_summaries, &rust_summaries);
     eprintln!("{report}");
     assert!(
-        report.ocaml_only.is_empty() && report.rust_only.len() == 5,
+        report.ocaml_only.is_empty() && report.rust_only.is_empty(),
         "memory_leak.c summary harness should compare the expected procedure set\n{report}"
     );
     assert!(
@@ -1336,7 +1338,7 @@ fn test_summary_comparison_specialization_main() {
 
     let mut rust_summaries = std::collections::HashMap::new();
     for (pname, summary) in store.to_vec() {
-        if sil::builtin_decl::is_declared(&pname) {
+        if !should_compare_rust_summary(&pname, &tm) {
             continue;
         }
         rust_summaries.insert(
@@ -1426,7 +1428,7 @@ fn test_summary_comparison_c_triage() {
 
         let mut rust_summaries = std::collections::HashMap::new();
         for (pname, summary) in store.to_vec() {
-            if sil::builtin_decl::is_declared(&pname) {
+            if !should_compare_rust_summary(&pname, &tm) {
                 continue;
             }
             rust_summaries.insert(
@@ -1493,7 +1495,7 @@ fn test_summary_comparison_latent_cycle_phase1_baseline_10_4() {
 
     let mut rust_summaries = std::collections::HashMap::new();
     for (pname, summary) in store.to_vec() {
-        if sil::builtin_decl::is_declared(&pname) {
+        if !should_compare_rust_summary(&pname, &tm) {
             continue;
         }
         rust_summaries.insert(
@@ -2028,6 +2030,11 @@ fn format_rust_term_eq_with_phi(
     match term_eq.op {
         sil::binop::Binop::DivF => format!(
             "[DivF,[{}],[{}]]",
+            format_rust_ocaml_style_operand(&term_eq.lhs, phi),
+            format_rust_ocaml_style_operand(&term_eq.rhs, phi)
+        ),
+        sil::binop::Binop::DivI => format!(
+            "[DivI,[{}],[{}]]",
             format_rust_ocaml_style_operand(&term_eq.lhs, phi),
             format_rust_ocaml_style_operand(&term_eq.rhs, phi)
         ),

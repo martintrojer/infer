@@ -2732,15 +2732,16 @@ fn exec_known_callee_summary_with_mode(
     mut state: crate::abductive::AbductiveDomain,
     non_disj_call_mode: NonDisjCallMode,
 ) -> KnownCalleeResults {
+    let callsite = known_callee.callsite;
     let CallSite {
         pdesc: _,
         ret_id,
-        ret_typ,
+        ret_typ: _,
         args,
         loc,
         call_flags: _,
         spec_requests,
-    } = known_callee.callsite;
+    } = callsite;
     let callee_pname = known_callee.callee_pname;
     let callee_summary = known_callee.callee_summary;
     let caller_spec = infer_caller_specialization(callee_summary, args, &state);
@@ -2760,51 +2761,15 @@ fn exec_known_callee_summary_with_mode(
     }
 
     // Empty-body callees (extern stubs): treat as unknown with type-aware
-    // havoc. Only pointer-typed formals get havoced.
-    // Cross-ref: OCaml PulseCallOperations.ml should_havoc checks Tptr.
+    // havoc. Cross-ref: OCaml PulseCallOperations.unknown_call goes through
+    // the ordinary unknown-call path even when a typed exported `@?` stub is
+    // scheduled as a known callee; keep one implementation of that behavior so
+    // direct unknown calls and typed-stub known calls stay in parity.
     if callee_summary.is_empty_body && callee_pname.is_c() {
         log::debug!("  [call] empty-body havoc: {callee_pname}");
-
-        let ret_val = crate::abstract_value::AbstractValue::mk_fresh();
-        crate::operations::write_id(ret_id, ret_val, &mut state);
-        if ret_typ.is_int() {
-            state.path_condition.and_is_int(ret_val);
-        }
-        let mut is_pure = true;
-        let mut actual_vals = Vec::new();
-        for (i, (arg_exp, _arg_typ)) in args.iter().enumerate() {
-            let arg_val = crate::operations::eval_or_fresh(arg_exp, loc, &mut state);
-            actual_vals.push(arg_val);
-            let formal_is_ptr = callee_summary
-                .formal_types
-                .get(i)
-                .is_some_and(|t| t.is_pointer());
-            if formal_is_ptr {
-                is_pure = false;
-                state.apply_unknown_effect(arg_val);
-                crate::operations::refresh_unknown_lvalue_root(arg_exp, arg_val, &mut state);
-            }
-        }
-        // Pure functions (no pointer args havoced): record FunctionApplication
-        // so f(x)==f(x) is detected. Cross-ref: OCaml
-        // PulseCallOperations.ml L220-235.
-        if is_pure {
-            let callee_name = format!("{callee_pname}");
-            if state
-                .path_condition
-                .and_fn_app(ret_val, &callee_name, &actual_vals)
-                .is_unsat()
-            {
-                return KnownCalleeResults {
-                    results: vec![],
-                    non_disj: NonDisjDomain::bottom(),
-                    used_summary_has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
-                    used_summary_was_empty: false,
-                };
-            }
-        }
+        let results = exec_known_call_as_unknown(callsite, callee_pname, state.clone());
         return KnownCalleeResults {
-            results: vec![ExecutionDomain::ContinueProgram(state)],
+            results: merge_return_history_from_equal_actuals(results, ret_id, args, loc, &state),
             non_disj: NonDisjDomain::bottom(),
             used_summary_has_dropped_disjuncts: callee_summary.has_dropped_disjuncts,
             used_summary_was_empty: false,
