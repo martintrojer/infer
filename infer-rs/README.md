@@ -9,13 +9,13 @@ iterate on in Rust.
 The authoritative dashboard is [`docs/STATUS.md`](docs/STATUS.md). At a glance:
 
 - Store-textual C Pulse sweep: `52 OK / 0 FAIL_ANALYZE / 0 TIMEOUT`. NPE
-  `expected 131, found 132` (`+1` over expected); LEAK `20/20` and UAF `7/7`
-  match exactly.
-- C-suite OCaml↔Rust Pulse summary parity: `133 matching / 4 diffs` (`+83/-83`
-  vs original `50/87` baseline), with four perfect-parity files. Per-pass
-  narrative and per-file breakdown in
-  [`docs/STATUS.md`](docs/STATUS.md) and
-  [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](docs/triage/c_pulse_summary_mismatches_2026_05_11.md).
+  found `134`; LEAK `20/20` and UAF `7/7` match exactly.
+- C-suite OCaml↔Rust Pulse summary parity across 22 tested files:
+  `199 matching / 62 diffs` (`76%` match), with **12 perfect-parity files**
+  (arithmetic, specialization, memory_leak, interprocedural,
+  array_out_of_bounds, assert, compound_literal, dangling_deref, enum,
+  frontend, getcwd, issues_abort_execution). Per-file breakdown in
+  [`docs/STATUS.md`](docs/STATUS.md).
 - Latest OpenSSL partial-corpus performance dashboard lives in
   [`docs/STATUS.md`](docs/STATUS.md). Wave 10/11 landed eight perf/cap fixes
   plus a Textual `DeclEnv` enhancement; the latest full-corpus checkpoint exits

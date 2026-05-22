@@ -42,9 +42,10 @@ Current status and active work are intentionally separated:
   [`plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md`](plans/OPENSSL_LINUX_PERF_EXPERIMENT_PLAN_2026_05.md),
   [`plans/OPENSSL_LINUX_PERF_BASELINE_RESULTS_2026_05.md`](plans/OPENSSL_LINUX_PERF_BASELINE_RESULTS_2026_05.md),
   and [`plans/OPENSSL_LINUX_PERF_POST_WAVE_2026_05.md`](plans/OPENSSL_LINUX_PERF_POST_WAVE_2026_05.md).
-  The live dashboard row is in [`STATUS.md`](STATUS.md): canonical Linux
-  post-wave `RUNS=3 JOBS=4` median `4:47.79`, `5.70 GiB`, `445/445`, `6`
-  aborts.
+  The live dashboard row is in [`STATUS.md`](STATUS.md). Wave 10/11
+  (2026-05-20/21) landed 8 perf/cap fixes; focused sentinel `sha512` improved
+  `~29s` → `26.0s`, `md4` RSS `2.49 GiB` → `0.43 GiB`, and `passwd_main`
+  wall-cap evasion was fixed (`3h+` → `1m01s`).
 
 #### Deep-port day plans (Wave 9)
 

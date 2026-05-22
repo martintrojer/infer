@@ -195,6 +195,9 @@ cost from retained-state storage cost.
   analysis in-process rather than through the capped `infer-rs` CLI. During the
   2026-05-14 Linux session on devvm36499 (235 GB RAM), repeated measurements
   climbed past 160 GB RSS before orchestrator SIGTERM.
+- `nullptr.c` is explicitly skipped in the triage harness (commit `363f07abdc`)
+  because its in-process analysis grows to 44+ GB. Use the capped CLI for
+  `nullptr.c` analysis instead.
 - Scope these tests to one file and add external caps, for example:
   `ulimit -v 8388608; INFER_RS_C_TRIAGE_FILES=<one_file>
   RUST_TEST_THREADS=1 RAYON_NUM_THREADS=1 timeout 180 cargo test
