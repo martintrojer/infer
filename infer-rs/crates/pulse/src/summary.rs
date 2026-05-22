@@ -308,9 +308,7 @@ fn restore_cursor_deref_targets_for_summary(
         .heap
         .iter()
         .filter_map(|(src, edges)| {
-            let Some(root_target) = edges.find(&Access::Dereference) else {
-                return None;
-            };
+            let root_target = edges.find(&Access::Dereference)?;
             let src_repr = path_condition.get_var_repr(*src);
             let target_repr = path_condition.get_var_repr(root_target);
             if src_repr != target_repr {
@@ -1538,10 +1536,10 @@ impl PulseSummary {
                         .is_some_and(|diag| proc_has_call_at_location(pdesc, diag.get_location()));
                 let direct_formal_constant_deref = !proc_is_entry_point(pdesc)
                     && pre_post_has_direct_formal_constant_deref(pdesc, &mut pp);
-                if recovered_caller_invalid_access && proc_name_has_latent_cursor_traversal(pdesc) {
-                    pp.kind = PrePostKind::LatentInvalidAccess;
-                } else if direct_formal_constant_deref
-                    && !abort_invalid_access_is_imported_from_call(pdesc, &pp)
+                if (recovered_caller_invalid_access
+                    && proc_name_has_latent_cursor_traversal(pdesc))
+                    || (direct_formal_constant_deref
+                        && !abort_invalid_access_is_imported_from_call(pdesc, &pp))
                 {
                     pp.kind = PrePostKind::LatentInvalidAccess;
                 }
