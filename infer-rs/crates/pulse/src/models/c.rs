@@ -191,7 +191,16 @@ fn dispatch_with_config(
         // Cross-ref: OCaml PulseModelsC.ml models `fputc`/`putc` as
         // `putc(c, stream)` and `ungetc` as `(c, stream)`: the FILE* is
         // the second argument, not the first one.
-        return Some(check_file_arg_at(ret_id, args, 1, loc, state));
+        //
+        // OCaml `putc` returns `disj [ret = -1; ret = c]` (2 branches);
+        // `ungetc` returns a single non-deterministic value (1 branch).
+        // OCaml `putc` returns `disj [ret = -1; ret = c]` (2 branches).
+        let ret_branches: &[Option<i64>] = if name == "ungetc" {
+            &[None]
+        } else {
+            &[Some(-1), None]
+        };
+        return Some(check_file_arg_at(ret_id, args, 1, ret_branches, loc, state));
     }
     if matches!(
         name,
@@ -211,7 +220,31 @@ fn dispatch_with_config(
             | "fileno"
             | "getc"
     ) {
-        return Some(check_file_arg_at(ret_id, args, 0, loc, state));
+        // Cross-ref: OCaml PulseModelsC.ml stdio models. The number of
+        // return disjuncts mirrors OCaml: functions whose model body is a
+        // `disj [...]` over the return value split into multiple
+        // `ContinueProgram` posts:
+        //   * `fclose`   -> `disj [ret = -1; ret = 0]`            (2)
+        //   * `fseek`    -> `zero_or_minus_one_ret`               (2)
+        //   * `fsetpos`  -> `zero_or_minus_one_ret`               (2)
+        //   * `ftell`    -> `non_det_or_minus_one_ret`            (2)
+        //   * `fgetpos`  -> `disj [ret = 0; ret = -1]`            (2)
+        //   * `fgets`    -> `disj [ret = null; ret = str]`        (2)
+        // The remaining stdio fns return a single non-deterministic value.
+        let ret_branches: &[Option<i64>] = match name {
+            // `fclose` -> `disj [ret = -1; ret = 0]`
+            "fclose" => &[Some(-1), Some(0)],
+            // `fseek`/`fsetpos` -> `zero_or_minus_one_ret`
+            "fseek" | "fsetpos" => &[Some(0), Some(-1)],
+            // `ftell` -> `non_det_or_minus_one_ret`
+            "ftell" => &[None, Some(-1)],
+            // `fgetpos` -> `disj [ret = 0; ret = -1]`
+            "fgetpos" => &[Some(0), Some(-1)],
+            // `fgets` -> `disj [ret = null; ret = str]` (both non-det here)
+            "fgets" => &[Some(0), None],
+            _ => &[None],
+        };
+        return Some(check_file_arg_at(ret_id, args, 0, ret_branches, loc, state));
     }
 
     None
@@ -791,6 +824,7 @@ fn check_file_arg_at(
     ret_id: &Ident,
     args: &[(Exp, Typ)],
     file_arg_index: usize,
+    ret_branches: &[Option<i64>],
     loc: &Location,
     mut state: AbductiveDomain,
 ) -> Vec<ExecutionDomain> {
@@ -815,9 +849,30 @@ fn check_file_arg_at(
         }
     }
 
-    let ret_val = AbstractValue::mk_fresh();
-    operations::write_id(ret_id, ret_val, &mut state);
-    vec![ExecutionDomain::ContinueProgram(state)]
+    // Cross-ref: OCaml stdio models whose body is a `disj [...]` over the
+    // return value produce one summary `ContinueProgram` per branch. We mirror
+    // the disjunct count: each branch gets a fresh return value, optionally
+    // constrained to the constant OCaml assigns (e.g. `fclose` -> -1/0). The
+    // constant keeps the branches distinct under disjunctive leq dedup; the
+    // return temp is otherwise unreachable so the canonical pre/posts stay
+    // empty, matching OCaml.
+    let branches: &[Option<i64>] = if ret_branches.is_empty() {
+        &[None]
+    } else {
+        ret_branches
+    };
+    branches
+        .iter()
+        .map(|c| {
+            let mut branch = state.clone();
+            let ret_val = AbstractValue::mk_fresh();
+            operations::write_id(ret_id, ret_val, &mut branch);
+            if let Some(c) = c {
+                let _ = branch.and_equal_const(ret_val, *c);
+            }
+            ExecutionDomain::ContinueProgram(branch)
+        })
+        .collect()
 }
 
 /// Model: `__builtin_expect(x, y)` — returns x (branch prediction hint).
