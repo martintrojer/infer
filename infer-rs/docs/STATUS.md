@@ -74,15 +74,17 @@ All tested C-suite files in the final expanded parity sweep:
 | `aliasing.c` | 2 | 4 | gaps |
 | `cleanup_attribute.c` | 3 | 3 | gaps |
 | `exit_example.c` | 5 | 2 | near-parity |
-| `integers.c` | 3 | 6 | gaps |
+| `integers.c` | 5 | 4 | gaps |
 | `divide_by_zero.c` | 0 | 1 | gap |
 | `fopen.c` | 39 | 0 | ✨ perfect |
-| **Total** | **237** | **24** | **91% match** |
+| **Total** | **239** | **22** | **92% match** |
 
 2026-06-09 update after rebasing onto main: Rust stdio `FILE*` models now mirror
 OCaml return-disjunct multiplicity for `fclose` / `fputc` / `putc` / `fseek` /
 `fsetpos` / `ftell` / `fgetpos` / `fgets`, moving `fopen.c` from `1/38` to
-`39/0` perfect parity.
+`39/0` perfect parity. Integer formula fixes now use exact IEEE float-to-rational
+conversion, rational-aware condition triviality, and integer-type contradiction
+checks, moving `integers.c` from `3/6` to `5/4`.
 
 ### OpenSSL benchmark
 
@@ -103,7 +105,7 @@ OCaml return-disjunct multiplicity for `fclose` / `fputc` / `putc` / `fseek` /
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `237` matching / `24` diffs (`91%` match); 13 files are perfect |
+| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `239` matching / `22` diffs (`92%` match); 13 files are perfect |
 
 ### NPE issue-count deltas (current Linux)
 
