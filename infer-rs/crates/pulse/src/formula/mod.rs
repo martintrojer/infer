@@ -405,8 +405,20 @@ impl Formula {
     /// Mark a variable as integer-typed. When the linear solver later
     /// derives a non-integer rational for this variable, the path is Unsat.
     /// Cross-ref: OCaml PulseFormula.ml and_is_int.
-    pub fn and_is_int(&mut self, v: AbstractValue) {
+    ///
+    /// OCaml conjoins the atom `IsInt(v) = 1`; if `v` is *already* known to be
+    /// a non-integer rational constant (e.g. `(int)1.234`), that atom folds to
+    /// `0 = 1` and kills the path. Mirror that here by checking the current
+    /// known constant at mark time, not only when the solver later derives a
+    /// fractional value.
+    pub fn and_is_int(&mut self, v: AbstractValue) -> SatUnsat<()> {
+        if let Some(q) = self.phi.get_known_const(v) {
+            if !q.is_integer() {
+                return SatUnsat::Unsat;
+            }
+        }
         self.phi_mut().mark_is_int(v);
+        SatUnsat::Sat(())
     }
 
     /// Add a prune constraint (from a branch condition).
@@ -1022,8 +1034,18 @@ impl Formula {
     }
 
     fn normalize_condition_atom(&self, atom: &Atom) -> Option<Atom> {
+        // Rational-aware triviality: `Term::Const` is `i64`-only, so a fully
+        // determined condition over non-integer rationals (e.g. `v != 2` with
+        // `v = 5/2` from a float literal/division) must be folded here before
+        // it is resolved into a truncated `2 != 2`. OCaml keeps `Q.t`
+        // constants in terms and drops such always-true conditions outright.
+        if self.phi.condition_atom_rational_truth(atom) == Some(true) {
+            return None;
+        }
         let normalized = self.phi.normalize_condition_atom(atom);
-        if normalized.is_trivially_true() == Some(true) {
+        if normalized.is_trivially_true() == Some(true)
+            || self.phi.condition_atom_rational_truth(&normalized) == Some(true)
+        {
             None
         } else {
             Some(normalized)

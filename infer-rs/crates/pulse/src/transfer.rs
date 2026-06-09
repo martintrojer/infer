@@ -171,16 +171,18 @@ fn exec_load(
             operations::write_id_with_history(id, value.clone(), &mut state);
             // Mark integer-typed loads for integer reasoning.
             // Cross-ref: OCaml Pulse.ml and_is_int_if_integer_type.
-            if typ.is_int() {
-                state.path_condition.and_is_int(value.addr);
+            // A fractional value loaded at integer type (e.g. `(int)1.234`)
+            // makes the path infeasible, matching OCaml's `IsInt(v)=1` atom.
+            if typ.is_int() && state.path_condition.and_is_int(value.addr).is_unsat() {
+                return vec![];
             }
             record_more_precise_formal_dynamic_type(pdesc, rhs_exp, typ, value.addr, &mut state);
             vec![ExecutionDomain::ContinueProgram(state)]
         }
         PulseResult::Recoverable(value, errors) => {
             operations::write_id_with_history(id, value.clone(), &mut state);
-            if typ.is_int() {
-                state.path_condition.and_is_int(value.addr);
+            if typ.is_int() && state.path_condition.and_is_int(value.addr).is_unsat() {
+                return vec![];
             }
             record_more_precise_formal_dynamic_type(pdesc, rhs_exp, typ, value.addr, &mut state);
             stopped_results_from_recoverable_errors(pdesc, state, errors)
@@ -249,6 +251,14 @@ fn exec_store(
         }
         PulseResult::Recoverable(v, _) => v,
     };
+
+    // Cross-ref: OCaml `Pulse.exec_instr_aux Store` calls
+    // `and_is_int_if_integer_type typ rhs_addr` on the stored value. Storing a
+    // fractional value at integer type (e.g. `store &z <- 1.234:int`) folds the
+    // `IsInt(v)=1` atom to a contradiction and kills the path.
+    if lhs_typ.is_int() && state.path_condition.and_is_int(rhs_val.addr).is_unsat() {
+        return vec![];
+    }
 
     // Cross-ref: OCaml `Pulse.exec_instr_aux Store` evaluates the LHS with
     // mode=Write so that the outermost Lfield/Lindex base check abduces

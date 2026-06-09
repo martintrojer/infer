@@ -23,6 +23,29 @@ use crate::sat_unsat::SatUnsat;
 /// Rational number type (arbitrary precision).
 pub type Q = Ratio<i64>;
 
+/// Exact IEEE-754 conversion of a float to a rational, mirroring OCaml's
+/// `Q.of_float` (used in `PulseFormulaTerm.of_q` for `Cfloat` literals).
+///
+/// OCaml keeps the *exact* binary value of the float (e.g. `2.2` becomes
+/// `2476979795053773/1125899906842624`), not a "nice" decimal approximation.
+/// `num_rational::Ratio::approximate_float` instead returns a small
+/// continued-fraction approximation (`2.2 -> 11/5`), which diverges from
+/// OCaml's canonical formula surface. We therefore convert exactly via
+/// `num-bigint` and only fall back to `None` if the exact value does not fit
+/// in `i64` numerator/denominator.
+pub fn q_of_float(f: f64) -> Option<Q> {
+    use num_bigint::BigInt;
+    use num_traits::ToPrimitive;
+
+    let exact = Ratio::<BigInt>::from_float(f)?;
+    let numer = exact.numer().to_i64()?;
+    let denom = exact.denom().to_i64()?;
+    if denom == 0 {
+        return None;
+    }
+    Some(Ratio::<i64>::new(numer, denom))
+}
+
 /// A linear arithmetic expression: `constant + Σ(coeff_i * var_i)`.
 ///
 /// Invariant: no coefficient in `vars` is zero.
@@ -341,5 +364,19 @@ mod tests {
         // should be 2(y + 1) + 3 = 2y + 5
         assert_eq!(result.get_coefficient(y), Some(&Q::from_integer(2)));
         assert_eq!(*result.get_constant_part(), Q::from_integer(5));
+    }
+}
+
+#[cfg(test)]
+mod q_of_float_tests {
+    use super::*;
+    #[test]
+    fn exact_float_conversion() {
+        let q = q_of_float(2.2).unwrap();
+        assert_eq!(*q.numer(), 2476979795053773);
+        assert_eq!(*q.denom(), 1125899906842624);
+        let q2 = q_of_float(2.0).unwrap();
+        assert_eq!(*q2.numer(), 2);
+        assert_eq!(*q2.denom(), 1);
     }
 }

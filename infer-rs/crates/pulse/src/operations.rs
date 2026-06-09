@@ -388,9 +388,12 @@ fn eval_const(
         )),
         Const::Cfloat(f) => {
             let v = AbstractValue::mk_fresh();
-            // Convert float to rational for the linear solver.
-            // E.g., 5.5 → 11/2, enabling 2x=5.5 → x=2.75 (non-integer).
-            if let Some(q) = crate::formula::lin_arith::Q::approximate_float(f.0) {
+            // Convert float to the *exact* IEEE-754 rational for the linear
+            // solver, mirroring OCaml's `Q.of_float` in
+            // `PulseFormulaTerm.of_q`. E.g. `5.5 -> 11/2`, but also
+            // `2.2 -> 2476979795053773/1125899906842624` (not the `11/5`
+            // approximation that `approximate_float` would produce).
+            if let Some(q) = crate::formula::lin_arith::q_of_float(f.0) {
                 let lin = crate::formula::lin_arith::LinArith::of_q(q);
                 let _ = state.and_equal_linear(v, lin);
             }

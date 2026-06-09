@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use num_traits::Zero;
+use num_traits::{One, Zero};
 
 use crate::abstract_value::AbstractValue;
 use crate::sat_unsat::SatUnsat;
@@ -537,6 +537,51 @@ impl Phi {
     /// condition against the current caller-side phi before remembering it.
     pub(crate) fn normalize_condition_atom(&self, atom: &Atom) -> Atom {
         self.resolve_condition_atom(atom)
+    }
+
+    /// Resolve a term to an *exact rational* constant, if the term is fully
+    /// determined by known constants/linear equalities. Unlike `as_const`,
+    /// this preserves non-integer rationals (e.g. `5/2` from a float literal
+    /// or float division) instead of truncating to `i64`.
+    ///
+    /// Used for rational-aware condition triviality: `Term::Const` can only
+    /// hold an `i64`, so `v != 2` with `v = 5/2` would otherwise round to the
+    /// spurious `2 != 2`. OCaml keeps `Q.t` constants in `Term.Const` and
+    /// folds such conditions away (`PulseFormulaTerm.eval_const_shallow`).
+    fn resolve_term_to_q(&self, t: &Term) -> Option<Q> {
+        match t {
+            Term::Var(v) => self.get_known_const(self.get_repr(*v)),
+            Term::Const(c) => Some(Q::from_integer(*c)),
+            Term::Add(a, b) => Some(self.resolve_term_to_q(a)? + self.resolve_term_to_q(b)?),
+            Term::Sub(a, b) => Some(self.resolve_term_to_q(a)? - self.resolve_term_to_q(b)?),
+            Term::Mult(a, b) => Some(self.resolve_term_to_q(a)? * self.resolve_term_to_q(b)?),
+            Term::Neg(a) => Some(-self.resolve_term_to_q(a)?),
+            Term::Not(a) => {
+                let q = self.resolve_term_to_q(a)?;
+                Some(if q.is_zero() { Q::one() } else { Q::zero() })
+            }
+            Term::IsZero(a) => {
+                let q = self.resolve_term_to_q(a)?;
+                Some(if q.is_zero() { Q::one() } else { Q::zero() })
+            }
+        }
+    }
+
+    /// Evaluate a condition atom's truth value using *exact rationals*, when
+    /// both sides resolve to known rational constants. Returns `None` when the
+    /// atom is not fully determined (so it must be recorded as a real
+    /// condition). Mirrors OCaml's rational-precise constant folding, which
+    /// never truncates a `Q.t` to an integer before comparing.
+    pub(crate) fn condition_atom_rational_truth(&self, atom: &Atom) -> Option<bool> {
+        let (a, b, cmp): (&Term, &Term, fn(&Q, &Q) -> bool) = match atom {
+            Atom::Equal(a, b) => (a, b, |x, y| x == y),
+            Atom::NotEqual(a, b) => (a, b, |x, y| x != y),
+            Atom::LessEqual(a, b) => (a, b, |x, y| x <= y),
+            Atom::LessThan(a, b) => (a, b, |x, y| x < y),
+        };
+        let qa = self.resolve_term_to_q(a)?;
+        let qb = self.resolve_term_to_q(b)?;
+        Some(cmp(&qa, &qb))
     }
 
     /// Summary-time condition simplification.
