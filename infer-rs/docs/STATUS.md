@@ -76,8 +76,13 @@ All tested C-suite files in the final expanded parity sweep:
 | `exit_example.c` | 5 | 2 | near-parity |
 | `integers.c` | 3 | 6 | gaps |
 | `divide_by_zero.c` | 0 | 1 | gap |
-| `fopen.c` | 1 | 38 | major gap |
-| **Total** | **199** | **62** | **76% match** |
+| `fopen.c` | 39 | 0 | ✨ perfect |
+| **Total** | **237** | **24** | **91% match** |
+
+2026-06-09 update after rebasing onto main: Rust stdio `FILE*` models now mirror
+OCaml return-disjunct multiplicity for `fclose` / `fputc` / `putc` / `fseek` /
+`fsetpos` / `ftell` / `fgetpos` / `fgets`, moving `fopen.c` from `1/38` to
+`39/0` perfect parity.
 
 ### OpenSSL benchmark
 
@@ -98,7 +103,7 @@ All tested C-suite files in the final expanded parity sweep:
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `199` matching / `62` diffs (`76%` match); 12 files are perfect |
+| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `237` matching / `24` diffs (`91%` match); 13 files are perfect |
 
 ### NPE issue-count deltas (current Linux)
 
