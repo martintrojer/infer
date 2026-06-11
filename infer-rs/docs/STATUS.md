@@ -77,7 +77,7 @@ All tested C-suite files in the final expanded parity sweep:
 | `getcwd.c` | 4 | 0 | ✨ perfect |
 | `issues_abort_execution.c` | 3 | 0 | ✨ perfect |
 | `angelism.c` | 18 | 3 | near-parity |
-| `funptr.c` | 27 | 1 | accepted limit |
+| `funptr.c` | 28 | 0 | ✨ perfect |
 | `latent.c` | 11 | 3 | cycle-cursor residuals |
 | `abduce.c` | 7 | 1 | near-parity |
 | `aliasing.c` | 2 | 4 | gaps |
@@ -86,14 +86,17 @@ All tested C-suite files in the final expanded parity sweep:
 | `integers.c` | 5 | 4 | gaps |
 | `divide_by_zero.c` | 0 | 1 | gap |
 | `fopen.c` | 39 | 0 | ✨ perfect |
-| **Total** | **239** | **22** | **92% match** |
+| **Total** | **240** | **21** | **92% match** |
 
 2026-06-09 update after rebasing onto main: Rust stdio `FILE*` models now mirror
 OCaml return-disjunct multiplicity for `fclose` / `fputc` / `putc` / `fseek` /
 `fsetpos` / `ftell` / `fgetpos` / `fgets`, moving `fopen.c` from `1/38` to
 `39/0` perfect parity. Integer formula fixes now use exact IEEE float-to-rational
 conversion, rational-aware condition triviality, and integer-type contradiction
-checks, moving `integers.c` from `3/6` to `5/4`.
+checks, moving `integers.c` from `3/6` to `5/4`. The exact accepted-limit
+harness cleanup for `conditionnaly_apply_funptr_with_intptrptr` now treats the
+single benign Rust-only `assign_NULL` specialization as accepted, moving
+`funptr.c` from `27/1` to `28/0`.
 
 ### OpenSSL benchmark
 
@@ -114,7 +117,7 @@ checks, moving `integers.c` from `3/6` to `5/4`.
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `239` matching / `22` diffs (`92%` match); 13 files are perfect |
+| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `240` matching / `21` diffs (`92%` match); 14 files are perfect |
 
 ### NPE issue-count deltas (current Linux)
 
@@ -370,7 +373,7 @@ parity.
 - `arithmetic.c` — `11/0` perfect after NonDisjDomain force-continue / DivF
   validation (`d0319ba4b4`) and unary-neg summary normalization (`b65c8395fd`).
 
-### C-suite OCaml↔Rust Pulse summary parity (`133 matching / 4 diffs`)
+### C-suite OCaml↔Rust Pulse summary parity (`134 matching / 3 diffs`)
 
 A separate parity track compares OCaml and Rust Pulse summaries directly per
 procedure on a slice of the C Pulse test suite (`arithmetic.c`, `funptr.c`,
@@ -511,9 +514,10 @@ port also landed:
   two arithmetic presentation rows and moving `arithmetic.c` to `11/0` perfect.
 
 Full six-file triage delta vs original 2026-05-11 baseline
-(`50 matching / 87 diffs`) is now `133 matching / 4 diffs`
-(`+83 matching / -83 diffs`). Wave 9 started from `119/18` and completed at
-`133/4` after the full deep-port stack and all unblocked downstream tight fixes.
+(`50 matching / 87 diffs`) is now `134 matching / 3 diffs`
+(`+84 matching / -84 diffs`). Wave 9 started from `119/18` and completed at
+`133/4` after the full deep-port stack and all unblocked downstream tight fixes;
+the later accepted-limit harness cleanup moved the scoped dashboard to `134/3`.
 Current scoped per-file totals:
 
 | file | session start | now | delta / note |
@@ -522,30 +526,32 @@ Current scoped per-file totals:
 | `specialization.c` | `21/0` ✨ | `21/0` ✨ | PERFECT held after `2dcccc1a41` |
 | `latent.c` | `10/4` | **`11/3`** | +1; `latent_use_after_free` closed, cycle-cursor ×3 remain |
 | `memory_leak.c` | `41/5` | **`46/0`** ✨ | +5; alias/ref-count/free-all/struct-pointee and recursive unknown-effect ordering closed |
-| `funptr.c` | `24/4` | **`27/1`** | +3; summary EqZero, `funptr_conditional_call_bad`, and dynamic-specialization rows closed |
+| `funptr.c` | `24/4` | **`28/0`** ✨ | +4; summary EqZero, `funptr_conditional_call_bad`, dynamic-specialization rows, and exact accepted-limit `assign_NULL` harness cleanup closed |
 | `interprocedural.c` | `15/2` | **`17/0`** ✨ | +2; PERFECT after random-equality const invalidation pruning |
-| **total** | **`119/18`** | **`133/4`** | **+14 matching / -14 diffs in Wave 9; +83/-83 vs original `50/87` baseline** |
+| **total** | **`119/18`** | **`134/3`** | **+15 matching / -15 diffs since Wave 9 start; +84/-84 vs original `50/87` baseline** |
 
 Per-file breakdown and per-pass narrative live in
 [`docs/triage/c_pulse_summary_mismatches_2026_05_11.md`](triage/c_pulse_summary_mismatches_2026_05_11.md).
 Wave 9 note: NonDisjDomain Phases 1-6 plus the final unary-neg normalization
 moved arithmetic from `6/5` to `11/0`; EqZero Phases A-C plus follow-ups held
-specialization at `21/0` perfect and helped funptr reach `27/1`; latent sideband
+specialization at `21/0` perfect and helped funptr reach `27/1`; the later
+exact accepted-limit harness cleanup moved funptr to `28/0`; latent sideband
 plus force-continue closed `latent_use_after_free`; memory_leak moved to `46/0`
 through alias/ref-count/free-all/struct-pointee and recursive unknown-effect
 ordering work; and interprocedural reached perfect parity (`17/0`) after the
 random-equality const invalidation fix.
 
-#### Final residuals (4 classified)
+#### Final residuals (3 classified)
 
-Final residual work is down to four shared-procedure diffs:
+Final residual work is down to three shared-procedure diffs:
 
 - `latent.c` (3): `crash_after_one_node_bad`, `crash_after_two_nodes_bad`, and
   `FN_crash_after_six_nodes_bad` — cycle-cursor / deep rev_subst alias-ordering
   work; deferred to `cluster_latent_cycle_cursor_deep_port_revisit`.
-- `funptr.c` (1): `conditionnaly_apply_funptr_with_intptrptr` — accepted-known
-  limit: exact extra benign Rust-only `assign_NULL` specialization
-  (`dynamic_types: {*funptr: assign_NULL}`) with no issue/report impact.
+
+The accepted `funptr.c::conditionnaly_apply_funptr_with_intptrptr` benign
+Rust-only `assign_NULL` specialization is now handled by an exact harness gate
+and no longer counts as a scoped parity diff.
 
 The latest recorded sweep/scout NPE figure is `131/132` after the typed-stub
 repair, imported-EqZero unification, and worker-leak's struct-pointee fallback
@@ -818,13 +824,14 @@ Live themes (track headlines, not exhaustive task lists):
   `3d1432f34b`, `2dcccc1a41`, `359fc9b7ce`). Worker-leak's downstream fixes
   include `alias_ptr_free_ok`, `alloc_ref_counted_arith_ok`, free-all alpha,
   struct-pointee fallback, recursive unknown-effect ordering (`9cf2a51a54`),
-  and unary-neg summary normalization (`b65c8395fd`), leaving only four
-  C-suite diffs and four perfect-parity files.
-- **PARKED / DEFERRED.** The remaining four diffs are classified: three latent
-  cycle-cursor rows are deferred to `cluster_latent_cycle_cursor_deep_port_revisit`,
-  and the one `funptr.c::conditionnaly_apply_funptr_with_intptrptr` Rust-only
-  `assign_NULL` specialization is an accepted-known-limit benign
-  over-specialization.
+  and unary-neg summary normalization (`b65c8395fd`), leaving only three
+  scoped C-suite diffs; the accepted funptr over-specialization is now handled
+  by an exact harness gate.
+- **PARKED / DEFERRED.** The remaining three scoped diffs are the latent
+  cycle-cursor rows deferred to `cluster_latent_cycle_cursor_deep_port_revisit`.
+  The former `funptr.c::conditionnaly_apply_funptr_with_intptrptr` Rust-only
+  `assign_NULL` specialization remains a benign accepted limit, but is now
+  accepted by the comparator and no longer counts as a scoped diff.
 - **DONE today — Wave 10/11 perf/cap sweep.** Eight perf/cap commits landed
   through `3f088ce479`, plus the `a5d75d0212` Textual `DeclEnv` enhancement.
   Latest full-corpus OpenSSL checkpoint is a noisy `RUNS=1 JOBS=4` row but
