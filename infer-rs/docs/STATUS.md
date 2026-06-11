@@ -82,11 +82,11 @@ All tested C-suite files in the final expanded parity sweep:
 | `abduce.c` | 7 | 1 | near-parity |
 | `aliasing.c` | 4 | 2 | gaps |
 | `cleanup_attribute.c` | 3 | 3 | gaps |
-| `exit_example.c` | 5 | 2 | near-parity |
+| `exit_example.c` | 7 | 0 | ✨ perfect |
 | `integers.c` | 5 | 4 | gaps |
 | `divide_by_zero.c` | 1 | 0 | ✨ perfect |
 | `fopen.c` | 39 | 0 | ✨ perfect |
-| **Total** | **243** | **18** | **93% match** |
+| **Total** | **245** | **16** | **94% match** |
 
 2026-06-09 update after rebasing onto main: Rust stdio `FILE*` models now mirror
 OCaml return-disjunct multiplicity for `fclose` / `fputc` / `putc` / `fseek` /
@@ -99,7 +99,9 @@ single benign Rust-only `assign_NULL` specialization as accepted, moving
 `funptr.c` from `27/1` to `28/0`. Global pre-stack seeding now mirrors
 OCaml's abducible global handling, moving `aliasing.c` from `2/4` to `4/2`.
 Constant divide-by-zero paths now stop like OCaml, moving `divide_by_zero.c`
-from `0/1` to `1/0`.
+from `0/1` to `1/0`. Non-disjunctive top propagation for nodes with only
+non-executable disjuncts now matches OCaml, moving `exit_example.c` from `5/2`
+to `7/0`.
 
 ### OpenSSL benchmark
 
@@ -120,7 +122,7 @@ from `0/1` to `1/0`.
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `243` matching / `18` diffs (`93%` match); 15 files are perfect |
+| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `245` matching / `16` diffs (`94%` match); 16 files are perfect |
 
 ### NPE issue-count deltas (current Linux)
 
