@@ -1542,8 +1542,7 @@ impl PulseSummary {
                         .is_some_and(|diag| proc_has_call_at_location(pdesc, diag.get_location()));
                 let direct_formal_constant_deref = !proc_is_entry_point(pdesc)
                     && pre_post_has_direct_formal_constant_deref(pdesc, &mut pp);
-                if (recovered_caller_invalid_access
-                    && proc_name_has_latent_cursor_traversal(pdesc))
+                if (recovered_caller_invalid_access && proc_name_has_latent_cursor_traversal(pdesc))
                     || (direct_formal_constant_deref
                         && !abort_invalid_access_is_imported_from_call(pdesc, &pp))
                 {

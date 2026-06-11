@@ -181,6 +181,14 @@ pub struct InferConfig {
     #[serde(rename = "pulse-force-continue")]
     pub pulse_force_continue: bool,
 
+    /// Prevent setting the non-disjunctive state to `top` when a CFG node
+    /// produced only non-executable (Stopped/Exit/Abort) disjuncts. When false
+    /// (the default) such nodes mark the summary as having dropped disjuncts,
+    /// which lets callers fire `pulse_force_continue`.
+    /// OCaml: `--pulse-prevent-non-disj-top` (default false)
+    #[serde(rename = "pulse-prevent-non-disj-top")]
+    pub pulse_prevent_non_disj_top: bool,
+
     /// Regex of methods that should be modelled as wrappers to `free(3)`.
     /// OCaml: `--pulse-model-free-pattern` (default none)
     #[serde(rename = "pulse-model-free-pattern")]
@@ -324,6 +332,7 @@ impl Default for InferConfig {
             liveness_only: false,
             pulse_report_issues_for_tests: false,
             pulse_force_continue: true,
+            pulse_prevent_non_disj_top: false,
             pulse_model_free_pattern: None,
             pulse_model_malloc_pattern: None,
             pulse_model_realloc_pattern: None,

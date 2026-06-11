@@ -1896,6 +1896,22 @@ impl TransferFunctions for PulseTransferFunctions<'_> {
         // threaded through this node's instructions so the retained old post
         // does not mask the freshly evolved over-approx state.
         joined.non_disj = state.non_disj.join(&joined.non_disj);
+        // Cross-ref: OCaml `AbstractInterpreter.exec_node_instrs` sets the
+        // non-disjunctive state to `top` (which carries
+        // `has_dropped_disjuncts=true`) when this node produced a non-empty
+        // disjunct set in which *no* disjunct is executable
+        // (Continue/Exception) — e.g. a wrapper whose only path is
+        // `exit()`/`abort()` ends purely in `ExitProgram`. Marking the summary
+        // as having dropped disjuncts is what lets callers fire
+        // `pulse_force_continue`, preserving the extra AbortProgram disjunct
+        // (`indirect_exit_example_ok` / `indirect_abort_example_ok`).
+        // `pulse_prevent_non_disj_top` (default false) disables this.
+        if !config::get().pulse_prevent_non_disj_top
+            && !state.disjuncts.is_empty()
+            && !state.disjuncts.iter().any(ExecutionDomain::is_executable)
+        {
+            joined.non_disj = joined.non_disj.join(&NonDisjDomain::top());
+        }
         joined.sync_dropped_bit_from_non_disj();
         if node_id != pdesc.exit_node {
             shrink_intermediate_post_to_stack_reachable(&mut joined);

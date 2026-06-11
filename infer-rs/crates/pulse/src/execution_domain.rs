@@ -56,6 +56,19 @@ impl ExecutionDomain {
         matches!(self, ExecutionDomain::ContinueProgram(_))
     }
 
+    /// Is this disjunct "executable", i.e. one whose instructions are actually
+    /// run when threaded through subsequent CFG nodes? Stopped states
+    /// (Exit/Abort/Latent) are passed through unchanged.
+    ///
+    /// Cross-ref: OCaml `PulseExecutionDomain.is_executable` — only
+    /// `ContinueProgram` and `ExceptionRaised` are executable.
+    pub fn is_executable(&self) -> bool {
+        matches!(
+            self,
+            ExecutionDomain::ContinueProgram(_) | ExecutionDomain::ExceptionRaised(_)
+        )
+    }
+
     /// Extract the abstract state, regardless of variant.
     pub fn get_astate(&self) -> &AbductiveDomain {
         match self {
@@ -458,5 +471,18 @@ mod tests {
         assert!(!exec1.equal_fast(&exec2));
         assert!(!exec1.leq(&exec2));
         assert!(!exec2.leq(&exec1));
+    }
+
+    #[test]
+    fn is_executable_only_true_for_continue_and_exception() {
+        let (state, root, _nested) = make_state_with_nested_value(0);
+        assert!(ExecutionDomain::ContinueProgram(state.clone()).is_executable());
+        assert!(ExecutionDomain::ExceptionRaised(state.clone()).is_executable());
+        assert!(!ExecutionDomain::ExitProgram(state.clone()).is_executable());
+        assert!(!ExecutionDomain::LatentInvalidAccess {
+            state: Box::new(state),
+            diagnostic: Box::new(invalid_access_diagnostic(root)),
+        }
+        .is_executable());
     }
 }
