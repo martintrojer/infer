@@ -221,6 +221,15 @@ impl Attr {
     pub fn is_variadic(&self) -> bool {
         self.is_marker("variadic")
     }
+
+    /// Textual cleanup marker on an annotated local: `.cleanup`.
+    ///
+    /// Cross-ref: OCaml `Textual.Attr.is_cleanup`. Carries
+    /// `ProcAttributes.var_data.has_cleanup_attribute` through the bridge so
+    /// Pulse cleanup modeling activates.
+    pub fn is_cleanup(&self) -> bool {
+        self.is_marker("cleanup")
+    }
 }
 
 // ---- Typ ----

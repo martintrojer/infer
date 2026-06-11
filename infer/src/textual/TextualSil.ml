@@ -1073,20 +1073,23 @@ module ProcDescBridge = struct
 
 
   let build_locals lang {locals} =
-    let make_var_data name typ : ProcAttributes.var_data =
+    let make_var_data name typ ~has_cleanup_attribute : ProcAttributes.var_data =
       { name
       ; typ
       ; modify_in_block= false
       ; is_constexpr= false
       ; is_declared_unused= false
       ; is_structured_binding= false
-      ; has_cleanup_attribute= false
+      ; has_cleanup_attribute
       ; tmp_id= None }
     in
     List.map locals ~f:(fun (var, annotated_typ) ->
         let name = VarName.to_mangled var in
         let typ = TypBridge.to_sil lang ~attrs:annotated_typ.Typ.attributes annotated_typ.Typ.typ in
-        make_var_data name typ )
+        let has_cleanup_attribute =
+          List.exists annotated_typ.Typ.attributes ~f:Textual.Attr.is_cleanup
+        in
+        make_var_data name typ ~has_cleanup_attribute )
 
 
   let to_sil lang decls_env cfgs ({procdecl; nodes; start; exit_loc} as pdesc) =

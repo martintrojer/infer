@@ -616,7 +616,7 @@ module ProcDescBridge = struct
     let locals_type = compute_locals_type nodes in
     let locals =
       P.get_locals pdesc
-      |> List.map ~f:(fun ({name; typ} : ProcAttributes.var_data) ->
+      |> List.map ~f:(fun ({name; typ; has_cleanup_attribute} : ProcAttributes.var_data) ->
              let var = Mangled.to_string name |> sanitize_ident |> VarName.of_string in
              let typ =
                if SilTyp.is_void typ then
@@ -630,7 +630,8 @@ module ProcDescBridge = struct
                             Typ.Void )
                else TypBridge.of_sil typ
              in
-             (var, Typ.mk_without_attributes typ) )
+             let attributes = if has_cleanup_attribute then [Textual.Attr.mk_cleanup] else [] in
+             (var, {Typ.typ; attributes}) )
     in
     let exit_loc = P.get_loc pdesc |> LocationBridge.of_sil in
     let fresh_ident = None in

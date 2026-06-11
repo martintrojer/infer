@@ -229,6 +229,10 @@ module Attr : sig
 
   val is_const : t -> bool
 
+  val mk_cleanup : t
+
+  val is_cleanup : t -> bool
+
   val mk_python_args : string list -> t
 
   val find_python_args : t -> string list option

@@ -639,7 +639,7 @@ fn procdesc_to_sil(
             is_constexpr: false,
             is_declared_unused: false,
             is_structured_binding: false,
-            has_cleanup_attribute: false,
+            has_cleanup_attribute: at.attributes.iter().any(ast::Attr::is_cleanup),
         })
         .collect();
 

@@ -1390,6 +1390,30 @@ define f(n1: int) : int {
     }
 
     #[test]
+    fn test_parse_local_cleanup_attribute() {
+        // The `.cleanup` marker on a local's annotated type must round-trip so
+        // ProcAttributes.var_data.has_cleanup_attribute is carried through the
+        // Textual bridge (activates Pulse cleanup modeling).
+        let src = r#".source_language = "c"
+
+define f() : void {
+  local x: .cleanup int
+  #entry:
+    ret null
+}"#;
+        let m = parse_module(src, "t.sil").unwrap();
+        match &m.decls[0] {
+            Decl::Proc(p) => {
+                assert_eq!(p.locals.len(), 1);
+                let (name, at) = &p.locals[0];
+                assert_eq!(name.value, "x");
+                assert!(at.attributes.iter().any(Attr::is_cleanup));
+            }
+            other => panic!("expected Proc, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_wildcard_field_name() {
         let src = r#".source_language = "c"
 

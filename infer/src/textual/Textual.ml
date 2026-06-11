@@ -568,6 +568,10 @@ module Attr = struct
 
   let is_const {name; values} = String.equal name "constant" && List.is_empty values
 
+  let mk_cleanup = mk "cleanup"
+
+  let is_cleanup {name; values} = String.equal name "cleanup" && List.is_empty values
+
   let is_curry {name; values} = String.equal name "curry" && List.is_empty values
 
   let is_final {name; values} = String.equal name "final" && List.is_empty values
