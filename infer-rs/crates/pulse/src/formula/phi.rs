@@ -733,23 +733,46 @@ impl Phi {
             }
         }
 
+        // Canonicalize a comparison-side term to a single kept summary variable
+        // when its normalized linear form (folding through `linear_eqs`) is
+        // exactly that variable. This mirrors OCaml, which presents conditions
+        // in terms of their linear representative: e.g. `5 != 2*y` where
+        // `v = 2*y` is kept collapses to `5 != v`, instead of keeping the
+        // literal `mult(2, y)` term alongside a redundant `v != 5` phi atom.
+        fn canonicalize_to_linear_repr(
+            phi: &Phi,
+            term: Term,
+            keep: &HashSet<AbstractValue>,
+        ) -> Term {
+            // Only attempt to rewrite genuinely compound affine terms; leaving
+            // bare variables and constants untouched keeps the existing
+            // visible-variable selection intact.
+            if matches!(term, Term::Var(_) | Term::Const(_)) {
+                return term;
+            }
+            let Some(lin) = phi.term_to_lin(&term) else {
+                return term;
+            };
+            let normalized = phi.normalize_linear(&lin);
+            match normalized.get_as_var() {
+                Some(v) if keep.contains(&v) => Term::Var(v),
+                _ => term,
+            }
+        }
+
+        let simplify = |term: &Term| {
+            canonicalize_to_linear_repr(
+                self,
+                simplify_term(self, term, precondition_vocabulary, keep),
+                keep,
+            )
+        };
+
         match atom {
-            Atom::Equal(a, b) => Atom::Equal(
-                simplify_term(self, a, precondition_vocabulary, keep),
-                simplify_term(self, b, precondition_vocabulary, keep),
-            ),
-            Atom::NotEqual(a, b) => Atom::NotEqual(
-                simplify_term(self, a, precondition_vocabulary, keep),
-                simplify_term(self, b, precondition_vocabulary, keep),
-            ),
-            Atom::LessEqual(a, b) => Atom::LessEqual(
-                simplify_term(self, a, precondition_vocabulary, keep),
-                simplify_term(self, b, precondition_vocabulary, keep),
-            ),
-            Atom::LessThan(a, b) => Atom::LessThan(
-                simplify_term(self, a, precondition_vocabulary, keep),
-                simplify_term(self, b, precondition_vocabulary, keep),
-            ),
+            Atom::Equal(a, b) => Atom::Equal(simplify(a), simplify(b)),
+            Atom::NotEqual(a, b) => Atom::NotEqual(simplify(a), simplify(b)),
+            Atom::LessEqual(a, b) => Atom::LessEqual(simplify(a), simplify(b)),
+            Atom::LessThan(a, b) => Atom::LessThan(simplify(a), simplify(b)),
         }
     }
 
