@@ -169,6 +169,12 @@ fn exec_load(
     match result {
         PulseResult::Ok(value) => {
             operations::write_id_with_history(id, value.clone(), &mut state);
+            // Constant division by zero in the loaded expression proved the
+            // disjunct infeasible (see `Formula::is_infeasible`); drop it to
+            // match OCaml's `SatUnsat`-threaded `eval_binop`.
+            if state.path_condition.is_infeasible() {
+                return vec![];
+            }
             // Mark integer-typed loads for integer reasoning.
             // Cross-ref: OCaml Pulse.ml and_is_int_if_integer_type.
             // A fractional value loaded at integer type (e.g. `(int)1.234`)
@@ -181,6 +187,9 @@ fn exec_load(
         }
         PulseResult::Recoverable(value, errors) => {
             operations::write_id_with_history(id, value.clone(), &mut state);
+            if state.path_condition.is_infeasible() {
+                return vec![];
+            }
             if typ.is_int() && state.path_condition.and_is_int(value.addr).is_unsat() {
                 return vec![];
             }
@@ -251,6 +260,14 @@ fn exec_store(
         }
         PulseResult::Recoverable(v, _) => v,
     };
+
+    // Cross-ref: OCaml `PulseArithmetic.eval_binop` threads `SatUnsat`, so a
+    // constant division by zero folded during RHS evaluation makes the whole
+    // disjunct `Unsat` and it is dropped. Rust evaluates binops eagerly and
+    // discards that result, so check the sticky infeasibility flag here.
+    if state.path_condition.is_infeasible() {
+        return vec![];
+    }
 
     // Cross-ref: OCaml `Pulse.exec_instr_aux Store` calls
     // `and_is_int_if_integer_type typ rhs_addr` on the stored value. Storing a

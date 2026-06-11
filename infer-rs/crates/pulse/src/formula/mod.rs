@@ -55,6 +55,17 @@ pub enum Operand {
 pub struct Formula {
     conditions: BTreeMap<Atom, usize>,
     phi: Arc<phi::Phi>,
+    /// Sticky flag set when an evaluation (e.g. constant division by zero)
+    /// proves the current disjunct infeasible but the caller discards the
+    /// `SatUnsat` result (as `eval_binop` does for the result value).
+    ///
+    /// Cross-ref: OCaml `PulseArithmetic.eval_binop` threads the `SatUnsat`
+    /// monad so a `Formula.and_equal_binop` that folds `y / 0` to `Undefined`
+    /// makes the whole disjunct `Unsat` and it is dropped. Rust evaluates
+    /// binops eagerly inside `operations::eval_with_history` and ignores the
+    /// returned `SatUnsat`, so we remember the contradiction here and let the
+    /// transfer functions drop the path.
+    path_is_infeasible: bool,
 }
 
 impl Formula {
@@ -98,6 +109,12 @@ impl Formula {
     /// Get the canonical representative of a variable.
     pub fn get_var_repr(&self, v: AbstractValue) -> AbstractValue {
         self.phi.get_repr(v)
+    }
+
+    /// Whether an eagerly-evaluated operation proved this disjunct infeasible.
+    /// See [`Formula::path_is_infeasible`].
+    pub fn is_infeasible(&self) -> bool {
+        self.path_is_infeasible
     }
 }
 
@@ -731,6 +748,17 @@ impl Formula {
             // arithmetic summaries, while dropping this relation makes the
             // float residual purely presentationally different.
             sil::binop::Binop::DivF => {
+                // Constant division by zero is undefined: OCaml's
+                // PulseFormulaTerm.eval_const_shallow / simplify_shallow raise
+                // `Undefined` when the divisor folds to a constant zero, which
+                // makes the whole disjunct Unsat. Match that so the path dies
+                // instead of surviving as a ContinueProgram summary.
+                if let Some(qy) = operand_q(y, &self.phi) {
+                    if qy == Q::from_integer(0) {
+                        self.path_is_infeasible = true;
+                        return SatUnsat::Unsat;
+                    }
+                }
                 if let (Some(qx), Some(qy)) = (operand_q(x, &self.phi), operand_q(y, &self.phi)) {
                     if qy != Q::from_integer(0) {
                         let result = qx / qy;
@@ -766,6 +794,16 @@ impl Formula {
             | sil::binop::Binop::Mod
             | sil::binop::Binop::Shiftlt
             | sil::binop::Binop::Shiftrt => {
+                // Constant integer division/modulo by zero is undefined: OCaml's
+                // PulseFormulaTerm folding raises `Undefined` (-> Unsat) when the
+                // divisor folds to a constant zero. Match that so the disjunct
+                // dies rather than surviving as a ContinueProgram summary.
+                if matches!(op, sil::binop::Binop::DivI | sil::binop::Binop::Mod) {
+                    if let Some(0) = operand_const(y, &self.phi) {
+                        self.path_is_infeasible = true;
+                        return SatUnsat::Unsat;
+                    }
+                }
                 if let (Some(cx), Some(cy)) =
                     (operand_const(x, &self.phi), operand_const(y, &self.phi))
                 {
