@@ -1007,12 +1007,18 @@ impl PrePost {
     }
 
     fn add_pre_stack_for_global_function_pointer_values(&mut self) {
+        // Cross-ref: OCaml `PulseAbductiveDomain.SafeStack.eval` already seeds
+        // every evaluated global into the precondition (`is_abducible`
+        // returns true for globals). The function-pointer specific export
+        // (MustBeValid pre-attr + positive `0 < funptr` atom) must therefore
+        // run for globals already bound in the pre stack, not only for ones
+        // missing from it.
         let post_globals: Vec<_> = self
             .post
             .post
             .stack
             .iter()
-            .filter(|(var, _addr)| var.is_global() && self.pre.stack.find(var).is_none())
+            .filter(|(var, _addr)| var.is_global())
             .map(|(var, addr)| (var.clone(), *addr))
             .collect();
 

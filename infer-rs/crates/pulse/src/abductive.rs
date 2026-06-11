@@ -450,6 +450,21 @@ impl AbductiveDomain {
             let addr = AbstractValue::mk_fresh();
             let value = ValueWithHistory::new(addr, ValueHistory::epoch());
             self.post.stack.add_with_history(var.clone(), value.clone());
+            // Cross-ref: OCaml `PulseAbductiveDomain.SafeStack.eval` records a
+            // fresh stack var in the precondition when it `is_abducible`, i.e.
+            // it is already present in the pre-stack (formals) or it is a
+            // global. Globals therefore get a `g=g` pre-stack binding plus a
+            // registered pre-heap address, which summaries expose alongside
+            // the `MustBeValid` pre-attr on the global's address.
+            if var.is_global() && self.pre.stack.find_with_history(var).is_none() {
+                // Do not record the history of values in the pre as they are
+                // unused (matches OCaml's epoch-history hack).
+                self.pre.stack.add_with_history(
+                    var.clone(),
+                    ValueWithHistory::new(addr, ValueHistory::epoch()),
+                );
+                self.pre.heap.register_address(addr);
+            }
             value
         }
     }
