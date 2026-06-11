@@ -8,6 +8,14 @@ Date: 2026-05-19
 
 Scope guard: **read-only triage**. No source edits, no commits, no sweeps. Only ran scoped C triage, wrote this `/tmp` report, and filed task-graph follow-ups.
 
+> **Historical task-name note (added 2026-06):** The follow-up task names cited
+> below (e.g. `cluster_interproc_random_equality_const_invalidation`) were
+> planned names from this 2026-05-19 scout; they were never created as live
+> `mu` tasks. The underlying work has mostly landed or been superseded by the
+> final sweep recorded in `docs/STATUS.md`. Treat `docs/STATUS.md` and
+> `mu task list -w infer-rs` as authoritative for current state; this doc is
+> historical.
+
 ## Command / artifact
 
 ```sh

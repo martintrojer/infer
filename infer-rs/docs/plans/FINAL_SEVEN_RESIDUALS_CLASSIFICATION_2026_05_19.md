@@ -7,6 +7,16 @@ Workspace: `/home/mtrojer/.local/state/mu/workspaces/infer-rs/worker-1`
 Baseline classified: `origin/infer-rs` / `d0319ba4b4` (`pulse: close arithmetic force-continue and DivF residuals`).  
 Scope: read-only scout; no source edits and no commits.
 
+> **Historical task-name note (added 2026-06):** The task names cited below
+> under "Follow-up filed" / "New tasks filed"
+> (`cluster_arithmetic_unary_neg_summary_presentation`,
+> `cluster_memory_leak_interproc_recursion_branch_havoc`,
+> `cluster_latent_cycle_cursor_deep_port_revisit`) were planned names from this
+> 2026-05-19 scout; they were never created as live `mu` tasks. The underlying
+> work has mostly landed or been superseded by the final sweep recorded in
+> `docs/STATUS.md`. Treat `docs/STATUS.md` and `mu task list -w infer-rs` as
+> authoritative for current state; this doc is historical.
+
 ## Re-baseline
 
 The freshly recreated worker-1 workspace initially sat one commit behind `origin/infer-rs`; I checked out `origin/infer-rs` read-only before measuring the requested final-seven surface.

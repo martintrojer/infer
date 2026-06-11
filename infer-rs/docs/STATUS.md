@@ -9,6 +9,15 @@ mu state -w infer-rs
 mu task list -w infer-rs --status OPEN
 ```
 
+> **Note on historical plan docs:** Some `docs/plans/*_2026_05_19.md` (and
+> related) docs say tasks were "filed" (e.g.
+> `cluster_arithmetic_unary_neg_summary_presentation`,
+> `cluster_memory_leak_interproc_recursion_branch_havoc`,
+> `cluster_interproc_random_equality_const_invalidation`,
+> `scout_npe_per_file_full_remeasure`). Those were planned task names, not live
+> `mu` tasks; the work has mostly landed or been superseded by the final sweep
+> below. This dashboard and `mu task list` are authoritative for current state.
+
 ## Final session results (2026-05-20/21)
 
 This section records the final worker session sweep. It supersedes the older
