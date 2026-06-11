@@ -80,13 +80,13 @@ All tested C-suite files in the final expanded parity sweep:
 | `funptr.c` | 28 | 0 | ✨ perfect |
 | `latent.c` | 11 | 3 | cycle-cursor residuals |
 | `abduce.c` | 7 | 1 | near-parity |
-| `aliasing.c` | 2 | 4 | gaps |
+| `aliasing.c` | 4 | 2 | gaps |
 | `cleanup_attribute.c` | 3 | 3 | gaps |
 | `exit_example.c` | 5 | 2 | near-parity |
 | `integers.c` | 5 | 4 | gaps |
 | `divide_by_zero.c` | 0 | 1 | gap |
 | `fopen.c` | 39 | 0 | ✨ perfect |
-| **Total** | **240** | **21** | **92% match** |
+| **Total** | **242** | **19** | **93% match** |
 
 2026-06-09 update after rebasing onto main: Rust stdio `FILE*` models now mirror
 OCaml return-disjunct multiplicity for `fclose` / `fputc` / `putc` / `fseek` /
@@ -96,7 +96,8 @@ conversion, rational-aware condition triviality, and integer-type contradiction
 checks, moving `integers.c` from `3/6` to `5/4`. The exact accepted-limit
 harness cleanup for `conditionnaly_apply_funptr_with_intptrptr` now treats the
 single benign Rust-only `assign_NULL` specialization as accepted, moving
-`funptr.c` from `27/1` to `28/0`.
+`funptr.c` from `27/1` to `28/0`. Global pre-stack seeding now mirrors
+OCaml's abducible global handling, moving `aliasing.c` from `2/4` to `4/2`.
 
 ### OpenSSL benchmark
 
@@ -117,7 +118,7 @@ single benign Rust-only `assign_NULL` specialization as accepted, moving
 | specialization summary harness | `21 / 21` ✨ (was `20 / 1`; `may_double_free_if_alias` closed by `d1e188b3a0` / `2dcccc1a41` direct-formal PotentialInvalidAccessSummary follow-up after full EqZero sideband chain landed — perfect parity) |
 | `virt.sil` virtual dispatch | `0` skipped procedures (full coverage) |
 | `make check` | current checkpoint passes with `INFER_BIN=../infer/bin/infer` |
-| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `240` matching / `21` diffs (`92%` match); 14 files are perfect |
+| C-suite OCaml↔Rust Pulse summary triage | expanded all-tested-file parity: `242` matching / `19` diffs (`93%` match); 14 files are perfect |
 
 ### NPE issue-count deltas (current Linux)
 
