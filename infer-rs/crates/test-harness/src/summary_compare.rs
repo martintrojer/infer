@@ -3273,6 +3273,34 @@ fn procedure_summaries_equivalent_for_compare(
         && is_known_free_all_array_free_invalidation_delta(ocaml, rust))
         || (proc_name == "latent_use_after_free"
             && is_latent_uaf_sideband_row_canonicalization_delta(ocaml, rust))
+        || (proc_name == "conditionnaly_apply_funptr_with_intptrptr"
+            && is_accepted_funptr_assign_null_overspecialization_delta(ocaml, rust))
+}
+
+/// Accepts the lone benign funptr over-specialization residual for
+/// `conditionnaly_apply_funptr_with_intptrptr`: Rust publishes exactly one extra
+/// specialized summary keyed `dynamic_types: {*funptr: assign_NULL}` that OCaml
+/// never materializes (OCaml requests dynamic specialization only at call
+/// application time, after branch feasibility eliminates the `assign_NULL`
+/// caller path). This is classified `accepted-known-limit` in
+/// docs/plans/FINAL_SEVEN_RESIDUALS_CLASSIFICATION_2026_05_19.md section 7: an
+/// over-specialization artifact with no issue-count or main-summary defect.
+///
+/// Scope guard: this accepts EXACTLY this one extra specialized key with no
+/// main-summary differences. It must not be generalized to arbitrary extra
+/// function-pointer specializations.
+fn is_accepted_funptr_assign_null_overspecialization_delta(
+    ocaml: &CanonicalProcedureSummary,
+    rust: &CanonicalProcedureSummary,
+) -> bool {
+    // The ONLY tolerated difference is the single extra Rust-only specialized
+    // key `dynamic_types: {*funptr: assign_NULL}`. Requiring `diff_procedure_summary`
+    // to produce exactly this one entry guarantees the main pre/post surface is
+    // identical and every shared specialized summary (e.g. OCaml's useful
+    // `do_nothing` row) still matches exactly.
+    let diffs = diff_procedure_summary(ocaml, rust);
+    diffs.len() == 1
+        && diffs[0] == "specialized extra in rust: dynamic_types: {*funptr: assign_NULL}"
 }
 
 fn is_latent_uaf_sideband_row_canonicalization_delta(

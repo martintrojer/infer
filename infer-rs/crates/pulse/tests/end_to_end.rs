@@ -1200,6 +1200,24 @@ fn assert_specialization_summary_report_at_post_overflow_baseline(
     );
 }
 
+fn assert_funptr_summary_report_at_accepted_overspecialization_baseline(
+    report: &test_harness::summary_compare::ComparisonReport,
+) {
+    // funptr.c parity stays closed once the lone benign over-specialization
+    // residual for conditionnaly_apply_funptr_with_intptrptr is accepted by the
+    // comparator (Rust-only `dynamic_types: {*funptr: assign_NULL}`). See
+    // docs/plans/FINAL_SEVEN_RESIDUALS_CLASSIFICATION_2026_05_19.md section 7.
+    assert_eq!(
+        (report.matching, report.differences.len()),
+        (28, 0),
+        "funptr.c summary parity should treat the assign_NULL over-specialization as accepted\n{report}"
+    );
+    assert!(
+        report.ocaml_only.is_empty() && report.rust_only.is_empty(),
+        "funptr.c should compare the same procedure set\n{report}"
+    );
+}
+
 fn assert_latent_summary_report_at_sideband_rebase_baseline(
     report: &test_harness::summary_compare::ComparisonReport,
 ) {
@@ -1449,6 +1467,9 @@ fn test_summary_comparison_c_triage() {
         }
         if filename == "latent.c" {
             assert_latent_summary_report_at_sideband_rebase_baseline(&report);
+        }
+        if filename == "funptr.c" {
+            assert_funptr_summary_report_at_accepted_overspecialization_baseline(&report);
         }
         summary_lines.push(format!(
             "{filename}\tmatching={}\tdiffs={}\tocaml_only={}\trust_only={}",
