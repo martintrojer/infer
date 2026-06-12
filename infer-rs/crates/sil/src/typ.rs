@@ -374,6 +374,16 @@ impl Typ {
             _ => None,
         }
     }
+
+    /// Whether this type is a pointer whose pointee is `const`-qualified.
+    ///
+    /// Mirrors OCaml's `Typ.is_ptr_to_const`.
+    pub fn is_ptr_to_const(&self) -> bool {
+        match &*self.desc {
+            TypeDesc::Tptr(t, _) => t.quals.is_const,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Typ {
