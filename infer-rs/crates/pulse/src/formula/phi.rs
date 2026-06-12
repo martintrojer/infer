@@ -552,7 +552,6 @@ impl Phi {
         match t {
             Term::Var(v) => self.get_known_const(self.get_repr(*v)),
             Term::Const(c) => Some(Q::from_integer(*c)),
-            Term::Rational(q) => Some(*q),
             Term::Add(a, b) => Some(self.resolve_term_to_q(a)? + self.resolve_term_to_q(b)?),
             Term::Sub(a, b) => Some(self.resolve_term_to_q(a)? - self.resolve_term_to_q(b)?),
             Term::Mult(a, b) => Some(self.resolve_term_to_q(a)? * self.resolve_term_to_q(b)?),
@@ -682,7 +681,7 @@ impl Phi {
                         phi.resolve_term(term)
                     }
                 }
-                Term::Const(_) | Term::Rational(_) => term.clone(),
+                Term::Const(_) => term.clone(),
                 Term::Add(a, b) => {
                     let a = simplify_term(phi, a, precondition_vocabulary, keep);
                     let b = simplify_term(phi, b, precondition_vocabulary, keep);
@@ -939,7 +938,6 @@ impl Phi {
         match term {
             Term::Var(v) => Some(LinArith::of_var(self.get_repr(*v))),
             Term::Const(c) => Some(LinArith::of_int(*c)),
-            Term::Rational(q) => Some(LinArith::of_q(*q)),
             Term::Add(lhs, rhs) => Some(self.term_to_lin(lhs)?.add(&self.term_to_lin(rhs)?)),
             Term::Sub(lhs, rhs) => Some(self.term_to_lin(lhs)?.sub(&self.term_to_lin(rhs)?)),
             Term::Neg(inner) => Some(self.term_to_lin(inner)?.neg()),
@@ -1451,16 +1449,17 @@ impl Phi {
                 let repr = self.get_repr(*v);
                 if let Some(lin) = self.linear_eqs.get(&repr) {
                     if let Some(q) = lin.get_as_const() {
-                        // Resolve to a constant term, preserving non-integer
-                        // rationals (e.g. `5/2` from float division or the
-                        // exact value of a float literal) via `Term::Rational`.
-                        // `Term::of_q` keeps integers as `Term::Const`.
-                        return Term::of_q(q);
+                        // Only resolve to Const if value is an integer.
+                        // Non-integer rationals (e.g., 5/2 from float division)
+                        // can't be represented in Term::Const(i64).
+                        if q.is_integer() {
+                            return Term::Const(*q.numer() / *q.denom());
+                        }
                     }
                 }
                 Term::Var(repr)
             }
-            Term::Const(_) | Term::Rational(_) => t.clone(),
+            Term::Const(_) => t.clone(),
             Term::Add(a, b) => {
                 let ra = self.resolve_term(a);
                 let rb = self.resolve_term(b);
@@ -1526,10 +1525,11 @@ impl Phi {
 
                 let resolved = if let Some(lin) = self.linear_eqs.get(&repr) {
                     if let Some(q) = lin.get_as_const() {
-                        // Preserve non-integer rationals via `Term::Rational`
-                        // so float-literal/division conditions surface the
-                        // exact fraction instead of truncating to an int.
-                        Term::of_q(q)
+                        if q.is_integer() {
+                            Term::Const(*q.numer() / *q.denom())
+                        } else {
+                            Term::Var(repr)
+                        }
                     } else {
                         Term::Var(repr)
                     }
@@ -1548,7 +1548,7 @@ impl Phi {
                 visited.remove(&repr);
                 resolved
             }
-            Term::Const(_) | Term::Rational(_) => t.clone(),
+            Term::Const(_) => t.clone(),
             Term::Add(a, b) => {
                 let ra = self.resolve_condition_term(a, visited);
                 let rb = self.resolve_condition_term(b, visited);
@@ -1622,7 +1622,7 @@ fn lin_arith_to_term_with(
     style: LinearTermStyle,
     mut var_to_term: impl FnMut(AbstractValue) -> Option<Term>,
 ) -> Option<Term> {
-    let const_term = |q: &Q| Term::of_q(*q);
+    let const_term = |q: &Q| Term::Const(*q.numer() / *q.denom());
     let scaled_term = |coeff: &Q, term: Term| {
         if *coeff == Q::from_integer(1) {
             term
@@ -1703,38 +1703,6 @@ mod tests {
         let result = phi.and_const_eq(v, 0);
         assert!(result.is_sat());
         assert!(phi.is_known_zero(v));
-    }
-
-    #[test]
-    fn test_resolve_condition_term_preserves_non_integer_rational() {
-        // A variable known to equal a non-integer rational (e.g. the exact
-        // value of a float literal like `2.2`) must resolve to a
-        // `Term::Rational`, not truncate to a spurious integer `Term::Const`.
-        let mut phi = Phi::ttrue();
-        let v = AbstractValue::of_raw(1);
-        let q = super::super::lin_arith::q_of_float(2.2).unwrap();
-        assert!(!q.is_integer());
-        assert!(phi.and_linear_eq(v, LinArith::of_q(q)).is_sat());
-
-        let resolved =
-            phi.resolve_condition_term(&Term::Var(v), &mut std::collections::HashSet::new());
-        assert_eq!(resolved, Term::Rational(q));
-        // The integer-only extractor must not see a value here.
-        assert_eq!(resolved.as_const(), None);
-        assert_eq!(resolved.as_q(), Some(q));
-    }
-
-    #[test]
-    fn test_resolve_condition_term_folds_integer_rational_to_const() {
-        // An integer-valued rational must collapse back to `Term::Const`.
-        let mut phi = Phi::ttrue();
-        let v = AbstractValue::of_raw(1);
-        assert!(phi
-            .and_linear_eq(v, LinArith::of_q(Q::from_integer(3)))
-            .is_sat());
-        let resolved =
-            phi.resolve_condition_term(&Term::Var(v), &mut std::collections::HashSet::new());
-        assert_eq!(resolved, Term::Const(3));
     }
 
     #[test]
