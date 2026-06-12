@@ -136,8 +136,21 @@ impl BaseAddressAttributes {
     }
 
     /// Mark an address as initialized.
+    ///
+    /// Cross-ref: OCaml `PulseBaseAddressAttributes.initialize` adds
+    /// `Initialized` and removes any `Uninitialized` marker.
     pub fn initialize(&mut self, addr: AbstractValue) {
         self.add_one(addr, Attribute::Initialized);
+        let has_uninit = self.map.get(&addr).is_some_and(|attrs| {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::Uninitialized))
+        });
+        if has_uninit {
+            if let Some(attrs) = self.map_mut().get_mut(&addr) {
+                Arc::make_mut(attrs).remove_uninitialized();
+            }
+        }
     }
 
     /// Mark an address as always reachable.
@@ -146,8 +159,13 @@ impl BaseAddressAttributes {
     }
 
     /// Mark an address as written to.
+    ///
+    /// Cross-ref: OCaml `PulseAbductiveDomain.add_one` calls `initialize` when
+    /// adding a `WrittenTo` attribute, so a write both records the marker and
+    /// clears any `Uninitialized` state on the value.
     pub fn mark_written_to(&mut self, addr: AbstractValue, timestamp: u64, loc: Location) {
         self.add_one(addr, Attribute::WrittenTo(timestamp, loc));
+        self.initialize(addr);
     }
 
     /// Check if an address is allocated.

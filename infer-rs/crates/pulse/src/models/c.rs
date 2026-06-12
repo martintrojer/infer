@@ -41,6 +41,7 @@ pub const MODELED_NAMES: &[&str] = &[
     "memmove",
     "memset",
     "realloc",
+    "strdup",
     "exit",
     "_exit",
     "abort",
@@ -165,6 +166,16 @@ fn dispatch_with_config(
     // Cross-ref: OCaml PulseModelsC.ml realloc_common.
     if name == "realloc" {
         return Some(realloc(env.tenv, ret_id, args, loc, state));
+    }
+    // strdup(str): check src validity, then allocate-or-null with CMalloc.
+    // Cross-ref: OCaml PulseModelsC.ml strdup =
+    //   check_valid str @@> alloc_common_dsl ~null_case:true ~initialize:true
+    //   CMalloc None @@> data_dependency_to_ret [str].
+    // `initialize:true` + `size None` means the returned buffer is NOT marked
+    // Uninitialized; `data_dependency_to_ret` is pure taint propagation with no
+    // heap/attr effect, so it is a no-op for summary-surface parity.
+    if name == "strdup" {
+        return Some(strdup(env.tenv, ret_id, args, loc, state));
     }
     if matches_procname_pattern(callee, cfg.pulse_model_free_pattern.as_deref()) {
         return Some(free(ret_id, args, loc, state));
@@ -532,6 +543,36 @@ fn malloc(
 ) -> Vec<ExecutionDomain> {
     let size_exp = args.first().map(|(exp, _)| exp);
     allocate_or_null(tenv, ret_id, Allocator::CMalloc, size_exp, loc, state)
+}
+
+/// Model: `ret = strdup(str)` — check `str` validity, then allocate-or-null.
+///
+/// Cross-ref: OCaml `PulseModelsC.strdup`. Uses `size None` (so the allocated
+/// buffer is not marked `Uninitialized`) and `initialize:true`.
+fn strdup(
+    tenv: Option<&Tenv>,
+    ret_id: &Ident,
+    args: &[(Exp, Typ)],
+    loc: &Location,
+    mut state: AbductiveDomain,
+) -> Vec<ExecutionDomain> {
+    // check_valid str (NoAccess: MustBeValid only, no MustBeInitialized).
+    if let Some((src_exp, _)) = args.first() {
+        let src_addr = operations::eval_or_fresh(src_exp, loc, &mut state);
+        match operations::check_addr_access_no_init(src_addr, loc, &mut state) {
+            PulseResult::FatalError(diag, _) => {
+                return vec![ExecutionDomain::AbortProgram {
+                    state: Box::new(state),
+                    diagnostic: Box::new(diag),
+                }];
+            }
+            PulseResult::Recoverable((), errors) => {
+                return stopped_results_from_recoverable_errors(state, errors);
+            }
+            PulseResult::Ok(()) => {}
+        }
+    }
+    allocate_or_null(tenv, ret_id, Allocator::CMalloc, None, loc, state)
 }
 
 /// Model: configured wrapper to `malloc(size)` — allocate or null with a
