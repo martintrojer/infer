@@ -2022,6 +2022,7 @@ fn format_rust_term(term: &pulse::formula::term::Term) -> String {
     match term {
         pulse::formula::term::Term::Var(var) => format!("{var}"),
         pulse::formula::term::Term::Const(constant) => constant.to_string(),
+        pulse::formula::term::Term::Rational(q) => format!("{}/{}", q.numer(), q.denom()),
         pulse::formula::term::Term::Add(lhs, rhs) => {
             format!("add({}, {})", format_rust_term(lhs), format_rust_term(rhs))
         }

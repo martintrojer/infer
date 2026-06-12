@@ -14,7 +14,7 @@ diagnostics = { path = "../diagnostics" }
 serde = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
-num-rational = "0.4"
+num-rational = { version = "0.4", features = ["serde"] }
 num-traits = { workspace = true }
 num-bigint = { workspace = true }
 rustc-hash = "2"

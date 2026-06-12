@@ -244,6 +244,7 @@ enum CanonOperand {
 enum CanonTermNode {
     Var(ValueSortKey),
     Const(i64),
+    Rational(CanonQ),
     Neg,
     Not,
     IsZero,
@@ -276,6 +277,7 @@ enum CanonTermNode {
 enum CanonTerm {
     Var(ValueSortKey),
     Const(i64),
+    Rational(CanonQ),
     Tree(Box<[CanonTermNode]>),
 }
 
@@ -1135,6 +1137,7 @@ impl Canonicalizer {
         match term {
             Term::Var(value) => CanonTerm::Var(self.partial_value_key(*value)),
             Term::Const(value) => CanonTerm::Const(*value),
+            Term::Rational(q) => CanonTerm::Rational(CanonQ::from_q(q)),
             _ => {
                 let mut nodes: Vec<CanonTermNode> = Vec::new();
                 self.flatten_term(term, &mut nodes);
@@ -1156,6 +1159,7 @@ impl Canonicalizer {
         match term {
             Term::Var(value) => out.push(CanonTermNode::Var(self.partial_value_key(*value))),
             Term::Const(value) => out.push(CanonTermNode::Const(*value)),
+            Term::Rational(q) => out.push(CanonTermNode::Rational(CanonQ::from_q(q))),
             Term::Add(lhs, rhs) => {
                 self.flatten_term(lhs, out);
                 self.flatten_term(rhs, out);
@@ -1448,6 +1452,7 @@ fn format_canon_term(term: &CanonTerm) -> String {
     match term {
         CanonTerm::Var(v) => format_value_key(v),
         CanonTerm::Const(v) => format!("const:{v}"),
+        CanonTerm::Rational(q) => format!("rational:{}/{}", q.num, q.den),
         CanonTerm::Tree(nodes) => format_canon_term_nodes(nodes),
     }
 }
@@ -1464,6 +1469,7 @@ fn format_canon_term_nodes(nodes: &[CanonTermNode]) -> String {
         match node {
             CanonTermNode::Var(v) => stack.push(format_value_key(v)),
             CanonTermNode::Const(v) => stack.push(format!("const:{v}")),
+            CanonTermNode::Rational(q) => stack.push(format!("rational:{}/{}", q.num, q.den)),
             CanonTermNode::Neg => {
                 let t = stack.pop().expect("malformed CanonTerm post-order: Neg");
                 stack.push(format!("neg({t})"));
@@ -2513,6 +2519,7 @@ mod tests {
                 Term::Neg(t) => format!("neg({})", legacy_term_str(t, canon)),
                 Term::Not(t) => format!("not({})", legacy_term_str(t, canon)),
                 Term::IsZero(t) => format!("is_zero({})", legacy_term_str(t, canon)),
+                Term::Rational(q) => format!("rational:{}/{}", q.numer(), q.denom()),
             }
         }
         for atom in phi.atoms.iter() {
@@ -2824,6 +2831,7 @@ mod tests {
                 Term::Neg(t) => format!("neg({})", legacy_term_str(t, canon)),
                 Term::Not(t) => format!("not({})", legacy_term_str(t, canon)),
                 Term::IsZero(t) => format!("is_zero({})", legacy_term_str(t, canon)),
+                Term::Rational(q) => format!("rational:{}/{}", q.numer(), q.denom()),
             }
         }
 
